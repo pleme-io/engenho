@@ -9,7 +9,7 @@
 //! | no public method of a catalog-holding type returns an owned collection without a declared bound | `no_public_store_signature_returns_an_undeclared_collection` | test gate over the source |
 //! | the scanner behind that gate sees what it must, and only that | `the_signature_scanner_*` | test |
 //! | scalar reads and visitors allocate nothing catalog-sized | `the_read_surface_clones_nothing_it_does_not_return_*` | test |
-//! | `for_each_resource` visits every stored object once, in key order, with its meta | `for_each_resource_visits_every_object_once_with_its_meta` | test |
+//! | `for_each_resource` visits every stored object once, in key order, with its meta, and returns the revision they are at |`for_each_resource_visits_every_object_once_with_its_meta` | test |
 //! | `for_each_change_since` is the watch replay's window, and refuses below the watermark without visiting | `for_each_change_since_*` | test |
 //! | `last_applied_index` tracks applies and `wait_for_applied` reads it | `last_applied_index_tracks_applies` | test |
 //!
@@ -815,8 +815,19 @@ async fn for_each_resource_visits_every_object_once_with_its_meta() {
     put(&mesh, pod("a"), json!({ "i": 99 })).await;
 
     let mut seen = Vec::new();
-    mesh.for_each_resource(|key, value, meta| seen.push((key.clone(), value.clone(), meta)))
+    let at = mesh
+        .for_each_resource(|key, value, meta| seen.push((key.clone(), value.clone(), meta)))
         .await;
+    assert_eq!(
+        at,
+        mesh.current_revision().await,
+        "the revision the objects were visited at, from the same guard"
+    );
+    assert_eq!(
+        seen.iter().map(|(_, _, meta)| meta.mod_revision).max(),
+        Some(at),
+        "no visited object is newer than the revision reported with it"
+    );
 
     let mut expected_keys: Vec<ResourceKey> = keys.to_vec();
     expected_keys.sort();

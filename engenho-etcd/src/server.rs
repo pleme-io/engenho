@@ -131,13 +131,41 @@ pub struct ReadOnlyKv<S> {
 #[allow(clippy::module_name_repetitions)]
 #[tonic::async_trait]
 pub trait EtcdReadStore: EtcdRevision {
-    /// Every key/value under `prefix`, already rendered onto the wire.
+    /// Every key/value under `prefix`, already rendered onto the wire, and
+    /// the revision they were read at, from ONE look at the store.
     ///
     /// # Errors
     ///
     /// [`StoreGone`] once the store has been dropped — never an empty
     /// vector, which a caller cannot tell from an empty keyspace.
-    async fn range(&self, prefix: &str) -> Result<Vec<crate::pb::mvccpb::KeyValue>, StoreGone>;
+    async fn range_at(&self, prefix: &str) -> Result<RangeAt, StoreGone>;
+
+    /// The keys of [`Self::range_at`] alone, for a caller that reports no
+    /// revision with them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::range_at`].
+    async fn range(&self, prefix: &str) -> Result<Vec<crate::pb::mvccpb::KeyValue>, StoreGone> {
+        self.range_at(prefix).await.map(|at| at.kvs)
+    }
+}
+
+/// The key/values under a prefix, and the revision they were read at.
+///
+/// ★ ONE LOOK, SO THE HEADER CANNOT BE NEWER THAN THE KEYS. The Range
+/// service used to read the keys, then the revision in a second call. A
+/// write landing between the two made the header name a revision the keys
+/// did not reflect, and a client that lists at the header revision and
+/// watches from the one after it — how a list-then-watch client resumes —
+/// never saw that write. The revision now travels with the keys, and the
+/// service has no second read to make.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangeAt {
+    /// Every key/value under the prefix, rendered onto the wire.
+    pub kvs: Vec<crate::pb::mvccpb::KeyValue>,
+    /// The store's revision when `kvs` were read.
+    pub revision: i64,
 }
 
 #[tonic::async_trait]
@@ -158,7 +186,7 @@ impl<S: EtcdReadStore> etcdserverpb::kv_server::Kv for ReadOnlyKv<S> {
             crate::kv::RangeShape::Interval { start, .. } => start.clone(),
         };
 
-        let mut kvs = self.store.range(&prefix).await?;
+        let RangeAt { mut kvs, revision } = self.store.range_at(&prefix).await?;
         if let crate::kv::RangeShape::Point(k) = &shape {
             kvs.retain(|kv| kv.key == k.as_bytes());
         }
@@ -170,7 +198,6 @@ impl<S: EtcdReadStore> etcdserverpb::kv_server::Kv for ReadOnlyKv<S> {
 
         let total = i64::try_from(kvs.len()).unwrap_or(i64::MAX);
         let (kvs, more) = crate::kv::assemble_range(kvs, req.limit);
-        let revision = self.store.revision().await?;
         // `count` is the TOTAL matching, not the number returned — a client
         // paginating reads it to size the remaining work, and reporting the
         // page length instead would make every page look like the last.
@@ -238,6 +265,10 @@ mod tests {
         kvs: Vec<crate::pb::mvccpb::KeyValue>,
         /// Set to answer as a store that has been dropped.
         gone: bool,
+        /// The revision `range_at` reports its keys were read at. The live
+        /// revision is always 42; a lower value is a store that has moved on
+        /// since the keys were read.
+        read_at: i64,
     }
 
     impl FakeStore {
@@ -262,6 +293,7 @@ mod tests {
                     })
                     .collect(),
                 gone: false,
+                read_at: 42,
             }
         }
 
@@ -279,14 +311,17 @@ mod tests {
 
     #[tonic::async_trait]
     impl EtcdReadStore for FakeStore {
-        async fn range(&self, prefix: &str) -> Result<Vec<crate::pb::mvccpb::KeyValue>, StoreGone> {
+        async fn range_at(&self, prefix: &str) -> Result<RangeAt, StoreGone> {
             self.live()?;
-            Ok(self
-                .kvs
-                .iter()
-                .filter(|kv| kv.key.starts_with(prefix.as_bytes()))
-                .cloned()
-                .collect())
+            Ok(RangeAt {
+                kvs: self
+                    .kvs
+                    .iter()
+                    .filter(|kv| kv.key.starts_with(prefix.as_bytes()))
+                    .cloned()
+                    .collect(),
+                revision: self.read_at,
+            })
         }
     }
 
@@ -396,6 +431,22 @@ mod tests {
         assert_eq!(h1.member_id, h2.member_id);
         assert_ne!(h1.cluster_id, 0, "zero reads as 'unset' to some clients");
         assert_eq!(h1.revision, 42, "the store's live revision");
+    }
+
+    /// The header names the revision the keys were read at, not a later
+    /// one. Read in a second call, it was newer than the keys whenever a
+    /// write landed between the two reads, and a client that lists at the
+    /// header and watches from the revision after it never sees that write.
+    #[tokio::test]
+    async fn the_range_header_is_the_revision_the_keys_were_read_at() {
+        let mut s = svc(&[("default", "a")]);
+        // The keys were read at 41; the store has since moved on to 42.
+        s.store.read_at = 41;
+        let header = range_of(&s, prefix_req("/registry/"))
+            .await
+            .header
+            .expect("a header");
+        assert_eq!(header.revision, 41);
     }
 
     #[tokio::test]

@@ -45,8 +45,8 @@ use std::time::Duration;
 
 use engenho_etcd::pb::mvccpb::{Event, KeyValue};
 use engenho_etcd::server::{
-    EtcdReadStore, EtcdRevision, EtcdStatusStore, EtcdWatchStore, OpenedWatch, StoreGone, WatchEnd,
-    WatchFeed, WatchStart, WatchStep,
+    EtcdReadStore, EtcdRevision, EtcdStatusStore, EtcdWatchStore, OpenedWatch, RangeAt, StoreGone,
+    WatchEnd, WatchFeed, WatchStart, WatchStep,
 };
 use engenho_store::resource::ResourceKey;
 use engenho_store::watch_backend::{WATCH_CHANNEL_CAPACITY, WatchGone, WatchOpts, WatchSignal};
@@ -173,24 +173,31 @@ impl MeshEtcdStore {
     /// objects; rendering them onto the wire happens after the guard drops,
     /// so the store's lock is held for a filter and a clone, not for
     /// serialization.
-    async fn kvs_under(&self, prefix: &str) -> Result<Vec<KeyValue>, StoreGone> {
+    ///
+    /// ★ THE REVISION COMES FROM THE SAME GUARD. `for_each_resource` returns
+    /// the revision the visited objects are at, so the Range header cannot
+    /// name a revision newer than its keys.
+    async fn range_under(&self, prefix: &str) -> Result<RangeAt, StoreGone> {
         let store = self.live()?;
         let mut hits = Vec::new();
-        store
+        let read_at = store
             .for_each_resource(|key, value, meta| {
                 if let Some(path) = registry_path_under(key, prefix) {
                     hits.push((path, value.clone(), meta));
                 }
             })
             .await;
-        let mut out: Vec<KeyValue> = hits
+        let mut kvs: Vec<KeyValue> = hits
             .into_iter()
             .map(|(path, value, meta)| to_kv(path, &value, &meta))
             .collect();
         // etcd returns a Range in byte order and clients paginate on it.
         // BTreeMap order is by ResourceKey, which is NOT the same ordering.
-        out.sort_by(|a, b| a.key.cmp(&b.key));
-        Ok(out)
+        kvs.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(RangeAt {
+            kvs,
+            revision: wire_revision(read_at),
+        })
     }
 }
 
@@ -212,8 +219,8 @@ impl EtcdRevision for MeshEtcdStore {
 
 #[tonic::async_trait]
 impl EtcdReadStore for MeshEtcdStore {
-    async fn range(&self, prefix: &str) -> Result<Vec<KeyValue>, StoreGone> {
-        self.kvs_under(prefix).await
+    async fn range_at(&self, prefix: &str) -> Result<RangeAt, StoreGone> {
+        self.range_under(prefix).await
     }
 }
 
@@ -699,6 +706,18 @@ mod tests {
                 &value,
                 &meta
             )]
+        );
+
+        // The seed wrote revisions 1 to 4 (the Widget is 4); the Range is
+        // read at 4 even though its newest served key is the Secret at 3.
+        let at = EtcdReadStore::range_at(&facade, "/registry/")
+            .await
+            .expect("live");
+        assert_eq!(at.revision, 4, "the revision the keys were read at");
+        assert_eq!(
+            at.revision,
+            wire_revision(store.current_revision().await),
+            "nothing has been written since"
         );
     }
 

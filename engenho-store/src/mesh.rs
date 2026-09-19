@@ -612,17 +612,24 @@ impl StoreMesh {
     /// ★ `visit` RUNS UNDER THE LOCK `apply` TAKES. Filter and clone in it;
     /// render after this returns. A visitor that serializes every object
     /// holds every write for the length of that work.
+    ///
+    /// ★ RETURNS THE REVISION THE VISITED OBJECTS ARE AT, read under the same
+    /// guard. A reader that reports the objects with a revision must use this
+    /// one. A revision from a second call can be newer than the objects, and
+    /// a client that lists at it and then watches from the revision after it
+    /// never sees the writes that landed in between.
     pub async fn for_each_resource(
         &self,
         mut visit: impl FnMut(&ResourceKey, &ResourceValue, crate::revision::VersionMeta),
-    ) {
+    ) -> crate::revision::Revision {
         self.store
             .read(|c| {
                 for (key, (value, meta)) in &c.resources {
                     visit(key, value, *meta);
                 }
+                c.revision()
             })
-            .await;
+            .await
     }
 
     /// Visit every retained change with `revision > from`, in revision
