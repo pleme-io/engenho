@@ -41,11 +41,16 @@
 //! silently dropped writes would be far worse than one that is absent.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use engenho_etcd::pb::mvccpb::{Event, KeyValue};
-use engenho_etcd::server::{EtcdReadStore, EtcdStatusStore, EtcdWatchStore};
-use engenho_store::StoreMesh;
+use engenho_etcd::server::{
+    EtcdReadStore, EtcdRevision, EtcdStatusStore, EtcdWatchStore, OpenedWatch, StoreGone, WatchEnd,
+    WatchFeed, WatchStart, WatchStep,
+};
 use engenho_store::resource::ResourceKey;
+use engenho_store::watch_backend::{WATCH_CHANNEL_CAPACITY, WatchGone, WatchOpts, WatchSignal};
+use engenho_store::{DEFAULT_HISTORY_CAPACITY, Revision, StoreMesh, WatchStream};
 
 /// The `/registry` path for one stored object, or `None` when the kind is
 /// not in the catalog.
@@ -138,15 +143,19 @@ impl MeshEtcdStore {
         }
     }
 
-    /// The live store, or `None` once the node has shut down.
+    /// The live store, or [`StoreGone`] once the node has shut down.
     ///
-    /// A dropped store means the process is terminating. Every accessor
-    /// below degrades to an empty/zero answer rather than panicking: the
-    /// listener task is being torn down in the same breath, and taking the
-    /// shutdown path down with a panic would turn a clean stop into a
-    /// crash.
-    fn live(&self) -> Option<Arc<StoreMesh>> {
-        self.store.upgrade()
+    /// ★ GONE IS AN ANSWER, NOT AN EMPTY ONE (T3.8). A dropped store means
+    /// the process is terminating. Every accessor below used to degrade to
+    /// an empty/zero answer — a `Range` of nothing at revision 0, which is
+    /// exactly what an empty cluster looks like, so a backup tool dialled
+    /// during a shutdown would have saved an empty keyspace and reported
+    /// success. Now every one returns `StoreGone`, which the services send
+    /// as gRPC `Unavailable`. Still no panic: the listener task is being
+    /// torn down in the same breath, and taking the shutdown path down with
+    /// a panic would turn a clean stop into a crash.
+    fn live(&self) -> Result<Arc<StoreMesh>, StoreGone> {
+        self.store.upgrade().ok_or(StoreGone)
     }
 
     /// Every object whose `/registry` path starts with `prefix`.
@@ -164,10 +173,8 @@ impl MeshEtcdStore {
     /// objects; rendering them onto the wire happens after the guard drops,
     /// so the store's lock is held for a filter and a clone, not for
     /// serialization.
-    async fn kvs_under(&self, prefix: &str) -> Vec<KeyValue> {
-        let Some(store) = self.live() else {
-            return Vec::new();
-        };
+    async fn kvs_under(&self, prefix: &str) -> Result<Vec<KeyValue>, StoreGone> {
+        let store = self.live()?;
         let mut hits = Vec::new();
         store
             .for_each_resource(|key, value, meta| {
@@ -183,49 +190,40 @@ impl MeshEtcdStore {
         // etcd returns a Range in byte order and clients paginate on it.
         // BTreeMap order is by ResourceKey, which is NOT the same ordering.
         out.sort_by(|a, b| a.key.cmp(&b.key));
-        out
+        Ok(out)
     }
 }
 
-impl MeshEtcdStore {
-    /// The store's current global revision, or 0 once it is gone.
-    async fn current_revision(&self) -> i64 {
-        let Some(store) = self.live() else {
-            return 0;
-        };
-        // ★ Scalar read. The whole-catalog read this used to avoid
-        // (`current_catalog()`, which deep-cloned every resource plus the
-        // 8192-entry watch-replay ring to hand back one integer) no longer
-        // exists: the catalog is sealed inside engenho-store (T3.2b).
-        i64::try_from(store.current_revision().await.0).unwrap_or(i64::MAX)
+/// A store revision as the etcd wire carries it.
+fn wire_revision(revision: Revision) -> i64 {
+    i64::try_from(revision.0).unwrap_or(i64::MAX)
+}
+
+#[tonic::async_trait]
+impl EtcdRevision for MeshEtcdStore {
+    /// ★ Scalar read. The whole-catalog read this used to avoid
+    /// (`current_catalog()`, which deep-cloned every resource plus the
+    /// 8192-entry watch-replay ring to hand back one integer) no longer
+    /// exists: the catalog is sealed inside engenho-store (T3.2b).
+    async fn revision(&self) -> Result<i64, StoreGone> {
+        Ok(wire_revision(self.live()?.current_revision().await))
     }
 }
 
 #[tonic::async_trait]
 impl EtcdReadStore for MeshEtcdStore {
-    async fn revision(&self) -> i64 {
-        self.current_revision().await
-    }
-
-    async fn range(&self, prefix: &str) -> Vec<KeyValue> {
+    async fn range(&self, prefix: &str) -> Result<Vec<KeyValue>, StoreGone> {
         self.kvs_under(prefix).await
     }
 }
 
 #[tonic::async_trait]
 impl EtcdStatusStore for MeshEtcdStore {
-    async fn revision(&self) -> i64 {
-        self.current_revision().await
+    async fn applied_index(&self) -> Result<u64, StoreGone> {
+        Ok(self.live()?.last_applied_index().await)
     }
 
-    async fn applied_index(&self) -> u64 {
-        match self.live() {
-            Some(store) => store.last_applied_index().await,
-            None => 0,
-        }
-    }
-
-    async fn db_size(&self) -> Option<i64> {
+    async fn db_size(&self) -> Result<Option<i64>, StoreGone> {
         // ★ MEASURED, NOT GUESSED — AND NOT ZERO, WHICH IS WHY THIS IS NOT
         // `None`. The trait's doc says `None` becomes 0 "which etcd clients
         // read as unknown". That is FALSE, and it was proved by pointing
@@ -268,79 +266,123 @@ impl EtcdStatusStore for MeshEtcdStore {
                 .saturating_add(*path_len)
                 .saturating_add(serialized_len(value))
         });
-        Some(i64::try_from(bytes).unwrap_or(i64::MAX))
+        Ok(Some(i64::try_from(bytes).unwrap_or(i64::MAX)))
     }
 }
 
+/// How many signals one façade watch may buffer: the whole replay ring,
+/// plus the store's usual live headroom.
+///
+/// A replay can never exceed the ring, so a far-behind start is served
+/// whole rather than overflowing at registration. The bound is not an
+/// allocation — a tokio channel grows by blocks as it fills.
+const FEED_BUFFER: usize = DEFAULT_HISTORY_CAPACITY + WATCH_CHANNEL_CAPACITY;
+
 #[tonic::async_trait]
 impl EtcdWatchStore for MeshEtcdStore {
-    async fn revision(&self) -> i64 {
-        self.current_revision().await
-    }
+    type Feed = MeshWatchFeed;
 
-    async fn changes_since(&self, prefix: &str, since: i64) -> Result<Vec<Event>, i64> {
-        let Some(store) = self.live() else {
-            return Ok(Vec::new());
+    /// ★ ONE CALL TO THE STORE'S ATOMIC `watch_from` (T3.8). This used to be
+    /// two: a live `subscribe`, then a `changes_since` history read. Two
+    /// looks at the store are only gap-free if every caller orders them
+    /// correctly, and even then a change committed between them was in both
+    /// and reached the client twice. The store's `watch_from` captures the
+    /// replay and attaches the live tail under ONE lock, so replay → live
+    /// has no gap, no duplicate and no reorder by construction.
+    async fn watch_from(
+        &self,
+        prefix: &str,
+        start: WatchStart,
+    ) -> Result<OpenedWatch<MeshWatchFeed>, WatchEnd> {
+        let store = self.live()?;
+        let current = store.current_revision().await;
+        // The store replays every change strictly AFTER `after`.
+        let after = match start {
+            // A change landing between this read and the subscription is
+            // replayed, not lost: it is after `current`.
+            WatchStart::Now => current,
+            WatchStart::At(first) => Revision(first.get() - 1),
+            // Below every watermark, zero included: refused WITH the
+            // watermark, so the client learns where it may resume.
+            WatchStart::BeforeHistory => {
+                return Err(WatchEnd::Compacted {
+                    compact_revision: watermark(store.compacted_revision().await),
+                });
+            }
         };
-        // The gap case is a VALUE the caller must handle, not an empty
-        // vector it could forward by accident: a client resuming below the
-        // watermark has to be told where it may safely restart, or it
-        // believes it is tracking a cluster it has already lost sync with.
-        //
-        // A negative `since` is below every watermark, including zero.
-        let Ok(from) = u64::try_from(since).map(engenho_store::Revision) else {
-            return Err(watermark(store.compacted_revision().await));
-        };
-        // ★ ONE GUARD, AND ONLY THE MATCHING CHANGES ARE CLONED (T3.2b).
-        // This used to clone the whole catalog — every resource and the
-        // entire replay ring — to read one window of the ring. The store
-        // applies the same window and the same refusal the watch replay
-        // does; rendering happens after its guard drops.
-        let mut hits = Vec::new();
-        store
-            .for_each_change_since(from, |change| {
-                if let Some(path) = registry_path_under(&change.key, prefix) {
-                    hits.push((path, change.clone()));
-                }
+        let stream = store
+            .watch_from(WatchOpts {
+                from: after,
+                buffer: FEED_BUFFER,
+                // etcd sends no unsolicited progress markers; a bookmark
+                // would only be skipped on the way out.
+                bookmark_every: Duration::ZERO,
             })
             .await
-            .map_err(|gone| watermark(gone.compacted))?;
-        Ok(hits
-            .into_iter()
-            .map(|(path, change)| change_to_event(path, &change))
-            .collect())
+            .map_err(|gone| watch_end(&gone))?;
+        Ok(OpenedWatch {
+            revision: wire_revision(current),
+            feed: MeshWatchFeed {
+                stream,
+                prefix: prefix.to_owned(),
+                after,
+            },
+        })
     }
+}
 
-    async fn subscribe(&self, prefix: &str) -> Option<tokio::sync::mpsc::Receiver<Event>> {
-        use engenho_store::watch_backend::WatchSignal;
+/// One open etcd watch over the store's atomic watch stream.
+///
+/// ★ HOLDS THE STREAM, NOT THE STORE — the façade's `Weak` discipline,
+/// kept. An open watch must not keep a stopped node's store alive. When the
+/// store is dropped its watcher registry goes with it and the stream
+/// closes; that bare close is the one place a watch learns `StoreGone`, and
+/// [`WatchFeed::next`] cannot return without naming it.
+#[derive(Debug)]
+pub struct MeshWatchFeed {
+    stream: WatchStream,
+    prefix: String,
+    /// The requested start, exclusive. A start AHEAD of the store attaches
+    /// at the store's revision, so the live tail would also carry the
+    /// changes between the two, which the client never asked for.
+    after: Revision,
+}
 
-        // A store that cannot subscribe returns `None` and the caller
-        // REFUSES the watch, rather than serving history and falling
-        // silent — a client that believes it is tracking the cluster and
-        // is not is the one failure mode a watch must never have.
-        let mut stream = self.live()?.watch().await.ok()?;
-        let prefix = prefix.to_string();
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
-        tokio::spawn(async move {
-            while let Some(Ok(signal)) = stream.next().await {
-                // A Bookmark is a progress marker with no etcd equivalent
-                // in this direction; it is dropped rather than rendered as
-                // an empty event, which a client would count as a change.
-                let WatchSignal::Event(event) = signal else {
-                    continue;
-                };
-                let Some(rendered) = watch_event_to_event(&event, &prefix) else {
-                    continue;
-                };
-                // A full channel means the client is not draining. Ending
-                // the watch is correct; dropping the SEND would give it a
-                // stream with a silent hole in it.
-                if tx.send(rendered).await.is_err() {
-                    break;
+#[tonic::async_trait]
+impl WatchFeed for MeshWatchFeed {
+    async fn next(&mut self) -> WatchStep {
+        loop {
+            match self.stream.next().await {
+                Some(Ok(WatchSignal::Event(event))) => {
+                    if event.resource_version <= self.after.0 {
+                        continue;
+                    }
+                    if let Some(rendered) = watch_event_to_event(&event, &self.prefix) {
+                        return WatchStep::Event(rendered);
+                    }
                 }
+                // Bookmarks are off for this stream. A stray one is skipped
+                // rather than rendered as an empty event, which a client
+                // would count as a change.
+                Some(Ok(WatchSignal::Bookmark(_))) => {}
+                Some(Err(gone)) => return WatchStep::End(watch_end(&gone)),
+                // The stream ends without a reason only when every sender is
+                // gone: the store, and its watcher registry, were dropped.
+                None => return WatchStep::End(WatchEnd::StoreGone(StoreGone)),
             }
-        });
-        Some(rx)
+        }
+    }
+}
+
+/// The etcd end for the store's typed watch end.
+fn watch_end(gone: &WatchGone) -> WatchEnd {
+    match *gone {
+        WatchGone::CompactedTooOld { compacted, .. } => WatchEnd::Compacted {
+            compact_revision: watermark(compacted),
+        },
+        WatchGone::Overflow { last_seen, .. } => WatchEnd::Overflow {
+            last_seen: wire_revision(last_seen),
+        },
     }
 }
 
@@ -373,59 +415,17 @@ fn serialized_len(value: &serde_json::Value) -> usize {
     }
 }
 
-/// One store `Change` rendered as an etcd `Event`; the caller has already
-/// selected it by its `/registry` `path`.
+/// One `WatchEvent` — replayed or live — rendered as an etcd `Event`.
 ///
-/// ★ `prev_kv` IS POPULATED HERE AND CANNOT BE ON THE LIVE PATH. `Change`
-/// carries `prior`; the live `WatchEvent` the store broadcasts does not —
-/// it keeps only the post-image. So a history replay can answer
-/// `prev_kv` truthfully and a live event cannot, and the live path returns
-/// `None` rather than echoing the current value as if it were the previous
-/// one. A fabricated `prev_kv` is worse than an absent one: a client
-/// diffing against it would compute an empty change set and conclude
-/// nothing happened.
-fn change_to_event(path: String, change: &engenho_store::revision::Change) -> Event {
-    use engenho_store::revision::ChangeKind;
-
-    let rev = i64::try_from(change.revision.0).unwrap_or(i64::MAX);
-    let meta = &change.version_meta;
-    let deleted = matches!(change.kind, ChangeKind::Delete);
-
-    Event {
-        // 0 = PUT, 1 = DELETE in mvccpb.
-        r#type: i32::from(deleted),
-        kv: Some(KeyValue {
-            key: path.clone().into_bytes(),
-            create_revision: i64::try_from(meta.create_revision.0).unwrap_or(0),
-            mod_revision: rev,
-            version: i64::try_from(meta.version).unwrap_or(0),
-            // etcd sends an EMPTY value on a delete. `Change.value` holds
-            // the tombstone (the object as it was), which belongs in
-            // `prev_kv`, not in `kv` — a client that read it there would
-            // treat a deleted object as still present.
-            value: if deleted {
-                Vec::new()
-            } else {
-                serde_json::to_vec(&change.value).unwrap_or_default()
-            },
-            lease: 0,
-        }),
-        prev_kv: change.prior.as_ref().map(|p| KeyValue {
-            key: path.into_bytes(),
-            create_revision: i64::try_from(meta.create_revision.0).unwrap_or(0),
-            mod_revision: rev.saturating_sub(1),
-            version: i64::try_from(meta.version.saturating_sub(1)).unwrap_or(0),
-            value: serde_json::to_vec(p).unwrap_or_default(),
-            lease: 0,
-        }),
-    }
-}
-
-/// One LIVE `WatchEvent` rendered as an etcd `Event`.
-///
-/// Separate from [`change_to_event`] because the live broadcast carries
-/// strictly less information — no `prior`, no `VersionMeta` — and pretending
-/// otherwise is how a façade starts lying. See that function's header.
+/// ★ ONE RENDERER FOR BOTH HALVES OF A WATCH (T3.8). The store's
+/// `WatchEvent` carries the post-image and the revision, but no `prior` and
+/// no `VersionMeta`. History used to be read as `Change`s and could fill
+/// `prev_kv` (and invented its `mod_revision` as `rev - 1`); the live half
+/// could not. Now both come through the one atomic stream, so both render
+/// here, and `prev_kv`, `create_revision` and `version` are absent/zero —
+/// etcd's "unknown" — rather than guessed. A fabricated `prev_kv` is worse
+/// than an absent one: a client diffing against it would compute an empty
+/// change set and conclude nothing happened.
 fn watch_event_to_event(event: &engenho_store::watch::WatchEvent, prefix: &str) -> Option<Event> {
     use engenho_store::watch::WatchEventKind;
 
@@ -543,7 +543,7 @@ mod tests {
     // These pin that the answers did not change with it.
 
     use engenho_store::command::{Reason, ResourceCommand};
-    use engenho_store::{InProcessRouter, Revision, default_config};
+    use engenho_store::{InProcessRouter, default_config};
     use serde_json::json;
 
     async fn boot(cluster: &str) -> Arc<StoreMesh> {
@@ -634,12 +634,12 @@ mod tests {
         let facade = MeshEtcdStore::new(&store);
         assert_eq!(
             EtcdStatusStore::db_size(&facade).await,
-            Some(i64::try_from(expected).expect("small")),
+            Ok(Some(i64::try_from(expected).expect("small"))),
             "the paths and bodies of the three served objects, and not the Widget"
         );
         assert_eq!(
             EtcdStatusStore::applied_index(&facade).await,
-            store.last_applied_index().await
+            Ok(store.last_applied_index().await)
         );
     }
 
@@ -655,14 +655,22 @@ mod tests {
                 .collect()
         };
         assert_eq!(
-            keys(EtcdReadStore::range(&facade, "/registry/pods/").await),
+            keys(
+                EtcdReadStore::range(&facade, "/registry/pods/")
+                    .await
+                    .expect("live")
+            ),
             vec![
                 "/registry/pods/default/web".to_owned(),
                 "/registry/pods/kube-system/dns".to_owned(),
             ]
         );
         assert_eq!(
-            keys(EtcdReadStore::range(&facade, "/registry/").await),
+            keys(
+                EtcdReadStore::range(&facade, "/registry/")
+                    .await
+                    .expect("live")
+            ),
             vec![
                 "/registry/pods/default/web".to_owned(),
                 "/registry/pods/kube-system/dns".to_owned(),
@@ -670,7 +678,9 @@ mod tests {
             ],
             "every served object, byte-ordered; the Widget has no path"
         );
-        let web = EtcdReadStore::range(&facade, "/registry/pods/default/").await;
+        let web = EtcdReadStore::range(&facade, "/registry/pods/default/")
+            .await
+            .expect("live");
         let (value, meta) = store
             .get_with_meta(&pod("default", "web"))
             .await
@@ -685,51 +695,115 @@ mod tests {
         );
     }
 
+    // ── T3.8: one atomic watch_from; a gone store is an answer ─────────
+
+    use engenho_etcd::pb::etcdserverpb::kv_server::Kv as _;
+    use engenho_etcd::pb::etcdserverpb::maintenance_server::Maintenance as _;
+    use engenho_etcd::pb::etcdserverpb::{RangeRequest, StatusRequest};
+    use engenho_etcd::server::{MaintenanceSvc, ReadOnlyKv, ServerIdentity};
+    use std::num::NonZeroU64;
+
+    fn at(revision: u64) -> WatchStart {
+        WatchStart::At(NonZeroU64::new(revision).expect("a start revision is at least 1"))
+    }
+
+    /// Every step the feed has ready. The replay is enqueued whole when the
+    /// watch opens, so it is all ready at once; the first quiet interval
+    /// ends the read.
+    async fn ready(feed: &mut MeshWatchFeed) -> Vec<i64> {
+        let mut revisions = Vec::new();
+        while let Ok(step) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), feed.next()).await
+        {
+            match step {
+                WatchStep::Event(event) => {
+                    revisions.push(event.kv.expect("an event carries its kv").mod_revision);
+                }
+                WatchStep::End(end) => panic!("the watch ended early: {end}"),
+            }
+        }
+        revisions
+    }
+
+    async fn open(facade: &MeshEtcdStore, prefix: &str, start: WatchStart) -> MeshWatchFeed {
+        EtcdWatchStore::watch_from(facade, prefix, start)
+            .await
+            .expect("the watch opens")
+            .feed
+    }
+
+    /// Terminate `store`, which the façade must not be keeping alive.
+    async fn stop(store: Arc<StoreMesh>) {
+        Arc::try_unwrap(store)
+            .map_err(|_| "the facade is holding a strong reference to the store")
+            .expect("reclaimable")
+            .terminate()
+            .await
+            .expect("terminate");
+    }
+
     #[tokio::test]
-    async fn history_is_the_window_after_since_under_the_prefix() {
-        let store = boot("facade-history").await;
+    async fn a_watch_replays_its_prefix_then_tails_live_with_nothing_lost_or_doubled() {
+        let store = boot("facade-watch").await;
         seed(&store).await;
         let facade = MeshEtcdStore::new(&store);
 
-        let revs = |events: Vec<Event>| -> Vec<i64> {
-            events
-                .into_iter()
-                .map(|e| e.kv.expect("a kv").mod_revision)
-                .collect()
-        };
-        // Pods are revisions 1 and 2; the Secret 3; the Widget 4.
+        // Pods are revisions 1 and 2; the Secret 3; the Widget 4, which has
+        // no registry path and so is never served.
+        let mut everything = open(&facade, "/registry/", at(1)).await;
+        assert_eq!(ready(&mut everything).await, vec![1, 2, 3]);
+        let mut pods = open(&facade, "/registry/pods/", at(2)).await;
         assert_eq!(
-            revs(
-                EtcdWatchStore::changes_since(&facade, "/registry/", 0)
-                    .await
-                    .expect("ok")
-            ),
-            vec![1, 2, 3]
-        );
-        assert_eq!(
-            revs(
-                EtcdWatchStore::changes_since(&facade, "/registry/pods/", 1)
-                    .await
-                    .expect("ok")
-            ),
+            ready(&mut pods).await,
             vec![2],
-            "strictly after `since`, and only under the prefix"
+            "from the start, and only under the prefix"
         );
+        let now = EtcdWatchStore::watch_from(&facade, "/registry/", WatchStart::Now)
+            .await
+            .expect("opens");
+        assert_eq!(now.revision, 4, "acknowledged at the store's revision");
+        let mut now = now.feed;
         assert_eq!(
-            revs(
-                EtcdWatchStore::changes_since(&facade, "/registry/", 4)
-                    .await
-                    .expect("ok")
-            ),
-            Vec::<i64>::new()
+            ready(&mut now).await,
+            Vec::<i64>::new(),
+            "no history for Now"
         );
-        // Nothing is compacted, so the watermark is 0 — and a negative
-        // resume point is still below it. Read as "from 0" it would replay
-        // the whole window to a client that asked for something impossible.
+
+        put(&store, pod("default", "late"), json!({ "spec": {} })).await;
+        for feed in [&mut everything, &mut pods, &mut now] {
+            assert_eq!(ready(feed).await, vec![5], "the live change, exactly once");
+        }
+
+        // Before every watermark, zero included: refused WITH it.
         assert_eq!(
-            EtcdWatchStore::changes_since(&facade, "/registry/", -1).await,
-            Err(0),
-            "a negative resume point is below even a zero watermark"
+            EtcdWatchStore::watch_from(&facade, "/registry/", WatchStart::BeforeHistory)
+                .await
+                .err(),
+            Some(WatchEnd::Compacted {
+                compact_revision: 0
+            }),
+        );
+    }
+
+    /// etcd's `start_revision` ahead of the store waits for it. The store
+    /// attaches such a watch at its own revision, so without the start
+    /// filter the changes between the two would reach a client that never
+    /// asked for them.
+    #[tokio::test]
+    async fn a_start_ahead_of_the_store_delivers_nothing_before_it() {
+        let store = boot("facade-ahead").await;
+        seed(&store).await;
+        let facade = MeshEtcdStore::new(&store);
+
+        let mut ahead = open(&facade, "/registry/", at(7)).await;
+        assert_eq!(ready(&mut ahead).await, Vec::<i64>::new());
+        for name in ["a", "b", "c", "d"] {
+            put(&store, pod("default", name), json!({})).await;
+        }
+        assert_eq!(
+            ready(&mut ahead).await,
+            vec![7, 8],
+            "revisions 5 and 6 precede the requested start"
         );
     }
 
@@ -776,20 +850,142 @@ mod tests {
         let store = Arc::new(store);
         let facade = MeshEtcdStore::new(&store);
 
+        let facade = &facade;
+        let refused = |start| async move {
+            EtcdWatchStore::watch_from(facade, "/registry/", start)
+                .await
+                .err()
+        };
+        let compacted = Some(WatchEnd::Compacted {
+            compact_revision: 4,
+        });
         assert_eq!(
-            EtcdWatchStore::changes_since(&facade, "/registry/", 3).await,
-            Err(4),
+            refused(at(4)).await,
+            compacted,
             "below the reloaded watermark"
         );
         assert_eq!(
-            EtcdWatchStore::changes_since(&facade, "/registry/", -1).await,
-            Err(4),
-            "a negative resume point is below every watermark"
+            refused(WatchStart::BeforeHistory).await,
+            compacted,
+            "a negative start is below every watermark"
         );
+        let mut from_watermark = open(facade, "/registry/", at(5)).await;
         assert_eq!(
-            EtcdWatchStore::changes_since(&facade, "/registry/", 4).await,
-            Ok(Vec::new()),
+            ready(&mut from_watermark).await,
+            Vec::<i64>::new(),
             "the watermark itself is servable"
         );
+    }
+
+    /// ★ T3.8. A dropped store used to answer a Range with `Ok`, no keys, at
+    /// revision 0 — exactly an empty cluster, which a backup tool would
+    /// save as a valid empty snapshot. Every service now answers
+    /// `Unavailable`, and every store read says `StoreGone`.
+    #[tokio::test]
+    async fn a_dropped_store_is_unavailable_never_an_empty_answer() {
+        let store = boot("facade-dropped").await;
+        seed(&store).await;
+        let facade = MeshEtcdStore::new(&store);
+        let identity = ServerIdentity::default();
+        let kv = ReadOnlyKv {
+            store: facade.clone(),
+            identity,
+        };
+        let maintenance = MaintenanceSvc {
+            store: facade.clone(),
+            identity,
+        };
+        stop(store).await;
+
+        let range = kv
+            .range(tonic::Request::new(RangeRequest {
+                key: b"/registry/".to_vec(),
+                range_end: engenho_etcd::keyspace::prefix_range_end(b"/registry/"),
+                ..RangeRequest::default()
+            }))
+            .await
+            .map(tonic::Response::into_inner);
+        let range = range.expect_err("a Range from a dropped store must not succeed");
+        assert_eq!(range.code(), tonic::Code::Unavailable);
+        assert_eq!(range.message(), StoreGone.to_string());
+
+        let status = maintenance
+            .status(tonic::Request::new(StatusRequest::default()))
+            .await
+            .map(tonic::Response::into_inner);
+        assert_eq!(
+            status.expect_err("a dropped store has no status").code(),
+            tonic::Code::Unavailable
+        );
+
+        assert_eq!(EtcdRevision::revision(&facade).await, Err(StoreGone));
+        assert_eq!(
+            EtcdReadStore::range(&facade, "/registry/").await,
+            Err(StoreGone)
+        );
+        assert_eq!(
+            EtcdStatusStore::applied_index(&facade).await,
+            Err(StoreGone)
+        );
+        assert_eq!(EtcdStatusStore::db_size(&facade).await, Err(StoreGone));
+        assert_eq!(
+            EtcdWatchStore::watch_from(&facade, "/registry/", WatchStart::Now)
+                .await
+                .err(),
+            Some(WatchEnd::StoreGone(StoreGone))
+        );
+    }
+
+    /// ★ T3.8. When the store goes away under an open watch its stream just
+    /// closes — no reason attached. That close is `StoreGone`, and the
+    /// client is told so with a cancel; the watch used to fall silent.
+    #[tokio::test]
+    async fn a_watch_open_when_the_store_is_dropped_is_cancelled_with_the_reason() {
+        use engenho_etcd::pb::etcdserverpb::watch_request::RequestUnion;
+        use engenho_etcd::pb::etcdserverpb::{WatchCreateRequest, WatchRequest, WatchResponse};
+
+        /// The next reply, which must come within 5s: silence is the defect.
+        async fn reply(
+            rx: &mut tokio::sync::mpsc::Receiver<Result<WatchResponse, tonic::Status>>,
+        ) -> WatchResponse {
+            tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("a reply within 5s — the watch fell silent")
+                .expect("the stream is open")
+                .expect("a response, not a status")
+        }
+
+        let store = boot("facade-watch-dropped").await;
+        seed(&store).await;
+        let facade = Arc::new(MeshEtcdStore::new(&store));
+
+        let (req_tx, req_rx) = tokio::sync::mpsc::channel(1);
+        req_tx
+            .send(Ok(WatchRequest {
+                request_union: Some(RequestUnion::CreateRequest(WatchCreateRequest {
+                    key: b"/registry/".to_vec(),
+                    range_end: engenho_etcd::keyspace::prefix_range_end(b"/registry/"),
+                    ..WatchCreateRequest::default()
+                })),
+            }))
+            .await
+            .expect("queue");
+        // The client half-closes, as one does once its watches exist.
+        drop(req_tx);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        tokio::spawn(engenho_etcd::server::run_watch_loop(
+            facade,
+            ServerIdentity::default(),
+            tokio_stream::wrappers::ReceiverStream::new(req_rx),
+            tx,
+        ));
+        let ack = reply(&mut rx).await;
+        assert!(ack.created);
+
+        stop(store).await;
+        let end = reply(&mut rx).await;
+        assert!(end.canceled, "the end of a watch is said: {end:?}");
+        assert_eq!(end.watch_id, ack.watch_id);
+        assert_eq!(end.cancel_reason, StoreGone.to_string());
     }
 }

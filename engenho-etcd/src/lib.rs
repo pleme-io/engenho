@@ -27,14 +27,25 @@
 //!   hints that do not affect encoding. Every field number and type is
 //!   upstream's, byte for byte.
 //!
-//! ## What is NOT here yet
+//! * [`server`] — the gRPC services: a read-only `KV`, `Watch` and
+//!   `Maintenance`, over three store traits. `engenho-runtime`'s
+//!   `MeshEtcdStore` implements them over the live store and serves them
+//!   on the configured etcd listen address.
 //!
-//! The gRPC services themselves (`KV`, `Watch`, `Lease`, `Maintenance`).
-//! They are mechanical relative to the above — `Range` in, `RangeResponse`
-//! out — and the store already supplies the hard semantics: `Revision(u64)`,
-//! `VersionMeta` create/mod revisions, `Change`, `CompactedTooOld` and a
-//! `watch_from` stream are all in `engenho-store` today. Stated plainly so
-//! nobody reads this crate as finished: **there is no listener on :2379.**
+//! ## The two rules the services keep (T3.8)
+//!
+//! * **A gone store is `Unavailable`, never an empty answer.** Every store
+//!   trait returns `Result<_, server::StoreGone>`; an `Ok` Range with no
+//!   keys at revision 0 is indistinguishable from an empty cluster.
+//! * **A watch is one atomic `watch_from(prefix, start)`**, and every end
+//!   of it — compaction, overflow, the store going away, a client cancel —
+//!   reaches the client as a `canceled` response carrying its reason.
+//!
+//! ## What is NOT here
+//!
+//! Writes (`Put`, `DeleteRange`, `Txn`, `Compact`) and `Snapshot` are
+//! refused with a typed `Unimplemented` that says why; `Lease` and `Auth`
+//! are not served.
 
 pub mod keyspace;
 pub mod kv;
