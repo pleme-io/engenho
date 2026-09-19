@@ -19,6 +19,7 @@
 //! today's behavior for every controller that doesn't opt into a
 //! requeue — the drivers act on the result only when it's non-`Done`.
 
+use std::fmt;
 use std::ops::Deref;
 use std::time::Duration;
 
@@ -41,6 +42,75 @@ pub trait Controller: Send + Sync {
     /// default), which the drivers treat exactly as the pre-unification
     /// counter-only behavior.
     async fn tick(&self) -> Result<ReconcileOutcome, ControllerError>;
+
+    /// The type that does this controller's reconciling (T5.11).
+    ///
+    /// The default names `Self`. An adapter that only forwards to another
+    /// controller — `Arc<C>` here, the runtime's `DeclaredHere` — forwards
+    /// this too, so what the runtime records for a driver is the type it
+    /// really runs, not the wrapper around it. Through a `dyn Controller`
+    /// it is the concrete type behind the object.
+    fn controller_type(&self) -> ControllerType {
+        ControllerType::of::<Self>()
+    }
+}
+
+/// A type that implements [`Controller`], named by the compiler (T5.11).
+///
+/// The only constructor is [`ControllerType::of`], which takes the type
+/// itself: a catalog row built from it names a type that exists and
+/// implements `Controller`, or the row does not compile (E0412/E0433 for a
+/// renamed or deleted type, E0277 for one that stopped being a
+/// controller).
+///
+/// It holds `std::any::type_name`, whose exact text Rust does not promise
+/// to keep across compiler versions. So it is an identity for catalogs and
+/// the gates over them within one build — never something to persist, or
+/// to compare with a name written down by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ControllerType {
+    path: &'static str,
+}
+
+impl ControllerType {
+    /// The controller type `C`.
+    #[must_use]
+    pub fn of<C: Controller + ?Sized>() -> Self {
+        Self {
+            path: std::any::type_name::<C>(),
+        }
+    }
+
+    /// The type's full path, generic arguments included.
+    #[must_use]
+    pub const fn path(self) -> &'static str {
+        self.path
+    }
+
+    /// The crate that defines the type: the path's first segment.
+    #[must_use]
+    pub fn krate(self) -> &'static str {
+        self.bare().split("::").next().unwrap_or(self.path)
+    }
+
+    /// The type's own name: the path's last segment, without generic
+    /// arguments.
+    #[must_use]
+    pub fn ident(self) -> &'static str {
+        self.bare().rsplit("::").next().unwrap_or(self.path)
+    }
+
+    /// The path without its generic arguments, which may themselves hold
+    /// `::`.
+    fn bare(self) -> &'static str {
+        self.path.split('<').next().unwrap_or(self.path)
+    }
+}
+
+impl fmt::Display for ControllerType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.path)
+    }
 }
 
 /// Blanket impl so an `Arc<C>` is itself a [`Controller`]. This lets a caller
@@ -56,6 +126,9 @@ impl<C: Controller + ?Sized> Controller for std::sync::Arc<C> {
     }
     async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
         (**self).tick().await
+    }
+    fn controller_type(&self) -> ControllerType {
+        (**self).controller_type()
     }
 }
 
@@ -220,6 +293,54 @@ mod tests {
             }
         }
         let _boxed: Box<dyn Controller> = Box::new(Dummy);
+    }
+
+    struct Named;
+    #[async_trait]
+    impl Controller for Named {
+        fn name(&self) -> &'static str {
+            "named"
+        }
+        async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
+            Ok(ReconcileReport::default().into())
+        }
+    }
+
+    struct Generic<T>(std::marker::PhantomData<T>);
+    #[async_trait]
+    impl<T: Send + Sync> Controller for Generic<T> {
+        fn name(&self) -> &'static str {
+            "generic"
+        }
+        async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
+            Ok(ReconcileReport::default().into())
+        }
+    }
+
+    /// A controller type is named by its crate and its own name, whatever
+    /// generic arguments it carries (they may hold `::` themselves).
+    #[test]
+    fn a_controller_type_is_its_crate_and_its_name() {
+        let named = ControllerType::of::<Named>();
+        assert_eq!(named.krate(), "engenho_controllers");
+        assert_eq!(named.ident(), "Named");
+        let generic = ControllerType::of::<Generic<std::collections::BTreeMap<String, u8>>>();
+        assert_eq!(generic.krate(), "engenho_controllers");
+        assert_eq!(generic.ident(), "Generic");
+        assert_ne!(named, generic);
+    }
+
+    /// What a controller reports is the type that reconciles: through an
+    /// `Arc` (which the runtime's drivers hold), through a `dyn`, and
+    /// through both — never the wrapper.
+    #[test]
+    fn a_controller_reports_the_type_that_reconciles_not_its_wrapper() {
+        let want = ControllerType::of::<Named>();
+        assert_eq!(Named.controller_type(), want);
+        assert_eq!(std::sync::Arc::new(Named).controller_type(), want);
+        let object: std::sync::Arc<dyn Controller> = std::sync::Arc::new(Named);
+        assert_eq!(object.controller_type(), want);
+        assert_eq!(std::sync::Arc::new(object).controller_type(), want);
     }
 
     #[test]

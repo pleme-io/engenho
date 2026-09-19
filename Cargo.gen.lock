@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "1966c7a2af4c79bd3e15ed9f790a9632ef689ccb7ec76505f5a973630018ea62",
+  "cargo_lock_sha256": "dc62688276f9ee8e8ad03012ea8b133f838bc3a6a2b90f8cfe97f1dddc8a2fdb",
   "manifest_sha256": {
     "Cargo.toml": "04cf79221801b8562c19d8a3bcbf45a55f2886ba7d654cd6a523bd856736a98c",
     "engenho-apiserver/Cargo.toml": "be7d04cd80fe124f3094eb3f147cbde15e2eabe2975858e18f9ed7ab6c190ab1",
@@ -21,7 +21,7 @@
     "engenho-mcp/Cargo.toml": "dc06fc92995d436359c7da1e38aff4fa8fbd4ed1bdb9f70d815f1e0d27163086",
     "engenho-oracle/Cargo.toml": "9b0da2a6c1d469c28eb0617b8d71df0b0bf6db7751596956e0bb74a6ac979984",
     "engenho-revoada/Cargo.toml": "08cfd6e45e8acfb75f3073e3a70a9a11a9c33575c43509d0199b1e73bb8012f9",
-    "engenho-runtime/Cargo.toml": "1bb074d1b048ced7b852c243698ed6dab8b4ea4d2b1eb1537067e10ab7579665",
+    "engenho-runtime/Cargo.toml": "3e13d396eb3b50c98b251b81ab2241e844b186c095621723b5f63e6736445ede",
     "engenho-scheduler/Cargo.toml": "b8e178bbb3012942524cd91c4f5e3c1160e11d2ec81eb81ce5f18bd1504426d1",
     "engenho-store/Cargo.toml": "8b378fa9e3e1223b200168b5ff6f7a03c6dcc42fd6fb670576aaf0a9af5a80f1",
     "engenho-substrate-props/Cargo.toml": "6f95b92f74fa8ac52030f06626f6af99c00c7939722497de0e91f8074fc0c52a",
@@ -29,7 +29,7 @@
     "engenho-sui-typescape/Cargo.toml": "30fde1a3a1db010241fa2d2c10c14a4953dcbb9979d760cf0843622f3b694207",
     "engenho-teia/Cargo.toml": "5f49fb93d3d30e02eea21bec4cb5cbe8b972bd40d3db3b8c29ce3c3f5f79c6fb",
     "engenho-types/Cargo.toml": "ed835cbe693033a0b05c49550da9b34545d51a477a28a053bd0a86878bc917c3",
-    "engenho/Cargo.toml": "4a6b88432fea4ff0c2c3a8490d9b4393999440875d6a5f2010980dde7e78f13d"
+    "engenho/Cargo.toml": "ba8430805198d138d2911a932e4ee76a903a601ab17de17073da36f9c0ec780c"
   },
   "target_resolves": {
     "base": {
@@ -17317,6 +17317,8 @@
           "default",
           "memoffset",
           "net",
+          "process",
+          "signal",
           "socket"
         ]
       },

@@ -319,7 +319,9 @@ mod tests {
     #[test]
     fn no_lease_at_all_reads_as_unknown_never_as_ready() {
         // A Node object with a stored Ready=True and NO lease — the shape
-        // `register_node` produces at boot before the first heartbeat.
+        // `register_node` wrote on every boot before T1.3a, and what a Node
+        // the kubelet once published Ready on looks like after its lease is
+        // lost.
         let mut node = json!({"status": {"conditions": [
             {"type": "Ready", "status": "True"}
         ]}});

@@ -15,12 +15,12 @@ use engenho_config::{
     ResolvedDatapath,
 };
 use engenho_controllers::{
-    Controller, ControllerError, CrdController, CronJobController, DaemonSetController,
-    DeclaresReads, DeploymentController, DynamicHandlerSink, EndpointsController, FakeRouter,
-    GcController, Heartbeat, IptablesRouter, IpvsRouter, JobController, NamespaceController,
-    PodDisruptionBudgetController, PvBinderController, Reads, ReconcileOutcome,
-    ReplicaSetController, ServiceRouter, ServiceRoutingController, StatefulSetController,
-    TickClass, WallClock, WatchDriver, WatchDriverConfig,
+    Controller, ControllerError, ControllerType, CrdController, CronJobController,
+    DaemonSetController, DeclaresReads, DeploymentController, DynamicHandlerSink,
+    EndpointsController, FakeRouter, GcController, Heartbeat, IptablesRouter, IpvsRouter,
+    JobController, NamespaceController, PodDisruptionBudgetController, PvBinderController, Reads,
+    ReconcileOutcome, ReplicaSetController, ServiceRouter, ServiceRoutingController,
+    StatefulSetController, WallClock, WatchDriver, WatchDriverConfig,
     admission::{AdmissionChain, AdmissionMode, AdmissionWebhook},
     cluster_ip::{ClusterIpDefaultingWebhook, StoreServiceIpSource},
     event_recorder::EventSink,
@@ -47,6 +47,9 @@ use tracing::{info, warn};
 
 use crate::child::{Child, ChildTask, Children, DeadChild, Driver, Listener, Wiring};
 use crate::error::RuntimeError;
+use crate::node_registration::{HostOwned, register_node};
+use crate::panics::PanicCounter;
+use crate::rebind::serve_rebinding;
 
 /// The assembled single-node runtime. Owns the store spine, the
 /// apiserver, every child task (drivers + listeners, one owned set), and the
@@ -56,6 +59,8 @@ pub struct Runtime {
     store: Arc<StoreMesh>,
     apiserver: ApiServer,
     children: Children,
+    /// Every panic in the process, counted by the hook `start` installs.
+    panics: PanicCounter,
     /// Kept alive for the runtime's lifetime so the kubelet's backend
     /// outlives every driver tick; tests pass their own clone to
     /// [`Runtime::start_with_backend`] and inspect it.
@@ -99,6 +104,11 @@ impl Runtime {
         config: EngenhoConfig,
         backend: Arc<dyn ContainerRuntime>,
     ) -> Result<Self, RuntimeError> {
+        // 0. Count every panic in the process from here on (T2.7): the hook
+        //    chains to whatever was installed before it, and installs once
+        //    however many runtimes start.
+        let panics = PanicCounter::install();
+
         // 1. Validate the whole config (every section + cross-section).
         config.validate()?;
 
@@ -117,17 +127,19 @@ impl Runtime {
         }
         info!(node = %config.runtime.node_name, "store reached leadership");
 
-        // 4. Register THIS node so the scheduler has a schedulable
-        //    target (the missing brick — no other code does this).
-        register_node(&store, &config.runtime.node_name).await?;
+        // 4. Register THIS node so the scheduler has a target: create its
+        //    Node if absent, else merge only the host-owned fields — a
+        //    restart never undoes a cordon, a taint or an operator's label.
+        let node_name = &config.runtime.node_name;
+        register_node(&store, node_name, &HostOwned::measured(node_name)).await?;
 
         // 4.5. Seed the bootstrap RBAC policy (Brick B) — cluster-admin +
         //    system:discovery + system:basic-user + system:public-info-viewer
         //    ClusterRoles + their ClusterRoleBindings — BEFORE the apiserver
         //    binds, so the very first request authorizes against a seeded store.
-        //    Idempotent (Put preserves uid across restarts, same as
-        //    register_node). MUST precede step 5 so anonymous discovery + bound
-        //    roles resolve through real bindings from the first request.
+        //    Idempotent (Put preserves uid across restarts). MUST precede
+        //    step 5 so anonymous discovery + bound roles resolve through real
+        //    bindings from the first request.
         //    Seed the four system namespaces FIRST: a namespace must exist
         //    before anything namespaced can live in it, and `default` is what
         //    every client opens to.
@@ -372,8 +384,17 @@ impl Runtime {
             store,
             apiserver,
             children,
+            panics,
             backend,
         })
+    }
+
+    /// The process's panic count: every panic since the runtime started,
+    /// caught or not — a contained tick's, a dead child's, a request
+    /// handler's.
+    #[must_use]
+    pub fn panics(&self) -> PanicCounter {
+        self.panics
     }
 
     /// Every child the runtime spawned, with its state and heartbeat.
@@ -1058,116 +1079,13 @@ async fn boot_store(config: &EngenhoConfig) -> Result<Arc<StoreMesh>, RuntimeErr
     }
 }
 
-/// Idempotent Node self-registration. Re-Put on restart is fine — the
-/// store preserves `metadata.uid` across updates. K8s shape mirrors the
-/// scheduler's `is_schedulable` expectation: `spec.unschedulable=false`
-/// + a Ready=True condition.
-///
-/// Writes `status.allocatable` (+ `status.capacity`) for cpu/memory.
-/// This is LOAD-BEARING: engenho-scheduler's M0.1 resource-fit predicate
-/// uses a zero-on-absent allocatable policy (an un-sized node fits NO
-/// pod that requests cpu/memory). Without these values, every pod that
-/// declares a request would stay Pending forever. We report the host's
-/// actual logical-CPU count + total memory so the single-node cluster
-/// advertises real capacity.
-/// Kubernetes' `kubernetes.io/arch` label speaks Go's `GOARCH`, not Rust's
-/// `std::env::consts::ARCH`.
-///
-/// The two disagree on exactly the values that matter here: Rust says
-/// `aarch64` and `x86_64` where Kubernetes says `arm64` and `amd64`. This
-/// is the difference between a label that works and a label that looks
-/// right and matches nothing — the reference pangea Postgres carries
-/// `nodeSelector: {kubernetes.io/arch: arm64}`, and against an `aarch64`
-/// label the scheduler's exact-match predicate leaves it
-/// `NodeSelectorMismatch` **forever**, with a correct-looking label
-/// visible in `kubectl get node -o yaml`.
-///
-/// Unknown architectures pass through verbatim rather than guessing: a
-/// wrong-but-plausible label is worse than an unfamiliar one, because it
-/// matches a selector that meant something else.
-#[must_use]
-fn kube_arch() -> &'static str {
-    match std::env::consts::ARCH {
-        "aarch64" => "arm64",
-        "x86_64" => "amd64",
-        "arm" => "arm",
-        "powerpc64" => "ppc64le",
-        "s390x" => "s390x",
-        other => other,
-    }
-}
-
-/// The `kubernetes.io/os` label, in Go's `GOOS` vocabulary.
-///
-/// Rust says `macos`; Kubernetes says `darwin`. Same failure mode as
-/// [`kube_arch`].
-#[must_use]
-fn kube_os() -> &'static str {
-    match std::env::consts::OS {
-        "macos" => "darwin",
-        other => other,
-    }
-}
-
-/// The well-known labels upstream's kubelet self-applies at registration.
-///
-/// Without these, `metadata.labels` is ABSENT — not sparse — and
-/// `matches_node_selector` is an exact-match AND over that map, so EVERY
-/// `nodeSelector` key fails and every pod carrying one stays Pending
-/// permanently. Measured on the live node 2026-08-30: `labels: None`.
-///
-/// The `beta.kubernetes.io/*` pair is deprecated upstream and still
-/// emitted, because charts in the wild continue to select on it and a
-/// missing label is a silent non-match rather than an error.
-#[must_use]
-fn well_known_node_labels(node_name: &str) -> serde_json::Value {
-    serde_json::json!({
-        "kubernetes.io/hostname": node_name,
-        "kubernetes.io/os": kube_os(),
-        "kubernetes.io/arch": kube_arch(),
-        "beta.kubernetes.io/os": kube_os(),
-        "beta.kubernetes.io/arch": kube_arch(),
-    })
-}
-
-async fn register_node(store: &StoreMesh, node_name: &str) -> Result<(), RuntimeError> {
-    let (cpu, memory) = host_capacity();
-    let mut value = serde_json::json!({
-        "kind": "Node",
-        "apiVersion": "v1",
-        "metadata": {
-            "name": node_name,
-            "labels": well_known_node_labels(node_name),
-        },
-        "spec": { "unschedulable": false },
-        "status": {
-            "capacity": { "cpu": cpu, "memory": memory },
-            "allocatable": { "cpu": cpu, "memory": memory },
-            "conditions": [{ "type": "Ready", "status": "True" }]
-        }
-    });
-    // Route the self-registered Node through the SAME boundary stamp the
-    // apiserver create path uses, so AGE works on the Node too. Frozen once
-    // into the replicated Put.
-    stamp_creation_timestamp_value(&mut value);
-    store
-        .propose(ResourceCommand::Put {
-            key: ResourceKey::cluster_scoped("", "v1", "Node", node_name),
-            value,
-            expected: None,
-            reason: Reason::Operator,
-        })
-        .await?;
-    info!(node = %node_name, "registered schedulable node");
-    Ok(())
-}
-
 /// Inject `metadata.creationTimestamp` (if absent) into an opaque JSON
-/// body from the typed RFC3339 boundary render — the non-handler `Put`
-/// seeders (register_node) route through this so every born object,
-/// including the self-registered Node, carries a real creationTimestamp.
-/// Mirrors the apiserver handler's `stamp_creation_timestamp`.
-fn stamp_creation_timestamp_value(body: &mut serde_json::Value) {
+/// body from the typed RFC3339 boundary render — the non-handler seeders
+/// (and node registration's create path) route through this so every born
+/// object, including the self-registered Node, carries a real
+/// creationTimestamp. Mirrors the apiserver handler's
+/// `stamp_creation_timestamp`.
+pub(crate) fn stamp_creation_timestamp_value(body: &mut serde_json::Value) {
     if let Some(obj) = body.as_object_mut() {
         let metadata = obj
             .entry("metadata".to_string())
@@ -1205,7 +1123,7 @@ const RBAC_VERSION: &str = "v1";
 /// Each seed is a TYPED Rust value (`ClusterRole`/`ClusterRoleBinding`) →
 /// `serde_json::to_value` → `ResourceCommand::Put` (TYPED EMISSION — no `json!()`
 /// of the policy bodies; only the Put envelope helper). Idempotent because Put
-/// preserves `metadata.uid` across restarts, exactly like `register_node`.
+/// preserves `metadata.uid` across restarts.
 /// The four namespaces every conformant control plane has at first boot.
 ///
 /// Upstream's kube-apiserver creates these during bootstrap, and their absence
@@ -1220,15 +1138,13 @@ const RBAC_VERSION: &str = "v1";
 /// * `kube-public` — world-readable cluster info.
 /// * `kube-node-lease` — Node heartbeat Leases (`coordination.k8s.io`).
 ///
-/// Idempotent across restarts for the same reason [`register_node`] is: the
-/// apply path preserves `metadata.uid` and `creationTimestamp` on a Put over
+/// Idempotent across restarts: the apply path preserves `metadata.uid` and `creationTimestamp` on a Put over
 /// an existing key, so re-seeding an unchanged namespace is a no-op rather
 /// than a new object identity.
 ///
 /// Each is built as a TYPED [`Namespace`] rather than a `json!()` literal, so
 /// a field that does not exist is a compile error — the shape
-/// `seed_bootstrap_rbac` established and the one `register_node` still
-/// predates.
+/// `seed_bootstrap_rbac` established.
 async fn seed_system_namespaces(store: &StoreMesh) -> Result<(), RuntimeError> {
     for name in SYSTEM_NAMESPACES {
         let ns = system_namespace(name);
@@ -1825,7 +1741,7 @@ fn host_memory_bytes() -> Option<u64> {
 /// named as `pending-node-allocatable-reservation` rather than approximated,
 /// because a made-up reservation is the same class of defect as the made-up
 /// total this replaces.
-fn host_capacity() -> (String, String) {
+pub(crate) fn host_capacity() -> (String, String) {
     let cpus = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(1);
@@ -2566,6 +2482,10 @@ impl<C: Controller> Controller for DeclaredHere<C> {
     async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
         self.controller.tick().await
     }
+
+    fn controller_type(&self) -> ControllerType {
+        self.controller.controller_type()
+    }
 }
 
 impl<C> DeclaresReads for DeclaredHere<C> {
@@ -2676,24 +2596,13 @@ impl<'a> Parts<'a> {
         }
     }
 
-    /// Wrap `controller` in a `WatchDriver` woken by exactly the kinds it
-    /// declares it reads (T1.7). This is the only place a driver's filter is
-    /// built, and it takes nothing but the declaration: a controller that
-    /// declares no reads cannot be driven (E0277), and no list of what wakes
-    /// a driver is written anywhere. The three controllers whose crates do
-    /// not declare yet are declared beside their spawn ([`DeclaredHere`]),
-    /// as reads, and the read census holds those to their sources too.
-    fn watch<C: Controller + DeclaresReads + 'static>(&self, controller: C) -> ChildTask {
-        let reads = controller.reads();
-        let config = WatchDriverConfig {
-            filter: reads.filter(),
-            debounce: self.debounce,
-            fallback_interval: self.fallback,
-            stuck_tick_after: STUCK_TICK_AFTER,
-        };
-        let watch = WatchDriver::new(controller, self.store.clone(), config);
-        let wiring = Wiring::new(reads, watch.wakes().clone());
-        ChildTask::driver(watch.heartbeat(), wiring, watch.run())
+    /// `driver`'s body: `controller` behind a `WatchDriver`. See [`drive`].
+    fn watch<C: Controller + DeclaresReads + 'static>(
+        &self,
+        driver: Driver,
+        controller: C,
+    ) -> ChildTask {
+        drive(driver, controller, self.store, self.debounce, self.fallback)
     }
 
     #[allow(
@@ -2705,33 +2614,42 @@ impl<'a> Parts<'a> {
         let ns = || self.ns.clone();
         let events = || self.events.clone();
         match driver {
-            Driver::Deployment => {
-                self.watch(DeploymentController::new(store.clone(), ns()).with_event_sink(events()))
-            }
-            Driver::ReplicaSet => {
-                self.watch(ReplicaSetController::new(store.clone(), ns()).with_event_sink(events()))
-            }
-            Driver::StatefulSet => self
-                .watch(StatefulSetController::new(store.clone(), ns()).with_event_sink(events())),
-            Driver::DaemonSet => {
-                self.watch(DaemonSetController::new(store.clone(), ns()).with_event_sink(events()))
-            }
-            Driver::Job => {
-                self.watch(JobController::new(store.clone(), ns()).with_event_sink(events()))
-            }
+            Driver::Deployment => self.watch(
+                driver,
+                DeploymentController::new(store.clone(), ns()).with_event_sink(events()),
+            ),
+            Driver::ReplicaSet => self.watch(
+                driver,
+                ReplicaSetController::new(store.clone(), ns()).with_event_sink(events()),
+            ),
+            Driver::StatefulSet => self.watch(
+                driver,
+                StatefulSetController::new(store.clone(), ns()).with_event_sink(events()),
+            ),
+            Driver::DaemonSet => self.watch(
+                driver,
+                DaemonSetController::new(store.clone(), ns()).with_event_sink(events()),
+            ),
+            Driver::Job => self.watch(
+                driver,
+                JobController::new(store.clone(), ns()).with_event_sink(events()),
+            ),
             // CronJob: parses spec.schedule (5-field cron) against the
             // WallClock and creates a batch/v1 Job from the jobTemplate on
             // schedule; the JobController then runs that Job's Pods.
             Driver::CronJob => self.watch(
+                driver,
                 CronJobController::new(store.clone(), Arc::new(WallClock), ns())
                     .with_event_sink(events()),
             ),
-            Driver::PodDisruptionBudget => {
-                self.watch(PodDisruptionBudgetController::new(store.clone(), ns()))
-            }
-            Driver::Endpoints => {
-                self.watch(EndpointsController::new(store.clone(), ns()).with_event_sink(events()))
-            }
+            Driver::PodDisruptionBudget => self.watch(
+                driver,
+                PodDisruptionBudgetController::new(store.clone(), ns()),
+            ),
+            Driver::Endpoints => self.watch(
+                driver,
+                EndpointsController::new(store.clone(), ns()).with_event_sink(events()),
+            ),
             // Service routing: resolves Service + Endpoints → typed
             // ServiceRoutes and drives the platform-selected datapath
             // backend. The backend is chosen by `networking.datapath_mode`
@@ -2751,14 +2669,17 @@ impl<'a> Parts<'a> {
                     mode = ?self.config.networking.datapath_mode,
                     "service routing backend selected"
                 );
-                self.watch(ServiceRoutingController::new(store.clone(), backend, ns()))
+                self.watch(
+                    driver,
+                    ServiceRoutingController::new(store.clone(), backend, ns()),
+                )
             }
-            Driver::Gc => self.watch(GcController::new(store.clone(), ns())),
+            Driver::Gc => self.watch(driver, GcController::new(store.clone(), ns())),
             // Namespace: cascade-deletion of a Terminating namespace's
             // contents + finalizer clear. It reads every namespaced kind, so
             // each child's deletion wakes it; the fallback tick covers the
             // rest of the drain.
-            Driver::Namespace => self.watch(NamespaceController::new(store.clone(), ns())),
+            Driver::Namespace => self.watch(driver, NamespaceController::new(store.clone(), ns())),
             // PV/PVC binder: binds Pending claims to matching Available PVs
             // and dynamically provisions a node-local hostPath PV (under
             // data_dir/local-path) when no static PV matches. A claim that
@@ -2773,6 +2694,7 @@ impl<'a> Parts<'a> {
                     .to_string_lossy()
                     .into_owned();
                 self.watch(
+                    driver,
                     PvBinderController::new(store.clone(), ns(), local_path_root)
                         .with_csi(Arc::new(engenho_kubelet::DriverCsiProvisioner::new(
                             self.csi_drivers.clone(),
@@ -2791,6 +2713,7 @@ impl<'a> Parts<'a> {
                     .to_string_lossy()
                     .into_owned();
                 self.watch(
+                    driver,
                     engenho_controllers::volume_snapshot::VolumeSnapshotController::new(
                         store.clone(),
                         snapshot_root,
@@ -2803,18 +2726,22 @@ impl<'a> Parts<'a> {
             // become routable + discoverable with no parallel codepath. The
             // fallback tick covers a CRD installed before the driver
             // subscribed.
-            Driver::Crd => self.watch(CrdController::new(store.clone(), self.handler_sink.clone())),
+            Driver::Crd => self.watch(
+                driver,
+                CrdController::new(store.clone(), self.handler_sink.clone()),
+            ),
             // Scheduler: pending Pod → spec.nodeName.
-            Driver::Scheduler => self.watch(DeclaredHere::new(
-                self.scheduler.clone(),
-                Reads::of(SCHEDULER_READS),
-            )),
+            Driver::Scheduler => self.watch(
+                driver,
+                DeclaredHere::new(self.scheduler.clone(), Reads::of(SCHEDULER_READS)),
+            ),
             // Served-capability honesty: truthful status conditions on the
             // kinds engenho advertises in discovery but does not implement
             // (APIService, FlowSchema, PriorityLevelConfiguration). Without
             // it an aggregated APIService registers successfully while every
             // request to its group silently goes nowhere.
             Driver::ServedCapability => self.watch(
+                driver,
                 engenho_controllers::served_capability::ServedCapabilityController::new(
                     store.clone(),
                 ),
@@ -2831,6 +2758,7 @@ impl<'a> Parts<'a> {
                     engenho_controllers::network_policy::ComputedNetworkPolicyEnforcer::new(),
                 );
                 self.watch(
+                    driver,
                     engenho_controllers::network_policy_controller::NetworkPolicyController::new(
                         store.clone(),
                         enforcer,
@@ -2846,31 +2774,37 @@ impl<'a> Parts<'a> {
             // It reads nothing from the store: registration is a filesystem
             // event, so no store event wakes it and the fallback tick drives
             // the scan.
-            Driver::CsiRegistrar => self.watch(DeclaredHere::new(
-                engenho_kubelet::CsiRegistrarController::new(
-                    &self.config.runtime.data_dir,
-                    self.csi_drivers.clone(),
+            Driver::CsiRegistrar => self.watch(
+                driver,
+                DeclaredHere::new(
+                    engenho_kubelet::CsiRegistrarController::new(
+                        &self.config.runtime.data_dir,
+                        self.csi_drivers.clone(),
+                    ),
+                    Reads::nothing(),
                 ),
-                Reads::nothing(),
-            )),
+            ),
             // CNI status: publish which network config this node resolved
             // and whether its plugin chain is executed or merely planned.
-            Driver::CniStatus => {
-                self.watch(engenho_controllers::cni_status::CniStatusController::new(
+            Driver::CniStatus => self.watch(
+                driver,
+                engenho_controllers::cni_status::CniStatusController::new(
                     store.clone(),
                     self.config.runtime.node_name.clone(),
                     std::path::PathBuf::from(CNI_CONFIG_DIR),
                     CNI_INSTALL,
-                ))
-            }
+                ),
+            ),
             // Kubelet: bound Pod → container via the backend.
-            Driver::Kubelet => self.watch(DeclaredHere::new(
-                self.kubelet.clone(),
-                Reads::of(KUBELET_READS),
-            )),
+            Driver::Kubelet => self.watch(
+                driver,
+                DeclaredHere::new(self.kubelet.clone(), Reads::of(KUBELET_READS)),
+            ),
         }
     }
 
+    /// A listener's body: bind and serve, and bind again whenever that ends
+    /// ([`serve_rebinding`], T2.7).
     fn listener(&self, listener: Listener) -> ChildTask {
         let beat = Arc::new(Heartbeat::new());
         match listener {
@@ -2878,21 +2812,61 @@ impl<'a> Parts<'a> {
                 let api: Arc<dyn engenho_kubelet::server::KubeletApi> = Arc::new(WeakKubeletApi {
                     kubelet: Arc::downgrade(&self.kubelet),
                 });
+                let addr = self.config.runtime.kubelet_listen_addr.clone();
                 ChildTask::new(
                     beat.clone(),
-                    serve_kubelet_http(self.config.runtime.kubelet_listen_addr.clone(), api, beat),
+                    serve_rebinding(listener, beat, move || {
+                        serve_kubelet_http(addr.clone(), api.clone())
+                    }),
                 )
             }
-            Listener::EtcdFacade => ChildTask::new(
-                beat.clone(),
-                serve_etcd_facade(
-                    self.config.runtime.etcd_listen_addr.clone(),
-                    crate::etcd_facade::MeshEtcdStore::new(self.store),
-                    beat,
-                ),
-            ),
+            Listener::EtcdFacade => {
+                let addr = self.config.runtime.etcd_listen_addr.clone();
+                let etcd_store = crate::etcd_facade::MeshEtcdStore::new(self.store);
+                ChildTask::new(
+                    beat.clone(),
+                    serve_rebinding(listener, beat, move || {
+                        serve_etcd_facade(addr.clone(), etcd_store.clone())
+                    }),
+                )
+            }
         }
     }
+}
+
+/// Wrap `controller` in a `WatchDriver` as the catalog says `driver` runs.
+///
+/// * Woken by exactly the kinds the controller declares it reads (T1.7).
+///   This is the only place a driver's filter is built, and it takes nothing
+///   but the declaration: a controller that declares no reads cannot be
+///   driven (E0277), and no list of what wakes a driver is written anywhere.
+///   The three controllers whose crates do not declare yet are declared
+///   beside their spawn ([`DeclaredHere`]), as reads, and the read census
+///   holds those to their sources too.
+/// * A panic in its tick is handled by the driver's catalog [`TickState`]
+///   (T2.7): contained and re-ticked for a Stateless driver, fatal to the
+///   child for a Stateful one. The catalog row is the only source of it.
+///
+/// [`TickState`]: crate::TickState
+fn drive<C: Controller + DeclaresReads + 'static>(
+    driver: Driver,
+    controller: C,
+    store: &Arc<StoreMesh>,
+    debounce: Duration,
+    fallback: Duration,
+) -> ChildTask {
+    let reads = controller.reads();
+    let config = WatchDriverConfig {
+        filter: reads.filter(),
+        debounce,
+        fallback_interval: fallback,
+        stuck_tick_after: STUCK_TICK_AFTER,
+        tick_state: driver.tick_state(),
+    };
+    let controller_type = controller.controller_type();
+    let watch = WatchDriver::new(controller, store.clone(), config);
+    let wiring = Wiring::new(controller_type, reads, watch.wakes().clone());
+    ChildTask::driver(watch.heartbeat(), wiring, watch.run())
 }
 
 /// Build the ONE kubelet, with its event sink, `ServiceAccount` projection
@@ -3012,14 +2986,9 @@ fn build_kubelet(
 ///
 /// A bind failure is logged and NOT fatal: the apiserver is already serving,
 /// and killing a working control plane because one auxiliary port is taken
-/// trades a partial outage for a total one. The listener then HALTS (see
-/// [`halt`]): its heartbeat says so, and its task stays alive, parked.
-async fn serve_kubelet_http(
-    addr: String,
-    api: Arc<dyn engenho_kubelet::server::KubeletApi>,
-    beat: Arc<Heartbeat>,
-) -> std::convert::Infallible {
-    beat.begin();
+/// trades a partial outage for a total one. This is ONE attempt; when it
+/// ends, [`serve_rebinding`] records it and binds again after a backoff.
+async fn serve_kubelet_http(addr: String, api: Arc<dyn engenho_kubelet::server::KubeletApi>) {
     match tokio::net::TcpListener::bind(&addr).await {
         Ok(listener) => {
             let bound = listener
@@ -3039,11 +3008,11 @@ async fn serve_kubelet_http(
              are unreachable from off-process (the apiserver is unaffected)"
         ),
     }
-    halt(&beat).await
 }
 
 /// The etcd v3 façade on :2379, as a catalog child. Same failure posture as
-/// :10250: a bind failure is a WARNING and the listener halts.
+/// :10250: a bind failure is a WARNING, and [`serve_rebinding`] binds again
+/// after a backoff.
 ///
 /// ★ THIS IS WHAT MAKES engenho DRIVABLE BY SOFTWARE THAT HAS NEVER HEARD OF
 /// IT. `etcdctl get /registry/ --prefix --keys-only`, `snapshot save`, every
@@ -3055,12 +3024,7 @@ async fn serve_kubelet_http(
 /// silently dropping writes. See `etcd_facade`'s header. `MeshEtcdStore` holds
 /// a `Weak`, so the three services never keep the store alive past shutdown,
 /// and every clone is the SAME store.
-async fn serve_etcd_facade(
-    addr: String,
-    etcd_store: crate::etcd_facade::MeshEtcdStore,
-    beat: Arc<Heartbeat>,
-) -> std::convert::Infallible {
-    beat.begin();
+async fn serve_etcd_facade(addr: String, etcd_store: crate::etcd_facade::MeshEtcdStore) {
     match tokio::net::TcpListener::bind(&addr).await {
         Ok(listener) => {
             let bound = listener
@@ -3101,20 +3065,6 @@ async fn serve_etcd_facade(
              unaffected)"
         ),
     }
-    halt(&beat).await
-}
-
-/// A listener whose serve has ended: record [`TickClass::Halted`] and park.
-///
-/// Its output is `Infallible`, so it cannot return; it must not panic; and
-/// rebinding is an actuator that waits for liveness to be visible (T2.7
-/// after T2.8). So it parks. The task stays in the child set as Running —
-/// it did not panic and was not aborted — and the heartbeat's `Halted` is
-/// what says it no longer serves. A liveness projection must read `Halted`
-/// as not-ok.
-async fn halt(beat: &Heartbeat) -> std::convert::Infallible {
-    beat.end(TickClass::Halted);
-    std::future::pending().await
 }
 
 /// Construct the `ServiceRouter` backend for a resolved datapath choice.
@@ -3140,79 +3090,6 @@ fn make_service_router(resolved: ResolvedDatapath) -> Arc<dyn ServiceRouter> {
 // `start_inner` (typed error for unimplemented strategies) and handed to
 // `spawn_children`. `Scheduler::new<S: SchedulingStrategy + 'static>`
 // accepts the box (Box<dyn Trait> implements Trait via the blanket impl).
-
-#[cfg(test)]
-mod node_label_tests {
-    use super::{kube_arch, kube_os, well_known_node_labels};
-
-    /// The labels speak Go's vocabulary, not Rust's.
-    ///
-    /// This is the whole point of the mapping: the reference pangea
-    /// Postgres selects `kubernetes.io/arch: arm64`, and Rust's
-    /// `std::env::consts::ARCH` is `aarch64` on the same machine. Emitting
-    /// the Rust spelling yields a label that reads correctly in
-    /// `kubectl get node -o yaml` and matches no selector anyone writes.
-    #[test]
-    fn labels_use_go_vocabulary_not_rust() {
-        assert_ne!(
-            kube_arch(),
-            "aarch64",
-            "kubernetes.io/arch must never be the Rust spelling"
-        );
-        assert_ne!(
-            kube_os(),
-            "macos",
-            "kubernetes.io/os must never be the Rust spelling"
-        );
-        assert!(
-            matches!(kube_arch(), "arm64" | "amd64" | "arm" | "ppc64le" | "s390x"),
-            "unexpected GOARCH rendering: {}",
-            kube_arch()
-        );
-        assert!(
-            matches!(kube_os(), "linux" | "darwin" | "windows"),
-            "unexpected GOOS rendering: {}",
-            kube_os()
-        );
-    }
-
-    /// Every well-known key upstream's kubelet self-applies is present and
-    /// non-empty. An ABSENT labels map is what made every nodeSelector fail
-    /// permanently; a present-but-partial one fails the same way, quietly.
-    #[test]
-    fn every_well_known_label_is_present_and_non_empty() {
-        let labels = well_known_node_labels("cid");
-        let obj = labels.as_object().expect("labels must be an object");
-        for key in [
-            "kubernetes.io/hostname",
-            "kubernetes.io/os",
-            "kubernetes.io/arch",
-            "beta.kubernetes.io/os",
-            "beta.kubernetes.io/arch",
-        ] {
-            let v = obj
-                .get(key)
-                .unwrap_or_else(|| panic!("missing well-known label {key}"))
-                .as_str()
-                .unwrap_or_else(|| panic!("{key} must be a string"));
-            assert!(!v.is_empty(), "{key} is empty, which matches nothing");
-        }
-        assert_eq!(obj["kubernetes.io/hostname"], "cid");
-    }
-
-    /// The deprecated beta aliases must agree with their replacements —
-    /// charts in the wild still select on them, and a disagreement would
-    /// make the same node match one selector and not its equivalent.
-    #[test]
-    fn beta_aliases_agree_with_their_replacements() {
-        let labels = well_known_node_labels("cid");
-        assert_eq!(labels["beta.kubernetes.io/os"], labels["kubernetes.io/os"]);
-        assert_eq!(
-            labels["beta.kubernetes.io/arch"],
-            labels["kubernetes.io/arch"]
-        );
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -3346,11 +3223,15 @@ mod tests {
     }
 
     use super::*;
+    use crate::Dormant;
+    use crate::TickState;
+    use crate::child::DeathCause;
     use crate::child::{ChildHandle, ChildState};
+    use crate::impl_census::{Implementors, workspace_sources};
     use crate::read_census::{Census, Section};
     use engenho_config::KubeletBackendKind as CfgKind;
-    use engenho_controllers::{Beat, KindFilter};
-    use std::collections::BTreeSet;
+    use engenho_controllers::{Beat, KindFilter, TickClass};
+    use std::collections::{BTreeMap, BTreeSet};
 
     // ── host capacity ────────────────────────────────────────────────────
 
@@ -3557,16 +3438,123 @@ mod tests {
         rt.shutdown().await.unwrap();
     }
 
-    /// A listener that cannot bind does not end its task — its output is
-    /// `Infallible` — and does not pretend to serve: it parks, `Halted`.
-    #[tokio::test]
-    async fn a_listener_that_cannot_bind_halts_and_parks() {
-        // A loopback address that passes config validation (T4.9 keeps node
-        // listeners on loopback and rejects a non-literal before start) but
-        // cannot be bound, because this test already holds the port.
-        let occupied = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a free port");
+    // ── T2.7: a panic in a tick, and a listener that stops serving ────
+    //
+    // A tick that panicked ended its driver for the life of the process, and
+    // a listener whose bind failed parked forever. What a panic does now
+    // follows the catalog's `TickState` for the driver, and a listener binds
+    // again on a growing backoff.
+
+    /// The fallback the panic tests tick on: short, so several ticks fit in
+    /// a test, and no store event wakes a controller that reads nothing.
+    const PANIC_FALLBACK: Duration = Duration::from_millis(200);
+
+    /// A controller whose every tick panics. What its driver does about that
+    /// is the catalog's call, not this controller's.
+    struct PanicsEveryTick;
+
+    #[async_trait::async_trait]
+    impl Controller for PanicsEveryTick {
+        fn name(&self) -> &'static str {
+            "panics-every-tick"
+        }
+
+        async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
+            panic!("tripped over a bad object");
+        }
+    }
+
+    /// `PanicsEveryTick` run as the catalog's `driver`, built by the same
+    /// [`drive`] every catalog driver is built by, as the only child of a
+    /// set. The store is returned so it outlives the set.
+    async fn a_panicking(driver: Driver) -> (Children, Arc<StoreMesh>) {
+        let config = ephemeral_test_config();
+        let store = boot_store(&config).await.unwrap();
+        assert!(store.wait_for_leadership(Duration::from_secs(5)).await);
+        let children = Children::spawn_catalog(&config, |child| {
+            (child == Child::Driver(driver)).then(|| {
+                drive(
+                    driver,
+                    DeclaredHere::new(PanicsEveryTick, Reads::nothing()),
+                    &store,
+                    Duration::from_millis(10),
+                    PANIC_FALLBACK,
+                )
+            })
+        });
+        assert_eq!(children.len(), 1, "precondition: {driver:?} is spawned");
+        (children, store)
+    }
+
+    /// A Stateless driver (the catalog says so) contains its tick's panic:
+    /// it keeps ticking, each panic is counted and classed as one, and its
+    /// task does not end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stateless_driver_whose_tick_panics_keeps_ticking() {
+        let driver = Driver::CniStatus;
+        assert_eq!(driver.tick_state(), TickState::Stateless, "precondition");
+        let (mut children, _store) = a_panicking(driver).await;
+        let child = Child::Driver(driver);
+
+        let deadline = std::time::Instant::now() + TICK_DEADLINE;
+        let beat = loop {
+            let beat = children.get(child).map(|h| h.beat().snapshot());
+            if let Some(beat) = beat.filter(|b| b.panics >= 3) {
+                break beat;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "three panicking ticks never happened: {beat:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let died = tokio::time::timeout(PANIC_FALLBACK * 3, children.next_dead()).await;
+        children.stop().await;
+
+        assert!(died.is_err(), "a contained panic ended the child: {died:?}");
+        assert_eq!(beat.last_class, Some(TickClass::Panicked), "{beat:?}");
+    }
+
+    /// A Stateful driver (the kubelet) does not contain its tick's panic: the
+    /// child is Dead after its first tick, and nothing re-ticks it over the
+    /// state the panic tore.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stateful_driver_whose_tick_panics_is_dead() {
+        let driver = Driver::Kubelet;
+        assert_eq!(driver.tick_state(), TickState::Stateful, "precondition");
+        let (mut children, _store) = a_panicking(driver).await;
+        let child = Child::Driver(driver);
+
+        let dead = tokio::time::timeout(TICK_DEADLINE, children.next_dead())
+            .await
+            .expect("a stateful driver's panic never ended its child");
+        // Longer than the fallback, so a driver that survived would re-tick.
+        tokio::time::sleep(PANIC_FALLBACK * 3).await;
+        let beat = children.get(child).map(|h| h.beat().snapshot());
+
+        assert_eq!(
+            dead,
+            DeadChild {
+                child,
+                cause: DeathCause::Panicked
+            }
+        );
+        assert_eq!(
+            children.get(child).map(ChildHandle::state),
+            Some(ChildState::Dead(DeathCause::Panicked))
+        );
+        assert_eq!(beat.map(|b| b.ticks_started), Some(1), "{beat:?}");
+        assert_eq!(beat.map(|b| b.panics), Some(1), "{beat:?}");
+    }
+
+    /// A listener whose port is taken at boot records `Halted`, stays a
+    /// Running child, and binds the port once it is free — no restart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_listener_whose_port_is_taken_binds_it_once_it_is_free() {
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = blocker.local_addr().unwrap();
         let mut cfg = ephemeral_test_config();
-        cfg.runtime.kubelet_listen_addr = occupied.local_addr().expect("local addr").to_string();
+        cfg.runtime.kubelet_listen_addr = addr.to_string();
         let rt = Runtime::start(cfg).await.unwrap();
         let kubelet_http = Child::Listener(Listener::KubeletHttp);
 
@@ -3574,10 +3562,20 @@ mod tests {
             b.last_class == Some(TickClass::Halted)
         })
         .await;
+        drop(blocker);
+
+        let deadline = std::time::Instant::now() + TICK_DEADLINE;
+        while tokio::net::TcpStream::connect(addr).await.is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "within {TICK_DEADLINE:?} the listener never bound {addr} after it was freed"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         assert_eq!(
             rt.children().get(kubelet_http).map(ChildHandle::state),
             Some(ChildState::Running),
-            "a halted listener is parked, not dead"
+            "a listener that could not bind is not dead"
         );
         rt.shutdown().await.unwrap();
     }
@@ -3867,6 +3865,101 @@ mod tests {
         assert_eq!(wiring.reads().kinds(), Some(&[][..]));
         assert!(!wiring.wakes().wakes_on("CSINode"));
         assert!(!wiring.wakes().wakes_on("Pod"));
+    }
+
+    // ── T5.11: every controller type is spawned or declared dormant ──────
+    //
+    // Rust cannot list a trait's implementors, so the list comes from the
+    // impl census over the workspace's shipped source — a CI gate, not a
+    // type. It is held against the types the SPAWNED drivers record, not
+    // against a second list of what the runtime is supposed to spawn.
+
+    /// A controller type as both the census and the catalog can name it.
+    fn crate_and_name(t: ControllerType) -> (String, String) {
+        (t.krate().to_owned(), t.ident().to_owned())
+    }
+
+    /// The adapters that hand `Controller` to another controller instead of
+    /// being one. Each forwards `controller_type`, so no driver ever records
+    /// one. A new adapter fails the gate until it is named here: that a type
+    /// only forwards is a claim someone has to make.
+    const FORWARDING: &[(&str, &str)] = &[
+        ("engenho_controllers", "Arc"),
+        ("engenho_runtime", "DeclaredHere"),
+    ];
+
+    #[tokio::test]
+    async fn every_controller_type_is_spawned_or_dormant() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the runtime crate sits inside the workspace");
+        let census = Implementors::of(&workspace_sources(root), "Controller");
+        let implemented: BTreeMap<(String, String), String> = census
+            .concrete
+            .iter()
+            .map(|i| ((i.krate.clone(), i.ident.clone()), i.path.clone()))
+            .collect();
+
+        let rt = Runtime::start(ephemeral_test_config()).await.unwrap();
+        let wirings: Vec<Wiring> = rt
+            .children()
+            .iter()
+            .filter_map(|(_, handle)| handle.wiring().cloned())
+            .collect();
+        rt.shutdown().await.unwrap();
+        let spawned: BTreeSet<(String, String)> = wirings
+            .iter()
+            .map(|w| crate_and_name(w.controller()))
+            .collect();
+        let dormant: BTreeSet<(String, String)> = Dormant::ALL
+            .iter()
+            .map(|d| crate_and_name(d.controller_type()))
+            .collect();
+
+        // Positive controls: a census gone blind, or drivers that record no
+        // type, would pass the gate below vacuously.
+        assert_eq!(
+            wirings.len(),
+            Driver::ALL.len(),
+            "every driver records the controller it runs"
+        );
+        let unseen: Vec<&(String, String)> = spawned
+            .iter()
+            .chain(&dormant)
+            .filter(|t| !implemented.contains_key(*t))
+            .collect();
+        assert!(
+            unseen.is_empty(),
+            "the census does not see these controller types: {unseen:?}"
+        );
+        let forwarding: BTreeSet<(String, String)> = census
+            .forwarding
+            .iter()
+            .map(|i| (i.krate.clone(), i.ident.clone()))
+            .collect();
+        let named: BTreeSet<(String, String)> = FORWARDING
+            .iter()
+            .map(|(k, i)| ((*k).to_owned(), (*i).to_owned()))
+            .collect();
+        assert_eq!(
+            forwarding, named,
+            "the adapters forwarding Controller are not the ones FORWARDING names"
+        );
+
+        // The gate.
+        let neither: Vec<(&(String, String), &String)> = implemented
+            .iter()
+            .filter(|(t, _)| !spawned.contains(*t) && !dormant.contains(*t))
+            .collect();
+        assert!(
+            neither.is_empty(),
+            "a Controller type is neither run by a Driver nor declared Dormant: {neither:?}"
+        );
+        let both: Vec<&(String, String)> = spawned.intersection(&dormant).collect();
+        assert!(
+            both.is_empty(),
+            "a Dormant controller is run by a Driver; delete its row: {both:?}"
+        );
     }
 }
 

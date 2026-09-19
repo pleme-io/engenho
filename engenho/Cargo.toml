@@ -30,3 +30,11 @@ anyhow             = { workspace = true }
 tokio              = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+# The stop-signal suite (tests/t2_9_stop_signal.rs) boots the BUILT binary and
+# signals it. `nix` is already in the graph (0.29); `signal` is the one safe
+# `kill(2)` wrapper, so the test needs no `unsafe` of its own.
+nix        = { version = "0.29", default-features = false, features = ["signal"] }
+serde_json = { workspace = true }
+tempfile   = "3"

@@ -80,6 +80,16 @@
 //!
 //! Every tick is recorded in the driver's [`Heartbeat`]: when it began and
 //! ended and how it ended, readable without a lock by whoever supervises it.
+//!
+//! ## A panic in a tick (T2.7)
+//!
+//! What a tick's panic does is decided by the driver's
+//! [`WatchDriverConfig::tick_state`] — see [`crate::contain`]. A
+//! [`TickState::Stateless`] tick is contained: the panic becomes
+//! [`ControllerError::Panicked`], is counted in the heartbeat, gets no
+//! targeted retry, and the next event or the fallback re-ticks it. A
+//! [`TickState::Stateful`] tick is not: the panic ends the driver's task,
+//! which the task's owner sees and marks Dead. The default is Stateful.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -91,6 +101,7 @@ use tracing::{debug, info, warn};
 
 use shigoto_types::failure::FailureKind;
 
+use crate::contain::{TickState, contained};
 use crate::controller::{Controller, ReconcileOutcome};
 use crate::curve::{Curve, Streak};
 use crate::error::ControllerError;
@@ -151,6 +162,15 @@ pub struct WatchDriverConfig {
     /// a `start()` that already spawned a process, leaving a running
     /// container with no local record — a worse state than a slow one.
     pub stuck_tick_after: Duration,
+    /// Whether the controller's tick leaves in-memory state the next tick
+    /// relies on, which decides what a panic in a tick does (T2.7).
+    /// Stateless: contained, counted, re-ticked by the next event or the
+    /// fallback. Stateful: the panic ends the driver's task.
+    ///
+    /// Default Stateful: wrong in that direction costs availability, wrong
+    /// in the other costs correctness. The runtime sets it from its child
+    /// catalog.
+    pub tick_state: TickState,
 }
 
 impl Default for WatchDriverConfig {
@@ -160,6 +180,7 @@ impl Default for WatchDriverConfig {
             debounce: Duration::from_millis(50),
             fallback_interval: Duration::from_secs(30),
             stuck_tick_after: Duration::from_secs(120),
+            tick_state: TickState::Stateful,
         }
     }
 }
@@ -309,6 +330,7 @@ async fn run<C: Controller + ?Sized + 'static, S: WatchSource + ?Sized>(
     let mut ticker = Ticker {
         controller,
         stuck_after: config.stuck_tick_after,
+        tick_state: config.tick_state,
         slot: RequeueSlot::default(),
         failures: ConsecutiveFailures::default(),
         beat,
@@ -487,6 +509,12 @@ pub(crate) fn log_tick(
                 "controller requested requeue"
             );
         }
+        (Err(ControllerError::Panicked(panic)), _) => tracing::error!(
+            controller,
+            %panic,
+            "reconcile tick PANICKED and was contained (stateless); no targeted retry \u{2014} \
+             the next event or the fallback re-ticks it"
+        ),
         (Err(e), None) => tracing::error!(
             controller,
             error = %e,
@@ -545,6 +573,7 @@ impl RequeueSlot {
 struct Ticker<C: Controller + ?Sized + 'static> {
     controller: Arc<C>,
     stuck_after: Duration,
+    tick_state: TickState,
     slot: RequeueSlot,
     failures: ConsecutiveFailures,
     beat: Arc<Heartbeat>,
@@ -560,7 +589,7 @@ impl<C: Controller + ?Sized + 'static> Ticker<C> {
     async fn tick(&mut self) {
         self.slot.clear();
         self.beat.begin();
-        let result = tick_observed(&self.controller, self.stuck_after).await;
+        let result = tick_observed(&self.controller, self.stuck_after, self.tick_state).await;
         self.beat.end(TickClass::of(&result));
         let wake = next_wake(&result, &mut self.failures);
         log_tick(self.controller.name(), &result, wake);
@@ -663,8 +692,32 @@ fn drain_pending(
     None
 }
 
-/// Run one `tick()`, reporting it at ERROR once per `stuck_after` window
-/// while it has not returned — and **never cancelling it**.
+/// Run one `tick()`, contained when `tick_state` is Stateless, and reported
+/// as blocked while it has not returned.
+///
+/// A Stateless tick's panic comes back as [`ControllerError::Panicked`]; a
+/// Stateful tick's panic unwinds out of here and ends the driver's task
+/// (see [`crate::contain`]). The tick future is built inside the contained
+/// block, so a `tick` that panics before returning its future is contained
+/// too.
+async fn tick_observed<C: Controller + ?Sized + 'static>(
+    controller: &Arc<C>,
+    stuck_after: Duration,
+    tick_state: TickState,
+) -> Result<ReconcileOutcome, ControllerError> {
+    let name = controller.name();
+    let tick = async { controller.tick().await };
+    match tick_state {
+        TickState::Stateless => match observed(name, contained(tick), stuck_after).await {
+            Ok(result) => result,
+            Err(panic) => Err(ControllerError::Panicked(panic)),
+        },
+        TickState::Stateful => observed(name, tick, stuck_after).await,
+    }
+}
+
+/// Run `tick` to completion, reporting it at ERROR once per `stuck_after`
+/// window while it has not returned — and **never cancelling it**.
 ///
 /// `tokio::time::timeout` takes `&mut fut`, so an elapsed window does not
 /// drop the tick; it only lets us say so. This is the kubelet
@@ -672,18 +725,18 @@ fn drain_pending(
 /// makes the stall VISIBLE. A tick that hangs forever now produces a
 /// repeating ERROR naming the controller and the elapsed seconds, instead
 /// of the total silence that hid this defect for 12 hours.
-async fn tick_observed<C: Controller + ?Sized + 'static>(
-    controller: &Arc<C>,
+async fn observed<F: std::future::Future>(
+    controller: &'static str,
+    tick: F,
     stuck_after: Duration,
-) -> Result<crate::controller::ReconcileOutcome, crate::error::ControllerError> {
+) -> F::Output {
     let started = std::time::Instant::now();
-    let fut = controller.tick();
-    tokio::pin!(fut);
+    tokio::pin!(tick);
     loop {
-        match tokio::time::timeout(stuck_after, &mut fut).await {
+        match tokio::time::timeout(stuck_after, &mut tick).await {
             Ok(outcome) => return outcome,
             Err(_) => tracing::error!(
-                controller = controller.name(),
+                controller,
                 elapsed_s = started.elapsed().as_secs(),
                 "reconcile tick has NOT returned; this controller is blocked (not cancelled \u{2014} cancelling mid-tick would strand side effects)"
             ),
@@ -869,6 +922,8 @@ mod tests {
         Requeue(Duration),
         Transient,
         Declarative,
+        /// The tick panics (after its sleep, with no lock held).
+        Panic,
     }
 
     impl Answer {
@@ -888,6 +943,7 @@ mod tests {
                 Self::Declarative => Err(ControllerError::InvalidResource(
                     "spec.template is required".into(),
                 )),
+                Self::Panic => panic!("probe tick tripped over a bad object"),
             }
         }
     }
@@ -1408,5 +1464,116 @@ mod tests {
         assert_eq!((mid.ticks_started, mid.ticks_finished), (1, 0));
         assert_eq!(mid.last_class, None, "no tick has ended yet: {mid:?}");
         assert!(mid.last_start.is_some());
+    }
+
+    // ── T2.7: a panic in a tick ────────────────────────────────────────
+    //
+    // A tick that panicked used to end the driver's task, so one object that
+    // tripped an `unwrap` retired its whole controller for the life of the
+    // process. Now what a panic does follows what the tick leaves behind.
+
+    /// Drive the real loop with `tick_state` over a controller whose every
+    /// tick panics, with no events, for three fallbacks and a bit. Returns
+    /// the probe, the heartbeat, and the driver's task, still unjoined.
+    async fn a_panicking_driver(
+        tick_state: TickState,
+    ) -> (
+        Arc<Probe>,
+        Arc<Heartbeat>,
+        tokio::task::JoinHandle<Infallible>,
+    ) {
+        let probe = Probe::new(Answer::Panic);
+        let beat = Arc::new(Heartbeat::new());
+        let config = WatchDriverConfig {
+            fallback_interval: FALLBACK,
+            tick_state,
+            ..WatchDriverConfig::default()
+        };
+        let driver = tokio::spawn(run(probe.clone(), Feed::new(), config, beat.clone()));
+        tokio::time::sleep(FALLBACK * 3 + Duration::from_secs(5)).await;
+        (probe, beat, driver)
+    }
+
+    /// Stateless: the panic is contained. The driver keeps running, every
+    /// panicked tick is counted and classed as a panic, and the only thing
+    /// that re-ticks it is the fallback — one tick per interval, no
+    /// targeted retry.
+    #[tokio::test(start_paused = true)]
+    async fn a_stateless_panic_is_contained_counted_and_reticked_by_the_fallback() {
+        let (probe, beat, driver) = a_panicking_driver(TickState::Stateless).await;
+        let still_running = !driver.is_finished();
+        driver.abort();
+        let _ = driver.await;
+        let ticks = probe.stats().ticks;
+        let snap = beat.snapshot();
+
+        assert!(
+            still_running,
+            "a contained panic ended the driver: one bad object retired the controller"
+        );
+        assert_eq!(
+            ticks, 3,
+            "95 s with a 30 s fallback and no events is three ticks: a panic is \
+             re-ticked by the fallback and never by a targeted retry"
+        );
+        assert_eq!(
+            snap.panics, ticks,
+            "every panicked tick is counted: {snap:?}"
+        );
+        assert_eq!(
+            snap.ticks_finished, ticks,
+            "each panicked tick ended: {snap:?}"
+        );
+        assert_eq!(snap.last_class, Some(TickClass::Panicked), "{snap:?}");
+    }
+
+    /// Stateful: the panic is NOT contained. It ends the driver's task —
+    /// the owner of that task sees a panic and marks the child Dead — and
+    /// nothing re-ticks over the state the panic tore.
+    #[tokio::test(start_paused = true)]
+    async fn a_stateful_panic_ends_the_driver_task() {
+        let (probe, beat, driver) = a_panicking_driver(TickState::Stateful).await;
+        assert!(driver.is_finished(), "a stateful driver survived its panic");
+        let ended = match driver.await {
+            Ok(never) => match never {},
+            Err(ended) => ended,
+        };
+        let snap = beat.snapshot();
+
+        assert!(
+            ended.is_panic(),
+            "the driver's task ended but not by panic: {ended:?}"
+        );
+        assert_eq!(
+            probe.stats().ticks,
+            1,
+            "a stateful controller was re-ticked over the state its panic tore"
+        );
+        assert!(
+            snap.in_flight(),
+            "the panicked tick never ended; its heartbeat must not say it did: {snap:?}"
+        );
+        assert_eq!(
+            snap.panics, 0,
+            "the driver does not count a panic it did not contain — the task's \
+             owner does: {snap:?}"
+        );
+    }
+
+    /// When nobody says, a tick is Stateful: a driver built without the
+    /// catalog's word does not re-tick over torn state.
+    #[test]
+    fn a_driver_is_stateful_unless_told_otherwise() {
+        assert_eq!(WatchDriverConfig::default().tick_state, TickState::Stateful);
+    }
+
+    /// A contained panic's error takes the no-targeted-retry path, and it is
+    /// a failure in a row like any other.
+    #[test]
+    fn a_contained_panic_gets_no_targeted_retry() {
+        let mut failures = ConsecutiveFailures::default();
+        let panicked = Err(ControllerError::Panicked(crate::PanicMessage::Opaque));
+        assert_eq!(next_wake(&panicked, &mut failures), None);
+        assert_eq!(failures.count(), 1);
     }
 }

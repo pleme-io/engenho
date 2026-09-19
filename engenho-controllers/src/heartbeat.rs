@@ -58,10 +58,17 @@ crate::closed_enum! {
         /// rather than rounded to either known class.
         Unclassified,
         /// A child that is not a tick loop — a listener — stopped doing its
-        /// work: its bind failed or its server returned. It is parked, not
-        /// retried; nothing rebinds it until T2.7. Liveness must read this
-        /// as not-ok.
+        /// work: its bind failed or its server returned. It rebinds on a
+        /// growing backoff (T2.7). A listener serves while its heartbeat is
+        /// in flight; `Halted` with nothing in flight is one waiting to
+        /// rebind, and liveness must read that as not-ok.
         Halted,
+        /// The tick panicked and the driver contained it (T2.7): only a
+        /// Stateless child's tick is contained. Counted as a panic, and
+        /// re-ticked by the next event or the fallback — never by a
+        /// targeted retry. Its own class so a bug is never read as a
+        /// malformed declaration.
+        Panicked,
     }
 }
 
@@ -72,6 +79,7 @@ impl TickClass {
         match result {
             Ok(outcome) if outcome.result.requeue_after().is_some() => Self::Requeued,
             Ok(_) => Self::Done,
+            Err(ControllerError::Panicked(_)) => Self::Panicked,
             Err(e) => match e.classify() {
                 FailureKind::Transient => Self::Transient,
                 FailureKind::Declarative => Self::Declarative,
@@ -141,13 +149,21 @@ impl Heartbeat {
     }
 
     /// The tick that last [`begin`](Self::begin)-ed has ended as `class`.
+    ///
+    /// A tick that ended [`TickClass::Panicked`] is also a panic this
+    /// heartbeat counts: the class is the one decision, so a contained panic
+    /// cannot be recorded without being counted.
     pub fn end(&self, class: TickClass) {
+        if class == TickClass::Panicked {
+            self.record_panic();
+        }
         self.last_end.store(self.stamp(), Ordering::Release);
         self.last_class.store(class.code(), Ordering::Release);
         self.finished.fetch_add(1, Ordering::Release);
     }
 
-    /// The supervisor saw this child's task panic.
+    /// A panic in this child: its task's, seen by the supervisor, or a
+    /// contained tick's, recorded by [`end`](Self::end).
     pub fn record_panic(&self) {
         self.panics.fetch_add(1, Ordering::Release);
     }
@@ -196,7 +212,7 @@ pub struct Beat {
     pub last_end: Option<Instant>,
     /// How the last tick ended; `None` if none has.
     pub last_class: Option<TickClass>,
-    /// Panics the supervisor observed.
+    /// Panics observed in this child: contained ticks' and its task's.
     pub panics: u64,
 }
 
@@ -285,5 +301,26 @@ mod tests {
             TickClass::of(&Err(ControllerError::InvalidResource("bad".into()))),
             TickClass::Declarative
         );
+    }
+
+    /// A contained panic classifies as a panic, not as the Declarative
+    /// failure its retry class shares — a bug is never read as a malformed
+    /// declaration.
+    #[test]
+    fn a_contained_panic_is_its_own_class() {
+        let panicked = Err(ControllerError::Panicked(crate::PanicMessage::Opaque));
+        assert_eq!(TickClass::of(&panicked), TickClass::Panicked);
+    }
+
+    /// Ending a tick as `Panicked` counts the panic; no other class does.
+    #[test]
+    fn a_tick_that_ended_in_a_panic_is_counted_as_one() {
+        for class in TickClass::ALL {
+            let hb = Heartbeat::new();
+            hb.begin();
+            hb.end(*class);
+            let want = u64::from(*class == TickClass::Panicked);
+            assert_eq!(hb.snapshot().panics, want, "{class:?}");
+        }
     }
 }

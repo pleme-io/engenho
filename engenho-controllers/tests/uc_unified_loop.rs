@@ -20,8 +20,8 @@ use std::time::Duration;
 
 use engenho_controllers::{
     ConsecutiveFailures, Controller, ControllerError, KindFilter, ReconcileOutcome,
-    ReconcileReport, ReconcileResult, ReplicaSetController, WatchDriver, WatchDriverConfig,
-    next_wake,
+    ReconcileReport, ReconcileResult, ReplicaSetController, TickState, WatchDriver,
+    WatchDriverConfig, next_wake,
 };
 use engenho_store::{
     InProcessRouter, ResourceKey, StoreMesh,
@@ -148,6 +148,7 @@ async fn requeue_result_arms_the_requeue_slot_not_swallowed() {
             // swallowed, ticks would stay at 1.
             fallback_interval: Duration::from_secs(3600),
             stuck_tick_after: Duration::from_secs(120),
+            tick_state: TickState::Stateful,
         },
     );
     let handle = tokio::spawn(driver.run());

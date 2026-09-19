@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engenho_controllers::{
-    Controller, ControllerError, KindFilter, ReconcileOutcome, ReconcileReport, WatchDriver,
-    WatchDriverConfig,
+    Controller, ControllerError, KindFilter, ReconcileOutcome, ReconcileReport, TickState,
+    WatchDriver, WatchDriverConfig,
 };
 use engenho_store::{
     InProcessRouter, ResourceKey, StoreMesh,
@@ -63,6 +63,7 @@ async fn driver_ticks_on_matching_event() {
             debounce: Duration::from_millis(20),
             fallback_interval: Duration::from_secs(3600),
             stuck_tick_after: Duration::from_secs(120),
+            tick_state: TickState::Stateful,
         },
     );
     let handle = tokio::spawn(driver.run());
@@ -111,6 +112,7 @@ async fn driver_filter_skips_irrelevant_events() {
             debounce: Duration::from_millis(20),
             fallback_interval: Duration::from_secs(3600),
             stuck_tick_after: Duration::from_secs(120),
+            tick_state: TickState::Stateful,
         },
     );
     let handle = tokio::spawn(driver.run());
@@ -158,6 +160,7 @@ async fn driver_coalesces_burst_events_into_one_tick() {
             debounce: Duration::from_millis(100),
             fallback_interval: Duration::from_secs(3600),
             stuck_tick_after: Duration::from_secs(120),
+            tick_state: TickState::Stateful,
         },
     );
     let handle = tokio::spawn(driver.run());
@@ -214,6 +217,7 @@ async fn driver_fallback_timer_ticks_with_no_events() {
             debounce: Duration::from_millis(20),
             fallback_interval: Duration::from_millis(150),
             stuck_tick_after: Duration::from_secs(120),
+            tick_state: TickState::Stateful,
         },
     );
     let handle = tokio::spawn(driver.run());

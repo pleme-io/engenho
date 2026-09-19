@@ -8,7 +8,8 @@
 //! ## Subcommands
 //!
 //! * `engenho` (no args) — boot the daemon: init tracing → discover
-//!   config → boot the Runtime → wait for ctrl-c → graceful shutdown.
+//!   config → boot the Runtime → wait for SIGTERM or SIGINT (see
+//!   [`StopCause`]) → graceful shutdown.
 //!   On boot (TLS-enabled) the daemon writes `data_dir/kubeconfig`.
 //! * `engenho daemon` — explicit alias for the bare no-arg form. Runs
 //!   the EXACT same `run_daemon` path. This is the verb the substrate
@@ -32,12 +33,21 @@
 //! like a crash. Keep both spellings: `--help` is what a stranger types,
 //! `help` is what someone used to subcommand-style CLIs types.
 
+// The daemon's stop contract IS a unix signal: systemd and launchd stop a
+// unit with SIGTERM, a terminal with SIGINT. A build with no way to receive
+// SIGTERM would be a daemon every service-manager stop crashes, so there is
+// no such build. (Every CI lane is ubuntu or macOS.)
+#[cfg(not(unix))]
+compile_error!("the engenho daemon is unix-only: its stop path is SIGTERM/SIGINT (see StopCause)");
+
+use std::fmt;
 use std::path::PathBuf;
 
 use engenho_apiserver::load_or_generate_ca;
 use engenho_config::{ConfigTier, EngenhoConfig, TieredConfig, render_provenance};
 use engenho_kube_client::{emit_kubeconfig, emit_kubeconfig_with_admin};
 use engenho_runtime::Runtime;
+use tokio::signal::unix::{Signal, SignalKind, signal};
 use tracing_subscriber::EnvFilter;
 
 /// The verb list, written ONCE.
@@ -106,6 +116,126 @@ impl Command {
     }
 }
 
+/// Why the daemon is stopping: one arm per signal [`StopSignals`] subscribes
+/// to, and nothing else.
+///
+/// ★ WHY SIGTERM IS HERE. It is the signal `systemctl stop` and
+/// `launchctl kickstart -k` send. The daemon used to subscribe to SIGINT
+/// alone (`tokio::signal::ctrl_c`), so SIGTERM met the default disposition:
+/// the process died on the signal, `Runtime::shutdown` never ran and the
+/// store was never terminated — every service-manager stop was a crash.
+///
+/// Every mapping below is an exhaustive match, so a new arm cannot be added
+/// without naming its kernel signal and its log name. Not covered, by
+/// decision: SIGHUP and SIGQUIT are not subscribed and keep their default
+/// dispositions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopCause {
+    /// SIGINT — ctrl-c at an interactive terminal.
+    Interrupt,
+    /// SIGTERM — a service manager stopping the unit.
+    Terminate,
+}
+
+impl StopCause {
+    /// The kernel signal this cause arrives as.
+    fn kind(self) -> SignalKind {
+        match self {
+            Self::Interrupt => SignalKind::interrupt(),
+            Self::Terminate => SignalKind::terminate(),
+        }
+    }
+
+    /// The conventional signal name — what an operator greps the log for.
+    const fn signal_name(self) -> &'static str {
+        match self {
+            Self::Interrupt => "SIGINT",
+            Self::Terminate => "SIGTERM",
+        }
+    }
+
+    /// Register this cause's signal with tokio. From this call on, for the
+    /// rest of the process, the signal no longer kills it — tokio never
+    /// restores the default disposition — and each delivery is recorded on
+    /// the returned stream.
+    fn subscribe(self) -> Result<Signal, SignalSubscribeError> {
+        signal(self.kind()).map_err(|source| SignalSubscribeError {
+            cause: self,
+            source,
+        })
+    }
+}
+
+impl fmt::Display for StopCause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.signal_name())
+    }
+}
+
+/// Registering a stop signal failed, so the daemon refuses to boot: a daemon
+/// that could not hear its stop signal would die on it instead.
+#[derive(Debug)]
+struct SignalSubscribeError {
+    cause: StopCause,
+    source: std::io::Error,
+}
+
+impl fmt::Display for SignalSubscribeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "cannot subscribe to {} (the daemon would die on it instead of stopping cleanly)",
+            self.cause
+        )
+    }
+}
+
+impl std::error::Error for SignalSubscribeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// The daemon's stop signals, subscribed once before boot and held until the
+/// stop, so neither is ever fatal while the daemon runs.
+///
+/// Subscribing BEFORE `Runtime::start` means a stop requested during boot is
+/// recorded and honoured the moment boot completes, through the one clean
+/// path (`Runtime::shutdown` needs a booted runtime). A boot that never
+/// completes is escalated by the service manager's kill timeout, as it was
+/// before.
+struct StopSignals {
+    interrupt: Signal,
+    terminate: Signal,
+}
+
+impl StopSignals {
+    fn subscribe() -> Result<Self, SignalSubscribeError> {
+        Ok(Self {
+            interrupt: StopCause::Interrupt.subscribe()?,
+            terminate: StopCause::Terminate.subscribe()?,
+        })
+    }
+
+    /// The next stop signal to arrive.
+    ///
+    /// Cancel-safe, because `Signal::recv` is: `run_daemon` selects on it in
+    /// a loop, and a signal delivered while another branch runs stays
+    /// recorded on its stream until the next call.
+    ///
+    /// A stream that can no longer deliver (`recv` yields `None`, which
+    /// happens only once tokio's signal driver is gone) is NOT read as a
+    /// stop: its arm is disabled, and with both gone this pends forever —
+    /// the absence of a signal is not a request to stop.
+    async fn next(&mut self) -> StopCause {
+        tokio::select! {
+            Some(()) = self.interrupt.recv() => StopCause::Interrupt,
+            Some(()) = self.terminate.recv() => StopCause::Terminate,
+            else => std::future::pending().await,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Minimal arg parsing — the binary has exactly two optional verbs
@@ -128,7 +258,7 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Boot the engenho daemon and run until ctrl-c.
+/// Boot the engenho daemon and run until SIGTERM or SIGINT.
 async fn run_daemon() -> anyhow::Result<()> {
     // 1. Tracing — env-filtered, info default for our crates.
     tracing_subscriber::fmt()
@@ -141,6 +271,10 @@ async fn run_daemon() -> anyhow::Result<()> {
         version = env!("CARGO_PKG_VERSION"),
         "engenho — typed, attested, Rust-native Kubernetes runtime"
     );
+
+    // Subscribe to the stop signals before anything durable happens, so
+    // from here on neither SIGTERM nor SIGINT can kill the process mid-boot.
+    let mut stop = StopSignals::subscribe()?;
 
     // 2. Config via the sealed progressive-discovery fold
     //    (bare → discovered[DiscoveryLayer] → prescribed_default → operator
@@ -177,26 +311,21 @@ async fn run_daemon() -> anyhow::Result<()> {
     let mut runtime = Runtime::start(config).await?;
     tracing::info!(addr = %runtime.local_addr(), "engenho up — apiserver bound");
 
-    // 4. Run until ctrl-c, watching the runtime's children meanwhile. A
-    //    child's task cannot finish normally, so one that ends panicked or
+    // 4. Run until a stop signal, watching the runtime's children meanwhile.
+    //    A child's task cannot finish normally, so one that ends panicked or
     //    was aborted: the runtime marks it Dead and logs it at ERROR as it
     //    returns here. There is no respawn — the loop goes back to watching.
-    //    The stop signal is pinned OUTSIDE the loop so a signal that lands
-    //    while a death is being recorded is not lost.
-    let stop = tokio::signal::ctrl_c();
-    tokio::pin!(stop);
-    loop {
+    //    The signal streams live OUTSIDE the loop, so a signal that lands
+    //    while a death is being recorded stays recorded and is not lost.
+    let cause = loop {
         tokio::select! {
-            signal = &mut stop => {
-                signal?;
-                break;
-            }
+            cause = stop.next() => break cause,
             _dead = runtime.next_dead_child() => {}
         }
-    }
-    tracing::info!("shutdown signal received");
+    };
+    tracing::info!(signal = %cause, "shutdown signal received");
     runtime.shutdown().await?;
-    tracing::info!("engenho stopped cleanly");
+    tracing::info!(signal = %cause, "engenho stopped cleanly");
     Ok(())
 }
 
@@ -365,10 +494,43 @@ Docs: https://github.com/pleme-io/engenho
 
 #[cfg(test)]
 mod tests {
-    use super::Command;
+    use super::{Command, StopCause, StopSignals};
 
     fn parse(argv: &[&str]) -> anyhow::Result<Command> {
         Command::parse(argv.iter().map(|s| (*s).to_string()))
+    }
+
+    /// Each stop cause is logged under its conventional signal name, so the
+    /// log says WHICH signal stopped the daemon rather than just that one did.
+    #[test]
+    fn stop_cause_is_logged_by_signal_name() {
+        assert_eq!(StopCause::Interrupt.to_string(), "SIGINT");
+        assert_eq!(StopCause::Terminate.to_string(), "SIGTERM");
+    }
+
+    /// A delivered SIGTERM is read as [`StopCause::Terminate`] and a SIGINT
+    /// as [`StopCause::Interrupt`] — and, because both are subscribed first,
+    /// raising either one does not kill this test process.
+    ///
+    /// One test on purpose: tokio fans a signal out to every subscriber in
+    /// the process, so two signal tests running concurrently would read each
+    /// other's signals.
+    #[tokio::test]
+    async fn each_subscribed_signal_is_read_as_its_own_cause() {
+        use nix::sys::signal::{Signal, raise};
+        use std::time::Duration;
+
+        let mut stop = StopSignals::subscribe().expect("subscribe the stop signals");
+        for (signal, cause) in [
+            (Signal::SIGTERM, StopCause::Terminate),
+            (Signal::SIGINT, StopCause::Interrupt),
+        ] {
+            raise(signal).expect("raise the signal");
+            let read = tokio::time::timeout(Duration::from_secs(5), stop.next())
+                .await
+                .expect("a raised stop signal is delivered");
+            assert_eq!(read, cause, "{signal:?} was read as the wrong cause");
+        }
     }
 
     /// The bare no-arg form boots the daemon.
