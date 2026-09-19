@@ -1,0 +1,2475 @@
+{
+  "source": [
+    "kubernetes/kubernetes/staging/src/k8s.io/apiserver/pkg/storage/cacher/cacher.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apiserver/pkg/storage/cacher/cache_watcher.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apiserver/pkg/storage/cacher/watch_cache.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apiserver/pkg/storage/cacher/watch_cache_interval.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apiserver/pkg/storage/cacher/time_budget.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apiserver/pkg/storage/cacher/util.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apiserver/pkg/storage/cacher/delegator.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apiserver/pkg/storage/cacher/cacher_whitebox_test.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apiserver/pkg/storage/cacher/cache_watcher_test.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apiserver/pkg/storage/cacher/watch_cache_test.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apiserver/pkg/storage/cacher/time_budget_test.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apiserver/pkg/storage/cacher/util_test.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apiserver/pkg/storage/errors.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apiserver/pkg/storage/api_object_versioner.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apiserver/pkg/endpoints/handlers/watch.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apiserver/pkg/endpoints/handlers/get.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apiserver/pkg/features/kube_features.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apimachinery/pkg/api/errors/errors.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/types.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apimachinery/pkg/apis/meta/internalversion/validation/validation.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/client-go/tools/cache/reflector.go@v1.34.0",
+    "kube-rs/kube/kube-runtime/src/watcher.rs@4.2.0",
+    "kube-rs/kube/kube-core/src/params.rs@4.2.0",
+    "kube-rs/kube/kube-core/src/request.rs@4.2.0"
+  ],
+  "conventions": {
+    "evidence": "'test' = asserted by an upstream test; 'code' = read directly off upstream code (no test asserts that exact value).",
+    "layer": "which upstream function/component the vector exercises",
+    "status_410": {
+      "status": "Failure",
+      "code": 410,
+      "reason": "Expired"
+    },
+    "status_504_too_large": {
+      "status": "Failure",
+      "code": 504,
+      "reason": "Timeout",
+      "details": {
+        "retryAfterSeconds": 1,
+        "causes": [
+          {
+            "reason": "ResourceVersionTooLarge",
+            "message": "Too large resource version"
+          }
+        ]
+      }
+    },
+    "outcome_values": {
+      "error_event": "HTTP 200 chunked stream carrying exactly one ERROR watch event, then the stream closes (cacher newErrWatcher)",
+      "direct_error": "Watch() returns an error before a stream exists; surfaces as a non-200 HTTP status",
+      "established": "stream stays open and delivers the listed events",
+      "immediate_close": "stream opens and closes with zero events (cacher newImmediateCloseWatcher)",
+      "clean_eof": "stream ends with no ERROR event"
+    },
+    "feature_gates_v1_34_defaults": {
+      "WatchList": true,
+      "ResilientWatchCacheInitialization": "GA, locked true",
+      "ConsistentListFromCache": "GA, locked true",
+      "WatchFromStorageWithoutResourceVersion": "deprecated, locked false",
+      "ListFromCacheSnapshot": true
+    }
+  },
+  "cases": [
+    {
+      "name": "too_old.empty_buffer_after_relist.rv_below_list_rv",
+      "evidence": "test",
+      "layer": "watch_cache.getAllEventsSinceLocked",
+      "input": {
+        "cache": {
+          "capacity": 3,
+          "replace_at_rv": 9,
+          "removed_since_relist": false,
+          "buffer_rvs": []
+        },
+        "watch": {
+          "resource_version": "8",
+          "send_initial_events": null
+        }
+      },
+      "expected": {
+        "result": "too_old",
+        "status": {
+          "status": "Failure",
+          "code": 410,
+          "reason": "Expired",
+          "message": "too old resource version: 8 (9)"
+        }
+      },
+      "upstream_ref": "watch_cache_test.go:TestMarker; watch_cache.go:getAllEventsSinceLocked L888 (oldest = listResourceVersion + 1), L915-916"
+    },
+    {
+      "name": "too_old.empty_buffer_after_relist.rv_equal_list_rv_is_accepted",
+      "evidence": "test",
+      "layer": "watch_cache.getAllEventsSinceLocked",
+      "input": {
+        "cache": {
+          "capacity": 3,
+          "replace_at_rv": 9,
+          "removed_since_relist": false,
+          "buffer_rvs": []
+        },
+        "watch": {
+          "resource_version": "9",
+          "send_initial_events": null
+        }
+      },
+      "expected": {
+        "result": "ok",
+        "events": []
+      },
+      "upstream_ref": "watch_cache_test.go:TestMarker"
+    },
+    {
+      "name": "too_old.after_relist.event_after_list_rv_is_delivered",
+      "evidence": "test",
+      "layer": "watch_cache.getAllEventsSinceLocked",
+      "input": {
+        "cache": {
+          "capacity": 3,
+          "replace_at_rv": 9,
+          "then_add_rvs": [
+            12
+          ]
+        },
+        "watch": {
+          "resource_version": "9"
+        }
+      },
+      "expected": {
+        "result": "ok",
+        "events": [
+          {
+            "type": "ADDED",
+            "rv": 12
+          }
+        ]
+      },
+      "upstream_ref": "watch_cache_test.go:TestMarker"
+    },
+    {
+      "name": "too_old.no_relist.boundary_is_first_buffered_rv_minus_one",
+      "evidence": "test",
+      "layer": "watch_cache.getAllEventsSinceLocked",
+      "input": {
+        "cache": {
+          "capacity": 5,
+          "list_rv": 0,
+          "buffer_rvs": [
+            3
+          ]
+        },
+        "watch": {
+          "resource_version": "1"
+        }
+      },
+      "expected": {
+        "result": "too_old",
+        "status": {
+          "status": "Failure",
+          "code": 410,
+          "reason": "Expired",
+          "message": "too old resource version: 1 (2)"
+        }
+      },
+      "upstream_ref": "watch_cache_test.go:TestEvents (first block); watch_cache.go L895 (oldest = first buffered event RV), L915"
+    },
+    {
+      "name": "too_old.no_relist.rv_exactly_oldest_minus_one_is_accepted",
+      "evidence": "test",
+      "layer": "watch_cache.getAllEventsSinceLocked",
+      "input": {
+        "cache": {
+          "capacity": 5,
+          "list_rv": 0,
+          "buffer_rvs": [
+            3
+          ]
+        },
+        "watch": {
+          "resource_version": "2"
+        }
+      },
+      "expected": {
+        "result": "ok",
+        "events": [
+          {
+            "type": "ADDED",
+            "rv": 3,
+            "prev_object": null
+          }
+        ]
+      },
+      "upstream_ref": "watch_cache_test.go:TestEvents; watch_cache.go L915 (strict '<' against oldest-1)"
+    },
+    {
+      "name": "too_old.not_full.modified_events_carry_prev_object",
+      "evidence": "test",
+      "layer": "watch_cache.getAllEventsSinceLocked",
+      "input": {
+        "cache": {
+          "capacity": 5,
+          "list_rv": 0,
+          "ops": [
+            [
+              "add",
+              "pod",
+              3
+            ],
+            [
+              "update",
+              "pod",
+              4
+            ],
+            [
+              "update",
+              "pod",
+              5
+            ]
+          ]
+        },
+        "watch": {
+          "resource_version": "3"
+        }
+      },
+      "expected": {
+        "result": "ok",
+        "events": [
+          {
+            "type": "MODIFIED",
+            "rv": 4,
+            "prev_rv": 3
+          },
+          {
+            "type": "MODIFIED",
+            "rv": 5,
+            "prev_rv": 4
+          }
+        ]
+      },
+      "upstream_ref": "watch_cache_test.go:TestEvents (not-full block)"
+    },
+    {
+      "name": "too_old.full_buffer.evicted_prefix_is_gone",
+      "evidence": "test",
+      "layer": "watch_cache.getAllEventsSinceLocked",
+      "input": {
+        "cache": {
+          "capacity": 5,
+          "lower_bound": 5,
+          "upper_bound": 5,
+          "list_rv": 0,
+          "event_rvs_in_order": [
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9
+          ]
+        },
+        "watch": {
+          "resource_version": "3"
+        }
+      },
+      "expected": {
+        "result": "too_old",
+        "retained_buffer_rvs": [
+          5,
+          6,
+          7,
+          8,
+          9
+        ],
+        "status": {
+          "status": "Failure",
+          "code": 410,
+          "reason": "Expired",
+          "message": "too old resource version: 3 (4)"
+        }
+      },
+      "upstream_ref": "watch_cache_test.go:TestEvents (full-cache block); watch_cache.go:updateCache L361-367"
+    },
+    {
+      "name": "too_old.full_buffer.oldest_minus_one_replays_whole_buffer",
+      "evidence": "test",
+      "layer": "watch_cache.getAllEventsSinceLocked",
+      "input": {
+        "cache": {
+          "capacity": 5,
+          "lower_bound": 5,
+          "upper_bound": 5,
+          "list_rv": 0,
+          "event_rvs_in_order": [
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9
+          ]
+        },
+        "watch": {
+          "resource_version": "4"
+        }
+      },
+      "expected": {
+        "result": "ok",
+        "events_rvs": [
+          5,
+          6,
+          7,
+          8,
+          9
+        ]
+      },
+      "upstream_ref": "watch_cache_test.go:TestEvents (full-cache block)"
+    },
+    {
+      "name": "too_old.eviction_since_relist_invalidates_list_rv_floor",
+      "evidence": "test",
+      "note": "NAIVE TRAP: once any event has been evicted since the last relist, the floor is the first buffered event's RV, not listRV+1. RV 15 > listRV 10 still gets 410.",
+      "layer": "watch_cache.getAllEventsSinceLocked",
+      "input": {
+        "cache": {
+          "capacity": 2,
+          "replace_at_rv": 10,
+          "events": [
+            {
+              "rv": 20,
+              "t": "now"
+            },
+            {
+              "rv": 30,
+              "t": "now+150s"
+            },
+            {
+              "rv": 40,
+              "t": "now+150s"
+            },
+            {
+              "rv": 50,
+              "t": "now+151s"
+            }
+          ]
+        },
+        "watch": {
+          "resource_version": "15"
+        }
+      },
+      "expected": {
+        "result": "too_old",
+        "status_code": 410,
+        "reason": "Expired",
+        "message_contains": "too old resource version"
+      },
+      "upstream_ref": "watch_cache_test.go:TestCacheIncreaseDoesNotBreakWatch; watch_cache.go L886-895 (removedEventSinceRelist switch)"
+    },
+    {
+      "name": "too_old.conservative_floor_ignores_rv_gaps",
+      "evidence": "code",
+      "note": "NAIVE TRAP: the cacher does not remember the last evicted RV. With the newest evicted event at RV 50 and the oldest retained at RV 60, a watch from RV 52 lost nothing, but it still gets 410 because 52 < 60-1.",
+      "layer": "watch_cache.getAllEventsSinceLocked",
+      "input": {
+        "cache": {
+          "removed_since_relist": true,
+          "last_evicted_rv": 50,
+          "buffer_rvs": [
+            60,
+            61
+          ]
+        },
+        "watch_rvs": [
+          "52",
+          "58",
+          "59",
+          "60"
+        ]
+      },
+      "expected": {
+        "per_rv": {
+          "52": "too_old",
+          "58": "too_old",
+          "59": "ok events [60,61]",
+          "60": "ok events [61]"
+        },
+        "message_for_52": "too old resource version: 52 (59)"
+      },
+      "upstream_ref": "watch_cache.go:getAllEventsSinceLocked L895, L915-916"
+    },
+    {
+      "name": "too_old.relist_empties_buffer",
+      "evidence": "code",
+      "layer": "watch_cache.Replace",
+      "input": {
+        "cache": {
+          "buffer_rvs": [
+            101,
+            102,
+            103
+          ]
+        },
+        "op": {
+          "replace_at_rv": 200
+        },
+        "watch": {
+          "resource_version": "150"
+        }
+      },
+      "expected": {
+        "after_replace": {
+          "buffer_rvs": [],
+          "list_rv": 200,
+          "resource_version": 200,
+          "removed_since_relist": false
+        },
+        "watch_result": "too_old",
+        "message": "too old resource version: 150 (200)"
+      },
+      "upstream_ref": "watch_cache.go:Replace L772-773 (startIndex = endIndex; removedEventSinceRelist = false), L784-785 (listResourceVersion = resourceVersion = version)"
+    },
+    {
+      "name": "too_old.uninitialized_cache_is_500_not_410",
+      "evidence": "code",
+      "note": "Only reachable if no list has completed and the buffer is empty; upstream says this happens only in unit tests. A plain error hits newErrWatcher's default branch.",
+      "layer": "cacher.Watch -> watch_cache.getAllEventsSinceLocked",
+      "input": {
+        "cache": {
+          "list_rv": 0,
+          "buffer_rvs": []
+        },
+        "watch": {
+          "resource_version": "5"
+        }
+      },
+      "expected": {
+        "outcome": "error_event",
+        "event": {
+          "type": "ERROR",
+          "object": {
+            "status": "Failure",
+            "code": 500,
+            "reason": "InternalError",
+            "message": "watch cache isn't correctly initialized"
+          }
+        }
+      },
+      "upstream_ref": "watch_cache.go L896-897; cacher.go:newErrWatcher L1319-1326"
+    },
+    {
+      "name": "error_form.too_old_is_in_stream_error_event_not_http_410",
+      "evidence": "test",
+      "note": "NAIVE TRAP: the HTTP status is 200. The 410 lives inside a single ERROR watch event, after which the stream closes. The reason is 'Expired', not 'Gone'.",
+      "layer": "cacher.Watch + endpoints/handlers/watch.go",
+      "input": {
+        "cache": {
+          "list_rv": "lastRV",
+          "buffer_rvs": []
+        },
+        "watch": {
+          "resource_version": "lastRV-1",
+          "send_initial_events": null
+        }
+      },
+      "expected": {
+        "outcome": "error_event",
+        "http_status": 200,
+        "event": {
+          "type": "ERROR",
+          "object": {
+            "status": "Failure",
+            "code": 410,
+            "reason": "Expired"
+          }
+        },
+        "then": "stream closes"
+      },
+      "upstream_ref": "cacher_whitebox_test.go:TestEmptyWatchEventCache (RV-1); cacher.go L612-615; handlers/watch.go L240 (WriteHeader 200 before first event)"
+    },
+    {
+      "name": "error_form.unparseable_rv_is_direct_error",
+      "evidence": "code",
+      "layer": "cacher.Watch",
+      "input": {
+        "watch": {
+          "resource_version": "abc"
+        }
+      },
+      "expected": {
+        "outcome": "direct_error",
+        "error": "storage InvalidError on field resourceVersion",
+        "note": "returned before any errWatcher; the 'errors become ERROR events' rule applies only after the RV parses"
+      },
+      "upstream_ref": "cacher.go:Watch L491-495; api_object_versioner.go:ParseResourceVersion L90-102"
+    },
+    {
+      "name": "error_form.empty_and_zero_rv_parse_identically_but_are_routed_differently",
+      "evidence": "code",
+      "layer": "api_object_versioner.ParseResourceVersion + cacher.getWatchCacheResourceVersion",
+      "input": {
+        "resource_versions": [
+          "",
+          "0"
+        ]
+      },
+      "expected": {
+        "parsed": {
+          "": 0,
+          "0": 0
+        },
+        "distinguished_by": "len(opts.ResourceVersion) == 0 in getWatchCacheResourceVersion / getBookmarkAfterResourceVersionLockedFunc"
+      },
+      "upstream_ref": "api_object_versioner.go L91; cacher.go L1207-1209, L1233"
+    },
+    {
+      "name": "error_form.unready_cache_is_direct_429_with_retry_after",
+      "evidence": "code",
+      "layer": "cacher.Watch (ResilientWatchCacheInitialization GA in 1.34)",
+      "input": {
+        "cache": {
+          "ready": false,
+          "downtime_seconds": 14
+        },
+        "watch": {
+          "resource_version": "0"
+        }
+      },
+      "expected": {
+        "outcome": "direct_error",
+        "status": {
+          "code": 429,
+          "reason": "TooManyRequests",
+          "details": {
+            "retryAfterSeconds": 2
+          }
+        }
+      },
+      "upstream_ref": "cacher.go L499-505; cacher_whitebox_test.go:TestRetryAfterForUnreadyCache (asserted on GetList, same helper)",
+      "note": "The Watch path is read from code. The retryAfterSeconds=2 for a 14s downtime is test-asserted only on GetList, which calls the same calculateRetryAfterForUnreadyCache."
+    },
+    {
+      "name": "error_form.unready_retry_after_formula",
+      "evidence": "test",
+      "layer": "util.calculateRetryAfterForUnreadyCache",
+      "input": {
+        "formula": "int(min(30, max(1, exp(0.06 * downtime_seconds))))",
+        "downtime_seconds": [
+          0,
+          1,
+          3,
+          5,
+          7,
+          10,
+          14,
+          20,
+          30,
+          40,
+          540
+        ]
+      },
+      "expected": {
+        "retry_after_seconds": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          2,
+          3,
+          6,
+          11,
+          30
+        ]
+      },
+      "upstream_ref": "util.go:calculateRetryAfterForUnreadyCache L51-56; util_test.go:TestCalculateRetryAfterForUnreadyCache"
+    },
+    {
+      "name": "error_form.registration_race_yields_immediate_close",
+      "evidence": "code",
+      "layer": "cacher.Watch",
+      "input": {
+        "condition": "ready generation changed or cache went unready between the first check and watcher registration"
+      },
+      "expected": {
+        "outcome": "immediate_close",
+        "events": [],
+        "error_event": false
+      },
+      "upstream_ref": "cacher.go L620-652 (generation re-check, newImmediateCloseWatcher)"
+    },
+    {
+      "name": "future_rv.plain_watch_ahead_of_cache_is_accepted_without_504",
+      "evidence": "test",
+      "note": "MOST SURPRISING: a plain watch (sendInitialEvents unset) with RV ahead of the cache neither blocks nor fails. There is no 504 and no 410; the stream just stays open.",
+      "layer": "cacher.Watch",
+      "input": {
+        "cache": {
+          "list_rv": "lastRV",
+          "buffer_rvs": []
+        },
+        "watch": {
+          "resource_version": "lastRV+1",
+          "send_initial_events": null
+        }
+      },
+      "expected": {
+        "outcome": "established",
+        "events_within_1s": []
+      },
+      "upstream_ref": "cacher_whitebox_test.go:TestEmptyWatchEventCache (RV+1); cacher.go:waitUntilWatchCacheFreshAndForceAllEvents L1248-1266 (only blocks when SendInitialEvents==true)"
+    },
+    {
+      "name": "future_rv.events_up_to_requested_rv_are_suppressed",
+      "evidence": "test",
+      "layer": "cacher.Watch + cacheWatcher.process",
+      "input": {
+        "cache": {
+          "after_initial_list": true,
+          "add_rvs": [
+            1000
+          ]
+        },
+        "watch": {
+          "key": "pods/ns/foo",
+          "resource_version": "1010"
+        },
+        "then_update_rvs": [
+          1001,
+          1002,
+          1003,
+          1004,
+          1005,
+          1006,
+          1007,
+          1008,
+          1009,
+          1010,
+          1011
+        ]
+      },
+      "expected": {
+        "first_event_rv_gt": 1010,
+        "first_event_rv": 1011
+      },
+      "upstream_ref": "cacher_whitebox_test.go:TestStartingResourceVersion; cache_watcher.go:process L538 (event.ResourceVersion > resourceVersion)"
+    },
+    {
+      "name": "future_rv.event_exactly_at_requested_rv_is_not_delivered",
+      "evidence": "code",
+      "layer": "cacheWatcher.process",
+      "input": {
+        "watch": {
+          "resource_version": "50"
+        },
+        "incoming_event_rvs": [
+          49,
+          50,
+          51
+        ]
+      },
+      "expected": {
+        "delivered_rvs": [
+          51
+        ]
+      },
+      "upstream_ref": "cache_watcher.go:process L538"
+    },
+    {
+      "name": "future_rv.periodic_bookmarks_suppressed_until_cache_passes_rv",
+      "evidence": "code",
+      "note": "Periodic bookmarks carry the cacher's last processed RV. A watcher that started ahead of the cache gets nothing, not even bookmarks, until that RV passes its start RV.",
+      "layer": "cacheWatcher.process",
+      "input": {
+        "watch": {
+          "resource_version": "2000",
+          "allow_watch_bookmarks": true,
+          "send_initial_events": null
+        },
+        "cacher_last_processed_rv": 1500,
+        "bookmark_tick_rvs": [
+          1500,
+          1500,
+          2001
+        ]
+      },
+      "expected": {
+        "delivered": [
+          {
+            "type": "BOOKMARK",
+            "rv": 2001
+          }
+        ]
+      },
+      "upstream_ref": "cache_watcher.go:setBookmarkAfterResourceVersion L322-325 (rv 0 => state Sent); process L538"
+    },
+    {
+      "name": "future_rv.watchlist_blocks_3s_then_504_too_large",
+      "evidence": "test",
+      "layer": "cacher.Watch -> waitUntilWatchCacheFreshAndForceAllEvents -> watchCache.waitUntilFreshAndBlock",
+      "input": {
+        "cache": {
+          "resource_version": 100
+        },
+        "watch": {
+          "resource_version": "105",
+          "send_initial_events": true,
+          "allow_watch_bookmarks": true
+        },
+        "cache_advances": false
+      },
+      "expected": {
+        "outcome": "error_event",
+        "http_status": 200,
+        "block_seconds": 3,
+        "event": {
+          "type": "ERROR",
+          "object": {
+            "status": "Failure",
+            "code": 504,
+            "reason": "Timeout",
+            "message": "Timeout: Too large resource version: 105, current: 100",
+            "details": {
+              "retryAfterSeconds": 1,
+              "causes": [
+                {
+                  "reason": "ResourceVersionTooLarge",
+                  "message": "Too large resource version"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "upstream_ref": "cacher_whitebox_test.go:TestWaitUntilWatchCacheFreshAndForceAllEvents; watch_cache.go L52, L56, L480-484; storage/errors.go:NewTooLargeResourceVersionError L233-242; apimachinery errors.go:NewTimeoutError L400-409"
+    },
+    {
+      "name": "future_rv.watchlist_rv_unset_uses_etcd_current_rv_and_can_504",
+      "evidence": "test",
+      "layer": "cacher.getWatchCacheResourceVersion + waitUntilFreshAndBlock",
+      "input": {
+        "cache": {
+          "resource_version": 100
+        },
+        "etcd_current_rv": 105,
+        "watch": {
+          "resource_version": "",
+          "send_initial_events": true,
+          "allow_watch_bookmarks_variants": [
+            true,
+            false
+          ]
+        }
+      },
+      "expected": {
+        "required_rv": 105,
+        "outcome_if_cache_stuck": "error_event 504 Timeout with cause ResourceVersionTooLarge",
+        "progress_notify_requested": true
+      },
+      "upstream_ref": "cacher_whitebox_test.go:TestWaitUntilWatchCacheFreshAndForceAllEvents (scenarios 2 and 3); cacher.go L1232-1243, L1257-1260"
+    },
+    {
+      "name": "future_rv.watchlist_succeeds_when_cache_catches_up_within_timeout",
+      "evidence": "test",
+      "layer": "cacher.Watch",
+      "input": {
+        "cache": {
+          "resource_version": 100
+        },
+        "watch": {
+          "resource_version": "105",
+          "send_initial_events": true,
+          "allow_watch_bookmarks": true
+        },
+        "concurrently": "watchCache.Add(pod1 @ rv 105)"
+      },
+      "expected": {
+        "outcome": "established",
+        "first_event": {
+          "type": "ADDED",
+          "object": "pod1",
+          "rv": 105
+        }
+      },
+      "upstream_ref": "cacher_whitebox_test.go:TestWaitUntilWatchCacheFreshAndForceAllEvents (second Watch call)"
+    },
+    {
+      "name": "future_rv.list_timeout_is_also_too_large",
+      "evidence": "test",
+      "layer": "watchCache.WaitUntilFreshAndGetList",
+      "input": {
+        "cache": {
+          "capacity": 3,
+          "add_rvs": [
+            2
+          ],
+          "progress_notify_rv": 3
+        },
+        "list": {
+          "resource_version": "4"
+        },
+        "clock_step": "3s"
+      },
+      "expected": {
+        "is_timeout": true,
+        "is_too_large_resource_version": true
+      },
+      "upstream_ref": "watch_cache_test.go:TestWaitUntilFreshAndListTimeout"
+    },
+    {
+      "name": "watchlist.rv_zero_skips_wait",
+      "evidence": "code",
+      "layer": "watchCache.waitUntilFreshAndBlock",
+      "input": {
+        "watch": {
+          "resource_version": "0",
+          "send_initial_events": true
+        }
+      },
+      "expected": {
+        "waits": false,
+        "can_return_504": false
+      },
+      "upstream_ref": "watch_cache.go:waitUntilFreshAndBlock L463 (timer goroutine only when rv > 0), L480 (loop `w.resourceVersion < resourceVersion` is never true for 0)"
+    },
+    {
+      "name": "watchlist.old_rv_with_send_initial_events_never_410",
+      "evidence": "code",
+      "note": "NAIVE TRAP: sendInitialEvents=true returns an interval built from the current store before the too-old check runs, so an RV that has fallen out of the history window still succeeds.",
+      "layer": "watch_cache.getAllEventsSinceLocked",
+      "input": {
+        "cache": {
+          "removed_since_relist": true,
+          "buffer_rvs": [
+            500,
+            501
+          ]
+        },
+        "watch": {
+          "resource_version": "10",
+          "send_initial_events": true
+        }
+      },
+      "expected": {
+        "result": "ok",
+        "events": "ADDED for every object currently in the store, each at cache RV"
+      },
+      "upstream_ref": "watch_cache.go:getAllEventsSinceLocked L878-880"
+    },
+    {
+      "name": "watchlist.initial_events_end_bookmark_matrix",
+      "evidence": "test",
+      "layer": "cacher.Watch + setInitialEventsEndBookmarkIfRequested",
+      "input": {
+        "cache": {
+          "list_rv": 100,
+          "add": [
+            {
+              "name": "pod-1",
+              "rv": 101
+            },
+            {
+              "name": "pod-2",
+              "rv": 102
+            },
+            {
+              "name": "pod-3",
+              "rv": 103
+            }
+          ]
+        },
+        "watch_rv": "100"
+      },
+      "expected": {
+        "rows": [
+          {
+            "allow_watch_bookmarks": true,
+            "send_initial_events": true,
+            "events": [
+              "ADDED pod-1",
+              "ADDED pod-2",
+              "ADDED pod-3",
+              {
+                "type": "BOOKMARK",
+                "object_metadata": {
+                  "resourceVersion": "103",
+                  "annotations": {
+                    "k8s.io/initial-events-end": "true"
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "allow_watch_bookmarks": false,
+            "send_initial_events": true,
+            "events": [
+              "ADDED pod-1",
+              "ADDED pod-2",
+              "ADDED pod-3"
+            ]
+          },
+          {
+            "allow_watch_bookmarks": true,
+            "send_initial_events": false,
+            "events": [
+              "ADDED pod-1",
+              "ADDED pod-2",
+              "ADDED pod-3"
+            ]
+          },
+          {
+            "allow_watch_bookmarks": false,
+            "send_initial_events": false,
+            "events": [
+              "ADDED pod-1",
+              "ADDED pod-2",
+              "ADDED pod-3"
+            ]
+          },
+          {
+            "allow_watch_bookmarks": true,
+            "send_initial_events": null,
+            "events": [
+              "ADDED pod-1",
+              "ADDED pod-2",
+              "ADDED pod-3"
+            ]
+          }
+        ],
+        "no_further_events": true
+      },
+      "upstream_ref": "cacher_whitebox_test.go:TestInitialEventsEndBookmark; cacher.go L1274-1291"
+    },
+    {
+      "name": "watchlist.empty_store_still_gets_end_bookmark",
+      "evidence": "test",
+      "layer": "cacher.Watch",
+      "input": {
+        "store": {
+          "objects": [],
+          "rv": 100
+        },
+        "watch": {
+          "resource_version": "",
+          "send_initial_events": true,
+          "allow_watch_bookmarks": true
+        }
+      },
+      "expected": {
+        "events": [
+          {
+            "type": "BOOKMARK",
+            "object_metadata": {
+              "resourceVersion": "100",
+              "annotations": {
+                "k8s.io/initial-events-end": "true"
+              }
+            }
+          }
+        ]
+      },
+      "upstream_ref": "cacher_whitebox_test.go:TestWatchListIsSynchronisedWhenNoEventsFromStoreReceived"
+    },
+    {
+      "name": "watchlist.bookmark_object_is_empty_shell_with_rv",
+      "evidence": "test",
+      "layer": "cacher.dispatchEvents / setInitialEventsEndBookmarkIfRequested",
+      "input": {
+        "bookmark_rv": 103
+      },
+      "expected": {
+        "object": "c.newFunc() (zero-value object of the resource kind) with only metadata.resourceVersion set (+ initial-events-end annotation when applicable)"
+      },
+      "upstream_ref": "cacher.go L885-893, L1278-1287; cacher_whitebox_test.go:TestInitialEventsEndBookmark expected Object"
+    },
+    {
+      "name": "watchlist.get_watch_cache_resource_version_table",
+      "evidence": "test",
+      "layer": "cacher.getWatchCacheResourceVersion",
+      "input": {
+        "etcd_current_rv": 100
+      },
+      "expected": {
+        "rows": [
+          {
+            "rv": "",
+            "send_initial_events": null,
+            "allow_watch_bookmarks": "any",
+            "required_rv": 0
+          },
+          {
+            "rv": "",
+            "send_initial_events": true,
+            "allow_watch_bookmarks": "any",
+            "required_rv": 100
+          },
+          {
+            "rv": "",
+            "send_initial_events": false,
+            "allow_watch_bookmarks": "any",
+            "required_rv": 100
+          },
+          {
+            "rv": "0",
+            "send_initial_events": "any",
+            "allow_watch_bookmarks": "any",
+            "required_rv": 0
+          },
+          {
+            "rv": "95",
+            "send_initial_events": "any",
+            "allow_watch_bookmarks": "any",
+            "required_rv": 95
+          }
+        ]
+      },
+      "upstream_ref": "cacher_whitebox_test.go:TestGetWatchCacheResourceVersion; cacher.go L1232-1244"
+    },
+    {
+      "name": "watchlist.bookmark_after_rv_table",
+      "evidence": "test",
+      "layer": "cacher.getBookmarkAfterResourceVersionLockedFunc",
+      "input": {
+        "watch_cache_rv": 99
+      },
+      "expected": {
+        "rule": "nonzero only when sendInitialEvents==true AND allowWatchBookmarks==true",
+        "rows": [
+          {
+            "rv": "",
+            "send_initial_events": true,
+            "allow_watch_bookmarks": true,
+            "required_rv": 100,
+            "bookmark_after_rv": 100
+          },
+          {
+            "rv": "0",
+            "send_initial_events": true,
+            "allow_watch_bookmarks": true,
+            "required_rv": 0,
+            "bookmark_after_rv": 99
+          },
+          {
+            "rv": "95",
+            "send_initial_events": true,
+            "allow_watch_bookmarks": true,
+            "required_rv": 0,
+            "bookmark_after_rv": 95
+          },
+          {
+            "rv": "",
+            "send_initial_events": true,
+            "allow_watch_bookmarks": false,
+            "required_rv": 100,
+            "bookmark_after_rv": 0
+          },
+          {
+            "rv": "",
+            "send_initial_events": false,
+            "allow_watch_bookmarks": true,
+            "required_rv": 100,
+            "bookmark_after_rv": 0
+          },
+          {
+            "rv": "",
+            "send_initial_events": null,
+            "allow_watch_bookmarks": true,
+            "required_rv": 100,
+            "bookmark_after_rv": 0
+          },
+          {
+            "rv": "0",
+            "send_initial_events": null,
+            "allow_watch_bookmarks": true,
+            "required_rv": 0,
+            "bookmark_after_rv": 0
+          },
+          {
+            "rv": "95",
+            "send_initial_events": false,
+            "allow_watch_bookmarks": true,
+            "required_rv": 0,
+            "bookmark_after_rv": 0
+          }
+        ]
+      },
+      "upstream_ref": "cacher_whitebox_test.go:TestGetBookmarkAfterResourceVersionLockedFunc; cacher.go L1201-1219"
+    },
+    {
+      "name": "watchlist.storage_without_progress_notify_is_500_error_event",
+      "evidence": "code",
+      "layer": "cacher.Watch",
+      "input": {
+        "watch": {
+          "send_initial_events": true,
+          "allow_watch_bookmarks": true
+        },
+        "storage_supports_RequestWatchProgress": false
+      },
+      "expected": {
+        "outcome": "error_event",
+        "event": {
+          "type": "ERROR",
+          "object": {
+            "status": "Failure",
+            "code": 500,
+            "reason": "InternalError",
+            "message": "a watch stream was requested by the client but the required storage feature RequestWatchProgress is disabled"
+          }
+        }
+      },
+      "upstream_ref": "cacher.go L551-555; newErrWatcher default branch L1319-1326"
+    },
+    {
+      "name": "routing.rv_unset_watch_is_served_from_cache_like_rv_zero",
+      "evidence": "test",
+      "note": "SURPRISE vs docs: in 1.34, WatchFromStorageWithoutResourceVersion is locked false, so an RV-unset, sendInitialEvents-unset watch goes to the cacher with required RV 0. It replays the cache's current state, which may be stale, instead of a quorum read.",
+      "layer": "delegator.Watch + cacher.getWatchCacheResourceVersion + getAllEventsSinceLocked",
+      "input": {
+        "watch": {
+          "resource_version": "",
+          "send_initial_events": null
+        }
+      },
+      "expected": {
+        "routed_to": "cacher",
+        "required_rv": 0,
+        "initial_events": "synthetic ADDED for every object in the watch cache store, then live events"
+      },
+      "upstream_ref": "delegator.go:Watch L121-137; kube_features.go WatchFromStorageWithoutResourceVersion (1.33 Deprecated, LockToDefault, Default false); cacher_whitebox_test.go:TestGetWatchCacheResourceVersion row \"RV=unset, allowWatchBookmarks=true, sendInitialEvents=nil\" => 0; cacher.go L1237-1239; watch_cache.go L900-908"
+    },
+    {
+      "name": "routing.rv_zero_send_initial_events_false_starts_now_without_state",
+      "evidence": "code",
+      "layer": "watch_cache.getAllEventsSinceLocked",
+      "input": {
+        "cache": {
+          "resource_version": 300
+        },
+        "watch": {
+          "resource_version": "0",
+          "send_initial_events": false
+        }
+      },
+      "expected": {
+        "effective_rv": 300,
+        "initial_events": [],
+        "subsequent": "only events with rv > 300"
+      },
+      "upstream_ref": "watch_cache.go:getAllEventsSinceLocked L910-913"
+    },
+    {
+      "name": "routing.rv_zero_initial_events_use_cache_rv_not_object_rv_for_dedup",
+      "evidence": "code",
+      "layer": "cacheWatcher.processInterval",
+      "input": {
+        "interval": "built from store at cache RV 10 (object RVs 0..9)",
+        "requested_rv": 9,
+        "input_events_after_init": [
+          {
+            "rv": 9
+          },
+          {
+            "rv": 10
+          },
+          {
+            "rv": 11
+          }
+        ]
+      },
+      "expected": {
+        "watcher_rv_after_interval": 10,
+        "delivered_after_init": [
+          {
+            "rv": 11
+          }
+        ]
+      },
+      "upstream_ref": "cache_watcher.go:processInterval L460-462 (raise rv to interval rv), L493-503, process L538; cache_watcher_test.go:TestResourceVersionAfterInitEvents (vacuous, see note)",
+      "note": "VACUOUS UPSTREAM TEST: TestResourceVersionAfterInitEvents is meant to assert this, but it calls w.stopLocked() before processInterval. That closes c.done, so sendWatchCacheEvent returns early for every event, and the test reads from a closed ResultChan, which succeeds with zero values. It passes without delivering anything. The rule here is taken from the code, not from that test."
+    },
+    {
+      "name": "routing.send_initial_events_dropped_when_watchlist_gate_off",
+      "evidence": "code",
+      "layer": "delegator.Watch",
+      "input": {
+        "feature_gates": {
+          "WatchList": false
+        },
+        "watch": {
+          "send_initial_events": true
+        }
+      },
+      "expected": {
+        "send_initial_events_seen_by_cacher": null,
+        "note": "WatchList defaults to true in 1.34 (Beta)"
+      },
+      "upstream_ref": "delegator.go L129-131; kube_features.go WatchList {1.34 Default true Beta}"
+    },
+    {
+      "name": "validation.watch_options_matrix",
+      "evidence": "code",
+      "layer": "apimachinery internalversion/validation.validateWatchOptions",
+      "input": {
+        "watch_list_feature_enabled": true
+      },
+      "expected": {
+        "rows": [
+          {
+            "send_initial_events": true,
+            "resource_version_match": "",
+            "errors": [
+              "Forbidden resourceVersionMatch: sendInitialEvents requires setting resourceVersionMatch to NotOlderThan"
+            ]
+          },
+          {
+            "send_initial_events": true,
+            "resource_version_match": "NotOlderThan",
+            "allow_watch_bookmarks": false,
+            "errors": [],
+            "note": "valid, but no initial-events-end bookmark is ever sent (see watchlist.initial_events_end_bookmark_matrix)"
+          },
+          {
+            "send_initial_events": null,
+            "resource_version_match": "NotOlderThan",
+            "errors": [
+              "Forbidden resourceVersionMatch: resourceVersionMatch is forbidden for watch unless sendInitialEvents is provided"
+            ]
+          },
+          {
+            "send_initial_events": true,
+            "resource_version_match": "Exact",
+            "errors": [
+              "Forbidden resourceVersionMatch: sendInitialEvents requires setting resourceVersionMatch to NotOlderThan",
+              "NotSupported resourceVersionMatch: supported values NotOlderThan"
+            ]
+          },
+          {
+            "list": true,
+            "send_initial_events": true,
+            "errors": [
+              "Forbidden sendInitialEvents: sendInitialEvents is forbidden for list"
+            ]
+          }
+        ]
+      },
+      "upstream_ref": "internalversion/validation/validation.go:ValidateListOptions, validateWatchOptions"
+    },
+    {
+      "name": "bookmark.storage_bookmarks_not_forwarded_only_advance_rv",
+      "evidence": "test",
+      "layer": "cacher.dispatchEvents",
+      "input": {
+        "cache": {
+          "add_rvs": [
+            1000
+          ]
+        },
+        "watch": {
+          "resource_version": "1000",
+          "allow_watch_bookmarks": true
+        },
+        "progress_notify": "watchCache.UpdateResourceVersion(\"2000\")",
+        "bookmark_frequency": "2s (test override)"
+      },
+      "expected": {
+        "eventually": {
+          "type": "BOOKMARK",
+          "rv": 2000
+        },
+        "mechanism": "the storage BOOKMARK is not dispatched; it sets lastProcessedResourceVersion=2000 and the next periodic cacher bookmark carries 2000"
+      },
+      "upstream_ref": "cacher_whitebox_test.go:TestBookmarksOnResourceVersionUpdates; cacher.go L868-881; watch_cache.go:UpdateResourceVersion L412-438"
+    },
+    {
+      "name": "bookmark.periodic_tick_interval",
+      "evidence": "code",
+      "layer": "cacher.dispatchEvents",
+      "input": {},
+      "expected": {
+        "tick": "wait.Jitter(1s, 0.25) => uniform in [1s, 1.25s)",
+        "bookmark_rv": "lastProcessedResourceVersion (initialized to the first list RV)",
+        "delivered_to": "only watchers whose bookmark time bucket has expired"
+      },
+      "upstream_ref": "cacher.go L842, L849-859, L883-894, L1001-1016, L1036-1039"
+    },
+    {
+      "name": "bookmark.not_requested_never_sent",
+      "evidence": "test",
+      "layer": "cacher.Watch",
+      "input": {
+        "watch": {
+          "resource_version": "0",
+          "allow_watch_bookmarks": false,
+          "ctx_timeout": "3s"
+        },
+        "adds_every_100ms_for": "1s"
+      },
+      "expected": {
+        "bookmark_events": 0,
+        "registered_in_bookmark_buckets": false
+      },
+      "upstream_ref": "cacher_whitebox_test.go:TestCacherSendBookmarkEvents (allowWatchBookmarks=false); cacher.go L639-642"
+    },
+    {
+      "name": "bookmark.requested_is_sent_and_monotonic",
+      "evidence": "test",
+      "layer": "cacher.Watch",
+      "input": {
+        "watch": {
+          "resource_version": "0",
+          "allow_watch_bookmarks": true,
+          "ctx_timeout": "3s"
+        },
+        "adds_every_100ms_for": "1s",
+        "rv_start": 1000
+      },
+      "expected": {
+        "bookmark_within": "2s",
+        "bookmark_rv_ge_last_observed_rv": true
+      },
+      "upstream_ref": "cacher_whitebox_test.go:TestCacherSendBookmarkEvents (allowWatchBookmarks=true)"
+    },
+    {
+      "name": "bookmark.multiple_bookmarks_monotonic",
+      "evidence": "test",
+      "layer": "cacher",
+      "input": {
+        "bookmark_frequency": "1s (test override)",
+        "cache": {
+          "add_rvs": [
+            100
+          ]
+        },
+        "watch": {
+          "resource_version": "100",
+          "allow_watch_bookmarks": true,
+          "ctx_timeout": "10s"
+        },
+        "then_add_rvs": [
+          101
+        ]
+      },
+      "expected": {
+        "bookmarks_within_5s": ">= 2",
+        "each_bookmark_rv_ge_previous_event_rv": true
+      },
+      "upstream_ref": "cacher_whitebox_test.go:TestCacherSendsMultipleWatchBookmarks"
+    },
+    {
+      "name": "bookmark.rv_equal_to_watcher_rv_is_dropped_for_plain_watch",
+      "evidence": "code",
+      "note": "This is why TestCacherSendsMultipleWatchBookmarks adds pod 101 after starting the watch at 100: a bookmark only reaches a plain watcher once the RV has moved past its start RV.",
+      "layer": "cacheWatcher.process",
+      "input": {
+        "watcher": {
+          "resource_version": 100,
+          "bookmark_after_rv": 0
+        },
+        "bookmarks": [
+          100,
+          101
+        ]
+      },
+      "expected": {
+        "delivered": [
+          101
+        ]
+      },
+      "upstream_ref": "cache_watcher.go L322-325, L538; cacher_whitebox_test.go:TestCacherSendsMultipleWatchBookmarks comment"
+    },
+    {
+      "name": "bookmark.rv_equal_is_delivered_once_for_watchlist",
+      "evidence": "code",
+      "layer": "cacheWatcher.process",
+      "input": {
+        "watcher": {
+          "resource_version": 100,
+          "bookmark_after_rv": 100,
+          "state": "BookmarkReceived (not yet sent)"
+        },
+        "bookmarks": [
+          100,
+          100
+        ]
+      },
+      "expected": {
+        "delivered": [
+          {
+            "type": "BOOKMARK",
+            "rv": 100,
+            "annotations": {
+              "k8s.io/initial-events-end": "true"
+            }
+          }
+        ],
+        "second_rv_100_bookmark": "dropped (state now Sent)"
+      },
+      "upstream_ref": "cache_watcher.go L538, L304-315, L362-371"
+    },
+    {
+      "name": "bookmark.below_bookmark_after_rv_rejected_by_nonblocking_add",
+      "evidence": "code",
+      "layer": "cacheWatcher.nonblockingAdd",
+      "input": {
+        "watcher": {
+          "bookmark_after_rv": 10
+        },
+        "events": [
+          {
+            "type": "BOOKMARK",
+            "rv": 9
+          },
+          {
+            "type": "BOOKMARK",
+            "rv": 10
+          }
+        ]
+      },
+      "expected": {
+        "accepted": [
+          false,
+          true
+        ],
+        "state_after": "BookmarkReceived",
+        "watcher_terminated": false
+      },
+      "upstream_ref": "cache_watcher.go:nonblockingAdd L147-163"
+    },
+    {
+      "name": "bookmark.initial_events_end_annotation_only_on_first_matching_bookmark",
+      "evidence": "test",
+      "layer": "cacheWatcher.convertToWatchEvent",
+      "input": {
+        "watcher": {
+          "chan_size": 2,
+          "bookmark_after_rv": 10
+        },
+        "sequence": [
+          "init pod-1",
+          "init pod-2",
+          "add pod@5",
+          "nonblockingAdd BOOKMARK@10",
+          "add pod@15"
+        ]
+      },
+      "expected": {
+        "bookmark_event": {
+          "type": "BOOKMARK",
+          "metadata": {
+            "resourceVersion": "10",
+            "annotations": {
+              "k8s.io/initial-events-end": "true"
+            }
+          }
+        },
+        "plain_watch_bookmarks_annotated": false
+      },
+      "upstream_ref": "cache_watcher_test.go:TestCacheWatcherDrainingNoBookmarkAfterResourceVersionSent; cache_watcher.go L362-371"
+    },
+    {
+      "name": "bookmark.next_bookmark_time_rules",
+      "evidence": "code",
+      "layer": "cacheWatcher.nextBookmarkTime (frequency 60s)",
+      "input": {
+        "now": 0
+      },
+      "expected": {
+        "rows": [
+          {
+            "bookmark_after_rv_received": false,
+            "deadline": "any",
+            "next": "zero time => earliest bucket (immediate)",
+            "scheduled": true
+          },
+          {
+            "bookmark_after_rv_received": true,
+            "deadline": "none",
+            "next": 60,
+            "scheduled": true
+          },
+          {
+            "bookmark_after_rv_received": true,
+            "deadline": 120,
+            "next": 60,
+            "scheduled": true
+          },
+          {
+            "bookmark_after_rv_received": true,
+            "deadline": 10,
+            "next": 8,
+            "scheduled": true
+          },
+          {
+            "bookmark_after_rv_received": true,
+            "deadline": 2,
+            "next": 0,
+            "scheduled": true,
+            "note": "heartbeat == now is not Before(now)"
+          },
+          {
+            "bookmark_after_rv_received": true,
+            "deadline": 1,
+            "next": null,
+            "scheduled": false
+          }
+        ]
+      },
+      "upstream_ref": "cache_watcher.go:nextBookmarkTime L222-259"
+    },
+    {
+      "name": "bookmark.kube_rs_default_timeout_schedule",
+      "evidence": "code",
+      "layer": "cacheWatcher.nextBookmarkTime + kube-core WatchParams default",
+      "input": {
+        "client": "kube-rs watcher default (timeoutSeconds=290, allowWatchBookmarks=true)",
+        "watch_started_at": 0,
+        "reschedule_at": [
+          0,
+          240
+        ]
+      },
+      "expected": {
+        "next_after": {
+          "0": 60,
+          "240": 288
+        },
+        "deadline": 290,
+        "pretimeout_bookmark": 288
+      },
+      "upstream_ref": "cache_watcher.go L247-252; kube-core params.rs:populate_qp L381 (timeout.unwrap_or(290)); handlers/get.go L256-258"
+    },
+    {
+      "name": "bookmark.time_buckets_one_second_resolution",
+      "evidence": "test",
+      "layer": "watcherBookmarkTimeBuckets",
+      "input": {
+        "created_at": 0,
+        "watchers_deadlines": [
+          10,
+          20,
+          20
+        ],
+        "frequency": "60s"
+      },
+      "expected": {
+        "buckets": {
+          "8": 1,
+          "18": 2
+        },
+        "pop_at_0": [],
+        "pop_at_10": [
+          [
+            1
+          ]
+        ],
+        "pop_again_at_10": [],
+        "pop_at_22": [
+          [
+            2
+          ]
+        ]
+      },
+      "upstream_ref": "cache_watcher_test.go:TestTimeBucketWatchersBasic; cacher.go:addWatcherThreadUnsafe/popExpiredWatchersThreadUnsafe L218-247"
+    },
+    {
+      "name": "bookmark.waiting_for_bookmark_after_rv_reschedules_every_tick",
+      "evidence": "test",
+      "layer": "watcherBookmarkTimeBuckets + cacheWatcher",
+      "input": {
+        "watcher": {
+          "bookmark_after_rv": 10,
+          "deadline": 120
+        },
+        "steps": [
+          "pop@0",
+          "re-add",
+          "pop@1",
+          "re-add",
+          "pop@30",
+          "markBookmarkAfterRvAsReceived(BOOKMARK@10)",
+          "re-add",
+          "pop@60",
+          "pop@90"
+        ]
+      },
+      "expected": {
+        "pop@0": 1,
+        "pop@1": 1,
+        "pop@30": 1,
+        "pop@60": 0,
+        "pop@90": 1
+      },
+      "upstream_ref": "cache_watcher_test.go:TestBookmarkAfterResourceVersionWatchers"
+    },
+    {
+      "name": "bookmark.never_blocks_and_never_kills_a_watcher",
+      "evidence": "code",
+      "note": "NAIVE TRAP: a bookmark sent to a watcher with a full input buffer is silently dropped. It does not wait on the timeout budget and does not close the watcher. The watcher is re-queued, so a plain watcher's next attempt is about 60s later.",
+      "layer": "cacher.dispatchEvent",
+      "input": {
+        "event": {
+          "type": "BOOKMARK"
+        },
+        "watcher_input_buffer": "full"
+      },
+      "expected": {
+        "delivered": false,
+        "watcher_terminated": false,
+        "requeued": true
+      },
+      "upstream_ref": "cacher.go:dispatchEvent L940-943; finishDispatching L1104-1111; cache_watcher.go L165-167 comment \"bookmark events are never added via the add method only via the nonblockingAdd\""
+    },
+    {
+      "name": "bookmark.dispatch_with_concurrent_stop_does_not_hang",
+      "evidence": "test",
+      "layer": "cacher",
+      "input": {
+        "iterations": 1000,
+        "each": "Watch(rv=999, bookmarks) ; concurrently processEvent(BOOKMARK rv=i) and w.Stop()"
+      },
+      "expected": {
+        "result_chan_closes_within": "1s",
+        "deadlock": false
+      },
+      "upstream_ref": "cacher_whitebox_test.go:TestDispatchingBookmarkEventsWithConcurrentStop; cacher.go L1004-1010 (stopped watchers skipped)"
+    },
+    {
+      "name": "slow_watcher.channel_size_heuristic",
+      "evidence": "test",
+      "layer": "watchCache.suggestedWatchChannelSize",
+      "input": {
+        "formula": "clamp(ceil(capacity / eventFreshDuration_seconds), min=10, max={index&&trigger:10, index&&!trigger:1000, !index:100})",
+        "event_fresh_duration_default_s": 75
+      },
+      "expected": {
+        "rows": [
+          {
+            "capacity": 100,
+            "index": true,
+            "trigger": true,
+            "fresh_s": 75,
+            "size": 10
+          },
+          {
+            "capacity": 100,
+            "index": false,
+            "trigger": false,
+            "fresh_s": 75,
+            "size": 10
+          },
+          {
+            "capacity": 7500,
+            "index": true,
+            "trigger": true,
+            "fresh_s": 75,
+            "size": 10
+          },
+          {
+            "capacity": 7500,
+            "index": true,
+            "trigger": false,
+            "fresh_s": 75,
+            "size": 100
+          },
+          {
+            "capacity": 7500,
+            "index": true,
+            "trigger": false,
+            "fresh_s": 150,
+            "size": 50
+          },
+          {
+            "capacity": 7500,
+            "index": false,
+            "trigger": false,
+            "fresh_s": 75,
+            "size": 100
+          },
+          {
+            "capacity": 75000,
+            "index": true,
+            "trigger": false,
+            "fresh_s": 75,
+            "size": 1000
+          },
+          {
+            "capacity": 75000,
+            "index": true,
+            "trigger": false,
+            "fresh_s": 150,
+            "size": 500
+          },
+          {
+            "capacity": 75000,
+            "index": false,
+            "trigger": false,
+            "fresh_s": 75,
+            "size": 100
+          },
+          {
+            "capacity": 750000,
+            "index": true,
+            "trigger": true,
+            "fresh_s": 75,
+            "size": 10
+          }
+        ]
+      },
+      "upstream_ref": "watch_cache_test.go:TestSuggestedWatchChannelSize; watch_cache.go L820-864"
+    },
+    {
+      "name": "slow_watcher.time_budget_production_constants",
+      "evidence": "code",
+      "layer": "timeBudgetImpl",
+      "input": {
+        "refresh_per_second_ms": 50,
+        "max_budget_ms": 100,
+        "initial_budget_ms": 0,
+        "calls": [
+          [
+            "take",
+            0
+          ],
+          [
+            "take",
+            1
+          ],
+          [
+            "take",
+            2
+          ],
+          [
+            "take",
+            12
+          ],
+          [
+            "return",
+            30
+          ],
+          [
+            "take",
+            12
+          ],
+          [
+            "return",
+            -5
+          ],
+          [
+            "take",
+            12
+          ]
+        ]
+      },
+      "expected": {
+        "take_results_ms": [
+          0,
+          50,
+          50,
+          100,
+          30,
+          0
+        ]
+      },
+      "upstream_ref": "time_budget.go L26-29, L57-94; cacher.go L394 newTimeBudget()"
+    },
+    {
+      "name": "slow_watcher.time_budget_upstream_test_sequence",
+      "evidence": "test",
+      "layer": "timeBudgetImpl (test instance: maxBudget 200ms, refresh 50ms)",
+      "input": {
+        "steps": [
+          [
+            "take@t0"
+          ],
+          [
+            "set t0+10s",
+            "take"
+          ],
+          [
+            "advance 2s",
+            "take"
+          ],
+          [
+            "return 50ms",
+            "take"
+          ],
+          [
+            "return -50ns",
+            "take"
+          ],
+          [
+            "clock -2m",
+            "take"
+          ],
+          [
+            "clock +10m",
+            "take"
+          ],
+          [
+            "return 10s",
+            "clock -2m",
+            "take"
+          ]
+        ]
+      },
+      "expected": {
+        "take_results_ms": [
+          0,
+          200,
+          100,
+          50,
+          0,
+          0,
+          200,
+          200
+        ]
+      },
+      "upstream_ref": "time_budget_test.go:TestTimeBudget"
+    },
+    {
+      "name": "slow_watcher.shared_timer_kills_all_remaining_blocked",
+      "evidence": "code",
+      "note": "A single timer, set to the whole available budget (at most 100ms), is shared by every blocked watcher for one event. Once it fires, each remaining blocked watcher is closed immediately without waiting.",
+      "layer": "cacher.dispatchEvent + cacheWatcher.add",
+      "input": {
+        "blocked_watchers": [
+          "w1",
+          "w2",
+          "w3"
+        ],
+        "budget_ms": 100,
+        "w1_unblocks_ms": null
+      },
+      "expected": {
+        "w1": "waits up to 100ms then terminated",
+        "w2": "terminated without waiting (timer=nil)",
+        "w3": "terminated without waiting (timer=nil)",
+        "unused_budget_returned": "timeout - elapsed"
+      },
+      "upstream_ref": "cacher.go L962-997; cache_watcher.go:add L169-217 (timer == nil => closeFunc)"
+    },
+    {
+      "name": "slow_watcher.fast_watcher_not_blocked_by_slow",
+      "evidence": "test",
+      "layer": "cacher.dispatchEvent",
+      "input": {
+        "cache": {
+          "add_rvs": [
+            1000
+          ]
+        },
+        "w1": {
+          "rv": "999",
+          "reads": false
+        },
+        "w2": {
+          "rv": "999",
+          "reads": true
+        },
+        "then_add_rvs": "1001..1049",
+        "budget": "fakeTimeBudget 2s"
+      },
+      "expected": {
+        "w2_added_events": 50
+      },
+      "upstream_ref": "cacher_whitebox_test.go:TestDispatchEventWillNotBeBlockedByTimedOutWatcher; cacher.go L963-967 (nonblocking pass first)"
+    },
+    {
+      "name": "slow_watcher.termination_is_clean_eof_no_error_event",
+      "evidence": "code",
+      "note": "NAIVE TRAP: a watcher killed for unresponsiveness gets no ERROR event and no 410. Its stream just ends, so a client resumes from its last RV and only sees 410 if that RV has since left the history window.",
+      "layer": "cacheWatcher.stopLocked -> process -> processInterval -> handlers/watch.go",
+      "input": {
+        "termination": "forget(false)"
+      },
+      "expected": {
+        "outcome": "clean_eof",
+        "error_event": false,
+        "http_trailer": "none (chunked stream ends)"
+      },
+      "upstream_ref": "cache_watcher.go:stopLocked L126-145, process L531-536, processInterval L436-438 (defer close(c.result)); handlers/watch.go L263-266 'End of results'"
+    },
+    {
+      "name": "slow_watcher.graceful_only_when_bookmark_received_not_sent",
+      "evidence": "code",
+      "layer": "cacheWatcher.add closeFunc",
+      "input": {
+        "states": [
+          "WaitingForBookmark",
+          "BookmarkReceived",
+          "BookmarkSent"
+        ]
+      },
+      "expected": {
+        "graceful_drain": {
+          "WaitingForBookmark": false,
+          "BookmarkReceived": true,
+          "BookmarkSent": false
+        },
+        "note": "plain (non-watch-list) watchers start in BookmarkSent, so they are never drained"
+      },
+      "upstream_ref": "cache_watcher.go L176-204, L321-327"
+    },
+    {
+      "name": "slow_watcher.graceful_drain_delivers_buffer_then_closes",
+      "evidence": "test",
+      "layer": "cacheWatcher",
+      "input": {
+        "chan_size": 2,
+        "bookmark_after_rv": 10,
+        "init_events": [
+          "pod-1",
+          "pod-2"
+        ],
+        "then": [
+          [
+            "add",
+            "pod@5",
+            "ok"
+          ],
+          [
+            "nonblockingAdd",
+            "BOOKMARK@10",
+            "ok"
+          ],
+          [
+            "add",
+            "pod@15",
+            "ok"
+          ],
+          [
+            "add",
+            "pod@20 (1s timer)",
+            "fails"
+          ]
+        ]
+      },
+      "expected": {
+        "forget_called_with": true,
+        "stopped": true,
+        "client_events": [
+          "ADDED pod-1",
+          "ADDED pod-2",
+          "ADDED pod@5",
+          "BOOKMARK rv=10 annotated k8s.io/initial-events-end=true",
+          "ADDED pod@15"
+        ],
+        "pod@20_delivered": false,
+        "forget_calls_total": 2
+      },
+      "upstream_ref": "cache_watcher_test.go:TestCacheWatcherDrainingNoBookmarkAfterResourceVersionSent"
+    },
+    {
+      "name": "slow_watcher.slack_is_two_buffers_plus_one_in_flight",
+      "evidence": "test",
+      "note": "With chanSize=2 and a client reading nothing after init, 3 adds succeed on top of the 2 init events and the 4th blocks. Each watcher has an input buffer and a result buffer, plus one event held by the processing goroutine.",
+      "layer": "cacheWatcher",
+      "input": {
+        "chan_size": 2
+      },
+      "expected": {
+        "accepted_before_block": "result(2) + in-flight(1) + input(2)",
+        "test_comment": "we can add three events even though the chanSize is two because one event has been popped off from the input chan"
+      },
+      "upstream_ref": "cache_watcher_test.go:TestCacheWatcherDrainingNoBookmarkAfterResourceVersionSent; cache_watcher.go:newCacheWatcher L101-102 (input and result both sized chanSize)"
+    },
+    {
+      "name": "slow_watcher.not_graceful_when_waiting_for_bookmark",
+      "evidence": "test",
+      "layer": "cacheWatcher.add",
+      "input": {
+        "chan_size": 0,
+        "bookmark_after_rv": 10,
+        "init_events": 2,
+        "client_reads": 1,
+        "add_timer": "10ms"
+      },
+      "expected": {
+        "add_returns": false,
+        "forget_called_with": false,
+        "stopped": true,
+        "forget_calls_total": 2
+      },
+      "upstream_ref": "cache_watcher_test.go:TestCacheWatcherDrainingNoBookmarkAfterResourceVersionReceived"
+    },
+    {
+      "name": "slow_watcher.explicit_drain_delivers_all_buffered",
+      "evidence": "test",
+      "layer": "cacheWatcher",
+      "input": {
+        "chan_size": 1,
+        "init_event_rvs": [
+          5,
+          6
+        ],
+        "then_add_rvs": [
+          7
+        ],
+        "forget": true
+      },
+      "expected": {
+        "client_event_count": 3,
+        "forget_calls_total": 2
+      },
+      "upstream_ref": "cache_watcher_test.go:TestCacheWatcherDraining"
+    },
+    {
+      "name": "slow_watcher.interval_invalidation_closes_silently",
+      "evidence": "test",
+      "note": "If the buffer wraps under a watcher still replaying history, the watch closes without an out-of-history ERROR event. Upstream chose this on purpose; the client's re-watch then gets the explicit 410.",
+      "layer": "cacheWatcher.processInterval + watchCacheInterval",
+      "input": {
+        "cache": {
+          "add_rvs": "1000..1249"
+        },
+        "watch": {
+          "resource_version": "999"
+        },
+        "index_validator": "invalidates after first buffer fill"
+      },
+      "expected": {
+        "received_added_events": 100,
+        "error_event": false,
+        "then": "result channel closed"
+      },
+      "upstream_ref": "cacher_whitebox_test.go:TestCacheIntervalInvalidationStopsWatch; watch_cache_interval.go L200, L224 (bufferSize = 100); cache_watcher.go L466-483"
+    },
+    {
+      "name": "slow_watcher.terminate_all_on_cacher_stop_no_drain",
+      "evidence": "code",
+      "layer": "cacher.terminateAllWatchers",
+      "input": {
+        "trigger": "cacher stop / reflector failure (startCaching)"
+      },
+      "expected": {
+        "all_watchers": "stopped with drainInputBuffer=false (default)",
+        "outcome": "clean_eof"
+      },
+      "upstream_ref": "cacher.go L176-190, L468-480, L1114-1126"
+    },
+    {
+      "name": "slow_watcher.forget_is_idempotent",
+      "evidence": "test",
+      "layer": "cacher.forgetWatcher",
+      "input": {
+        "calls": 2
+      },
+      "expected": {
+        "all_watchers_after_each": 0,
+        "value_watchers_after_each": 0,
+        "panic": false
+      },
+      "upstream_ref": "cacher_whitebox_test.go:TestForgetWatcher; cacher.go L1162-1175"
+    },
+    {
+      "name": "slow_watcher.not_going_back_in_time",
+      "evidence": "test",
+      "layer": "cacher",
+      "input": {
+        "cache": {
+          "add_rvs": [
+            1000
+          ]
+        },
+        "slow_w1": {
+          "rv": "999",
+          "sleep_per_event_ms": 1
+        },
+        "then_add_rvs": "1001..1099",
+        "w2": {
+          "rv": "999"
+        }
+      },
+      "expected": {
+        "w2_rvs_non_decreasing": true
+      },
+      "upstream_ref": "cacher_whitebox_test.go:TestWatcherNotGoingBackInTime"
+    },
+    {
+      "name": "event_shape.deleted_via_selector_transition_carries_transition_rv",
+      "evidence": "test",
+      "note": "NAIVE TRAP: the DELETED object is the previous object body stamped with the event's RV, not its own last-modified RV. Sending the old RV makes a resuming client re-read history.",
+      "layer": "cacher.setCachingObjects + cacheWatcher.convertToWatchEvent",
+      "input": {
+        "ops": [
+          [
+            "add",
+            "pod{foo,bar}",
+            1001
+          ],
+          [
+            "update",
+            "pod{foo}",
+            1002
+          ],
+          [
+            "update",
+            "pod{}",
+            1003
+          ],
+          [
+            "delete",
+            "pod{}",
+            1004
+          ]
+        ],
+        "watchers": {
+          "all": "Everything",
+          "foo": "foo=true",
+          "bar": "bar=true"
+        }
+      },
+      "expected": {
+        "all": [
+          "ADDED pod{foo,bar}@1001",
+          "MODIFIED pod{foo}@1002",
+          "MODIFIED pod{}@1003",
+          "DELETED pod{}@1004"
+        ],
+        "foo": [
+          "ADDED pod{foo,bar}@1001",
+          "MODIFIED pod{foo}@1002",
+          "DELETED pod{foo} body with rv 1003"
+        ],
+        "bar": [
+          "ADDED pod{foo,bar}@1001",
+          "DELETED pod{foo,bar} body with rv 1002"
+        ]
+      },
+      "upstream_ref": "cacher_whitebox_test.go:TestCachingDeleteEvents; cacher.go L919-925; cache_watcher.go L389-397"
+    },
+    {
+      "name": "history_window.capacity_bounds",
+      "evidence": "test",
+      "layer": "watch_cache.capacityUpperBound",
+      "input": {
+        "event_fresh_durations": [
+          "75s (default)",
+          "45s",
+          "300s",
+          "225s",
+          "75s<<20"
+        ]
+      },
+      "expected": {
+        "upper_bound": [
+          102400,
+          102400,
+          409600,
+          409600,
+          1677721600
+        ],
+        "lower_bound_and_initial_capacity": 100,
+        "default_event_fresh_duration": "75s = bookmark frequency 60s + 15s"
+      },
+      "upstream_ref": "watch_cache_test.go:TestCapacityUpperBound; watch_cache.go L58-63, capacityUpperBound L210-230; cacher.go L71-75"
+    },
+    {
+      "name": "history_window.resize_rules",
+      "evidence": "test",
+      "layer": "watch_cache.resizeCacheLocked (DefaultEventFreshDuration=75s)",
+      "input": {
+        "note": "cache full; events evenly spaced by 'interval'; resize evaluated at start + interval*count"
+      },
+      "expected": {
+        "rows": [
+          {
+            "capacity": 5,
+            "count": 5,
+            "lower": 2,
+            "upper": 10,
+            "interval": "12.5s",
+            "new_capacity": 10,
+            "new_start_index": 0
+          },
+          {
+            "capacity": 5,
+            "count": 5,
+            "lower": 2,
+            "upper": 10,
+            "interval": "18.75s",
+            "new_capacity": 5,
+            "new_start_index": 0
+          },
+          {
+            "capacity": 5,
+            "count": 5,
+            "lower": 2,
+            "upper": 10,
+            "interval": "76s",
+            "new_capacity": 2,
+            "new_start_index": 3
+          },
+          {
+            "capacity": 5,
+            "count": 5,
+            "lower": 3,
+            "upper": 10,
+            "interval": "76s",
+            "new_capacity": 3,
+            "new_start_index": 2
+          },
+          {
+            "capacity": 5,
+            "count": 5,
+            "lower": 2,
+            "upper": 8,
+            "interval": "12.5s",
+            "new_capacity": 8,
+            "new_start_index": 0
+          },
+          {
+            "capacity": 8,
+            "count": 8,
+            "lower": 4,
+            "upper": 16,
+            "interval": "38.5s",
+            "new_capacity": 4,
+            "new_start_index": 4
+          }
+        ]
+      },
+      "upstream_ref": "watch_cache_test.go:TestDynamicCache; watch_cache.go:resizeCacheLocked L372-387, doCacheResizeLocked L397-410"
+    },
+    {
+      "name": "client.kube_rs.error_410_resets_to_relist",
+      "evidence": "code",
+      "layer": "kube-runtime watcher step_trampolined State::Watching",
+      "input": {
+        "state": "Watching{resource_version: \"500\"}",
+        "event": {
+          "type": "ERROR",
+          "object": {
+            "code": 410,
+            "reason": "Expired"
+          }
+        }
+      },
+      "expected": {
+        "emits": "Err(Error::WatchError(status))",
+        "next_state": "Empty (full relist; default ListSemantic::MostRecent => list with resourceVersion unset)"
+      },
+      "upstream_ref": "kube-runtime/src/watcher.rs L686-701 (err.code == 410 => State::default()), L169-181 (ListSemantic default MostRecent), L393-396"
+    },
+    {
+      "name": "client.kube_rs.non_410_error_keeps_position",
+      "evidence": "code",
+      "note": "kube-rs checks only the numeric code. A 504 or 500 ERROR event keeps the RV; when the server then closes the stream, the next step re-watches from the same RV.",
+      "layer": "kube-runtime watcher",
+      "input": {
+        "state": "Watching{resource_version: \"500\"}",
+        "events": [
+          {
+            "type": "ERROR",
+            "object": {
+              "code": 504,
+              "reason": "Timeout"
+            }
+          },
+          "stream end"
+        ]
+      },
+      "expected": {
+        "after_error": "Watching{resource_version: \"500\"}",
+        "after_stream_end": "InitListed{resource_version: \"500\"} => watch(rv=\"500\") without sendInitialEvents"
+      },
+      "upstream_ref": "kube-runtime/src/watcher.rs L686-701, L714, L635-655"
+    },
+    {
+      "name": "client.kube_rs.bookmark_advances_resume_rv_silently",
+      "evidence": "code",
+      "layer": "kube-runtime watcher",
+      "input": {
+        "state": "Watching{resource_version: \"500\"}",
+        "event": {
+          "type": "BOOKMARK",
+          "metadata": {
+            "resourceVersion": "900"
+          }
+        }
+      },
+      "expected": {
+        "emits": null,
+        "next_state": "Watching{resource_version: \"900\"}"
+      },
+      "upstream_ref": "kube-runtime/src/watcher.rs L682-685"
+    },
+    {
+      "name": "client.kube_rs.clean_eof_resumes_from_last_rv",
+      "evidence": "code",
+      "layer": "kube-runtime watcher",
+      "input": {
+        "state": "Watching{resource_version: \"900\"}",
+        "event": "stream end (server timeout or slow-watcher termination)"
+      },
+      "expected": {
+        "next_state": "InitListed{resource_version: \"900\"}",
+        "then": "watch(rv=\"900\"); a 410 arrives only if 900 has left the cacher history window"
+      },
+      "upstream_ref": "kube-runtime/src/watcher.rs L714"
+    },
+    {
+      "name": "client.kube_rs.streaming_list_initial_watch",
+      "evidence": "test",
+      "layer": "kube-core WatchParams + kube-runtime InitialWatch",
+      "input": {
+        "config": "watcher::Config::default().streaming_lists()"
+      },
+      "expected": {
+        "initial_query": "watch=true&timeoutSeconds=290&allowWatchBookmarks=true&sendInitialEvents=true&resourceVersionMatch=NotOlderThan&resourceVersion=0",
+        "server_side_consequence": "requiredRV=0 so the cacher never blocks this request and never returns 504; bookmarkAfterRV = cache RV at registration",
+        "resumed_watch_sends_send_initial_events": false
+      },
+      "upstream_ref": "kube-core/src/request.rs test watch_streaming_list; kube-runtime/src/watcher.rs L528-531, L411-419; cacher.go L1209-1210; watch_cache.go L480"
+    },
+    {
+      "name": "client.kube_rs.initial_watch_bookmark_handling",
+      "evidence": "code",
+      "layer": "kube-runtime watcher State::InitialWatch",
+      "input": {
+        "events": [
+          {
+            "type": "BOOKMARK",
+            "rv": "50",
+            "annotations": {}
+          },
+          {
+            "type": "BOOKMARK",
+            "rv": "60",
+            "annotations": {
+              "k8s.io/initial-events-end": "true"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "first": "ignored, stay InitialWatch",
+        "second": "emit InitDone; next_state Watching{resource_version: \"60\"}"
+      },
+      "upstream_ref": "kube-runtime/src/watcher.rs L599-609"
+    },
+    {
+      "name": "client.kube_rs.initial_watch_eof_restarts_from_scratch",
+      "evidence": "code",
+      "layer": "kube-runtime watcher State::InitialWatch",
+      "input": {
+        "event": "stream end before initial-events-end bookmark"
+      },
+      "expected": {
+        "next_state": "Empty (not InitListed)"
+      },
+      "upstream_ref": "kube-runtime/src/watcher.rs L632"
+    },
+    {
+      "name": "client.client_go.watch_410_relists_at_last_rv_first",
+      "evidence": "code",
+      "layer": "client-go Reflector",
+      "input": {
+        "watch_error": {
+          "code": 410,
+          "reason": "Expired"
+        },
+        "last_sync_rv": "500"
+      },
+      "expected": {
+        "isLastSyncResourceVersionUnavailable": false,
+        "next_list_rv": "500 (NotOlderThan semantics, may be served from watch cache)",
+        "if_that_list_returns_410_or_too_large": "retry list immediately with resourceVersion=\"\" (quorum read)"
+      },
+      "upstream_ref": "client-go/tools/cache/reflector.go L550-555, L623-632, L1002-1019"
+    },
+    {
+      "name": "client.client_go.too_large_detection",
+      "evidence": "code",
+      "layer": "client-go isTooLargeResourceVersionError",
+      "input": {
+        "errors": [
+          {
+            "id": "a",
+            "code": 504,
+            "reason": "Timeout",
+            "details": {
+              "causes": [
+                {
+                  "reason": "ResourceVersionTooLarge",
+                  "message": "Too large resource version"
+                }
+              ]
+            },
+            "message": "Timeout: Too large resource version: 105, current: 100"
+          },
+          {
+            "id": "b",
+            "code": 504,
+            "reason": "Timeout",
+            "details": {
+              "causes": [
+                {
+                  "message": "Too large resource version"
+                }
+              ]
+            },
+            "message": "Timeout: x"
+          },
+          {
+            "id": "c",
+            "code": 504,
+            "reason": "Timeout",
+            "details": {},
+            "message": "Timeout: Too large resource version: 7, current: 5"
+          },
+          {
+            "id": "d",
+            "code": 504,
+            "reason": "Timeout",
+            "details": null,
+            "message": "Timeout: Too large resource version: 7, current: 5"
+          },
+          {
+            "id": "e",
+            "code": 504,
+            "reason": "Timeout",
+            "details": {},
+            "message": "Timeout: request did not complete"
+          },
+          {
+            "id": "f",
+            "code": 500,
+            "reason": "InternalError",
+            "details": {
+              "causes": [
+                {
+                  "reason": "ResourceVersionTooLarge"
+                }
+              ]
+            },
+            "message": "x"
+          }
+        ]
+      },
+      "expected": {
+        "is_too_large": {
+          "a": true,
+          "b": true,
+          "c": true,
+          "d": false,
+          "e": false,
+          "f": true
+        },
+        "note": "the cause-type path ignores the HTTP code; the legacy message paths need reason=Timeout AND non-nil details. Server-side storage.IsTooLargeResourceVersion is stricter: it requires IsTimeout AND the cause."
+      },
+      "upstream_ref": "client-go/tools/cache/reflector.go:isTooLargeResourceVersionError L1048-1076; apimachinery errors.go:StatusCause L99-109; apiserver storage/errors.go:IsTooLargeResourceVersion L245-250"
+    },
+    {
+      "name": "server_timeout.randomized_when_unset",
+      "evidence": "code",
+      "layer": "endpoints/handlers/get.go ListResource",
+      "input": {
+        "timeoutSeconds": null,
+        "min_request_timeout": "T"
+      },
+      "expected": {
+        "timeout": "T * (1 + rand[0,1)) => [T, 2T)",
+        "at_timeout": "clean_eof, no ERROR event",
+        "cache_watcher_deadline": "same ctx deadline; drives the 2s-before-deadline bookmark"
+      },
+      "upstream_ref": "handlers/get.go L254-265; handlers/watch.go L261-262; cacher.go L569-570"
+    }
+  ]
+}

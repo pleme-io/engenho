@@ -27,6 +27,7 @@ members = [
   "engenho-cni",
   "engenho-csi",
   "engenho-etcd",
+  "engenho-oracle",
 ]
 
 [workspace.package]

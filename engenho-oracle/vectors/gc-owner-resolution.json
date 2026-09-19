@@ -1,0 +1,939 @@
+{
+  "source": [
+    "kubernetes/kubernetes/pkg/controller/garbagecollector/garbagecollector.go@v1.34.0",
+    "kubernetes/kubernetes/pkg/controller/garbagecollector/operations.go@v1.34.0",
+    "kubernetes/kubernetes/pkg/controller/garbagecollector/graph.go@v1.34.0",
+    "kubernetes/kubernetes/pkg/controller/garbagecollector/graph_builder.go@v1.34.0",
+    "kubernetes/kubernetes/pkg/controller/garbagecollector/uid_cache.go@v1.34.0",
+    "kubernetes/kubernetes/pkg/controller/garbagecollector/errors.go@v1.34.0",
+    "kubernetes/kubernetes/pkg/controller/garbagecollector/patch.go@v1.34.0",
+    "kubernetes/kubernetes/pkg/controller/controller_ref_manager.go@v1.34.0",
+    "kubernetes/kubernetes/pkg/controller/garbagecollector/garbagecollector_test.go@v1.34.0",
+    "kubernetes/kubernetes/test/integration/garbagecollector/garbage_collector_test.go@v1.34.0",
+    "kubernetes/kubernetes/cmd/kube-controller-manager/app/core.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/client-go/restmapper/discovery.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apimachinery/pkg/api/meta/restmapper.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apimachinery/pkg/api/meta/priority.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apimachinery/pkg/api/meta/multirestmapper.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apimachinery/pkg/runtime/schema/group_version.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/apimachinery/pkg/api/validation/objectmeta.go@v1.34.0",
+    "kube-rs/kube/kube-runtime/src/reflector/object_ref.rs@4.2.0"
+  ],
+  "conventions": {
+    "api_call_format": "Same format as upstream TestConflictingData clientActions: '<verb> <GroupVersionResource.String()> [ns=<namespace>] name=<name>'. Core group renders as '/v1, Resource=pods'. Cluster-scoped calls omit ns=.",
+    "absent_owner_cache_key": "objectReference{OwnerReference: ownerReferenceCoordinates(ref) /* apiVersion, kind, name, uid ONLY */, Namespace}. Controller and BlockOwnerDeletion are never part of the key.",
+    "rest_mapper_semantics": "'discovery' = client-go restmapper.NewDiscoveryRESTMapper behind DeferredDiscoveryRESTMapper (what kube-controller-manager wires into the GC, core.go:660-678). For every served kind it registers Kind, strings.ToLower(Kind) and Kind+'List' (discovery.go:114-117). Resolution is pinned to the ownerRef's exact group+version; there is no fallback to another served version.",
+    "live": "Objects that exist on the API server. A GET for anything not listed returns 404 NotFound.",
+    "worker_action": "What attemptToDeleteWorker does with the queue item afterwards: 'forget' or 'requeue' (AddRateLimited, no retry cap)."
+  },
+  "cases": [
+    {
+      "name": "apiResource: core namespaced kind resolves to plural resource + namespaced scope",
+      "input": {
+        "fn": "apiResource",
+        "owner_ref": {"apiVersion": "v1", "kind": "ReplicationController"},
+        "rest_mapper": {"semantics": "discovery", "served": [{"groupVersion": "v1", "kind": "ReplicationController", "resource": "replicationcontrollers", "namespaced": true}]}
+      },
+      "expected": {"ok": {"resource": "/v1, Resource=replicationcontrollers", "namespaced": true}},
+      "upstream_ref": "pkg/controller/garbagecollector/operations.go:44 apiResource (schema.FromAPIVersionAndKind + restMapper.RESTMapping(fqKind.GroupKind(), fqKind.Version); namespaced = mapping.Scope == meta.RESTScopeNamespace)"
+    },
+    {
+      "name": "apiResource: cluster-scoped kind resolves with namespaced=false",
+      "input": {
+        "fn": "apiResource",
+        "owner_ref": {"apiVersion": "v1", "kind": "Node"},
+        "rest_mapper": {"semantics": "discovery", "served": [{"groupVersion": "v1", "kind": "Node", "resource": "nodes", "namespaced": false}]}
+      },
+      "expected": {"ok": {"resource": "/v1, Resource=nodes", "namespaced": false}},
+      "upstream_ref": "pkg/controller/garbagecollector/operations.go:44 apiResource; garbagecollector_test.go:1108 'good child in ns1 -> cluster-scoped owner' (client action 'get /v1, Resource=nodes name=nodename')"
+    },
+    {
+      "name": "apiResource: unserved apiVersion fails even though the same group/kind is served at another version",
+      "input": {
+        "fn": "apiResource",
+        "owner_ref": {"apiVersion": "extensions/v1beta1", "kind": "Deployment"},
+        "rest_mapper": {"semantics": "discovery", "served": [{"groupVersion": "apps/v1", "kind": "Deployment", "resource": "deployments", "namespaced": true}]}
+      },
+      "expected": {"error": {"type": "restMappingError", "message": "unable to get REST mapping for extensions/v1beta1/Deployment."}},
+      "upstream_ref": "operations.go:46-48 (any RESTMapping error becomes newRESTMappingError(kind, apiVersion)); errors.go:28-31 Error(); garbagecollector_test.go:1090 deployment1extensions 'not served, still referenced'",
+      "naive_trap": "Falling back to a served version (apps/v1) of the same kind. Upstream pins resolution to the ref's exact group+version."
+    },
+    {
+      "name": "apiResource: all-lowercase kind resolves under the discovery RESTMapper",
+      "input": {
+        "fn": "apiResource",
+        "owner_ref": {"apiVersion": "v1", "kind": "replicationcontroller"},
+        "rest_mapper": {"semantics": "discovery", "served": [{"groupVersion": "v1", "kind": "ReplicationController", "resource": "replicationcontrollers", "namespaced": true}]}
+      },
+      "expected": {"ok": {"resource": "/v1, Resource=replicationcontrollers", "namespaced": true}},
+      "upstream_ref": "staging/src/k8s.io/client-go/restmapper/discovery.go:114 versionMapper.AddSpecific(gv.WithKind(strings.ToLower(resource.Kind)), plural, singular, scope)",
+      "naive_trap": "An exact-case kind table reports this ref as unresolvable, so the dependent is never collected. Upstream resolves it."
+    },
+    {
+      "name": "apiResource: mixed-case kind that is neither exact nor all-lowercase does not resolve",
+      "input": {
+        "fn": "apiResource",
+        "owner_ref": {"apiVersion": "v1", "kind": "replicationController"},
+        "rest_mapper": {"semantics": "discovery", "served": [{"groupVersion": "v1", "kind": "ReplicationController", "resource": "replicationcontrollers", "namespaced": true}]}
+      },
+      "expected": {"error": {"type": "restMappingError", "message": "unable to get REST mapping for v1/replicationController."}},
+      "upstream_ref": "client-go/restmapper/discovery.go:114-115 (only Kind and strings.ToLower(Kind) are registered); apimachinery/pkg/api/meta/restmapper.go:466 RESTMappings looks up kindToPluralResource by exact GVK",
+      "naive_trap": "Case-insensitive kind matching resolves this. Upstream does not."
+    },
+    {
+      "name": "apiResource: Kind+'List' resolves to a guessed resource that the server does not serve",
+      "input": {
+        "fn": "apiResource",
+        "owner_ref": {"apiVersion": "v1", "kind": "PodList"},
+        "rest_mapper": {"semantics": "discovery", "served": [{"groupVersion": "v1", "kind": "Pod", "resource": "pods", "namespaced": true}]}
+      },
+      "expected": {"ok": {"resource": "/v1, Resource=podlists", "namespaced": true}},
+      "upstream_ref": "client-go/restmapper/discovery.go:116-117 versionMapper.Add(gv.WithKind(resource.Kind+\"List\"), scope) ('TODO this is producing unsafe guesses'); apimachinery/pkg/api/meta/restmapper.go:99 Add -> :126 UnsafeGuessKindToResource (lowercase + 's')",
+      "naive_trap": "Treating an '*List' kind as unresolvable. Upstream maps it to a bogus resource with the item kind's scope."
+    },
+    {
+      "name": "apiResource: a mapping miss on a non-fresh discovery cache invalidates discovery and retries once",
+      "input": {
+        "fn": "DeferredDiscoveryRESTMapper.RESTMapping",
+        "owner_ref": {"apiVersion": "example.com/v1", "kind": "Widget"},
+        "cached_discovery": {"fresh": false, "served": []},
+        "live_discovery": {"served": [{"groupVersion": "example.com/v1", "kind": "Widget", "resource": "widgets", "namespaced": true}]}
+      },
+      "expected": {"discovery_reset": true, "ok": {"resource": "example.com/v1, Resource=widgets", "namespaced": true}},
+      "upstream_ref": "client-go/restmapper/discovery.go:285-296 DeferredDiscoveryRESTMapper.RESTMapping (if err != nil && !d.cl.Fresh() { d.Reset(); retry })"
+    },
+    {
+      "name": "validate: empty apiVersion is rejected at write time",
+      "input": {"fn": "validateOwnerReference", "owner_ref": {"apiVersion": "", "kind": "Pod", "name": "p", "uid": "u1"}},
+      "expected": {"valid": false, "errors": [{"field": "apiVersion", "detail": "version must not be empty"}]},
+      "upstream_ref": "staging/src/k8s.io/apimachinery/pkg/api/validation/objectmeta.go:69-75 validateOwnerReference"
+    },
+    {
+      "name": "validate: group-only apiVersion 'apps/' parses to an empty version and is rejected",
+      "input": {"fn": "validateOwnerReference", "owner_ref": {"apiVersion": "apps/", "kind": "Deployment", "name": "d", "uid": "u1"}},
+      "expected": {"valid": false, "parsed_gvk": {"group": "apps", "version": "", "kind": "Deployment"}, "errors": [{"field": "apiVersion", "detail": "version must not be empty"}]},
+      "upstream_ref": "apimachinery/pkg/runtime/schema/group_version.go:211 ParseGroupVersion (one '/' -> GroupVersion{gv[:i], gv[i+1:]}); objectmeta.go:73-75",
+      "naive_trap": "Only checking that the string is non-empty lets 'apps/' through."
+    },
+    {
+      "name": "validate: three-segment apiVersion fails to parse, so FromAPIVersionAndKind drops group and version",
+      "input": {"fn": "validateOwnerReference", "owner_ref": {"apiVersion": "a/b/c", "kind": "Pod", "name": "p", "uid": "u1"}},
+      "expected": {"valid": false, "parsed_gvk": {"group": "", "version": "", "kind": "Pod"}, "errors": [{"field": "apiVersion", "detail": "version must not be empty"}]},
+      "upstream_ref": "group_version.go:224-225 (default: 'unexpected GroupVersion string'); group_version.go:300-305 FromAPIVersionAndKind returns GroupVersionKind{Kind: kind} on parse error; objectmeta.go:73-75"
+    },
+    {
+      "name": "validate: core v1 Event is a banned owner",
+      "input": {"fn": "validateOwnerReference", "owner_ref": {"apiVersion": "v1", "kind": "Event", "name": "e", "uid": "u1"}},
+      "expected": {"valid": false, "errors": [{"field": "", "detail": "/v1, Kind=Event is disallowed from being an owner"}]},
+      "upstream_ref": "objectmeta.go:39-41 BannedOwners = {Group:\"\", Version:\"v1\", Kind:\"Event\"}; objectmeta.go:85-87"
+    },
+    {
+      "name": "validate: events.k8s.io/v1 Event is NOT banned (the ban is keyed by exact GVK)",
+      "input": {"fn": "validateOwnerReference", "owner_ref": {"apiVersion": "events.k8s.io/v1", "kind": "Event", "name": "e", "uid": "u1"}},
+      "expected": {"valid": true, "errors": []},
+      "upstream_ref": "objectmeta.go:39-41 BannedOwners contains only the core v1 GVK; objectmeta.go:85 lookup by full gvk",
+      "naive_trap": "Banning by kind name alone."
+    },
+    {
+      "name": "validate: two refs with controller=true are rejected",
+      "input": {"fn": "ValidateOwnerReferences", "owner_refs": [
+        {"apiVersion": "v1", "kind": "ReplicationController", "name": "a", "uid": "ua", "controller": true},
+        {"apiVersion": "v1", "kind": "ReplicationController", "name": "b", "uid": "ub", "controller": true}
+      ]},
+      "expected": {"valid": false, "errors": [{"field": "", "detail": "Only one reference can have Controller set to true. Found \"true\" in references for ReplicationController/a and ReplicationController/b"}]},
+      "upstream_ref": "objectmeta.go:92-108 ValidateOwnerReferences"
+    },
+    {
+      "name": "isDangling: owner GET returns 404 -> dangling, and the absence is cached under the dependent's namespace",
+      "input": {
+        "fn": "isDangling",
+        "item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "ToBeDeletedPod", "uid": "456"},
+        "owner_ref": {"apiVersion": "v1", "kind": "ReplicationController", "name": "owner1", "uid": "123"},
+        "rest_mapper": {"semantics": "discovery", "served": [{"groupVersion": "v1", "kind": "ReplicationController", "resource": "replicationcontrollers", "namespaced": true}]},
+        "absent_owner_cache": [],
+        "live": []
+      },
+      "expected": {
+        "dangling": true, "owner": null, "error": null,
+        "api_calls": ["get /v1, Resource=replicationcontrollers ns=ns1 name=owner1"],
+        "absent_owner_cache_added": [{"apiVersion": "v1", "kind": "ReplicationController", "name": "owner1", "uid": "123", "namespace": "ns1"}]
+      },
+      "upstream_ref": "garbagecollector.go:429-437 isDangling (errors.IsNotFound -> absentOwnerCache.Add, return true); garbagecollector_test.go:259 TestAttemptToDeleteItem; test/integration/garbagecollector/garbage_collector_test.go:573 TestCreateWithNonExistentOwner (uid \"doesn't matter\")"
+    },
+    {
+      "name": "isDangling: owner found with the same UID -> not dangling, live owner returned",
+      "input": {
+        "fn": "isDangling",
+        "item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "goodpod", "uid": "goodpoduid"},
+        "owner_ref": {"apiVersion": "apps/v1", "kind": "Deployment", "name": "deployment1", "uid": "deploymentuid1"},
+        "rest_mapper": {"semantics": "discovery", "served": [{"groupVersion": "apps/v1", "kind": "Deployment", "resource": "deployments", "namespaced": true}]},
+        "absent_owner_cache": [],
+        "live": [{"resource": "apps/v1, Resource=deployments", "namespace": "ns1", "name": "deployment1", "uid": "deploymentuid1"}]
+      },
+      "expected": {"dangling": false, "owner": {"uid": "deploymentuid1"}, "error": null, "api_calls": ["get apps/v1, Resource=deployments ns=ns1 name=deployment1"], "absent_owner_cache_added": []},
+      "upstream_ref": "garbagecollector.go:442-450 isDangling; garbagecollector_test.go:1949 'bad child -> existing owner with incorrect API version (good child, bad child, good parent)' step 15-16"
+    },
+    {
+      "name": "isDangling: an object with the owner's name exists but has a different UID -> dangling and cached",
+      "input": {
+        "fn": "isDangling",
+        "item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "p1", "uid": "p1uid"},
+        "owner_ref": {"apiVersion": "v1", "kind": "ReplicationController", "name": "rc1", "uid": "old-uid"},
+        "rest_mapper": {"semantics": "discovery", "served": [{"groupVersion": "v1", "kind": "ReplicationController", "resource": "replicationcontrollers", "namespaced": true}]},
+        "absent_owner_cache": [],
+        "live": [{"resource": "/v1, Resource=replicationcontrollers", "namespace": "ns1", "name": "rc1", "uid": "new-uid"}]
+      },
+      "expected": {
+        "dangling": true, "owner": null, "error": null,
+        "api_calls": ["get /v1, Resource=replicationcontrollers ns=ns1 name=rc1"],
+        "absent_owner_cache_added": [{"apiVersion": "v1", "kind": "ReplicationController", "name": "rc1", "uid": "old-uid", "namespace": "ns1"}]
+      },
+      "upstream_ref": "garbagecollector.go:442-449 isDangling ('item's owner is not found, UID mismatch')",
+      "naive_trap": "Resolving the owner by name only. A recreated owner with the same name does NOT adopt the old owner's dependents."
+    },
+    {
+      "name": "isDangling: owner ref carries no namespace, so the lookup is always in the dependent's namespace (the owner only exists in ns2)",
+      "input": {
+        "fn": "isDangling",
+        "item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "podname1", "uid": "poduid1"},
+        "owner_ref": {"apiVersion": "v1", "kind": "Pod", "name": "podname2", "uid": "poduid2"},
+        "rest_mapper": {"semantics": "discovery", "served": [{"groupVersion": "v1", "kind": "Pod", "resource": "pods", "namespaced": true}]},
+        "absent_owner_cache": [],
+        "live": [{"resource": "/v1, Resource=pods", "namespace": "ns2", "name": "podname2", "uid": "poduid2"}]
+      },
+      "expected": {
+        "dangling": true, "owner": null, "error": null,
+        "api_calls": ["get /v1, Resource=pods ns=ns1 name=podname2"],
+        "absent_owner_cache_added": [{"apiVersion": "v1", "kind": "Pod", "name": "podname2", "uid": "poduid2", "namespace": "ns1"}]
+      },
+      "upstream_ref": "garbagecollector.go:429 Namespace(resourceDefaultNamespace(namespaced, item.identity.Namespace)); operations.go:35-40; garbagecollector_test.go:1189 'bad child in ns1 -> owner in ns2 (owner first)' steps 6-7 (absentOwnerCache: [pod2ns1])",
+      "naive_trap": "Finding the owner by UID across all namespaces. Cross-namespace owner refs are always dangling."
+    },
+    {
+      "name": "isDangling: cluster-scoped owner is looked up without a namespace and its absence is cached with namespace \"\"",
+      "input": {
+        "fn": "isDangling",
+        "item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "p1", "uid": "p1uid"},
+        "owner_ref": {"apiVersion": "v1", "kind": "Node", "name": "nodename", "uid": "nodeuid1"},
+        "rest_mapper": {"semantics": "discovery", "served": [{"groupVersion": "v1", "kind": "Node", "resource": "nodes", "namespaced": false}]},
+        "absent_owner_cache": [],
+        "live": []
+      },
+      "expected": {
+        "dangling": true, "owner": null, "error": null,
+        "api_calls": ["get /v1, Resource=nodes name=nodename"],
+        "absent_owner_cache_added": [{"apiVersion": "v1", "kind": "Node", "name": "nodename", "uid": "nodeuid1", "namespace": ""}]
+      },
+      "upstream_ref": "garbagecollector.go:412-414 (if !namespaced { absentOwnerCacheKey.Namespace = \"\" }) and :429-432"
+    },
+    {
+      "name": "isDangling: cluster-key cache hit short-circuits BEFORE the RESTMapper, so even an unresolvable kind is dangling",
+      "input": {
+        "fn": "isDangling",
+        "item": {"apiVersion": "v1", "kind": "ConfigMap", "namespace": "ns1", "name": "dependent", "uid": "cmuid"},
+        "owner_ref": {"apiVersion": "example.com/v1", "kind": "Widget", "name": "owner", "uid": "wuid"},
+        "rest_mapper": {"semantics": "discovery", "served": []},
+        "absent_owner_cache": [{"apiVersion": "example.com/v1", "kind": "Widget", "name": "owner", "uid": "wuid", "namespace": ""}],
+        "live": []
+      },
+      "expected": {"dangling": true, "owner": null, "error": null, "api_calls": [], "rest_mapper_consulted": false, "absent_owner_cache_added": []},
+      "upstream_ref": "garbagecollector.go:382-390 (cache check for namespace \"\" key) runs before gc.apiResource at :408",
+      "naive_trap": "Resolving the kind first. That returns restMappingError and requeues forever."
+    },
+    {
+      "name": "isDangling: namespaced-key cache hit (key namespace == dependent namespace) -> dangling, no API call",
+      "input": {
+        "fn": "isDangling",
+        "item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "rc1Pod2", "uid": "456"},
+        "owner_ref": {"apiVersion": "v1", "kind": "ReplicationController", "name": "rc1", "uid": "1"},
+        "rest_mapper": {"semantics": "discovery", "served": [{"groupVersion": "v1", "kind": "ReplicationController", "resource": "replicationcontrollers", "namespaced": true}]},
+        "absent_owner_cache": [{"apiVersion": "v1", "kind": "ReplicationController", "name": "rc1", "uid": "1", "namespace": "ns1"}],
+        "live": []
+      },
+      "expected": {"dangling": true, "owner": null, "error": null, "api_calls": [], "absent_owner_cache_added": []},
+      "upstream_ref": "garbagecollector.go:392-400; garbagecollector_test.go:496 TestAbsentOwnerCache ('rc1 should already be in the cache, no request should be sent')"
+    },
+    {
+      "name": "isDangling: cache entry for the same owner in a different namespace does not match",
+      "input": {
+        "fn": "isDangling",
+        "item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "p1", "uid": "p1uid"},
+        "owner_ref": {"apiVersion": "v1", "kind": "ReplicationController", "name": "rc1", "uid": "1"},
+        "rest_mapper": {"semantics": "discovery", "served": [{"groupVersion": "v1", "kind": "ReplicationController", "resource": "replicationcontrollers", "namespaced": true}]},
+        "absent_owner_cache": [{"apiVersion": "v1", "kind": "ReplicationController", "name": "rc1", "uid": "1", "namespace": "ns2"}],
+        "live": []
+      },
+      "expected": {
+        "dangling": true, "owner": null, "error": null,
+        "api_calls": ["get /v1, Resource=replicationcontrollers ns=ns1 name=rc1"],
+        "absent_owner_cache_added": [{"apiVersion": "v1", "kind": "ReplicationController", "name": "rc1", "uid": "1", "namespace": "ns1"}]
+      },
+      "upstream_ref": "garbagecollector.go:383-400 (only the \"\" key and item.identity.Namespace key are probed); graph.go:29 objectReference{OwnerReference, Namespace} is the key"
+    },
+    {
+      "name": "isDangling: cache key ignores controller/blockOwnerDeletion (refs differing only in controller share one entry)",
+      "input": {
+        "fn": "isDangling.sequence",
+        "rest_mapper": {"semantics": "discovery", "served": [{"groupVersion": "v1", "kind": "ReplicationController", "resource": "replicationcontrollers", "namespaced": true}]},
+        "absent_owner_cache": [],
+        "live": [],
+        "steps": [
+          {"item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "rc1Pod1", "uid": "456"}, "owner_ref": {"apiVersion": "v1", "kind": "ReplicationController", "name": "rc1", "uid": "1", "controller": true}},
+          {"item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "rc1Pod2", "uid": "456"}, "owner_ref": {"apiVersion": "v1", "kind": "ReplicationController", "name": "rc1", "uid": "1", "controller": false}}
+        ]
+      },
+      "expected": {"results": [{"dangling": true}, {"dangling": true}], "get_count_for_rc1": 1},
+      "upstream_ref": "graph.go:193 ownerReferenceCoordinates (copies only UID, Name, Kind, APIVersion); garbagecollector.go:383; garbagecollector_test.go:496 TestAbsentOwnerCache (rc1Pod1 Controller=true, rc1Pod2 Controller=false, 'expected only 1 GET rc1 request')"
+    },
+    {
+      "name": "attemptToDeleteItem: absence cached via apiVersion v1 does NOT cover a ref to the same owner via v1beta1",
+      "input": {
+        "fn": "attemptToDeleteItem",
+        "item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "podname1", "uid": "poduid1", "virtual": false},
+        "rest_mapper": {"semantics": "discovery", "served": [
+          {"groupVersion": "v1", "kind": "Pod", "resource": "pods", "namespaced": true},
+          {"groupVersion": "rbac.authorization.k8s.io/v1", "kind": "Role", "resource": "roles", "namespaced": true},
+          {"groupVersion": "rbac.authorization.k8s.io/v1beta1", "kind": "Role", "resource": "roles", "namespaced": true}
+        ]},
+        "absent_owner_cache": [{"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "Role", "name": "role1", "uid": "roleuid1", "namespace": "ns1"}],
+        "live": [{"resource": "/v1, Resource=pods", "namespace": "ns1", "name": "podname1", "uid": "poduid1", "ownerReferences": [{"apiVersion": "rbac.authorization.k8s.io/v1beta1", "kind": "Role", "name": "role1", "uid": "roleuid1"}]}]
+      },
+      "expected": {
+        "api_calls": [
+          "get /v1, Resource=pods ns=ns1 name=podname1",
+          "get rbac.authorization.k8s.io/v1beta1, Resource=roles ns=ns1 name=role1",
+          "delete /v1, Resource=pods ns=ns1 name=podname1"
+        ],
+        "absent_owner_cache_after": [
+          {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "Role", "name": "role1", "uid": "roleuid1", "namespace": "ns1"},
+          {"apiVersion": "rbac.authorization.k8s.io/v1beta1", "kind": "Role", "name": "role1", "uid": "roleuid1", "namespace": "ns1"}
+        ],
+        "delete": {"propagationPolicy": "Background"}
+      },
+      "upstream_ref": "garbagecollector_test.go:1300 'good child -> existing owner with non-preferred accessible API version' steps 15-18; graph.go:193 (apiVersion is part of the key)"
+    },
+    {
+      "name": "isDangling: cache key includes UID, so a new owner incarnation (same name, new uid) is a cache miss",
+      "input": {
+        "fn": "isDangling",
+        "item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "p1", "uid": "p1uid"},
+        "owner_ref": {"apiVersion": "v1", "kind": "ReplicationController", "name": "rc1", "uid": "2"},
+        "rest_mapper": {"semantics": "discovery", "served": [{"groupVersion": "v1", "kind": "ReplicationController", "resource": "replicationcontrollers", "namespaced": true}]},
+        "absent_owner_cache": [{"apiVersion": "v1", "kind": "ReplicationController", "name": "rc1", "uid": "1", "namespace": "ns1"}],
+        "live": [{"resource": "/v1, Resource=replicationcontrollers", "namespace": "ns1", "name": "rc1", "uid": "2"}]
+      },
+      "expected": {"dangling": false, "owner": {"uid": "2"}, "error": null, "api_calls": ["get /v1, Resource=replicationcontrollers ns=ns1 name=rc1"], "absent_owner_cache_added": []},
+      "upstream_ref": "graph.go:193 ownerReferenceCoordinates includes UID; uid_cache.go:36-44 key is the whole objectReference",
+      "naive_trap": "Keying the cache by (kind, namespace, name). kube-rs ObjectRef equality does exactly that (see the kube-rs cases)."
+    },
+    {
+      "name": "absentOwnerCache: LRU with Has() promoting the entry (capacity 2: rc1, rc2, rc1 hit, rc3 -> rc2 evicted)",
+      "input": {
+        "fn": "absentOwnerCache.lru",
+        "capacity": 2,
+        "production_capacity": 500,
+        "sequence": [
+          {"op": "attemptToDeleteItem", "dependent": "rc1Pod1", "owner": {"kind": "ReplicationController", "name": "rc1", "uid": "1"}, "owner_get": 404},
+          {"op": "attemptToDeleteItem", "dependent": "rc2Pod1", "owner": {"kind": "ReplicationController", "name": "rc2", "uid": "2"}, "owner_get": 404},
+          {"op": "attemptToDeleteItem", "dependent": "rc1Pod2", "owner": {"kind": "ReplicationController", "name": "rc1", "uid": "1"}},
+          {"op": "attemptToDeleteItem", "dependent": "rc3Pod1", "owner": {"kind": "ReplicationController", "name": "rc3", "uid": "3"}, "owner_get": 404}
+        ]
+      },
+      "expected": {"cache_has": {"rc1": true, "rc2": false, "rc3": true}, "get_count_for_rc1": 1},
+      "upstream_ref": "garbagecollector_test.go:496 TestAbsentOwnerCache (NewReferenceCache(2)); uid_cache.go:40-44 Has uses lru.Get; graph_builder.go:160 NewReferenceCache(500)"
+    },
+    {
+      "name": "isDangling: unresolvable owner kind -> error, not dangling, no GET, nothing cached",
+      "input": {
+        "fn": "isDangling",
+        "item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "podname1", "uid": "poduid1"},
+        "owner_ref": {"apiVersion": "extensions/v1beta1", "kind": "Deployment", "name": "deployment1", "uid": "deploymentuid1"},
+        "rest_mapper": {"semantics": "discovery", "served": [{"groupVersion": "apps/v1", "kind": "Deployment", "resource": "deployments", "namespaced": true}]},
+        "absent_owner_cache": [],
+        "live": [{"resource": "apps/v1, Resource=deployments", "namespace": "ns1", "name": "deployment1", "uid": "deploymentuid1"}]
+      },
+      "expected": {"dangling": false, "owner": null, "error": {"type": "restMappingError", "message": "unable to get REST mapping for extensions/v1beta1/Deployment."}, "api_calls": [], "absent_owner_cache_added": []},
+      "upstream_ref": "garbagecollector.go:408-411 isDangling; operations.go:44-51 apiResource",
+      "naive_trap": "Reading 'cannot resolve the kind' as 'owner absent' and deleting the dependent. Upstream never does that."
+    },
+    {
+      "name": "isDangling: cluster-scoped dependent referencing a namespaced owner kind -> marker error, no GET",
+      "input": {
+        "fn": "isDangling",
+        "item": {"apiVersion": "v1", "kind": "Node", "namespace": "", "name": "nodename", "uid": "nodeuid1"},
+        "owner_ref": {"apiVersion": "v1", "kind": "Pod", "name": "podname1", "uid": "poduid1"},
+        "rest_mapper": {"semantics": "discovery", "served": [{"groupVersion": "v1", "kind": "Pod", "resource": "pods", "namespaced": true}]},
+        "absent_owner_cache": [],
+        "live": []
+      },
+      "expected": {"dangling": false, "owner": null, "error": {"type": "namespacedOwnerOfClusterScopedObjectErr", "message": "cluster-scoped objects cannot refer to namespaced owners"}, "api_calls": [], "absent_owner_cache_added": []},
+      "upstream_ref": "garbagecollector.go:416-424 isDangling; garbagecollector.go:290 sentinel",
+      "naive_trap": "GET /api/v1/namespaces//pods/podname1 (or a list across namespaces), which gets 404, calls the ref dangling and deletes the cluster-scoped object."
+    },
+    {
+      "name": "isDangling: non-404 GET error propagates (not dangling, not cached)",
+      "input": {
+        "fn": "isDangling",
+        "item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "p1", "uid": "p1uid"},
+        "owner_ref": {"apiVersion": "v1", "kind": "ReplicationController", "name": "rc1", "uid": "1"},
+        "rest_mapper": {"semantics": "discovery", "served": [{"groupVersion": "v1", "kind": "ReplicationController", "resource": "replicationcontrollers", "namespaced": true}]},
+        "absent_owner_cache": [],
+        "server_errors": [{"call": "get /v1, Resource=replicationcontrollers ns=ns1 name=rc1", "status": 403, "reason": "Forbidden"}]
+      },
+      "expected": {"dangling": false, "owner": null, "error": {"type": "api", "status": 403}, "api_calls": ["get /v1, Resource=replicationcontrollers ns=ns1 name=rc1"], "absent_owner_cache_added": [], "worker_action": "requeue"},
+      "upstream_ref": "garbagecollector.go:438-439 (case err != nil: return false, nil, err); garbagecollector.go:359-363 worker requeues"
+    },
+    {
+      "name": "classifyReferences: owner with deletionTimestamp but WITHOUT foregroundDeletion finalizer is SOLID",
+      "input": {
+        "fn": "classifyReferences",
+        "item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "p1", "uid": "p1uid"},
+        "owner_refs": [{"apiVersion": "v1", "kind": "ReplicationController", "name": "rc1", "uid": "1"}],
+        "live": [{"resource": "/v1, Resource=replicationcontrollers", "namespace": "ns1", "name": "rc1", "uid": "1", "deletionTimestamp": "2026-01-01T00:00:00Z", "finalizers": ["orphan"]}]
+      },
+      "expected": {"solid": ["1"], "dangling": [], "waitingForDependentsDeletion": []},
+      "upstream_ref": "garbagecollector.go:475-479 (waiting only if GetDeletionTimestamp() != nil && hasDeleteDependentsFinalizer)",
+      "naive_trap": "Treating a terminating owner as absent. That deletes dependents the owner meant to orphan."
+    },
+    {
+      "name": "classifyReferences: owner with deletionTimestamp AND foregroundDeletion finalizer -> waitingForDependentsDeletion",
+      "input": {
+        "fn": "classifyReferences",
+        "item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "p1", "uid": "p1uid"},
+        "owner_refs": [{"apiVersion": "v1", "kind": "ReplicationController", "name": "rc1", "uid": "1"}],
+        "live": [{"resource": "/v1, Resource=replicationcontrollers", "namespace": "ns1", "name": "rc1", "uid": "1", "deletionTimestamp": "2026-01-01T00:00:00Z", "finalizers": ["foregroundDeletion"]}]
+      },
+      "expected": {"solid": [], "dangling": [], "waitingForDependentsDeletion": ["1"]},
+      "upstream_ref": "garbagecollector.go:475-476; graph_builder.go:586-588 hasDeleteDependentsFinalizer (metav1.FinalizerDeleteDependents = \"foregroundDeletion\")"
+    },
+    {
+      "name": "classifyReferences: foregroundDeletion finalizer present but no deletionTimestamp -> SOLID",
+      "input": {
+        "fn": "classifyReferences",
+        "item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "p1", "uid": "p1uid"},
+        "owner_refs": [{"apiVersion": "v1", "kind": "ReplicationController", "name": "rc1", "uid": "1"}],
+        "live": [{"resource": "/v1, Resource=replicationcontrollers", "namespace": "ns1", "name": "rc1", "uid": "1", "deletionTimestamp": null, "finalizers": ["foregroundDeletion"]}]
+      },
+      "expected": {"solid": ["1"], "dangling": [], "waitingForDependentsDeletion": []},
+      "upstream_ref": "garbagecollector.go:475 (both conditions required)"
+    },
+    {
+      "name": "classifyReferences: the first error aborts classification, even after a verified-dangling ref",
+      "input": {
+        "fn": "classifyReferences",
+        "item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "p1", "uid": "p1uid"},
+        "owner_refs": [
+          {"apiVersion": "v1", "kind": "ReplicationController", "name": "gone", "uid": "g1"},
+          {"apiVersion": "test/v1", "kind": "invalid0", "name": "invalid", "uid": "invalid-0"}
+        ],
+        "rest_mapper": {"semantics": "discovery", "served": [{"groupVersion": "v1", "kind": "ReplicationController", "resource": "replicationcontrollers", "namespaced": true}]},
+        "live": []
+      },
+      "expected": {
+        "error": {"type": "restMappingError", "message": "unable to get REST mapping for test/v1/invalid0."},
+        "solid": null, "dangling": null, "waitingForDependentsDeletion": null,
+        "api_calls": ["get /v1, Resource=replicationcontrollers ns=ns1 name=gone"],
+        "absent_owner_cache_added": [{"apiVersion": "v1", "kind": "ReplicationController", "name": "gone", "uid": "g1", "namespace": "ns1"}],
+        "item_deleted": false, "item_patched": false, "worker_action": "requeue"
+      },
+      "upstream_ref": "garbagecollector.go:461-465 classifyReferences (return nil, nil, nil, err on first error); :402-407 TODO ('the garbage collector should i) ignore the reference ... ii) ... remove such references' - not implemented); test/integration/garbagecollector/garbage_collector_test.go:394-397 builds children with 25 'test/v1' unresolvable refs",
+      "naive_trap": "Skipping the unresolvable ref and deleting because every resolvable ref is dangling. Upstream requeues and never deletes."
+    },
+    {
+      "name": "attemptToDeleteItem: single dangling owner -> GET item, GET owner, DELETE item (Background, uid precondition). Owners come from the live object, not the graph node",
+      "input": {
+        "fn": "attemptToDeleteItem",
+        "item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "ToBeDeletedPod", "uid": "456", "virtual": true, "graph_owners": []},
+        "rest_mapper": {"semantics": "static-test", "served": [
+          {"groupVersion": "v1", "kind": "Pod", "resource": "pods", "namespaced": true},
+          {"groupVersion": "v1", "kind": "ReplicationController", "resource": "replicationcontrollers", "namespaced": true}
+        ]},
+        "absent_owner_cache": [],
+        "live": [{"resource": "/v1, Resource=pods", "namespace": "ns1", "name": "ToBeDeletedPod", "uid": "456", "resourceVersion": "", "finalizers": [], "ownerReferences": [{"apiVersion": "v1", "kind": "ReplicationController", "name": "owner1", "uid": "123"}]}]
+      },
+      "expected": {
+        "return": null,
+        "api_calls": [
+          "get /v1, Resource=pods ns=ns1 name=ToBeDeletedPod",
+          "get /v1, Resource=replicationcontrollers ns=ns1 name=owner1",
+          "delete /v1, Resource=pods ns=ns1 name=ToBeDeletedPod"
+        ],
+        "delete": {"propagationPolicy": "Background", "preconditions": {"uid": "456"}},
+        "item_virtual_after": true
+      },
+      "upstream_ref": "garbagecollector_test.go:259 TestAttemptToDeleteItem (expected action set + 'attemptToDeleteItem changed virtual to false unexpectedly'); garbagecollector.go:546 latest.GetOwnerReferences(); :624-644 default branch; operations.go:58-63 (RV precondition only when non-empty)"
+    },
+    {
+      "name": "attemptToDeleteItem: one solid + one dangling owner -> patch removes only the dangling ref, no delete",
+      "input": {
+        "fn": "attemptToDeleteItem",
+        "item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "oneValidOwnerPod", "uid": "pu"},
+        "rest_mapper": {"semantics": "discovery", "served": [
+          {"groupVersion": "v1", "kind": "Pod", "resource": "pods", "namespaced": true},
+          {"groupVersion": "v1", "kind": "ReplicationController", "resource": "replicationcontrollers", "namespaced": true}
+        ]},
+        "absent_owner_cache": [],
+        "live": [
+          {"resource": "/v1, Resource=pods", "namespace": "ns1", "name": "oneValidOwnerPod", "uid": "pu", "ownerReferences": [
+            {"apiVersion": "v1", "kind": "ReplicationController", "name": "toBeDeletedRC", "uid": "rc-del"},
+            {"apiVersion": "v1", "kind": "ReplicationController", "name": "remainingRC", "uid": "rc-keep"}
+          ]},
+          {"resource": "/v1, Resource=replicationcontrollers", "namespace": "ns1", "name": "remainingRC", "uid": "rc-keep"}
+        ]
+      },
+      "expected": {
+        "return": null,
+        "api_calls": [
+          "get /v1, Resource=pods ns=ns1 name=oneValidOwnerPod",
+          "get /v1, Resource=replicationcontrollers ns=ns1 name=toBeDeletedRC",
+          "get /v1, Resource=replicationcontrollers ns=ns1 name=remainingRC",
+          "patch /v1, Resource=pods ns=ns1 name=oneValidOwnerPod"
+        ],
+        "patch": {
+          "remove_owner_uids": ["rc-del"],
+          "type": "application/strategic-merge-patch+json",
+          "body": {"metadata": {"uid": "pu", "ownerReferences": [{"$patch": "delete", "uid": "rc-del"}]}},
+          "fallback": "only on 415 UnsupportedMediaType (e.g. custom resources): GET the item, then send a JSON merge patch {metadata:{resourceVersion:<live rv>, ownerReferences:<surviving refs>}}. It carries the RV precondition but no uid"
+        },
+        "item_deleted": false
+      },
+      "upstream_ref": "garbagecollector.go:566-590 (solid != 0 and dangling != 0 -> GenerateDeleteOwnerRefStrategicMergeBytes(item uid, dangling uids)); pkg/controller/controller_ref_manager.go:572-596; pkg/controller/garbagecollector/patch.go:91-105 (SMP, JSON-merge fallback only on IsUnsupportedMediaType) and :108 deleteOwnerRefJSONMergePatch; test/integration/garbagecollector/garbage_collector_test.go:486 TestCascadingDeletion (oneValidOwnerPodName survives)"
+    },
+    {
+      "name": "attemptToDeleteItem: solid + waitingForDependentsDeletion owner -> patch removes the waiting ref so the foreground owner can finish",
+      "input": {
+        "fn": "attemptToDeleteItem",
+        "item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "pod", "uid": "pu"},
+        "rest_mapper": {"semantics": "discovery", "served": [
+          {"groupVersion": "v1", "kind": "Pod", "resource": "pods", "namespaced": true},
+          {"groupVersion": "v1", "kind": "ReplicationController", "resource": "replicationcontrollers", "namespaced": true}
+        ]},
+        "absent_owner_cache": [],
+        "live": [
+          {"resource": "/v1, Resource=pods", "namespace": "ns1", "name": "pod", "uid": "pu", "ownerReferences": [
+            {"apiVersion": "v1", "kind": "ReplicationController", "name": "toBeDeletedRC", "uid": "rc-del", "blockOwnerDeletion": true},
+            {"apiVersion": "v1", "kind": "ReplicationController", "name": "remainingRC", "uid": "rc-keep"}
+          ]},
+          {"resource": "/v1, Resource=replicationcontrollers", "namespace": "ns1", "name": "toBeDeletedRC", "uid": "rc-del", "deletionTimestamp": "2026-01-01T00:00:00Z", "finalizers": ["foregroundDeletion"]},
+          {"resource": "/v1, Resource=replicationcontrollers", "namespace": "ns1", "name": "remainingRC", "uid": "rc-keep"}
+        ]
+      },
+      "expected": {"return": null, "patch": {"remove_owner_uids": ["rc-del"]}, "item_deleted": false, "final_owner_refs": ["remainingRC"]},
+      "upstream_ref": "garbagecollector.go:579-582 ('waitingForDependentsDeletion needs to be deleted from the ownerReferences'); test/integration/garbagecollector/garbage_collector_test.go:839 TestSolidOwnerDoesNotBlockWaitingOwner"
+    },
+    {
+      "name": "attemptToDeleteItem: live object has no ownerReferences -> no-op (only the item GET)",
+      "input": {
+        "fn": "attemptToDeleteItem",
+        "item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "independentPod", "uid": "iu"},
+        "rest_mapper": {"semantics": "discovery", "served": [{"groupVersion": "v1", "kind": "Pod", "resource": "pods", "namespaced": true}]},
+        "live": [{"resource": "/v1, Resource=pods", "namespace": "ns1", "name": "independentPod", "uid": "iu", "ownerReferences": []}]
+      },
+      "expected": {"return": null, "api_calls": ["get /v1, Resource=pods ns=ns1 name=independentPod"], "item_deleted": false},
+      "upstream_ref": "garbagecollector.go:546-552; test/integration/garbagecollector/garbage_collector_test.go:532-537 independentPodName"
+    },
+    {
+      "name": "attemptToDeleteItem: all owners dangling, item carries orphan finalizer -> DELETE with Orphan policy",
+      "input": {
+        "fn": "attemptToDeleteItem",
+        "item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "p1", "uid": "pu"},
+        "rest_mapper": {"semantics": "discovery", "served": [{"groupVersion": "v1", "kind": "Pod", "resource": "pods", "namespaced": true}, {"groupVersion": "v1", "kind": "ReplicationController", "resource": "replicationcontrollers", "namespaced": true}]},
+        "live": [{"resource": "/v1, Resource=pods", "namespace": "ns1", "name": "p1", "uid": "pu", "resourceVersion": "7", "finalizers": ["orphan"], "ownerReferences": [{"apiVersion": "v1", "kind": "ReplicationController", "name": "rc1", "uid": "1"}]}]
+      },
+      "expected": {"delete": {"propagationPolicy": "Orphan", "preconditions": {"uid": "pu", "resourceVersion": "7"}}},
+      "upstream_ref": "garbagecollector.go:629-632 (hasOrphanFinalizer -> DeletePropagationOrphan); operations.go:58-63"
+    },
+    {
+      "name": "attemptToDeleteItem: all owners dangling, item carries foregroundDeletion finalizer -> DELETE with Foreground policy",
+      "input": {
+        "fn": "attemptToDeleteItem",
+        "item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "p1", "uid": "pu"},
+        "rest_mapper": {"semantics": "discovery", "served": [{"groupVersion": "v1", "kind": "Pod", "resource": "pods", "namespaced": true}, {"groupVersion": "v1", "kind": "ReplicationController", "resource": "replicationcontrollers", "namespaced": true}]},
+        "live": [{"resource": "/v1, Resource=pods", "namespace": "ns1", "name": "p1", "uid": "pu", "resourceVersion": "7", "finalizers": ["foregroundDeletion"], "ownerReferences": [{"apiVersion": "v1", "kind": "ReplicationController", "name": "rc1", "uid": "1"}]}]
+      },
+      "expected": {"delete": {"propagationPolicy": "Foreground", "preconditions": {"uid": "pu", "resourceVersion": "7"}}},
+      "upstream_ref": "garbagecollector.go:633-635"
+    },
+    {
+      "name": "attemptToDeleteItem: only a waiting owner, item HAS dependents -> DELETE with Foreground policy",
+      "input": {
+        "fn": "attemptToDeleteItem",
+        "item": {"apiVersion": "apps/v1", "kind": "ReplicaSet", "namespace": "ns1", "name": "rs1", "uid": "rsu", "dependents": 2},
+        "rest_mapper": {"semantics": "discovery", "served": [{"groupVersion": "apps/v1", "kind": "ReplicaSet", "resource": "replicasets", "namespaced": true}, {"groupVersion": "apps/v1", "kind": "Deployment", "resource": "deployments", "namespaced": true}]},
+        "live": [
+          {"resource": "apps/v1, Resource=replicasets", "namespace": "ns1", "name": "rs1", "uid": "rsu", "resourceVersion": "9", "ownerReferences": [{"apiVersion": "apps/v1", "kind": "Deployment", "name": "d1", "uid": "du", "blockOwnerDeletion": true}]},
+          {"resource": "apps/v1, Resource=deployments", "namespace": "ns1", "name": "d1", "uid": "du", "deletionTimestamp": "2026-01-01T00:00:00Z", "finalizers": ["foregroundDeletion"]}
+        ]
+      },
+      "expected": {"delete": {"propagationPolicy": "Foreground", "preconditions": {"uid": "rsu", "resourceVersion": "9"}}},
+      "upstream_ref": "garbagecollector.go:591-623"
+    },
+    {
+      "name": "attemptToDeleteItem: only a waiting owner, item has NO dependents -> falls to default branch -> Background",
+      "input": {
+        "fn": "attemptToDeleteItem",
+        "item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "p1", "uid": "pu", "dependents": 0},
+        "rest_mapper": {"semantics": "discovery", "served": [{"groupVersion": "v1", "kind": "Pod", "resource": "pods", "namespaced": true}, {"groupVersion": "apps/v1", "kind": "ReplicaSet", "resource": "replicasets", "namespaced": true}]},
+        "live": [
+          {"resource": "/v1, Resource=pods", "namespace": "ns1", "name": "p1", "uid": "pu", "resourceVersion": "3", "finalizers": [], "ownerReferences": [{"apiVersion": "apps/v1", "kind": "ReplicaSet", "name": "rs1", "uid": "rsu", "blockOwnerDeletion": true}]},
+          {"resource": "apps/v1, Resource=replicasets", "namespace": "ns1", "name": "rs1", "uid": "rsu", "deletionTimestamp": "2026-01-01T00:00:00Z", "finalizers": ["foregroundDeletion"]}
+        ]
+      },
+      "expected": {"delete": {"propagationPolicy": "Background", "preconditions": {"uid": "pu", "resourceVersion": "3"}}},
+      "upstream_ref": "garbagecollector.go:591 (case len(waiting) != 0 && item.dependentsLength() != 0) not taken -> :624-644 default",
+      "naive_trap": "Always propagating Foreground when the owner is foreground-deleting."
+    },
+    {
+      "name": "attemptToDeleteItem: graph says item is being deleted and not deletingDependents -> return at once, zero API calls",
+      "input": {
+        "fn": "attemptToDeleteItem",
+        "item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "p1", "uid": "pu", "beingDeleted": true, "deletingDependents": false}
+      },
+      "expected": {"return": null, "api_calls": []},
+      "upstream_ref": "garbagecollector.go:506-512"
+    },
+    {
+      "name": "attemptToDeleteItem: the item itself is 404 -> enqueue virtual delete event, worker forgets",
+      "input": {
+        "fn": "attemptToDeleteItem",
+        "item": {"apiVersion": "apps/v1", "kind": "Deployment", "namespace": "ns1", "name": "deployment1", "uid": "deploymentuid1", "virtual": true},
+        "rest_mapper": {"semantics": "discovery", "served": [{"groupVersion": "apps/v1", "kind": "Deployment", "resource": "deployments", "namespaced": true}]},
+        "live": []
+      },
+      "expected": {
+        "return": {"type": "enqueuedVirtualDeleteEventErr", "message": "enqueued virtual delete event"},
+        "api_calls": ["get apps/v1, Resource=deployments ns=ns1 name=deployment1"],
+        "graph_changes_enqueued": [{"type": "delete", "virtual": true, "identity": {"apiVersion": "apps/v1", "kind": "Deployment", "namespace": "ns1", "name": "deployment1", "uid": "deploymentuid1"}}],
+        "worker_action": "forget"
+      },
+      "upstream_ref": "garbagecollector.go:516-526; :343-345; garbagecollector_test.go:1542 '(accessible parent apiVersion first)' steps 6-7"
+    },
+    {
+      "name": "attemptToDeleteItem: the item's name resolves to a different UID -> virtual delete event, worker forgets",
+      "input": {
+        "fn": "attemptToDeleteItem",
+        "item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "p1", "uid": "old"},
+        "rest_mapper": {"semantics": "discovery", "served": [{"groupVersion": "v1", "kind": "Pod", "resource": "pods", "namespaced": true}]},
+        "live": [{"resource": "/v1, Resource=pods", "namespace": "ns1", "name": "p1", "uid": "new"}]
+      },
+      "expected": {"return": {"type": "enqueuedVirtualDeleteEventErr"}, "api_calls": ["get /v1, Resource=pods ns=ns1 name=p1"], "item_deleted": false, "worker_action": "forget"},
+      "upstream_ref": "garbagecollector.go:531-537"
+    },
+    {
+      "name": "attemptToDeleteItem: ref to an unserved apiVersion of an EXISTING owner -> never deleted, requeued",
+      "input": {
+        "fn": "attemptToDeleteItem",
+        "item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "podname1", "uid": "poduid1"},
+        "rest_mapper": {"semantics": "discovery", "served": [{"groupVersion": "v1", "kind": "Pod", "resource": "pods", "namespaced": true}, {"groupVersion": "apps/v1", "kind": "Deployment", "resource": "deployments", "namespaced": true}]},
+        "live": [
+          {"resource": "/v1, Resource=pods", "namespace": "ns1", "name": "podname1", "uid": "poduid1", "ownerReferences": [{"apiVersion": "extensions/v1beta1", "kind": "Deployment", "name": "deployment1", "uid": "deploymentuid1"}]},
+          {"resource": "apps/v1, Resource=deployments", "namespace": "ns1", "name": "deployment1", "uid": "deploymentuid1"}
+        ]
+      },
+      "expected": {"return": {"type": "restMappingError"}, "api_calls": ["get /v1, Resource=pods ns=ns1 name=podname1"], "item_deleted": false, "worker_action": "requeue"},
+      "upstream_ref": "garbagecollector_test.go:1437 'child -> existing owner with inaccessible API version (owner first)' steps 6-7 ('mismatched child still enqueued - restmapper error')"
+    },
+    {
+      "name": "attemptToDeleteItem: ref to an unserved apiVersion of a DELETED owner -> still never deleted, requeued forever",
+      "input": {
+        "fn": "attemptToDeleteItem",
+        "item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "podname1", "uid": "poduid1"},
+        "rest_mapper": {"semantics": "discovery", "served": [{"groupVersion": "v1", "kind": "Pod", "resource": "pods", "namespaced": true}, {"groupVersion": "apps/v1", "kind": "Deployment", "resource": "deployments", "namespaced": true}]},
+        "absent_owner_cache": [{"apiVersion": "apps/v1", "kind": "Deployment", "name": "deployment1", "uid": "deploymentuid1", "namespace": "ns1"}],
+        "live": [{"resource": "/v1, Resource=pods", "namespace": "ns1", "name": "podname1", "uid": "poduid1", "ownerReferences": [{"apiVersion": "extensions/v1beta1", "kind": "Deployment", "name": "deployment1", "uid": "deploymentuid1"}]}]
+      },
+      "expected": {"return": {"type": "restMappingError"}, "api_calls": ["get /v1, Resource=pods ns=ns1 name=podname1"], "item_deleted": false, "worker_action": "requeue"},
+      "upstream_ref": "garbagecollector_test.go:1437 '(owner first)' steps 9-12 ('final state: child with unresolveable ownerRef remains, queued in pendingAttemptToDelete'); graph.go:193 (the apps/v1 cache key does not match the extensions/v1beta1 ref)",
+      "naive_trap": "Matching the cached absence by UID. The apps/v1 absence does not cover the extensions/v1beta1 ref, so the child leaks."
+    },
+    {
+      "name": "attemptToDeleteItem: cluster-scoped item referencing a namespaced owner kind -> not deleted, not requeued",
+      "input": {
+        "fn": "attemptToDeleteItem",
+        "item": {"apiVersion": "v1", "kind": "Node", "namespace": "", "name": "nodename", "uid": "nodeuid1"},
+        "rest_mapper": {"semantics": "discovery", "served": [{"groupVersion": "v1", "kind": "Node", "resource": "nodes", "namespaced": false}, {"groupVersion": "v1", "kind": "Pod", "resource": "pods", "namespaced": true}]},
+        "live": [
+          {"resource": "/v1, Resource=nodes", "namespace": "", "name": "nodename", "uid": "nodeuid1", "ownerReferences": [{"apiVersion": "v1", "kind": "Pod", "name": "podname1", "uid": "poduid1"}]},
+          {"resource": "/v1, Resource=pods", "namespace": "ns1", "name": "podname1", "uid": "poduid1"}
+        ]
+      },
+      "expected": {"return": {"type": "namespacedOwnerOfClusterScopedObjectErr"}, "api_calls": ["get /v1, Resource=nodes name=nodename"], "item_deleted": false, "worker_action": "forget"},
+      "upstream_ref": "garbagecollector_test.go:1267 'bad cluster-scoped child -> owner in ns1 (owner first)' steps 6-7 ('final state: parent and child present in graph, no queued actions'); garbagecollector.go:346-348"
+    },
+    {
+      "name": "attemptToDeleteItem: dependent in ns1 whose owner ref names a pod that only exists in ns2 -> deleted",
+      "input": {
+        "fn": "attemptToDeleteItem",
+        "item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "podname1", "uid": "poduid1"},
+        "rest_mapper": {"semantics": "static-test", "served": [{"groupVersion": "v1", "kind": "Pod", "resource": "pods", "namespaced": true}]},
+        "absent_owner_cache": [],
+        "live": [
+          {"resource": "/v1, Resource=pods", "namespace": "ns1", "name": "podname1", "uid": "poduid1", "ownerReferences": [{"apiVersion": "v1", "kind": "Pod", "name": "podname2", "uid": "poduid2"}]},
+          {"resource": "/v1, Resource=pods", "namespace": "ns2", "name": "podname2", "uid": "poduid2"}
+        ]
+      },
+      "expected": {
+        "api_calls": [
+          "get /v1, Resource=pods ns=ns1 name=podname1",
+          "get /v1, Resource=pods ns=ns1 name=podname2",
+          "delete /v1, Resource=pods ns=ns1 name=podname1"
+        ],
+        "absent_owner_cache_after": [{"apiVersion": "v1", "kind": "Pod", "name": "podname2", "uid": "poduid2", "namespace": "ns1"}],
+        "owner_in_ns2_untouched": true
+      },
+      "upstream_ref": "garbagecollector_test.go:1189 'bad child in ns1 -> owner in ns2 (owner first)' steps 6-7; test/integration/garbagecollector/garbage_collector_test.go:357 testCrossNamespaceReferences"
+    },
+    {
+      "name": "attemptToDeleteItem: ref shares a live owner's UID but names the wrong kind (Secret vs Deployment) -> dangling, child deleted",
+      "input": {
+        "fn": "attemptToDeleteItem",
+        "item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "badpod", "uid": "badpoduid"},
+        "rest_mapper": {"semantics": "static-test", "served": [{"groupVersion": "v1", "kind": "Pod", "resource": "pods", "namespaced": true}, {"groupVersion": "v1", "kind": "Secret", "resource": "secrets", "namespaced": true}, {"groupVersion": "apps/v1", "kind": "Deployment", "resource": "deployments", "namespaced": true}]},
+        "absent_owner_cache": [],
+        "live": [
+          {"resource": "/v1, Resource=pods", "namespace": "ns1", "name": "badpod", "uid": "badpoduid", "ownerReferences": [{"apiVersion": "v1", "kind": "Secret", "name": "secretname", "uid": "deploymentuid1"}]},
+          {"resource": "apps/v1, Resource=deployments", "namespace": "ns1", "name": "deployment1", "uid": "deploymentuid1"}
+        ]
+      },
+      "expected": {
+        "api_calls": [
+          "get /v1, Resource=pods ns=ns1 name=badpod",
+          "get /v1, Resource=secrets ns=ns1 name=secretname",
+          "delete /v1, Resource=pods ns=ns1 name=badpod"
+        ],
+        "absent_owner_cache_after": [{"apiVersion": "v1", "kind": "Secret", "name": "secretname", "uid": "deploymentuid1", "namespace": "ns1"}]
+      },
+      "upstream_ref": "garbagecollector_test.go:1949 'bad child -> existing owner with incorrect API version (good child, bad child, good parent)' steps 9-10",
+      "naive_trap": "Resolving owners by UID alone (e.g. through the graph's uidToNode). That calls this ref solid."
+    },
+    {
+      "name": "attemptToDeleteItem: ref to a non-preferred but still-served apiVersion (rbac v1beta1) of a live owner -> solid, no action",
+      "input": {
+        "fn": "attemptToDeleteItem",
+        "item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "podname1", "uid": "poduid1"},
+        "rest_mapper": {"semantics": "static-test", "served": [
+          {"groupVersion": "v1", "kind": "Pod", "resource": "pods", "namespaced": true},
+          {"groupVersion": "rbac.authorization.k8s.io/v1", "kind": "Role", "resource": "roles", "namespaced": true},
+          {"groupVersion": "rbac.authorization.k8s.io/v1beta1", "kind": "Role", "resource": "roles", "namespaced": true}
+        ]},
+        "live": [
+          {"resource": "/v1, Resource=pods", "namespace": "ns1", "name": "podname1", "uid": "poduid1", "ownerReferences": [{"apiVersion": "rbac.authorization.k8s.io/v1beta1", "kind": "Role", "name": "role1", "uid": "roleuid1"}]},
+          {"resource": "rbac.authorization.k8s.io/v1beta1, Resource=roles", "namespace": "ns1", "name": "role1", "uid": "roleuid1"}
+        ]
+      },
+      "expected": {
+        "return": null,
+        "api_calls": ["get /v1, Resource=pods ns=ns1 name=podname1", "get rbac.authorization.k8s.io/v1beta1, Resource=roles ns=ns1 name=role1"],
+        "item_deleted": false
+      },
+      "upstream_ref": "garbagecollector_test.go:1300 'good child -> existing owner with non-preferred accessible API version' steps 11-12"
+    },
+    {
+      "name": "deleteObject: 409 on RV-preconditioned delete, live ownerReferences changed -> return the conflict (requeue); next pass verifies the new owner and retries unconditionally when only the RV moved",
+      "input": {
+        "fn": "attemptToDeleteItem.sequence",
+        "item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "podname2", "uid": "poduid2"},
+        "absent_owner_cache": [{"apiVersion": "v1", "kind": "Pod", "name": "podname1", "uid": "poduid1", "namespace": "ns1"}],
+        "live_initial": {"resourceVersion": "42", "ownerReferences": [{"apiVersion": "v1", "kind": "Pod", "name": "podname1", "uid": "poduid1"}]},
+        "delete_reactor": [
+          {"call": 1, "expect_precondition_rv": "42", "side_effect": "set ownerReferences=[rbac.authorization.k8s.io/v1 Role role1 roleuid1], rv=43", "respond": 409},
+          {"call": 2, "expect_precondition_rv": "43", "side_effect": "rv=44, ownerReferences unchanged", "respond": 409},
+          {"call": 3, "expect_precondition_rv": null, "respond": "success"}
+        ]
+      },
+      "expected": {
+        "attempt_1": {"api_calls": ["get /v1, Resource=pods ns=ns1 name=podname2", "delete /v1, Resource=pods ns=ns1 name=podname2", "get /v1, Resource=pods ns=ns1 name=podname2"], "return": {"type": "Conflict"}, "worker_action": "requeue"},
+        "attempt_2": {"api_calls": ["get /v1, Resource=pods ns=ns1 name=podname2", "get rbac.authorization.k8s.io/v1, Resource=roles ns=ns1 name=role1", "delete /v1, Resource=pods ns=ns1 name=podname2", "get /v1, Resource=pods ns=ns1 name=podname2", "delete /v1, Resource=pods ns=ns1 name=podname2"], "return": null},
+        "absent_owner_cache_after": [
+          {"apiVersion": "v1", "kind": "Pod", "name": "podname1", "uid": "poduid1", "namespace": "ns1"},
+          {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "Role", "name": "role1", "uid": "roleuid1", "namespace": "ns1"}
+        ]
+      },
+      "upstream_ref": "garbagecollector_test.go:2319 'resourceVersion conflict between Get/Delete while processing object deletion' (issue 114603); operations.go:66-78 deleteObject (retry with resourceVersion \"\" only if liveObject.UID == item.UID && RV changed && reflect.DeepEqual(liveObject.OwnerReferences, ownersAtResourceVersion))"
+    },
+    {
+      "name": "deleteObject: 409 on RV-preconditioned delete, live GET then 404 -> success",
+      "input": {
+        "fn": "deleteObject",
+        "item": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "p1", "uid": "pu"},
+        "resourceVersion": "5",
+        "delete_response": 409,
+        "live_get_after_conflict": 404
+      },
+      "expected": {"return": null, "api_calls": ["delete /v1, Resource=pods ns=ns1 name=p1", "get /v1, Resource=pods ns=ns1 name=p1"]},
+      "upstream_ref": "operations.go:66-72 ('object we wanted to delete is gone, success!')"
+    },
+    {
+      "name": "worker: restMappingError on the queued item -> requeue with rate limit (no retry cap)",
+      "input": {
+        "fn": "attemptToDeleteWorker",
+        "item": {"apiVersion": "extensions/v1beta1", "kind": "Deployment", "namespace": "ns1", "name": "deployment1", "uid": "deploymentuid1", "virtual": true, "in_graph": true, "graph_node_observed": false},
+        "rest_mapper": {"semantics": "static-test", "served": [{"groupVersion": "apps/v1", "kind": "Deployment", "resource": "deployments", "namespaced": true}]}
+      },
+      "expected": {"api_calls": [], "worker_action": "requeue", "item_stays_in_graph": true},
+      "upstream_ref": "garbagecollector.go:349-363 (restMappingError: 'For now, record the error and retry.'); garbagecollector_test.go:1376 '(child first)' steps 4-5 ('requeued on restmapper error')"
+    },
+    {
+      "name": "worker: virtual owner of a namespaced kind with no namespace coordinate (created from a cluster-scoped child) -> forget, zero API calls",
+      "input": {
+        "fn": "attemptToDeleteWorker",
+        "item": {"apiVersion": "v1", "kind": "Pod", "namespace": "", "name": "podname1", "uid": "poduid1", "virtual": true, "in_graph": true, "graph_node_observed": false},
+        "rest_mapper": {"semantics": "static-test", "served": [{"groupVersion": "v1", "kind": "Pod", "resource": "pods", "namespaced": true}]}
+      },
+      "expected": {"return": {"type": "namespacedOwnerOfClusterScopedObjectErr"}, "api_calls": [], "worker_action": "forget", "virtual_node_stays_in_graph": true},
+      "upstream_ref": "operations.go:87-92 getObject ('the only way this can happen is if a cluster-scoped object referenced this type as an owner'); garbagecollector_test.go:1231 '(child first)' steps 4-5 ('namespace-scoped virtual object without a namespace coordinate not re-queued')"
+    },
+    {
+      "name": "worker: virtual owner that EXISTS but has not been observed by an informer -> requeue until observed",
+      "input": {
+        "fn": "attemptToDeleteWorker",
+        "item": {"apiVersion": "v1", "kind": "Node", "namespace": "ns1", "name": "nodename", "uid": "nodeuid1", "virtual": true, "in_graph": true, "graph_node_observed": false},
+        "rest_mapper": {"semantics": "static-test", "served": [{"groupVersion": "v1", "kind": "Node", "resource": "nodes", "namespaced": false}]},
+        "live": [{"resource": "/v1, Resource=nodes", "namespace": "", "name": "nodename", "uid": "nodeuid1", "ownerReferences": []}]
+      },
+      "expected": {"return": null, "api_calls": ["get /v1, Resource=nodes name=nodename"], "worker_action": "requeue"},
+      "upstream_ref": "garbagecollector.go:364-369 ('requeue if item hasn't been observed via an informer event yet', issue 56121); garbagecollector_test.go:1108 steps 2-3 ('virtual node1 still not observed, got requeued')"
+    },
+    {
+      "name": "worker: queued virtual node whose UID is now an observed node in the graph -> forget without calling attemptToDeleteItem",
+      "input": {
+        "fn": "attemptToDeleteWorker",
+        "item": {"apiVersion": "rbac.authorization.k8s.io/v1beta1", "kind": "Role", "namespace": "ns1", "name": "role1", "uid": "roleuid1", "virtual": true, "in_graph": true, "graph_node_observed": true}
+      },
+      "expected": {"api_calls": [], "worker_action": "forget"},
+      "upstream_ref": "garbagecollector.go:326-340; garbagecollector_test.go:1300 steps 9-10 ('virtual node dropped from attemptToDelete with no further action because the real node has been observed now')"
+    },
+    {
+      "name": "graph: a virtual owner node inherits the DEPENDENT's namespace even for a cluster-scoped owner kind; observation fixes it",
+      "input": {
+        "fn": "processGraphChanges.sequence",
+        "events": [
+          {"type": "add", "object": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "podname1", "uid": "poduid1", "ownerReferences": [{"apiVersion": "v1", "kind": "Node", "name": "nodename", "uid": "nodeuid1"}]}},
+          {"type": "add", "object": {"apiVersion": "v1", "kind": "Node", "namespace": "", "name": "nodename", "uid": "nodeuid1"}}
+        ]
+      },
+      "expected": {
+        "after_event_1": {"virtual_node": {"apiVersion": "v1", "kind": "Node", "namespace": "ns1", "name": "nodename", "uid": "nodeuid1", "virtual": true}, "attemptToDelete": ["virtual Node ns1/nodename"]},
+        "after_event_2": {"node": {"apiVersion": "v1", "kind": "Node", "namespace": "", "name": "nodename", "uid": "nodeuid1", "virtual": false}, "events": []}
+      },
+      "upstream_ref": "graph_builder.go:423-432 (virtual node Namespace: n.identity.Namespace); graph_builder.go:703-737 (observed identity replaces virtual); garbagecollector_test.go:1108 'good child in ns1 -> cluster-scoped owner' ('node1 switched to observed, fixed namespace coordinate')",
+      "naive_trap": "A cache key built from this virtual identity carries namespace ns1 for a cluster-scoped owner. That is why isDangling probes both the \"\" key and the item-namespace key."
+    },
+    {
+      "name": "graph: virtual delete of a virtual owner whose dependents disagree on coordinates -> keep node under an alternate identity, cache the verified-absent identity",
+      "input": {
+        "fn": "processGraphChanges",
+        "graph": {
+          "virtual_owner": {"apiVersion": "apps/v1", "kind": "Deployment", "namespace": "ns1", "name": "deployment1", "uid": "deploymentuid1"},
+          "dependents": [
+            {"name": "podname2", "namespace": "ns1", "owner_ref": {"apiVersion": "apps/v1", "kind": "Deployment", "name": "deployment1", "uid": "deploymentuid1"}},
+            {"name": "podname1", "namespace": "ns1", "owner_ref": {"apiVersion": "extensions/v1beta1", "kind": "Deployment", "name": "deployment1", "uid": "deploymentuid1"}}
+          ]
+        },
+        "event": {"type": "delete", "virtual": true, "identity": {"apiVersion": "apps/v1", "kind": "Deployment", "namespace": "ns1", "name": "deployment1", "uid": "deploymentuid1"}}
+      },
+      "expected": {
+        "node_removed": false,
+        "node_identity_after": {"apiVersion": "extensions/v1beta1", "kind": "Deployment", "namespace": "ns1", "name": "deployment1", "uid": "deploymentuid1", "virtual": true},
+        "absent_owner_cache_added": [{"apiVersion": "apps/v1", "kind": "Deployment", "name": "deployment1", "uid": "deploymentuid1", "namespace": "ns1"}],
+        "attemptToDelete_added": ["podname2 (matching dependent)", "virtual extensions/v1beta1 Deployment ns1/deployment1 (AddRateLimited)"]
+      },
+      "upstream_ref": "graph_builder.go:781-815; :863 partitionDependents; :928 getAlternateOwnerIdentity; garbagecollector_test.go:1542 '(accessible parent apiVersion first)' steps 10-11"
+    },
+    {
+      "name": "graph: alternate identity when the absent identity sorts AFTER every alternate -> the first alternate wins (kind compares first)",
+      "input": {
+        "fn": "getAlternateOwnerIdentity",
+        "verified_absent": {"apiVersion": "v1", "kind": "Secret", "namespace": "ns1", "name": "secretname", "uid": "deploymentuid1"},
+        "dependents": [
+          {"namespace": "ns1", "owner_refs": [{"apiVersion": "v1", "kind": "Secret", "name": "secretname", "uid": "deploymentuid1"}]},
+          {"namespace": "ns1", "owner_refs": [{"apiVersion": "apps/v1", "kind": "Deployment", "name": "deployment1", "uid": "deploymentuid1"}]}
+        ]
+      },
+      "expected": {"alternate": {"apiVersion": "apps/v1", "kind": "Deployment", "namespace": "ns1", "name": "deployment1", "uid": "deploymentuid1"}},
+      "upstream_ref": "graph_builder.go:897-921 referenceLessThan (kind, then apiVersion, then namespace, then name, then uid); :976-981 (first following, else first); garbagecollector_test.go:1678 steps 11-12 ('parent node switched to alternate identity, still virtual')"
+    },
+    {
+      "name": "graph: owner observed AFTER a child that referenced it cross-namespace -> OwnerRefInvalidNamespace warning on the child, child enqueued",
+      "input": {
+        "fn": "processGraphChanges.sequence",
+        "events": [
+          {"type": "add", "object": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "podname1", "uid": "poduid1", "ownerReferences": [{"apiVersion": "v1", "kind": "Pod", "name": "podname2", "uid": "poduid2"}]}},
+          {"type": "add", "object": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns2", "name": "podname2", "uid": "poduid2"}}
+        ]
+      },
+      "expected": {
+        "event_recorded": {"type": "Warning", "reason": "OwnerRefInvalidNamespace", "message": "ownerRef [v1/Pod, namespace: ns1, name: podname2, uid: poduid2] does not exist in namespace \"ns1\"", "involvedObject": {"kind": "Pod", "apiVersion": "v1", "namespace": "ns1", "name": "podname1"}},
+        "attemptToDelete": ["virtual Pod ns1/podname2 (stale)", "Pod ns1/podname1"],
+        "owner_node_after": {"namespace": "ns2", "virtual": false}
+      },
+      "upstream_ref": "graph_builder.go:703-725 (partitionDependents on observed identity; namespace mismatch -> reportInvalidNamespaceOwnerRef); :476-506; garbagecollector_test.go:1144 'bad child in ns1 -> owner in ns2 (child first)' steps 4-5"
+    },
+    {
+      "name": "graph: child referencing an existing virtual CLUSTER-scoped-looking owner node from a different namespace is enqueued for verification (issue 98040)",
+      "input": {
+        "fn": "addDependentToOwners",
+        "graph": {"virtual_owner": {"apiVersion": "v1", "kind": "Pod", "namespace": "", "name": "podname1", "uid": "poduid1", "virtual": true, "created_by": "cluster-scoped child Node/nodename"}},
+        "new_dependent": {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "podname2", "uid": "poduid2", "owner_ref": {"apiVersion": "v1", "kind": "Pod", "name": "podname1", "uid": "poduid1"}}
+      },
+      "expected": {"attemptToDelete_added": ["Pod ns1/podname2"], "events": []},
+      "upstream_ref": "graph_builder.go:459-464 ('the owner could be a missing instance of a namespaced type incorrectly referenced by a cluster-scoped child (issue #98040)'); garbagecollector_test.go:2055 'cluster-scoped bad child, namespaced good child, missing parent' steps 4-5"
+    },
+    {
+      "name": "steady state (issue 98040): namespaced good child of a missing pod is deleted; the cluster-scoped bad child and its virtual parent stay forever with no retries",
+      "input": {
+        "fn": "scenario",
+        "objects": [
+          {"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "podname2", "uid": "poduid2", "ownerReferences": [{"apiVersion": "v1", "kind": "Pod", "name": "podname1", "uid": "poduid1"}]},
+          {"apiVersion": "v1", "kind": "Node", "namespace": "", "name": "nodename", "uid": "nodeuid1", "ownerReferences": [{"apiVersion": "v1", "kind": "Pod", "name": "podname1", "uid": "poduid1"}]}
+        ],
+        "missing": [{"apiVersion": "v1", "kind": "Pod", "namespace": "ns1", "name": "podname1", "uid": "poduid1"}]
+      },
+      "expected": {
+        "deleted": ["Pod ns1/podname2"],
+        "remaining_graph": ["Node nodename (owners: Pod podname1)", "virtual Pod <no namespace>/podname1"],
+        "absent_owner_cache": [{"apiVersion": "v1", "kind": "Pod", "name": "podname1", "uid": "poduid1", "namespace": "ns1"}],
+        "pending_attemptToDelete": []
+      },
+      "upstream_ref": "garbagecollector_test.go:2055 steps 6-11 ('steady-state is bad cluster child and bad virtual parent coordinates, with no retries')"
+    },
+    {
+      "name": "integration: deleting a CRD cascades to its CRs and then to core dependents that name a CR as owner",
+      "input": {
+        "fn": "integration",
+        "setup": ["CRD (random, namespaced)", "CR owner in ns crd-mixed", "ConfigMap dependent with ownerReference -> CR owner", "sleep gc syncPeriod + 5s"],
+        "action": "delete the CustomResourceDefinition"
+      },
+      "expected": {"owner_cr_deleted": true, "dependent_configmap_deleted": true, "repeat_after_recreating_crd": true},
+      "upstream_ref": "test/integration/garbagecollector/garbage_collector_test.go:1246 TestCRDDeletionCascading / testCRDDeletion; mechanism (inferred from code): the CR delete event adds the owner identity to absentOwnerCache (graph_builder.go:835-845), which isDangling checks before the RESTMapper (garbagecollector.go:383-408)"
+    },
+    {
+      "name": "kube-rs contrast: ObjectRef equality and hash ignore uid (extra)",
+      "input": {
+        "fn": "kube_runtime::reflector::ObjectRef::eq/hash",
+        "a": {"kind": "Pod", "namespace": "my-namespace", "name": "my-pod", "extra": {"uid": null, "resource_version": null}},
+        "b": {"kind": "Pod", "namespace": "my-namespace", "name": "my-pod", "extra": {"uid": "638ffacd-f666-4402-ba10-7848c66ef576", "resource_version": "123"}}
+      },
+      "expected": {"equal": true, "hash_equal": true},
+      "upstream_ref": "kube-rs/kube kube-runtime/src/reflector/object_ref.rs:144 #[educe(Hash(ignore), PartialEq(ignore))] pub extra; :356 test comparison_should_ignore_extra",
+      "naive_trap": "A Rust port that keys absentOwnerCache (or owner lookups) by kube-rs ObjectRef merges two owner incarnations. The upstream key includes uid AND apiVersion."
+    },
+    {
+      "name": "kube-rs contrast: ObjectRef::from_owner_ref needs an exact apiVersion + kind string match and takes the namespace from the caller",
+      "input": {
+        "fn": "kube_runtime::reflector::ObjectRef::<Pod>::from_owner_ref",
+        "namespace": "ns1",
+        "variants": [
+          {"owner": {"apiVersion": "v1", "kind": "Pod", "name": "p", "uid": "u"}},
+          {"owner": {"apiVersion": "v1", "kind": "pod", "name": "p", "uid": "u"}}
+        ]
+      },
+      "expected": {"results": [
+        {"some": {"name": "p", "namespace": "ns1", "extra_uid": "u"}},
+        {"none": true}
+      ]},
+      "upstream_ref": "kube-rs/kube kube-runtime/src/reflector/object_ref.rs:222-240 from_owner_ref (owner.api_version == K::api_version && owner.kind == K::kind)",
+      "naive_trap": "The upstream GC resolves kind 'pod' through the discovery RESTMapper (discovery.go:114). A from_owner_ref resolver drops that ref."
+    }
+  ]
+}

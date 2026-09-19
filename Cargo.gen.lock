@@ -1,14 +1,14 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "d8f76a74e2212c440a83a0eb59de17fc253f1f455d7258e32bf1027a1ac3184c",
+  "cargo_lock_sha256": "08a5006aea0de36e97d3af84161eead971562fe3a51e967baf3cebb655bd007b",
   "manifest_sha256": {
-    "Cargo.toml": "fa338977673f1e7f3f219b61103d38a0fda8e10d771815cb6409cba2b60d07e3",
-    "engenho-apiserver/Cargo.toml": "dd8ed22200247d6e30cbd121f61cf79de3c9bc3f83946ddd4519d6626b03ac33",
+    "Cargo.toml": "04cf79221801b8562c19d8a3bcbf45a55f2886ba7d654cd6a523bd856736a98c",
+    "engenho-apiserver/Cargo.toml": "be7d04cd80fe124f3094eb3f147cbde15e2eabe2975858e18f9ed7ab6c190ab1",
     "engenho-cluster-config-render/Cargo.toml": "5f5f6d40c2b9a572f18418d12e568412517972684259f34a9aa3d34de0a5dc8c",
     "engenho-cluster-config/Cargo.toml": "49d8ea7131956ec2d6323ae41968f624fab66bbbbca1afbb0537b2327a683391",
     "engenho-cni/Cargo.toml": "18a964f983410b945d3e150fe0f2a33635fe63aaadb02f9425a20eac53f39908",
     "engenho-config/Cargo.toml": "b96a79e9008ee6a636df2a80815df844ce2081fac132eeddd6e4d60e87055b88",
-    "engenho-controllers/Cargo.toml": "6e33573c7d9d4e64b9e4ef83236b6542861862afa1b15ba47c8e1565bfd058b7",
+    "engenho-controllers/Cargo.toml": "72a54a403a2139ee2efcc0739d5a9d59140e272b6ec5b16faf01463be1eac93c",
     "engenho-csi/Cargo.toml": "1e80780c1c952308203895db7e3cac22d1f7e6465cacb9d698060412e56d4c97",
     "engenho-diff/Cargo.toml": "b58a040e9e4ade051db52e99e78ad8c20b3c48581751017f66b040081a64d311",
     "engenho-etcd/Cargo.toml": "317b6fd67d6f09f733ea06e938cc987bda0908861ab91c22ae1716a723445ef0",
@@ -19,6 +19,7 @@
     "engenho-kube-proto/Cargo.toml": "7545b21650bdbf36fa4b0592ee3659069a39555f10174f42142bf337b1f1c00b",
     "engenho-kubelet/Cargo.toml": "61f3b57b809bf3b6a8680f57d32637a7a4e414337f2cda04f2c1db2500f02fae",
     "engenho-mcp/Cargo.toml": "dc06fc92995d436359c7da1e38aff4fa8fbd4ed1bdb9f70d815f1e0d27163086",
+    "engenho-oracle/Cargo.toml": "9b0da2a6c1d469c28eb0617b8d71df0b0bf6db7751596956e0bb74a6ac979984",
     "engenho-revoada/Cargo.toml": "08cfd6e45e8acfb75f3073e3a70a9a11a9c33575c43509d0199b1e73bb8012f9",
     "engenho-runtime/Cargo.toml": "1bb074d1b048ced7b852c243698ed6dab8b4ea4d2b1eb1537067e10ab7579665",
     "engenho-scheduler/Cargo.toml": "b8e178bbb3012942524cd91c4f5e3c1160e11d2ec81eb81ce5f18bd1504426d1",
@@ -6530,6 +6531,34 @@
             "features": [
               "env-filter"
             ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
+      },
+      "engenho-oracle-0.53.118": {
+        "runtime_dependencies": [
+          {
+            "name": "serde",
+            "package_key": "serde-1.0.228",
+            "kind": "normal",
+            "features": [
+              "derive"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "serde_json",
+            "package_key": "serde_json-1.0.150",
+            "kind": "normal",
+            "features": [],
             "uses_default_features": true,
             "optional": false,
             "target": null,
@@ -39021,6 +39050,13 @@
           "path": "src/main.rs"
         }
       ]
+    },
+    "engenho-oracle-0.53.118": {
+      "edition": "2024",
+      "lib_target": {
+        "name": "engenho_oracle",
+        "path": "src/lib.rs"
+      }
     },
     "engenho-revoada-0.53.118": {
       "edition": "2024",

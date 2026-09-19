@@ -1392,6 +1392,7 @@ dependencies = [
  "ed25519-dalek",
  "engenho-controllers",
  "engenho-kube-proto",
+ "engenho-oracle",
  "engenho-store",
  "engenho-substrate",
  "engenho-types",
@@ -1709,6 +1710,14 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "engenho-oracle"
+version = "0.53.118"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

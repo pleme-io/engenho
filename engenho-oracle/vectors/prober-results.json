@@ -1,0 +1,3480 @@
+{
+  "source": [
+    "kubernetes/kubernetes/pkg/kubelet/prober/worker.go@v1.34.0",
+    "kubernetes/kubernetes/pkg/kubelet/prober/worker_test.go@v1.34.0",
+    "kubernetes/kubernetes/pkg/kubelet/prober/common_test.go@v1.34.0",
+    "kubernetes/kubernetes/pkg/kubelet/prober/prober.go@v1.34.0",
+    "kubernetes/kubernetes/pkg/kubelet/prober/prober_test.go@v1.34.0",
+    "kubernetes/kubernetes/pkg/kubelet/prober/prober_manager.go@v1.34.0",
+    "kubernetes/kubernetes/pkg/kubelet/prober/prober_manager_test.go@v1.34.0",
+    "kubernetes/kubernetes/pkg/kubelet/prober/results/results_manager.go@v1.34.0",
+    "kubernetes/kubernetes/pkg/probe/probe.go@v1.34.0",
+    "kubernetes/kubernetes/pkg/probe/util.go@v1.34.0",
+    "kubernetes/kubernetes/pkg/probe/exec/exec.go@v1.34.0",
+    "kubernetes/kubernetes/pkg/probe/exec/exec_test.go@v1.34.0",
+    "kubernetes/kubernetes/pkg/probe/http/http.go@v1.34.0",
+    "kubernetes/kubernetes/pkg/probe/http/http_test.go@v1.34.0",
+    "kubernetes/kubernetes/pkg/probe/http/request.go@v1.34.0",
+    "kubernetes/kubernetes/pkg/probe/tcp/tcp.go@v1.34.0",
+    "kubernetes/kubernetes/pkg/probe/grpc/grpc.go@v1.34.0",
+    "kubernetes/kubernetes/pkg/features/kube_features.go@v1.34.0",
+    "kubernetes/kubernetes/pkg/apis/core/v1/defaults.go@v1.34.0",
+    "kubernetes/kubernetes/pkg/apis/core/validation/validation.go@v1.34.0",
+    "kubernetes/kubernetes/staging/src/k8s.io/cri-client/pkg/remote_runtime.go@v1.34.0",
+    "kubernetes/kubernetes/pkg/kubelet/kuberuntime/kuberuntime_container.go@v1.34.0",
+    "kubernetes/kubernetes/pkg/kubelet/util/ioutils/ioutils.go@v1.34.0",
+    "kubernetes/kubernetes/pkg/kubelet/events/event.go@v1.34.0"
+  ],
+  "cases": [
+    {
+      "name": "initial_value_per_probe_type",
+      "input": {
+        "kind": "worker_initial_value",
+        "probe_types": [
+          "liveness",
+          "readiness",
+          "startup"
+        ]
+      },
+      "expected": {
+        "liveness": "Success",
+        "readiness": "Failure",
+        "startup": "Unknown",
+        "set_when": "first tick that observes a new non-empty containerID, before any gating (onHold/initialDelay/started)"
+      },
+      "upstream_ref": "code: worker.go:102-115 newWorker; worker.go:235-243 doProbe"
+    },
+    {
+      "name": "result_enum_encoding",
+      "input": {
+        "kind": "results_enum"
+      },
+      "expected": {
+        "Unknown": -1,
+        "Success": 0,
+        "Failure": 1,
+        "String": {
+          "Unknown": "UNKNOWN",
+          "Success": "Success",
+          "Failure": "Failure"
+        },
+        "zero_value": "Success"
+      },
+      "upstream_ref": "code: results/results_manager.go:45-65"
+    },
+    {
+      "name": "seq_readiness_failure_threshold_3",
+      "input": {
+        "kind": "worker_sequence",
+        "probe_type": "readiness",
+        "spec": {
+          "success_threshold": 1,
+          "failure_threshold": 3,
+          "initial_delay_seconds": 0
+        },
+        "steps": [
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "S"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "S"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "S"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "F"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "F"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "F"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "F"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "F"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "S"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "S"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "S"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "F"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "F"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "F"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "F"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "F"
+          }
+        ]
+      },
+      "expected": {
+        "result": [
+          "Success",
+          "Success",
+          "Success",
+          "Success",
+          "Success",
+          "Failure",
+          "Failure",
+          "Failure",
+          "Success",
+          "Success",
+          "Success",
+          "Success",
+          "Success",
+          "Failure",
+          "Failure",
+          "Failure"
+        ],
+        "result_run": [
+          1,
+          2,
+          3,
+          1,
+          2,
+          3,
+          4,
+          5,
+          1,
+          2,
+          3,
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "on_hold": [
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false
+        ],
+        "prober_invoked": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "keep_going": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "upstream_ref": "test: worker_test.go:193 TestFailureThreshold (result); result_run derived from worker.go:314-319"
+    },
+    {
+      "name": "seq_readiness_success_threshold_3",
+      "input": {
+        "kind": "worker_sequence",
+        "probe_type": "readiness",
+        "spec": {
+          "success_threshold": 3,
+          "failure_threshold": 1,
+          "initial_delay_seconds": 0
+        },
+        "steps": [
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "S"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "S"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "S"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "S"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "S"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "F"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "S"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "S"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "S"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "S"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "S"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "F"
+          }
+        ]
+      },
+      "expected": {
+        "result": [
+          "Failure",
+          "Failure",
+          "Success",
+          "Success",
+          "Success",
+          "Failure",
+          "Failure",
+          "Failure",
+          "Success",
+          "Success",
+          "Success",
+          "Failure"
+        ],
+        "result_run": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          1,
+          1,
+          2,
+          3,
+          4,
+          5,
+          1
+        ],
+        "on_hold": [
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false
+        ],
+        "keep_going": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "upstream_ref": "test: worker_test.go:228 TestSuccessThreshold"
+    },
+    {
+      "name": "seq_readiness_failure_run_must_be_consecutive",
+      "input": {
+        "kind": "worker_sequence",
+        "probe_type": "readiness",
+        "spec": {
+          "success_threshold": 1,
+          "failure_threshold": 2,
+          "initial_delay_seconds": 0
+        },
+        "steps": [
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "F"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "S"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "F"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "S"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "F"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "F"
+          }
+        ]
+      },
+      "expected": {
+        "result": [
+          "Failure",
+          "Success",
+          "Success",
+          "Success",
+          "Success",
+          "Failure"
+        ],
+        "result_run": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          2
+        ],
+        "note": "step 1 shows Failure only because readiness initialValue is Failure; the probe verdict itself was below threshold and left state unchanged"
+      },
+      "upstream_ref": "code: worker.go:314-325 (resultRun resets to 1 whenever result differs from lastResult)"
+    },
+    {
+      "name": "seq_probe_error_neither_counts_nor_breaks_run",
+      "input": {
+        "kind": "worker_sequence",
+        "probe_type": "readiness",
+        "spec": {
+          "success_threshold": 1,
+          "failure_threshold": 3,
+          "initial_delay_seconds": 0
+        },
+        "steps": [
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "S"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "F"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "F"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "E"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "E"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "E"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "F"
+          }
+        ]
+      },
+      "expected": {
+        "result": [
+          "Success",
+          "Success",
+          "Success",
+          "Success",
+          "Success",
+          "Success",
+          "Failure"
+        ],
+        "result_run": [
+          1,
+          1,
+          2,
+          2,
+          2,
+          2,
+          3
+        ],
+        "keep_going": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "upstream_ref": "code: worker.go:297-301 ('Prober error, throw away the result.' returns before lastResult/resultRun are touched)"
+    },
+    {
+      "name": "seq_liveness_errors_forever_never_kill",
+      "input": {
+        "kind": "worker_sequence",
+        "probe_type": "liveness",
+        "spec": {
+          "success_threshold": 1,
+          "failure_threshold": 1,
+          "initial_delay_seconds": 0
+        },
+        "steps": [
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "E"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "E"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "E"
+          }
+        ]
+      },
+      "expected": {
+        "result": [
+          "Success",
+          "Success",
+          "Success"
+        ],
+        "on_hold": [
+          false,
+          false,
+          false
+        ],
+        "result_run": [
+          0,
+          0,
+          0
+        ]
+      },
+      "upstream_ref": "code: worker.go:110 (liveness initialValue Success) + worker.go:297-301 (errors discarded)"
+    },
+    {
+      "name": "seq_readiness_errors_forever_never_ready",
+      "input": {
+        "kind": "worker_sequence",
+        "probe_type": "readiness",
+        "spec": {
+          "success_threshold": 1,
+          "failure_threshold": 3,
+          "initial_delay_seconds": 0
+        },
+        "steps": [
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "E"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "E"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "E"
+          }
+        ]
+      },
+      "expected": {
+        "result": [
+          "Failure",
+          "Failure",
+          "Failure"
+        ],
+        "result_run": [
+          0,
+          0,
+          0
+        ]
+      },
+      "upstream_ref": "code: worker.go:106 (readiness initialValue Failure) + worker.go:297-301"
+    },
+    {
+      "name": "seq_startup_errors_forever_never_started_never_restarted",
+      "input": {
+        "kind": "worker_sequence",
+        "probe_type": "startup",
+        "spec": {
+          "success_threshold": 1,
+          "failure_threshold": 3,
+          "initial_delay_seconds": 0
+        },
+        "steps": [
+          {
+            "container_id": "a",
+            "running": true,
+            "started": false,
+            "probe": "E"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": false,
+            "probe": "E"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": false,
+            "probe": "E"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": false,
+            "probe": "E"
+          }
+        ]
+      },
+      "expected": {
+        "result": [
+          "Unknown",
+          "Unknown",
+          "Unknown",
+          "Unknown"
+        ],
+        "on_hold": [
+          false,
+          false,
+          false,
+          false
+        ],
+        "container_started": false,
+        "note": "failureThreshold is never reached, so the container is neither marked started nor restarted; liveness/readiness workers stay gated off"
+      },
+      "upstream_ref": "code: worker.go:114 (startup initialValue Unknown) + worker.go:297-301; prober_manager.go:270-287 isContainerStarted"
+    },
+    {
+      "name": "seq_readiness_success_run_carries_across_container_restart",
+      "input": {
+        "kind": "worker_sequence",
+        "probe_type": "readiness",
+        "spec": {
+          "success_threshold": 3,
+          "failure_threshold": 1,
+          "initial_delay_seconds": 0
+        },
+        "restart_policy": "Always",
+        "steps": [
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "S"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "S"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "S"
+          },
+          {
+            "container_id": "a",
+            "running": false,
+            "terminated": true,
+            "started": false,
+            "probe": "S"
+          },
+          {
+            "container_id": "b",
+            "running": true,
+            "started": true,
+            "probe": "S"
+          }
+        ]
+      },
+      "expected": {
+        "result": [
+          "Failure",
+          "Failure",
+          "Success",
+          "Failure",
+          "Success"
+        ],
+        "result_run": [
+          1,
+          2,
+          3,
+          3,
+          4
+        ],
+        "prober_invoked": [
+          true,
+          true,
+          true,
+          false,
+          true
+        ],
+        "keep_going": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "note": "step 5: new container b is first Set to initialValue Failure, then the FIRST successful probe on b makes it Ready because lastResult/resultRun were not reset on the container-ID change; a per-container counter would leave b at Failure until 3 successes"
+      },
+      "upstream_ref": "code: worker.go:235-243 (containerID change resets only onHold) + worker.go:250-262 (non-running path Sets Failure without touching lastResult/resultRun) + worker.go:314-327"
+    },
+    {
+      "name": "seq_startup_failure_threshold_3_then_hold",
+      "input": {
+        "kind": "worker_sequence",
+        "probe_type": "startup",
+        "spec": {
+          "success_threshold": 1,
+          "failure_threshold": 3,
+          "initial_delay_seconds": 0
+        },
+        "steps": [
+          {
+            "container_id": "a",
+            "running": true,
+            "started": false,
+            "probe": "F"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": false,
+            "probe": "F"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": false,
+            "probe": "F"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": false,
+            "probe": "F"
+          }
+        ]
+      },
+      "expected": {
+        "result": [
+          "Unknown",
+          "Unknown",
+          "Failure",
+          "Failure"
+        ],
+        "result_run": [
+          1,
+          2,
+          0,
+          0
+        ],
+        "on_hold": [
+          false,
+          false,
+          true,
+          true
+        ],
+        "prober_invoked": [
+          true,
+          true,
+          true,
+          false
+        ]
+      },
+      "upstream_ref": "test: worker_test.go:296 TestStartupProbeFailureThreshold (step 4 state asserted without a doProbe call; step-4 prober_invoked=false derived from worker.go:245-248)"
+    },
+    {
+      "name": "seq_startup_success_puts_worker_on_hold",
+      "input": {
+        "kind": "worker_sequence",
+        "probe_type": "startup",
+        "spec": {
+          "success_threshold": 1,
+          "failure_threshold": 3,
+          "initial_delay_seconds": 0
+        },
+        "steps": [
+          {
+            "container_id": "a",
+            "running": true,
+            "started": false,
+            "probe": "S"
+          }
+        ]
+      },
+      "expected": {
+        "result": [
+          "Success"
+        ],
+        "on_hold": [
+          true
+        ],
+        "result_run": [
+          0
+        ]
+      },
+      "upstream_ref": "test: worker_test.go:263 TestStartupProbeSuccessThreshold; code: worker.go:329-339 (startup holds after ANY Set, success or failure)"
+    },
+    {
+      "name": "seq_liveness_failure_holds_until_new_container",
+      "input": {
+        "kind": "worker_sequence",
+        "probe_type": "liveness",
+        "spec": {
+          "success_threshold": 1,
+          "failure_threshold": 1,
+          "initial_delay_seconds": 0
+        },
+        "steps": [
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "F"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "S"
+          },
+          {
+            "container_id": "b",
+            "running": true,
+            "started": true,
+            "probe": "S"
+          }
+        ]
+      },
+      "expected": {
+        "result": [
+          "Failure",
+          "Failure",
+          "Success"
+        ],
+        "result_container": [
+          "a",
+          "a",
+          "b"
+        ],
+        "on_hold": [
+          true,
+          true,
+          false
+        ],
+        "result_run": [
+          0,
+          0,
+          1
+        ],
+        "prober_invoked": [
+          true,
+          false,
+          true
+        ],
+        "removed_on_step_3": "a"
+      },
+      "upstream_ref": "test: worker_test.go:414 TestOnHoldOnLivenessOrStartupCheckFailure (liveness)"
+    },
+    {
+      "name": "seq_startup_hold_lifted_by_new_container_then_held_again_on_success",
+      "input": {
+        "kind": "worker_sequence",
+        "probe_type": "startup",
+        "spec": {
+          "success_threshold": 1,
+          "failure_threshold": 1,
+          "initial_delay_seconds": 0
+        },
+        "steps": [
+          {
+            "container_id": "a",
+            "running": true,
+            "started": false,
+            "probe": "F"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": false,
+            "probe": "S"
+          },
+          {
+            "container_id": "b",
+            "running": true,
+            "started": false,
+            "probe": "S"
+          }
+        ]
+      },
+      "expected": {
+        "result": [
+          "Failure",
+          "Failure",
+          "Success"
+        ],
+        "result_container": [
+          "a",
+          "a",
+          "b"
+        ],
+        "on_hold": [
+          true,
+          true,
+          true
+        ],
+        "result_run": [
+          0,
+          0,
+          0
+        ],
+        "prober_invoked": [
+          true,
+          false,
+          true
+        ]
+      },
+      "upstream_ref": "test: worker_test.go:414 TestOnHoldOnLivenessOrStartupCheckFailure (startup)"
+    },
+    {
+      "name": "seq_liveness_result_run_reset_after_failure_verdict",
+      "input": {
+        "kind": "worker_sequence",
+        "probe_type": "liveness",
+        "spec": {
+          "success_threshold": 1,
+          "failure_threshold": 3,
+          "initial_delay_seconds": 0
+        },
+        "steps": [
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "S"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "F"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "F"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "F"
+          }
+        ]
+      },
+      "expected": {
+        "result": [
+          "Success",
+          "Success",
+          "Success",
+          "Failure"
+        ],
+        "result_run": [
+          1,
+          1,
+          2,
+          0
+        ],
+        "on_hold": [
+          false,
+          false,
+          false,
+          true
+        ]
+      },
+      "upstream_ref": "test: worker_test.go:455 TestResultRunOnLivenessCheckFailure"
+    },
+    {
+      "name": "seq_startup_result_run_reset_after_failure_verdict",
+      "input": {
+        "kind": "worker_sequence",
+        "probe_type": "startup",
+        "spec": {
+          "success_threshold": 1,
+          "failure_threshold": 3,
+          "initial_delay_seconds": 0
+        },
+        "steps": [
+          {
+            "container_id": "a",
+            "running": true,
+            "started": false,
+            "probe": "F"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": false,
+            "probe": "F"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": false,
+            "probe": "F"
+          }
+        ]
+      },
+      "expected": {
+        "result": [
+          "Unknown",
+          "Unknown",
+          "Failure"
+        ],
+        "result_run": [
+          1,
+          2,
+          0
+        ],
+        "on_hold": [
+          false,
+          false,
+          true
+        ]
+      },
+      "upstream_ref": "test: worker_test.go:497 TestResultRunOnStartupCheckFailure"
+    },
+    {
+      "name": "seq_liveness_gated_until_started",
+      "input": {
+        "kind": "worker_sequence",
+        "probe_type": "liveness",
+        "spec": {
+          "success_threshold": 1,
+          "failure_threshold": 1,
+          "initial_delay_seconds": 0
+        },
+        "steps": [
+          {
+            "container_id": "a",
+            "running": true,
+            "started": false,
+            "probe": "F"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "F"
+          }
+        ]
+      },
+      "expected": {
+        "result": [
+          "Success",
+          "Failure"
+        ],
+        "prober_invoked": [
+          false,
+          true
+        ],
+        "on_hold": [
+          false,
+          true
+        ]
+      },
+      "upstream_ref": "test: worker_test.go:533 TestLivenessProbeDisabledByStarted"
+    },
+    {
+      "name": "seq_startup_gated_once_started",
+      "input": {
+        "kind": "worker_sequence",
+        "probe_type": "startup",
+        "spec": {
+          "success_threshold": 1,
+          "failure_threshold": 2,
+          "initial_delay_seconds": 0
+        },
+        "steps": [
+          {
+            "container_id": "a",
+            "running": true,
+            "started": false,
+            "probe": "F"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": false,
+            "probe": "S"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "probe": "F"
+          }
+        ]
+      },
+      "expected": {
+        "result": [
+          "Unknown",
+          "Success",
+          "Success"
+        ],
+        "prober_invoked": [
+          true,
+          true,
+          false
+        ]
+      },
+      "upstream_ref": "test: worker_test.go:552 TestStartupProbeDisabledByStarted"
+    },
+    {
+      "name": "seq_initial_delay_liveness",
+      "input": {
+        "kind": "worker_sequence",
+        "probe_type": "liveness",
+        "spec": {
+          "success_threshold": 1,
+          "failure_threshold": 1,
+          "initial_delay_seconds": 10
+        },
+        "steps": [
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "seconds_since_container_start": 0,
+            "probe": "S"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "seconds_since_container_start": 100,
+            "probe": "S"
+          }
+        ]
+      },
+      "expected": {
+        "result": [
+          "Success",
+          "Success"
+        ],
+        "prober_invoked": [
+          false,
+          true
+        ],
+        "keep_going": [
+          true,
+          true
+        ]
+      },
+      "upstream_ref": "test: worker_test.go:160 TestInitialDelay"
+    },
+    {
+      "name": "seq_initial_delay_readiness",
+      "input": {
+        "kind": "worker_sequence",
+        "probe_type": "readiness",
+        "spec": {
+          "success_threshold": 1,
+          "failure_threshold": 1,
+          "initial_delay_seconds": 10
+        },
+        "steps": [
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "seconds_since_container_start": 0,
+            "probe": "S"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": true,
+            "seconds_since_container_start": 100,
+            "probe": "S"
+          }
+        ]
+      },
+      "expected": {
+        "result": [
+          "Failure",
+          "Success"
+        ],
+        "prober_invoked": [
+          false,
+          true
+        ],
+        "keep_going": [
+          true,
+          true
+        ]
+      },
+      "upstream_ref": "test: worker_test.go:160 TestInitialDelay"
+    },
+    {
+      "name": "seq_initial_delay_startup",
+      "input": {
+        "kind": "worker_sequence",
+        "probe_type": "startup",
+        "spec": {
+          "success_threshold": 1,
+          "failure_threshold": 1,
+          "initial_delay_seconds": 10
+        },
+        "steps": [
+          {
+            "container_id": "a",
+            "running": true,
+            "started": false,
+            "seconds_since_container_start": 0,
+            "probe": "S"
+          },
+          {
+            "container_id": "a",
+            "running": true,
+            "started": false,
+            "seconds_since_container_start": 100,
+            "probe": "S"
+          }
+        ]
+      },
+      "expected": {
+        "result": [
+          "Unknown",
+          "Success"
+        ],
+        "prober_invoked": [
+          false,
+          true
+        ],
+        "keep_going": [
+          true,
+          true
+        ]
+      },
+      "upstream_ref": "test: worker_test.go:160 TestInitialDelay"
+    },
+    {
+      "name": "tick_initial_delay_truncates_elapsed_seconds",
+      "input": {
+        "kind": "worker_tick_predicate",
+        "rule": "probe_allowed = int32(floor(seconds_since_container_start)) >= initial_delay_seconds",
+        "rows": [
+          {
+            "initial_delay_seconds": 10,
+            "seconds_since_container_start": 9.999
+          },
+          {
+            "initial_delay_seconds": 10,
+            "seconds_since_container_start": 10.0
+          },
+          {
+            "initial_delay_seconds": 10,
+            "seconds_since_container_start": 10.9
+          },
+          {
+            "initial_delay_seconds": 0,
+            "seconds_since_container_start": 0.0
+          },
+          {
+            "initial_delay_seconds": -100,
+            "seconds_since_container_start": 0.0
+          }
+        ]
+      },
+      "expected": {
+        "probe_allowed": [
+          false,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "upstream_ref": "code: worker.go:279 'int32(time.Since(c.State.Running.StartedAt.Time).Seconds()) < w.spec.InitialDelaySeconds'; the -100 row is test: worker_test.go:119 'Initial delay passed'"
+    },
+    {
+      "name": "tick_no_pod_status",
+      "input": {
+        "kind": "worker_tick",
+        "pod_status": null
+      },
+      "expected": {
+        "liveness": {
+          "keep_going": true,
+          "result_set": false
+        },
+        "readiness": {
+          "keep_going": true,
+          "result_set": false
+        },
+        "startup": {
+          "keep_going": true,
+          "result_set": false
+        }
+      },
+      "upstream_ref": "test: worker_test.go:67 TestDoProbe 'No status'; code: worker.go:210-215"
+    },
+    {
+      "name": "tick_pod_phase_failed_stops_worker_without_setting",
+      "input": {
+        "kind": "worker_tick",
+        "pod_phase": "Failed",
+        "container": {
+          "running": true
+        }
+      },
+      "expected": {
+        "liveness": {
+          "keep_going": false,
+          "result_set": false
+        },
+        "readiness": {
+          "keep_going": false,
+          "result_set": false
+        },
+        "startup": {
+          "keep_going": false,
+          "result_set": false
+        }
+      },
+      "upstream_ref": "test: worker_test.go:74 TestDoProbe 'Pod failed'; code: worker.go:218-222 (same for Succeeded)"
+    },
+    {
+      "name": "tick_pod_phase_succeeded_stops_worker",
+      "input": {
+        "kind": "worker_tick",
+        "pod_phase": "Succeeded",
+        "container": {
+          "running": true
+        }
+      },
+      "expected": {
+        "liveness": {
+          "keep_going": false,
+          "result_set": false
+        },
+        "readiness": {
+          "keep_going": false,
+          "result_set": false
+        },
+        "startup": {
+          "keep_going": false,
+          "result_set": false
+        }
+      },
+      "upstream_ref": "code: worker.go:218 'status.Phase == v1.PodFailed || status.Phase == v1.PodSucceeded'"
+    },
+    {
+      "name": "tick_pod_deletion_running_container",
+      "input": {
+        "kind": "worker_tick",
+        "pod_phase": "Running",
+        "deletion_timestamp_set": true,
+        "container": {
+          "running": true,
+          "started_for_liveness_readiness": true,
+          "started_for_startup": false
+        },
+        "prober_would_return": "S"
+      },
+      "expected": {
+        "liveness": {
+          "keep_going": false,
+          "result_set": true,
+          "result": "Success",
+          "prober_invoked": false
+        },
+        "readiness": {
+          "keep_going": true,
+          "result_set": true,
+          "result": "Success",
+          "prober_invoked": true
+        },
+        "startup": {
+          "keep_going": false,
+          "result_set": true,
+          "result": "Success",
+          "prober_invoked": false
+        }
+      },
+      "upstream_ref": "test: worker_test.go:77 TestDoProbe 'Pod deletion'; code: worker.go:265-276"
+    },
+    {
+      "name": "tick_pod_deletion_with_non_running_container_sets_failure_not_success",
+      "input": {
+        "kind": "worker_tick",
+        "pod_phase": "Running",
+        "deletion_timestamp_set": true,
+        "restart_policy": "Always",
+        "container": {
+          "running": false,
+          "terminated": false
+        }
+      },
+      "expected": {
+        "liveness": {
+          "keep_going": true,
+          "result_set": true,
+          "result": "Failure"
+        },
+        "readiness": {
+          "keep_going": true,
+          "result_set": true,
+          "result": "Failure"
+        },
+        "startup": {
+          "keep_going": true,
+          "result_set": true,
+          "result": "Failure"
+        }
+      },
+      "upstream_ref": "code: worker.go:250-262 runs before the deletion branch at worker.go:265"
+    },
+    {
+      "name": "tick_container_status_missing",
+      "input": {
+        "kind": "worker_tick",
+        "pod_phase": "Running",
+        "container_status_present": false
+      },
+      "expected": {
+        "liveness": {
+          "keep_going": true,
+          "result_set": false
+        },
+        "readiness": {
+          "keep_going": true,
+          "result_set": false
+        },
+        "startup": {
+          "keep_going": true,
+          "result_set": false
+        }
+      },
+      "upstream_ref": "test: worker_test.go:86 TestDoProbe 'No container status'; code: worker.go:224-233"
+    },
+    {
+      "name": "tick_container_status_with_empty_container_id",
+      "input": {
+        "kind": "worker_tick",
+        "pod_phase": "Running",
+        "container_status_present": true,
+        "container_id": ""
+      },
+      "expected": {
+        "liveness": {
+          "keep_going": true,
+          "result_set": false
+        },
+        "readiness": {
+          "keep_going": true,
+          "result_set": false
+        },
+        "startup": {
+          "keep_going": true,
+          "result_set": false
+        }
+      },
+      "upstream_ref": "code: worker.go:225 '!ok || len(c.ContainerID) == 0'"
+    },
+    {
+      "name": "tick_container_found_only_in_init_container_statuses",
+      "input": {
+        "kind": "worker_tick",
+        "pod_phase": "Running",
+        "container_in": "InitContainerStatuses",
+        "container": {
+          "running": true,
+          "started": true
+        },
+        "prober_would_return": "S"
+      },
+      "expected": {
+        "readiness": {
+          "keep_going": true,
+          "result_set": true,
+          "result": "Success",
+          "prober_invoked": true
+        }
+      },
+      "upstream_ref": "code: worker.go:224-233 (falls back to status.InitContainerStatuses for restartable init containers)"
+    },
+    {
+      "name": "tick_container_waiting",
+      "input": {
+        "kind": "worker_tick",
+        "pod_phase": "Running",
+        "restart_policy": "Never",
+        "container": {
+          "running": false,
+          "terminated": false
+        }
+      },
+      "expected": {
+        "liveness": {
+          "keep_going": true,
+          "result_set": true,
+          "result": "Failure"
+        },
+        "readiness": {
+          "keep_going": true,
+          "result_set": true,
+          "result": "Failure"
+        },
+        "startup": {
+          "keep_going": true,
+          "result_set": true,
+          "result": "Failure"
+        }
+      },
+      "upstream_ref": "test: worker_test.go:94 TestDoProbe 'Container waiting' (test pod RestartPolicy Never, common_test.go:73); code: worker.go:260 'c.State.Terminated == nil ||'"
+    },
+    {
+      "name": "tick_container_terminated_restart_never_stops_worker",
+      "input": {
+        "kind": "worker_tick",
+        "pod_phase": "Running",
+        "restart_policy": "Never",
+        "feature_gates": {
+          "ContainerRestartRules": false
+        },
+        "container": {
+          "running": false,
+          "terminated": true
+        }
+      },
+      "expected": {
+        "liveness": {
+          "keep_going": false,
+          "result_set": true,
+          "result": "Failure"
+        },
+        "readiness": {
+          "keep_going": false,
+          "result_set": true,
+          "result": "Failure"
+        },
+        "startup": {
+          "keep_going": false,
+          "result_set": true,
+          "result": "Failure"
+        }
+      },
+      "upstream_ref": "test: worker_test.go:104 TestDoProbe 'Container terminated'; code: worker.go:260-261"
+    },
+    {
+      "name": "tick_container_terminated_restart_always_keeps_worker",
+      "input": {
+        "kind": "worker_tick",
+        "pod_phase": "Running",
+        "restart_policy": "Always",
+        "feature_gates": {
+          "ContainerRestartRules": false
+        },
+        "container": {
+          "running": false,
+          "terminated": true
+        }
+      },
+      "expected": {
+        "liveness": {
+          "keep_going": true,
+          "result_set": true,
+          "result": "Failure"
+        },
+        "readiness": {
+          "keep_going": true,
+          "result_set": true,
+          "result": "Failure"
+        },
+        "startup": {
+          "keep_going": true,
+          "result_set": true,
+          "result": "Failure"
+        }
+      },
+      "upstream_ref": "code: worker.go:260-261 'w.pod.Spec.RestartPolicy != v1.RestartPolicyNever' (OnFailure behaves the same)"
+    },
+    {
+      "name": "tick_probe_successful",
+      "input": {
+        "kind": "worker_tick",
+        "pod_phase": "Running",
+        "container": {
+          "running": true,
+          "started_for_liveness_readiness": true,
+          "started_for_startup": false
+        },
+        "prober_would_return": "S"
+      },
+      "expected": {
+        "liveness": {
+          "keep_going": true,
+          "result_set": true,
+          "result": "Success"
+        },
+        "readiness": {
+          "keep_going": true,
+          "result_set": true,
+          "result": "Success"
+        },
+        "startup": {
+          "keep_going": true,
+          "result_set": true,
+          "result": "Success"
+        }
+      },
+      "upstream_ref": "test: worker_test.go:109 TestDoProbe 'Probe successful'"
+    },
+    {
+      "name": "tick_started_pointer_nil_gates_liveness_and_readiness",
+      "input": {
+        "kind": "worker_tick",
+        "pod_phase": "Running",
+        "container": {
+          "running": true,
+          "started": null
+        },
+        "prober_would_return": "F"
+      },
+      "expected": {
+        "liveness": {
+          "keep_going": true,
+          "result": "Success",
+          "prober_invoked": false
+        },
+        "readiness": {
+          "keep_going": true,
+          "result": "Failure",
+          "prober_invoked": false
+        },
+        "startup": {
+          "keep_going": true,
+          "result": "Failure",
+          "prober_invoked": true,
+          "note": "FailureThreshold 1"
+        }
+      },
+      "upstream_ref": "code: worker.go:283-294 ('c.Started != nil && *c.Started' else-branch disables non-startup probes)"
+    },
+    {
+      "name": "prober_nil_probe_spec_is_success",
+      "input": {
+        "kind": "prober_probe",
+        "probe_spec": null
+      },
+      "expected": {
+        "result": "Success",
+        "error": false
+      },
+      "upstream_ref": "test: prober_test.go:160 TestProbe 'No probe'; code: prober.go:95-98"
+    },
+    {
+      "name": "prober_no_handler_is_error",
+      "input": {
+        "kind": "prober_probe",
+        "probe_spec": {}
+      },
+      "expected": {
+        "result": "Failure",
+        "error": true,
+        "error_text_prefix": "missing probe handler for",
+        "runProbe_attempts": 3,
+        "worker_effect": "discarded"
+      },
+      "upstream_ref": "test: prober_test.go:164 TestProbe 'No handler'; code: prober.go:196-198, 134-147"
+    },
+    {
+      "name": "prober_handler_failure",
+      "input": {
+        "kind": "prober_probe",
+        "handler": "exec",
+        "handler_returns": {
+          "result": "failure",
+          "error": false
+        }
+      },
+      "expected": {
+        "result": "Failure",
+        "error": false,
+        "event": {
+          "type": "Warning",
+          "reason": "Unhealthy",
+          "message_format": "%s probe failed: %s"
+        }
+      },
+      "upstream_ref": "test: prober_test.go:169 TestProbe 'Probe fails'; code: prober.go:119-122"
+    },
+    {
+      "name": "prober_handler_success",
+      "input": {
+        "kind": "prober_probe",
+        "handler": "exec",
+        "handler_returns": {
+          "result": "success",
+          "error": false
+        }
+      },
+      "expected": {
+        "result": "Success",
+        "error": false
+      },
+      "upstream_ref": "test: prober_test.go:174 TestProbe 'Probe succeeds'"
+    },
+    {
+      "name": "prober_handler_warning_is_success",
+      "input": {
+        "kind": "prober_probe",
+        "handler": "exec",
+        "handler_returns": {
+          "result": "warning",
+          "error": false
+        }
+      },
+      "expected": {
+        "result": "Success",
+        "error": false,
+        "event": {
+          "type": "Warning",
+          "reason": "ProbeWarning",
+          "message_format": "%s probe warning: %s"
+        }
+      },
+      "upstream_ref": "test: prober_test.go:179 TestProbe 'Probe result is warning'; code: prober.go:114-117; events/event.go:95"
+    },
+    {
+      "name": "prober_handler_unknown_without_error_is_counted_failure",
+      "input": {
+        "kind": "prober_probe",
+        "handler": "exec",
+        "handler_returns": {
+          "result": "unknown",
+          "error": false
+        }
+      },
+      "expected": {
+        "result": "Failure",
+        "error": false,
+        "worker_effect": "counts toward failureThreshold"
+      },
+      "upstream_ref": "test: prober_test.go:184 TestProbe 'Probe result is unknown with no error'; code: prober.go:124-126"
+    },
+    {
+      "name": "prober_handler_unknown_with_error_is_discarded",
+      "input": {
+        "kind": "prober_probe",
+        "handler": "exec",
+        "handler_returns": {
+          "result": "unknown",
+          "error": true
+        }
+      },
+      "expected": {
+        "result": "Failure",
+        "error": true,
+        "worker_effect": "discarded",
+        "event": {
+          "type": "Warning",
+          "reason": "Unhealthy",
+          "message_format": "%s probe errored and resulted in %s state: %s",
+          "note": "second %s is the raw probe.Result string, e.g. 'unknown', not the kubelet result"
+        }
+      },
+      "upstream_ref": "test: prober_test.go:190 TestProbe 'Probe result is unknown with an error'; code: prober.go:102-107"
+    },
+    {
+      "name": "prober_unsupported_probe_type",
+      "input": {
+        "kind": "prober_probe",
+        "probe_type": 666
+      },
+      "expected": {
+        "result": "Failure",
+        "error": true,
+        "error_text_prefix": "unknown probe type:"
+      },
+      "upstream_ref": "test: prober_test.go:197 TestProbe 'Unsupported probe type'; code: prober.go:91-92"
+    },
+    {
+      "name": "prober_exec_command_env_expansion_static_only",
+      "input": {
+        "kind": "prober_exec_command",
+        "command": [
+          "/bin/bash",
+          "-c",
+          "some $(A) $(B)"
+        ],
+        "container_env": [
+          {
+            "name": "A",
+            "value": "script"
+          }
+        ]
+      },
+      "expected": {
+        "command_sent_to_runtime": [
+          "/bin/bash",
+          "-c",
+          "some script $(B)"
+        ]
+      },
+      "upstream_ref": "test: prober_test.go:215 TestProbe 'Probe arguments are passed through'; code: prober.go:154 ExpandContainerCommandOnlyStatic"
+    },
+    {
+      "name": "prober_exec_command_passthrough",
+      "input": {
+        "kind": "prober_exec_command",
+        "command": [
+          "/bin/bash",
+          "-c",
+          "some script"
+        ],
+        "container_env": []
+      },
+      "expected": {
+        "command_sent_to_runtime": [
+          "/bin/bash",
+          "-c",
+          "some script"
+        ]
+      },
+      "upstream_ref": "test: prober_test.go:203 TestProbe"
+    },
+    {
+      "name": "retries_error_then_success_within_one_tick",
+      "input": {
+        "kind": "prober_retries",
+        "max_retries": 3,
+        "attempts": [
+          {
+            "result": "unknown",
+            "error": true
+          },
+          {
+            "result": "unknown",
+            "error": true
+          },
+          {
+            "result": "success",
+            "error": false
+          }
+        ]
+      },
+      "expected": {
+        "result": "success",
+        "error": false,
+        "attempts_made": 3
+      },
+      "upstream_ref": "code: prober.go:41 maxProbeRetries = 3; prober.go:134-147 runProbeWithRetries"
+    },
+    {
+      "name": "retries_three_errors_returns_last_error",
+      "input": {
+        "kind": "prober_retries",
+        "max_retries": 3,
+        "attempts": [
+          {
+            "result": "unknown",
+            "error": true
+          },
+          {
+            "result": "unknown",
+            "error": true
+          },
+          {
+            "result": "unknown",
+            "error": true
+          }
+        ]
+      },
+      "expected": {
+        "result": "unknown",
+        "error": true,
+        "attempts_made": 3
+      },
+      "upstream_ref": "code: prober.go:134-147"
+    },
+    {
+      "name": "retries_failure_is_not_retried",
+      "input": {
+        "kind": "prober_retries",
+        "max_retries": 3,
+        "attempts": [
+          {
+            "result": "failure",
+            "error": false
+          },
+          {
+            "result": "success",
+            "error": false
+          }
+        ]
+      },
+      "expected": {
+        "result": "failure",
+        "error": false,
+        "attempts_made": 1
+      },
+      "upstream_ref": "code: prober.go:142 'if err == nil { return result, output, nil }'"
+    },
+    {
+      "name": "retries_error_then_failure_counts_failure",
+      "input": {
+        "kind": "prober_retries",
+        "max_retries": 3,
+        "attempts": [
+          {
+            "result": "unknown",
+            "error": true
+          },
+          {
+            "result": "failure",
+            "error": false
+          }
+        ]
+      },
+      "expected": {
+        "result": "failure",
+        "error": false,
+        "attempts_made": 2
+      },
+      "upstream_ref": "code: prober.go:140-145"
+    },
+    {
+      "name": "exec_nil_error_success",
+      "input": {
+        "kind": "exec_probe",
+        "run_error": null,
+        "output": "OK",
+        "feature_gates": {
+          "ExecProbeTimeout": true
+        }
+      },
+      "expected": {
+        "result": "success",
+        "error": false,
+        "output": "OK"
+      },
+      "upstream_ref": "test: exec/exec_test.go:121 TestExec"
+    },
+    {
+      "name": "exec_exit_error_status_zero_is_success",
+      "input": {
+        "kind": "exec_probe",
+        "run_error": {
+          "type": "ExitError",
+          "exit_status": 0
+        },
+        "output": "OK",
+        "feature_gates": {
+          "ExecProbeTimeout": true
+        }
+      },
+      "expected": {
+        "result": "success",
+        "error": false,
+        "output": "OK"
+      },
+      "upstream_ref": "test: exec/exec_test.go:123 TestExec; code: exec/exec.go:66-70"
+    },
+    {
+      "name": "exec_output_truncated_to_10240_bytes",
+      "input": {
+        "kind": "exec_probe",
+        "run_error": null,
+        "output_repeat": {
+          "unit": "logs-123",
+          "count": 11264
+        },
+        "feature_gates": {
+          "ExecProbeTimeout": true
+        }
+      },
+      "expected": {
+        "result": "success",
+        "error": false,
+        "output_len": 10240,
+        "output_repeat": {
+          "unit": "logs-123",
+          "count": 1280
+        }
+      },
+      "upstream_ref": "test: exec/exec_test.go:125 TestExec 'truncated output'; code: exec/exec.go:34 maxReadLength = 10 * 1 << 10"
+    },
+    {
+      "name": "exec_non_exit_error_is_unknown_with_error",
+      "input": {
+        "kind": "exec_probe",
+        "run_error": {
+          "type": "generic",
+          "message": "test error"
+        },
+        "output": "",
+        "feature_gates": {
+          "ExecProbeTimeout": true
+        }
+      },
+      "expected": {
+        "result": "unknown",
+        "error": true,
+        "output": "",
+        "worker_effect": "retried up to 3x in-tick, then discarded"
+      },
+      "upstream_ref": "test: exec/exec_test.go:127 TestExec 'Run returns error'; code: exec/exec.go:82"
+    },
+    {
+      "name": "exec_exit_status_1_is_failure",
+      "input": {
+        "kind": "exec_probe",
+        "run_error": {
+          "type": "ExitError",
+          "exit_status": 1
+        },
+        "output": "",
+        "feature_gates": {
+          "ExecProbeTimeout": true
+        }
+      },
+      "expected": {
+        "result": "failure",
+        "error": false,
+        "output": ""
+      },
+      "upstream_ref": "test: exec/exec_test.go:129 TestExec 'Unhealthy'"
+    },
+    {
+      "name": "exec_any_nonzero_exit_status_is_failure",
+      "input": {
+        "kind": "exec_probe",
+        "run_error": {
+          "type": "ExitError"
+        },
+        "exit_statuses": [
+          1,
+          2,
+          126,
+          127,
+          137,
+          143,
+          255
+        ],
+        "feature_gates": {
+          "ExecProbeTimeout": true
+        }
+      },
+      "expected": {
+        "result": "failure",
+        "error": false
+      },
+      "upstream_ref": "code: exec/exec.go:68-71 'if exit.ExitStatus() == 0 { Success } return Failure'; CRI non-zero ExitCode becomes utilexec.CodeExitError at cri-client remote_runtime.go:535-540"
+    },
+    {
+      "name": "exec_timeout_with_gate_on_is_counted_failure",
+      "input": {
+        "kind": "exec_probe",
+        "run_error": {
+          "type": "ErrCommandTimedOut",
+          "message": "command timed out: command testcmd timed out"
+        },
+        "feature_gates": {
+          "ExecProbeTimeout": true
+        }
+      },
+      "expected": {
+        "result": "failure",
+        "error": false,
+        "output": "command timed out: command testcmd timed out"
+      },
+      "upstream_ref": "test: exec/exec_test.go:131 TestExec 'Timeout'; code: exec/exec.go:74-77"
+    },
+    {
+      "name": "exec_timeout_with_gate_off_is_discarded",
+      "input": {
+        "kind": "exec_probe",
+        "run_error": {
+          "type": "ErrCommandTimedOut",
+          "message": "command timed out: command testcmd timed out"
+        },
+        "feature_gates": {
+          "ExecProbeTimeout": false
+        }
+      },
+      "expected": {
+        "result": "unknown",
+        "error": true,
+        "output": "",
+        "worker_effect": "discarded"
+      },
+      "upstream_ref": "test: exec/exec_test.go:133 TestExec 'ExecProbeTimeout'; code: exec/exec.go:74-82"
+    },
+    {
+      "name": "exec_probe_timeout_gate_default",
+      "input": {
+        "kind": "feature_gate_default",
+        "gate": "ExecProbeTimeout",
+        "version": "1.34"
+      },
+      "expected": {
+        "default": true,
+        "prerelease": "GA",
+        "lock_to_default": false
+      },
+      "upstream_ref": "code: pkg/features/kube_features.go:1275-1277"
+    },
+    {
+      "name": "exec_cri_deadline_exceeded_maps_to_timeout_error",
+      "input": {
+        "kind": "cri_exec_sync",
+        "probe_timeout_seconds": 1,
+        "grpc_status": "DeadlineExceeded",
+        "cmd": [
+          "sh",
+          "-c",
+          "sleep 5"
+        ]
+      },
+      "expected": {
+        "error_wraps": "ErrCommandTimedOut",
+        "error_text": "command timed out: \"sh -c sleep 5\" timed out after 1s",
+        "grpc_deadline": "runtime connection timeout (default 2m) + probe timeout",
+        "runtime_request_timeout_field_seconds": 1
+      },
+      "upstream_ref": "code: staging/src/k8s.io/cri-client/pkg/remote_runtime.go:498-530 ExecSync/execSyncV1"
+    },
+    {
+      "name": "exec_output_is_stdout_then_stderr_concatenated",
+      "input": {
+        "kind": "cri_exec_output",
+        "stdout": "out",
+        "stderr": "err"
+      },
+      "expected": {
+        "combined": "outerr"
+      },
+      "upstream_ref": "code: kuberuntime/kuberuntime_container.go:1324-1330 RunInContainer 'append(stdout, stderr...)'"
+    },
+    {
+      "name": "http_status_classification",
+      "input": {
+        "kind": "http_status_classify",
+        "rule": "200 <= code < 300 -> success; 300 <= code < 400 -> warning; else failure",
+        "rows": [
+          101,
+          200,
+          201,
+          204,
+          299,
+          300,
+          301,
+          302,
+          304,
+          307,
+          308,
+          399,
+          400,
+          401,
+          403,
+          404,
+          418,
+          429,
+          499,
+          500,
+          502,
+          503,
+          599
+        ]
+      },
+      "expected": {
+        "results": [
+          "failure",
+          "success",
+          "success",
+          "success",
+          "success",
+          "warning",
+          "warning",
+          "warning",
+          "warning",
+          "warning",
+          "warning",
+          "warning",
+          "failure",
+          "failure",
+          "failure",
+          "failure",
+          "failure",
+          "failure",
+          "failure",
+          "failure",
+          "failure",
+          "failure",
+          "failure"
+        ],
+        "kubelet_result": {
+          "success": "Success",
+          "warning": "Success",
+          "failure": "Failure"
+        },
+        "note": "classification of the FINAL response status after the redirect policy ran; a followed redirect is classified by its target"
+      },
+      "upstream_ref": "code: probe/http/http.go:111-122 DoHTTPProbe; prober.go:110-122 (warning -> Success)"
+    },
+    {
+      "name": "http_200_body_is_output",
+      "input": {
+        "kind": "http_probe",
+        "server": {
+          "status": 200,
+          "body": "ok body"
+        },
+        "timeout_seconds": 1
+      },
+      "expected": {
+        "result": "success",
+        "error": false,
+        "output": "ok body"
+      },
+      "upstream_ref": "test: probe/http/http_test.go:154 TestHTTPProbeChecker"
+    },
+    {
+      "name": "http_500_failure_message_never_contains_body",
+      "input": {
+        "kind": "http_probe",
+        "server": {
+          "status": 500,
+          "body": "fail body"
+        },
+        "timeout_seconds": 1
+      },
+      "expected": {
+        "result": "failure",
+        "error": false,
+        "output": "HTTP probe failed with statuscode: 500"
+      },
+      "upstream_ref": "test: probe/http/http_test.go:299 TestHTTPProbeChecker; code: http.go:120-122 (issue 99425: must not contain the response body)"
+    },
+    {
+      "name": "http_server_writes_invalid_status_is_failure",
+      "input": {
+        "kind": "http_probe",
+        "server": {
+          "status": -1,
+          "body": "fail body"
+        },
+        "timeout_seconds": 1
+      },
+      "expected": {
+        "result": "failure",
+        "error": false
+      },
+      "upstream_ref": "test: probe/http/http_test.go:295 TestHTTPProbeChecker (FailureCode -1)"
+    },
+    {
+      "name": "http_timeout_before_response_is_counted_failure",
+      "input": {
+        "kind": "http_probe",
+        "server": {
+          "sleep_seconds": 3
+        },
+        "timeout_seconds": 1
+      },
+      "expected": {
+        "result": "failure",
+        "error": false,
+        "worker_effect": "counts toward failureThreshold"
+      },
+      "upstream_ref": "test: probe/http/http_test.go:303 TestHTTPProbeChecker; code: http.go:96-100 'Convert errors into failures to catch timeouts.'"
+    },
+    {
+      "name": "http_connection_refused_is_counted_failure",
+      "input": {
+        "kind": "http_probe",
+        "server": null,
+        "timeout_seconds": 1
+      },
+      "expected": {
+        "result": "failure",
+        "error": false,
+        "output": "<client.Do error string>"
+      },
+      "upstream_ref": "code: http.go:96-100"
+    },
+    {
+      "name": "http_body_read_error_is_discarded_not_counted",
+      "input": {
+        "kind": "http_probe",
+        "server": {
+          "status": 200,
+          "headers_sent_then_body_stalls_past_timeout": true
+        },
+        "timeout_seconds": 1
+      },
+      "expected": {
+        "result": "failure",
+        "error": true,
+        "output": "",
+        "worker_effect": "retried up to 3x, then discarded"
+      },
+      "upstream_ref": "code: http.go:102-108 (ReadAtMost error other than ErrLimitReached returns probe.Failure WITH err); http.Client.Timeout covers body read (Go net/http semantics, not a k8s test)"
+    },
+    {
+      "name": "http_body_over_limit_truncated_not_error",
+      "input": {
+        "kind": "http_probe",
+        "server": {
+          "status": 200,
+          "body_repeat": {
+            "unit": "a",
+            "count": 10241
+          },
+          "host_header_required": "www.success.com"
+        },
+        "request_headers": {
+          "Host": [
+            "www.success.com"
+          ]
+        }
+      },
+      "expected": {
+        "result": "success",
+        "error": false,
+        "output_repeat": {
+          "unit": "a",
+          "count": 10240
+        }
+      },
+      "upstream_ref": "test: probe/http/http_test.go:506 TestHTTPProbeChecker_PayloadTruncated; code: http.go:34, 102-106"
+    },
+    {
+      "name": "http_body_under_limit_full",
+      "input": {
+        "kind": "http_probe",
+        "server": {
+          "status": 200,
+          "body_repeat": {
+            "unit": "a",
+            "count": 10239
+          },
+          "host_header_required": "www.success.com"
+        },
+        "request_headers": {
+          "Host": [
+            "www.success.com"
+          ]
+        }
+      },
+      "expected": {
+        "result": "success",
+        "error": false,
+        "output_repeat": {
+          "unit": "a",
+          "count": 10239
+        }
+      },
+      "upstream_ref": "test: probe/http/http_test.go:542 TestHTTPProbeChecker_PayloadNormal"
+    },
+    {
+      "name": "http_local_redirect_followed_to_200",
+      "input": {
+        "kind": "http_probe",
+        "server": {
+          "redirect": {
+            "from": "/",
+            "to": "/new"
+          },
+          "target_status": 200
+        },
+        "redirect_codes": [
+          301,
+          302,
+          307,
+          308
+        ]
+      },
+      "expected": {
+        "result": "success",
+        "error": false
+      },
+      "upstream_ref": "test: probe/http/http_test.go:309-336 TestHTTPProbeChecker redirectHandler(bad=false)"
+    },
+    {
+      "name": "http_local_redirect_followed_to_500",
+      "input": {
+        "kind": "http_probe",
+        "server": {
+          "redirect": {
+            "from": "/",
+            "to": "/new"
+          },
+          "target_status": 500
+        },
+        "redirect_codes": [
+          301,
+          302,
+          307,
+          308
+        ]
+      },
+      "expected": {
+        "result": "failure",
+        "error": false
+      },
+      "upstream_ref": "test: probe/http/http_test.go:313-339 TestHTTPProbeChecker redirectHandler(bad=true)"
+    },
+    {
+      "name": "http_3xx_without_location_is_warning",
+      "input": {
+        "kind": "http_probe",
+        "server": {
+          "redirect": {
+            "from": "/",
+            "to": "/new",
+            "code": 308
+          },
+          "target": {
+            "status": 308,
+            "body": "ok body",
+            "location": null
+          }
+        }
+      },
+      "expected": {
+        "result": "warning",
+        "error": false,
+        "output": "Probe terminated redirects, Response body: ok body",
+        "kubelet_result": "Success"
+      },
+      "upstream_ref": "test: probe/http/http_test.go:346 TestHTTPProbeChecker redirectHandlerWithBody; code: http.go:112-114"
+    },
+    {
+      "name": "http_3xx_without_location_empty_body_is_warning",
+      "input": {
+        "kind": "http_probe",
+        "server": {
+          "redirect": {
+            "from": "/",
+            "to": "/new",
+            "code": 308
+          },
+          "target": {
+            "status": 308,
+            "body": "",
+            "location": null
+          }
+        }
+      },
+      "expected": {
+        "result": "warning",
+        "error": false,
+        "output": "Probe terminated redirects, Response body: "
+      },
+      "upstream_ref": "test: probe/http/http_test.go:342 TestHTTPProbeChecker"
+    },
+    {
+      "name": "http_redirects_kubelet_policy_no_nonlocal_follow",
+      "input": {
+        "kind": "http_redirect_policy",
+        "follow_non_local_redirects": false,
+        "kubelet_uses": false,
+        "rows": [
+          {
+            "desc": "local success",
+            "redirect_to": "/success"
+          },
+          {
+            "desc": "local fail",
+            "redirect_to": "/fail"
+          },
+          {
+            "desc": "same host different port, success",
+            "redirect_to": "<same-hostname:other-port>/success"
+          },
+          {
+            "desc": "same host different port, fail",
+            "redirect_to": "<same-hostname:other-port>/fail"
+          },
+          {
+            "desc": "different hostname",
+            "redirect_to": "http://0.0.0.0/fail"
+          },
+          {
+            "desc": "redirect loop",
+            "redirect_to": "/loop"
+          }
+        ]
+      },
+      "expected": {
+        "results": [
+          "success",
+          "failure",
+          "success",
+          "failure",
+          "warning",
+          "failure"
+        ],
+        "note": "hostname compare ignores port; a non-local redirect returns the 302 itself (warning => kubelet Success); a loop stops after 10 redirects with an error from client.Do => counted failure"
+      },
+      "upstream_ref": "test: probe/http/http_test.go:396 TestHTTPProbeChecker_NonLocalRedirects (-local); code: prober.go:60 followNonLocalRedirects = false; http.go:126-141 RedirectChecker"
+    },
+    {
+      "name": "http_redirects_follow_nonlocal_true",
+      "input": {
+        "kind": "http_redirect_policy",
+        "follow_non_local_redirects": true,
+        "rows": [
+          {
+            "desc": "local success",
+            "redirect_to": "/success"
+          },
+          {
+            "desc": "local fail",
+            "redirect_to": "/fail"
+          },
+          {
+            "desc": "same host different port, success",
+            "redirect_to": "<same-hostname:other-port>/success"
+          },
+          {
+            "desc": "same host different port, fail",
+            "redirect_to": "<same-hostname:other-port>/fail"
+          },
+          {
+            "desc": "different hostname",
+            "redirect_to": "http://0.0.0.0/fail"
+          },
+          {
+            "desc": "redirect loop",
+            "redirect_to": "/loop"
+          }
+        ]
+      },
+      "expected": {
+        "results": [
+          "success",
+          "failure",
+          "success",
+          "failure",
+          "failure",
+          "failure"
+        ]
+      },
+      "upstream_ref": "test: probe/http/http_test.go:396 TestHTTPProbeChecker_NonLocalRedirects (-nonlocal)"
+    },
+    {
+      "name": "http_host_header_preserved_across_redirect",
+      "input": {
+        "kind": "http_probe",
+        "server": {
+          "redirect": {
+            "from": "/redirect",
+            "to": "/success",
+            "code": 302
+          },
+          "success_requires_host": "www.success.com",
+          "else_status": 400
+        },
+        "rows": [
+          {
+            "Host": "www.success.com"
+          },
+          {
+            "Host": "www.fail.com"
+          }
+        ]
+      },
+      "expected": {
+        "results": [
+          "success",
+          "failure"
+        ],
+        "identical_for_follow_non_local_false_and_true": true
+      },
+      "upstream_ref": "test: probe/http/http_test.go:452 TestHTTPProbeChecker_HostHeaderPreservedAfterRedirect"
+    },
+    {
+      "name": "http_default_request_headers",
+      "input": {
+        "kind": "http_request_headers",
+        "user_headers": {}
+      },
+      "expected": {
+        "header_names_received": [
+          "Accept",
+          "Connection",
+          "User-Agent"
+        ],
+        "Accept": "*/*",
+        "User-Agent_prefix": "kube-probe/",
+        "User-Agent_format": "kube-probe/<major>.<minor>",
+        "no_Accept-Encoding": true
+      },
+      "upstream_ref": "test: probe/http/http_test.go:159-170, 219-224, 277-282 TestHTTPProbeChecker; code: request.go:63-92; http.go:53-55 (DisableKeepAlives, DisableCompression)"
+    },
+    {
+      "name": "http_request_header_overrides",
+      "input": {
+        "kind": "http_request_headers",
+        "rows": [
+          {
+            "user_headers": {
+              "Accept-Encoding": [
+                "gzip"
+              ]
+            }
+          },
+          {
+            "user_headers": {
+              "Accept-Encoding": [
+                "foo"
+              ]
+            }
+          },
+          {
+            "user_headers": {
+              "Accept-Encoding": [
+                ""
+              ]
+            }
+          },
+          {
+            "user_headers": {
+              "X-Muffins-Or-Cupcakes": [
+                "muffins"
+              ]
+            }
+          },
+          {
+            "user_headers": {
+              "User-Agent": [
+                "foo/1.0"
+              ]
+            }
+          },
+          {
+            "user_headers": {
+              "User-Agent": [
+                ""
+              ]
+            }
+          },
+          {
+            "user_headers": {
+              "User-Agent": [
+                "foo/1.0"
+              ],
+              "Accept": [
+                "text/html"
+              ]
+            }
+          },
+          {
+            "user_headers": {
+              "Accept": [
+                "foo/*"
+              ]
+            }
+          },
+          {
+            "user_headers": {
+              "Accept": [
+                ""
+              ]
+            }
+          },
+          {
+            "user_headers": {
+              "User-Agent": [
+                "foo/1.0"
+              ],
+              "Accept": [
+                ""
+              ]
+            }
+          },
+          {
+            "user_headers": {
+              "Host": [
+                "muffins.cupcakes.org"
+              ]
+            }
+          }
+        ]
+      },
+      "expected": {
+        "rows": [
+          {
+            "received_contains": "Accept-Encoding: gzip"
+          },
+          {
+            "received_contains": "Accept-Encoding: foo"
+          },
+          {
+            "received_contains": "Accept-Encoding: \n"
+          },
+          {
+            "received_contains": "X-Muffins-Or-Cupcakes: muffins"
+          },
+          {
+            "received_contains": "User-Agent: foo/1.0"
+          },
+          {
+            "received_not_contains": "User-Agent"
+          },
+          {
+            "received_contains": "Accept: text/html"
+          },
+          {
+            "received_contains": "Accept: foo/*"
+          },
+          {
+            "received_not_contains": "Accept:"
+          },
+          {
+            "received_not_contains": "Accept:"
+          },
+          {
+            "request_host": "muffins.cupcakes.org"
+          }
+        ]
+      },
+      "upstream_ref": "test: probe/http/http_test.go:171-294 TestHTTPProbeChecker; code: request.go:69-84"
+    },
+    {
+      "name": "http_request_url_construction",
+      "input": {
+        "kind": "http_request_url",
+        "rows": [
+          {
+            "scheme": "",
+            "host": "",
+            "port": 8080,
+            "path": "/healthz",
+            "pod_ip": "10.0.0.5"
+          },
+          {
+            "scheme": "HTTPS",
+            "host": "",
+            "port": 8443,
+            "path": "/ready",
+            "pod_ip": "10.0.0.5"
+          },
+          {
+            "scheme": "HTTP",
+            "host": "example.internal",
+            "port": 80,
+            "path": "path",
+            "pod_ip": "10.0.0.5"
+          },
+          {
+            "scheme": "",
+            "host": "",
+            "port": 8080,
+            "path": "/healthz",
+            "pod_ip": "fd00::5"
+          }
+        ]
+      },
+      "expected": {
+        "urls": [
+          "http://10.0.0.5:8080/healthz",
+          "https://10.0.0.5:8443/ready",
+          "http://example.internal:80/path",
+          "http://[fd00::5]:8080/healthz"
+        ],
+        "tls_verification": "skipped (InsecureSkipVerify)",
+        "proxy": "never (http.ProxyURL(nil))"
+      },
+      "upstream_ref": "code: probe/http/request.go:40-61, 95-109 (scheme lowercased, default http; host defaults to podIP; net.JoinHostPort); http.go:41, 52-54"
+    },
+    {
+      "name": "port_resolution",
+      "input": {
+        "kind": "resolve_container_port",
+        "container_ports": [
+          {
+            "name": "found",
+            "containerPort": 93
+          }
+        ],
+        "rows": [
+          {
+            "int": -1
+          },
+          {
+            "str": ""
+          },
+          {
+            "str": "-1"
+          },
+          {
+            "str": "not-found"
+          },
+          {
+            "str": "found"
+          },
+          {
+            "int": 76
+          },
+          {
+            "str": "118"
+          }
+        ]
+      },
+      "expected": {
+        "rows": [
+          {
+            "ok": false
+          },
+          {
+            "ok": false
+          },
+          {
+            "ok": false
+          },
+          {
+            "ok": false
+          },
+          {
+            "ok": true,
+            "port": 93
+          },
+          {
+            "ok": true,
+            "port": 76
+          },
+          {
+            "ok": true,
+            "port": 118
+          }
+        ]
+      },
+      "upstream_ref": "test: kubelet/prober/prober_test.go:44 TestGetURLParts and :99 TestGetTCPAddrParts; code: probe/util.go:27-47"
+    },
+    {
+      "name": "port_resolution_bounds",
+      "input": {
+        "kind": "resolve_container_port",
+        "container_ports": [
+          {
+            "name": "zero",
+            "containerPort": 0
+          }
+        ],
+        "rows": [
+          {
+            "int": 0
+          },
+          {
+            "int": 1
+          },
+          {
+            "int": 65535
+          },
+          {
+            "int": 65536
+          },
+          {
+            "str": "65535"
+          },
+          {
+            "str": "65536"
+          },
+          {
+            "str": "zero"
+          }
+        ]
+      },
+      "expected": {
+        "rows": [
+          {
+            "ok": false,
+            "error": "invalid port number: 0"
+          },
+          {
+            "ok": true,
+            "port": 1
+          },
+          {
+            "ok": true,
+            "port": 65535
+          },
+          {
+            "ok": false,
+            "error": "invalid port number: 65536"
+          },
+          {
+            "ok": true,
+            "port": 65535
+          },
+          {
+            "ok": false
+          },
+          {
+            "ok": false,
+            "error": "invalid port number: 0"
+          }
+        ]
+      },
+      "upstream_ref": "code: probe/util.go:43-46 'if port > 0 && port < 65536'"
+    },
+    {
+      "name": "port_resolution_unknown_name_error_is_atoi_error",
+      "input": {
+        "kind": "resolve_container_port",
+        "container_ports": [],
+        "rows": [
+          {
+            "str": "http"
+          }
+        ]
+      },
+      "expected": {
+        "rows": [
+          {
+            "ok": false,
+            "error": "strconv.Atoi: parsing \"http\": invalid syntax"
+          }
+        ]
+      },
+      "upstream_ref": "code: probe/util.go:34-38 (findPortByName error is overwritten by the Atoi fallback's error)"
+    },
+    {
+      "name": "unresolvable_named_port_freezes_probe_at_initial_value",
+      "input": {
+        "kind": "end_to_end",
+        "handler": "httpGet or tcpSocket",
+        "port": {
+          "str": "http"
+        },
+        "container_ports": [],
+        "ticks": 100
+      },
+      "expected": {
+        "api_validation": "passes (only IsValidPortName syntax is checked, not existence in container.ports)",
+        "per_tick": {
+          "runProbe_attempts": 3,
+          "probe_result": "unknown",
+          "error": true,
+          "worker_effect": "discarded",
+          "event": {
+            "type": "Warning",
+            "reason": "Unhealthy",
+            "message": "<Type> probe errored and resulted in unknown state: strconv.Atoi: parsing \"http\": invalid syntax"
+          }
+        },
+        "cached_result_forever": {
+          "liveness": "Success",
+          "readiness": "Failure",
+          "startup": "Unknown"
+        },
+        "consequence": {
+          "liveness": "never restarts the container",
+          "readiness": "container never Ready",
+          "startup": "container never Started and never restarted; liveness/readiness never run"
+        }
+      },
+      "upstream_ref": "code: validation.go ValidatePortNumOrName; prober.go:158-163, 175-179, 100-107; worker.go:297-301; worker.go:102-115"
+    },
+    {
+      "name": "tcp_connect_ok_success",
+      "input": {
+        "kind": "tcp_probe",
+        "listener": true
+      },
+      "expected": {
+        "result": "success",
+        "error": false,
+        "output": ""
+      },
+      "upstream_ref": "code: probe/tcp/tcp.go:50-63 DoTCPProbe"
+    },
+    {
+      "name": "tcp_connect_error_is_counted_failure",
+      "input": {
+        "kind": "tcp_probe",
+        "listener": false
+      },
+      "expected": {
+        "result": "failure",
+        "error": false,
+        "output": "<dial error string>"
+      },
+      "upstream_ref": "code: probe/tcp/tcp.go:54-57 'Convert errors to failures to handle timeouts.'"
+    },
+    {
+      "name": "tcp_host_defaults_to_pod_ip",
+      "input": {
+        "kind": "tcp_target",
+        "tcp_host": "",
+        "pod_ip": "10.0.0.5",
+        "port": 5432
+      },
+      "expected": {
+        "dial": "10.0.0.5:5432"
+      },
+      "upstream_ref": "code: prober.go:180-183"
+    },
+    {
+      "name": "grpc_status_classification",
+      "input": {
+        "kind": "grpc_probe",
+        "rows": [
+          {
+            "health_status": "SERVING"
+          },
+          {
+            "health_status": "NOT_SERVING"
+          },
+          {
+            "health_status": "UNKNOWN"
+          },
+          {
+            "health_status": "SERVICE_UNKNOWN"
+          },
+          {
+            "rpc_error_code": "Unimplemented"
+          },
+          {
+            "rpc_error_code": "DeadlineExceeded"
+          },
+          {
+            "rpc_error_code": "Unavailable"
+          },
+          {
+            "dial_error": "context.DeadlineExceeded"
+          },
+          {
+            "dial_error": "other"
+          }
+        ]
+      },
+      "expected": {
+        "rows": [
+          {
+            "result": "success",
+            "error": false,
+            "output": "service healthy"
+          },
+          {
+            "result": "failure",
+            "error": false,
+            "output": "service unhealthy (responded with \"NOT_SERVING\")"
+          },
+          {
+            "result": "failure",
+            "error": false
+          },
+          {
+            "result": "failure",
+            "error": false
+          },
+          {
+            "result": "failure",
+            "error": false
+          },
+          {
+            "result": "failure",
+            "error": false
+          },
+          {
+            "result": "failure",
+            "error": false
+          },
+          {
+            "result": "failure",
+            "error": false
+          },
+          {
+            "result": "failure",
+            "error": false
+          }
+        ],
+        "error_always_nil": true,
+        "host": "always pod IP (no host field)",
+        "service_default": ""
+      },
+      "upstream_ref": "code: probe/grpc/grpc.go:49-117 ('err is always nil'); prober.go:187-194"
+    },
+    {
+      "name": "update_pod_status_ready_and_started",
+      "input": {
+        "kind": "update_pod_status",
+        "containers": [
+          {
+            "name": "unprobed",
+            "running": true,
+            "workers": [
+              "liveness"
+            ],
+            "cached": {}
+          },
+          {
+            "name": "probed_ready",
+            "running": true,
+            "workers": [
+              "readiness"
+            ],
+            "cached": {
+              "readiness": "Success"
+            }
+          },
+          {
+            "name": "probed_pending",
+            "running": true,
+            "workers": [
+              "readiness"
+            ],
+            "cached": {}
+          },
+          {
+            "name": "probed_unready",
+            "running": true,
+            "workers": [
+              "readiness"
+            ],
+            "cached": {
+              "readiness": "Failure"
+            }
+          },
+          {
+            "name": "not_started_no_readiness",
+            "running": true,
+            "workers": [
+              "startup"
+            ],
+            "cached": {}
+          },
+          {
+            "name": "started_no_readiness",
+            "running": true,
+            "workers": [
+              "startup"
+            ],
+            "cached": {
+              "startup": "Success"
+            }
+          },
+          {
+            "name": "terminated",
+            "running": false,
+            "workers": [
+              "readiness"
+            ],
+            "cached": {
+              "readiness": "Success"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "ready": {
+          "unprobed": true,
+          "probed_ready": true,
+          "probed_pending": false,
+          "probed_unready": false,
+          "not_started_no_readiness": false,
+          "started_no_readiness": true,
+          "terminated": false
+        },
+        "started": {
+          "unprobed": true,
+          "probed_ready": true,
+          "probed_pending": true,
+          "probed_unready": true,
+          "not_started_no_readiness": false,
+          "started_no_readiness": true,
+          "terminated": false
+        },
+        "manual_readiness_trigger_attempted": {
+          "probed_pending": true,
+          "probed_unready": true
+        },
+        "manual_trigger_note": "non-blocking send; in the upstream test the fake workers have nil channels so the send falls to default"
+      },
+      "upstream_ref": "test: prober_manager_test.go:305 TestUpdatePodStatus (ready); started + manual trigger derived from prober_manager.go:270-316"
+    },
+    {
+      "name": "is_container_started",
+      "input": {
+        "kind": "is_container_started",
+        "rows": [
+          {
+            "running": true,
+            "startup_worker": false,
+            "startup_cached": null
+          },
+          {
+            "running": true,
+            "startup_worker": true,
+            "startup_cached": null
+          },
+          {
+            "running": true,
+            "startup_worker": true,
+            "startup_cached": "Unknown"
+          },
+          {
+            "running": true,
+            "startup_worker": true,
+            "startup_cached": "Failure"
+          },
+          {
+            "running": true,
+            "startup_worker": true,
+            "startup_cached": "Success"
+          },
+          {
+            "running": false,
+            "startup_worker": true,
+            "startup_cached": "Success"
+          }
+        ]
+      },
+      "expected": {
+        "started": [
+          true,
+          false,
+          false,
+          false,
+          true,
+          false
+        ]
+      },
+      "upstream_ref": "code: prober_manager.go:270-287"
+    },
+    {
+      "name": "results_manager_update_only_on_change",
+      "input": {
+        "kind": "results_manager",
+        "ops": [
+          {
+            "op": "set",
+            "id": "a",
+            "result": "Failure"
+          },
+          {
+            "op": "set",
+            "id": "a",
+            "result": "Failure"
+          },
+          {
+            "op": "set",
+            "id": "a",
+            "result": "Success"
+          },
+          {
+            "op": "remove",
+            "id": "a"
+          },
+          {
+            "op": "set",
+            "id": "a",
+            "result": "Success"
+          }
+        ]
+      },
+      "expected": {
+        "update_emitted": [
+          true,
+          false,
+          true,
+          false,
+          true
+        ],
+        "update_channel_capacity": 20
+      },
+      "upstream_ref": "code: results/results_manager.go:99-135"
+    },
+    {
+      "name": "probe_field_defaults",
+      "input": {
+        "kind": "probe_defaults",
+        "probe": {
+          "timeoutSeconds": 0,
+          "periodSeconds": 0,
+          "successThreshold": 0,
+          "failureThreshold": 0,
+          "initialDelaySeconds": 0
+        }
+      },
+      "expected": {
+        "timeoutSeconds": 1,
+        "periodSeconds": 10,
+        "successThreshold": 1,
+        "failureThreshold": 3,
+        "initialDelaySeconds": 0
+      },
+      "upstream_ref": "code: pkg/apis/core/v1/defaults.go:236-249 SetDefaults_Probe"
+    },
+    {
+      "name": "probe_validation",
+      "input": {
+        "kind": "probe_validation",
+        "rows": [
+          {
+            "probe_type": "liveness",
+            "successThreshold": 2
+          },
+          {
+            "probe_type": "startup",
+            "successThreshold": 2
+          },
+          {
+            "probe_type": "readiness",
+            "successThreshold": 2
+          },
+          {
+            "probe_type": "readiness",
+            "terminationGracePeriodSeconds": 10
+          },
+          {
+            "probe_type": "liveness",
+            "terminationGracePeriodSeconds": 0
+          },
+          {
+            "probe_type": "liveness",
+            "failureThreshold": -1
+          },
+          {
+            "probe_type": "readiness",
+            "handlers": [
+              "exec",
+              "httpGet"
+            ]
+          },
+          {
+            "probe_type": "readiness",
+            "handlers": []
+          },
+          {
+            "probe_type": "readiness",
+            "handlers": [
+              "exec"
+            ],
+            "exec_command": []
+          },
+          {
+            "probe_type": "readiness",
+            "handlers": [
+              "httpGet"
+            ],
+            "http_path": ""
+          }
+        ],
+        "base": "every row is an otherwise-valid probe with one exec handler (command non-empty) after SetDefaults_Probe"
+      },
+      "expected": {
+        "valid": [
+          false,
+          false,
+          true,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false
+        ]
+      },
+      "upstream_ref": "code: pkg/apis/core/validation/validation.go validateLivenessProbe / validateStartupProbe ('must be 1'), validateReadinessProbe ('must not be set for readinessProbes'), validateProbe, validateHandler, validateExecAction, validateHTTPGetAction"
+    },
+    {
+      "name": "worker_loop_timing",
+      "input": {
+        "kind": "worker_loop"
+      },
+      "expected": {
+        "period": "time.Duration(PeriodSeconds) * time.Second",
+        "startup_jitter": "sleep rand[0,1) * period before first probe ONLY if kubelet started less than one period ago",
+        "first_probe": "doProbe runs immediately (before the first tick) once jitter is done",
+        "manual_trigger": "readiness manual trigger runs doProbe and Resets the ticker to a full period from that moment",
+        "stop": "stop() is non-blocking and idempotent; on exit the worker removes its cached result for its last containerID"
+      },
+      "upstream_ref": "code: worker.go:148-201; test: worker_test.go:348 TestCleanUp (stop x10, result cleared)"
+    }
+  ]
+}
