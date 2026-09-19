@@ -15,8 +15,10 @@
 //!
 //! Registration fails for nothing else. A replay too large for the watcher's
 //! buffer is reported on the stream, after what fitted has been delivered, and
-//! [`crate::watch_end`] decides how that watch ends. It is never a refusal and
-//! never a 410.
+//! [`crate::watch_end`] decides whether that watch ends or resumes. It is
+//! never a refusal and never a 410. A resume that the store refuses (history
+//! compacted while the watch filtered its way forward) ends with this module's
+//! 410, as a client's own re-watch from there would.
 //!
 //! ## In-band, never an HTTP status
 //!

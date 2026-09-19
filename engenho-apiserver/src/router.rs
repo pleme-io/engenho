@@ -60,10 +60,10 @@ use crate::handler::ResourceHandler;
 use crate::health;
 use crate::openapi::ApiDoc;
 use crate::params::{
-    DryRun, ListWatchParams, ResumePoint, Selectors, WatchGvk, bookmark_line, event_line,
-    gvk_ns_matches,
+    DryRun, ListWatchParams, ResumePoint, Selectors, WatchGvk, bookmark_line, error_line,
+    event_line, gvk_ns_matches,
 };
-use crate::watch_end::WatchProgress;
+use crate::watch_end::{AfterGone, WatchProgress};
 use crate::watch_start::{WatchRefusal, WatchStart};
 
 /// The dispatch key for a registered handler: `(group, version, plural)`.
@@ -1245,9 +1245,9 @@ struct WatchStreamState {
     handler: Arc<dyn ResourceHandler>,
     namespace: Option<String>,
     selectors: Selectors,
-    /// What the client has been sent, and whether it asked for bookmarks:
-    /// decides how the watch ends when the store stops serving it
-    /// ([`crate::watch_end`]).
+    /// What the client has been sent, whether it asked for bookmarks, and
+    /// where the store stream opened: decides whether the watch ends or
+    /// resumes when the store stops serving it ([`crate::watch_end`]).
     progress: WatchProgress,
     /// Server-side deadline from `?timeoutSeconds=N`. `None` = stream
     /// until the client goes away.
@@ -1440,15 +1440,52 @@ async fn watch_response(
                     continue;
                 }
                 Some(Err(gone)) => {
-                    // The store stopped serving this watch. How it ends
+                    // The store stopped serving this watch. What happens
                     // depends on why, and on what the client has been sent
                     // (crate::watch_end): a 410 for a compaction, a bookmark
                     // and a clean close for an overflow the client can resume
-                    // past, a 429 for one it cannot. The WatchStream
-                    // surfaces its terminal Err once and then None, so the
-                    // line returned here is the last one; with no line the
-                    // body ends now.
-                    let end = st.progress.end(&gone);
+                    // past, a resume of the store watch for an overflow of
+                    // filtered history nothing can tell the client about,
+                    // and a 429 for an overflow with nothing to move past.
+                    //
+                    // The old WatchStream surfaces its terminal Err once and
+                    // then None, so a line returned here is the last one, and
+                    // with no line the body ends now.
+                    let end = match st.progress.after(&gone) {
+                        AfterGone::End(end) => end,
+                        AfterGone::Resume(resume) => {
+                            let reopened = st
+                                .handler
+                                .watch_stream(
+                                    st.namespace.as_deref(),
+                                    ResumePoint::At(resume.at()),
+                                    st.progress.bookmarks(),
+                                )
+                                .await;
+                            match reopened {
+                                Ok(WatchStart::Streaming(stream)) => {
+                                    st.stream = stream;
+                                    st.progress.resumed(&resume);
+                                    // A chain of resumes over filtered
+                                    // history sends nothing and may never
+                                    // wait on the store; give the worker
+                                    // back between links.
+                                    tokio::task::yield_now().await;
+                                    continue;
+                                }
+                                // The store compacted past the resume
+                                // point: the 410 a re-watch would get.
+                                Ok(WatchStart::Refused(refusal)) => {
+                                    return Some((Ok(refusal.status_line()), st));
+                                }
+                                // The store could not open a watch at all.
+                                // Said in-band, as the error it is.
+                                Err(err) => {
+                                    return Some((Ok(error_line(&err.to_status_object())), st));
+                                }
+                            }
+                        }
+                    };
                     let api_version = st.handler.api_version();
                     let gvk = WatchGvk {
                         api_version: &api_version,
@@ -2250,9 +2287,99 @@ mod tests {
         namespaced: bool,
         short_names: Vec<&'static str>,
         singular: &'static str,
-        /// The one stream `watch_stream` hands out, for the tests that
-        /// drive a watch; `None` keeps the typed not-exercised error.
-        watch: std::sync::Mutex<Option<WatchStream>>,
+        /// What `watch_stream` serves, for the tests that drive a watch.
+        watch: std::sync::Mutex<FakeWatch>,
+    }
+
+    /// What a [`FakeHandler`]'s `watch_stream` serves.
+    enum FakeWatch {
+        /// Nothing: the typed not-exercised error.
+        Unused,
+        /// One pre-built stream, handed out once.
+        Once(Option<WatchStream>),
+        /// A store history, opened afresh at every resume point.
+        History(FakeHistory),
+    }
+
+    /// A store history a watch can open, and re-open, at any revision.
+    ///
+    /// Each open registers a real store `WatchStream` over the changes past
+    /// its resume point, `buffer` slots deep, as the store's own
+    /// `register_captured` does. The registry is dropped at once, so a
+    /// stream whose replay fits closes cleanly after it: "caught up".
+    struct FakeHistory {
+        changes: Vec<engenho_store::Change>,
+        buffer: usize,
+        /// What every open after the first meets.
+        reopen: Reopen,
+        /// Every resume point the watch was opened at, in order.
+        opened: Vec<ResumePoint>,
+    }
+
+    /// What a [`FakeHistory`] does with every open after the first.
+    #[derive(Clone, Copy)]
+    enum Reopen {
+        /// Serves it like the first.
+        Serve,
+        /// History below this revision was compacted after the first open.
+        CompactedBelow(Revision),
+        /// The store stopped: the handler cannot open a watch at all.
+        Fail,
+    }
+
+    impl FakeHistory {
+        /// More opens than any test's history can need: a watch that
+        /// re-opens this often is re-opening in a loop.
+        const MAX_OPENS: usize = 32;
+
+        fn open(&mut self, from: ResumePoint) -> Result<WatchStart, ApiError> {
+            if self.opened.len() >= Self::MAX_OPENS {
+                return Err(ApiError::Internal(
+                    "fake store: the watch re-opened in a loop".into(),
+                ));
+            }
+            let first = self.opened.is_empty();
+            self.opened.push(from);
+            let head = self.changes.last().map_or(Revision(10), |c| c.revision);
+            let at = match from {
+                ResumePoint::At(rev) => rev,
+                ResumePoint::MostRecent => head,
+            };
+            match self.reopen {
+                Reopen::Fail if !first => {
+                    return Err(ApiError::StorageError("fake store stopped".into()));
+                }
+                Reopen::CompactedBelow(floor) if !first && at < floor => {
+                    let compacted = crate::watch_end::Compacted::try_from(
+                        engenho_store::WatchGone::CompactedTooOld {
+                            requested: at,
+                            compacted: floor,
+                        },
+                    )
+                    .expect("a compaction converts");
+                    return Ok(WatchStart::Refused(WatchRefusal::from(compacted)));
+                }
+                Reopen::Serve | Reopen::CompactedBelow(_) | Reopen::Fail => {}
+            }
+            let replay = self
+                .changes
+                .iter()
+                .filter(|c| c.revision > at)
+                .cloned()
+                .collect();
+            let opts = engenho_store::WatchOpts {
+                from: at,
+                buffer: self.buffer,
+                bookmark_every: std::time::Duration::ZERO,
+            };
+            Ok(WatchStart::Streaming(
+                engenho_store::watch_backend::WatcherRegistry::new().register_captured(
+                    replay,
+                    head.max(at),
+                    &opts,
+                ),
+            ))
+        }
     }
 
     impl FakeHandler {
@@ -2271,13 +2398,13 @@ mod tests {
                 namespaced,
                 short_names: Vec::new(),
                 singular: "",
-                watch: std::sync::Mutex::new(None),
+                watch: std::sync::Mutex::new(FakeWatch::Unused),
             })
         }
 
-        /// A core-group, namespaced handler whose `watch_stream` returns
-        /// `stream` once.
-        fn arc_watching(kind: &str, plural: &str, stream: WatchStream) -> Arc<dyn ResourceHandler> {
+        /// A core-group, namespaced handler whose `watch_stream` serves
+        /// `watch`.
+        fn watching(kind: &str, plural: &str, watch: FakeWatch) -> Arc<Self> {
             Arc::new(Self {
                 group: String::new(),
                 version: "v1".into(),
@@ -2286,8 +2413,16 @@ mod tests {
                 namespaced: true,
                 short_names: Vec::new(),
                 singular: "",
-                watch: std::sync::Mutex::new(Some(stream)),
+                watch: std::sync::Mutex::new(watch),
             })
+        }
+
+        /// Every resume point the watch was opened at, in order.
+        fn opened(&self) -> Vec<ResumePoint> {
+            match &*self.watch.lock().expect("fake watch lock") {
+                FakeWatch::History(history) => history.opened.clone(),
+                FakeWatch::Unused | FakeWatch::Once(_) => Vec::new(),
+            }
         }
 
         fn arc_with_meta(
@@ -2307,7 +2442,7 @@ mod tests {
                 namespaced,
                 short_names,
                 singular,
-                watch: std::sync::Mutex::new(None),
+                watch: std::sync::Mutex::new(FakeWatch::Unused),
             })
         }
     }
@@ -2374,13 +2509,20 @@ mod tests {
         async fn watch_stream(
             &self,
             _ns: Option<&str>,
-            _from: crate::params::ResumePoint,
+            from: crate::params::ResumePoint,
             _allow_bookmarks: bool,
         ) -> Result<crate::watch_start::WatchStart, ApiError> {
-            let stream = self.watch.lock().ok().and_then(|mut w| w.take());
-            stream.map(WatchStart::Streaming).ok_or_else(|| {
-                ApiError::Internal("fake handler: watch_stream not exercised".into())
-            })
+            let not_exercised =
+                || ApiError::Internal("fake handler: watch_stream not exercised".into());
+            let mut watch = self.watch.lock().map_err(|_| not_exercised())?;
+            match &mut *watch {
+                FakeWatch::Unused => Err(not_exercised()),
+                FakeWatch::Once(stream) => stream
+                    .take()
+                    .map(WatchStart::Streaming)
+                    .ok_or_else(not_exercised),
+                FakeWatch::History(history) => history.open(from),
+            }
         }
         async fn create(
             &self,
@@ -2432,7 +2574,7 @@ mod tests {
         }
     }
 
-    // ── how a streaming watch ends (T3.7) ────────────────────────────────
+    // ── how a streaming watch ends, or resumes (T3.7) ────────────────────
     //
     // Each test drives `watch_response` over a real store `WatchStream`
     // whose replay overflows a tiny buffer, and reads the whole body. The
@@ -2467,15 +2609,39 @@ mod tests {
             .register_captured(replay, boundary, &opts)
     }
 
+    /// A Pod handler over `changes`, opened afresh with a two-slot buffer at
+    /// every resume point.
+    fn pod_history(changes: Vec<engenho_store::Change>, reopen: Reopen) -> Arc<FakeHandler> {
+        FakeHandler::watching(
+            "Pod",
+            "pods",
+            FakeWatch::History(FakeHistory {
+                changes,
+                buffer: 2,
+                reopen,
+                opened: Vec::new(),
+            }),
+        )
+    }
+
     /// Every line a Pod watch from revision 10 sends before its body ends.
     async fn pod_watch_lines(stream: WatchStream, bookmarks: bool) -> Vec<serde_json::Value> {
-        let h = FakeHandler::arc_watching("Pod", "pods", stream);
-        let query = if bookmarks {
-            "watch=true&resourceVersion=10&allowWatchBookmarks=true"
-        } else {
-            "watch=true&resourceVersion=10&allowWatchBookmarks=false"
+        let h = FakeHandler::watching("Pod", "pods", FakeWatch::Once(Some(stream)));
+        watch_lines(h, 10, bookmarks).await
+    }
+
+    /// Every line a watch from revision `from` over `h` sends before its
+    /// body ends.
+    async fn watch_lines(
+        h: Arc<FakeHandler>,
+        from: u64,
+        bookmarks: bool,
+    ) -> Vec<serde_json::Value> {
+        let p = ListWatchParams {
+            resource_version: Some(from.to_string()),
+            allow_watch_bookmarks: bookmarks,
+            ..ListWatchParams::default()
         };
-        let p: ListWatchParams = serde_urlencoded::from_str(query).unwrap();
         let resp = watch_response(h, None, p, Selectors::default(), ResponseCodec::Json)
             .await
             .unwrap();
@@ -2541,18 +2707,143 @@ mod tests {
     }
 
     /// Every revision the store delivered was filtered out, and the client
-    /// asked for no bookmarks: it would resume at 10 and meet the same
-    /// overflow. The watch ends with a 429 that tells it to back off.
+    /// asked for no bookmarks, so nothing on the wire can move it past them.
+    /// Ending the watch would send it back to 10, into the same replay and
+    /// the same overflow. The router resumes the store watch at each
+    /// overflow's `last_seen` instead, each time strictly further on, and
+    /// the client gets the Pod past all of it without a break.
     #[tokio::test]
-    async fn an_overflow_with_no_progress_ends_with_an_in_band_429() {
-        let stream = overflowing(vec![
-            created("ConfigMap", "a", 11),
-            created("ConfigMap", "b", 12),
-            created("ConfigMap", "c", 13),
-        ]);
-        let lines = pod_watch_lines(stream, false).await;
+    async fn an_overflow_of_filtered_history_resumes_the_store_watch_and_reaches_past_it() {
+        let mut changes: Vec<_> = (11..=17)
+            .map(|rev| created("ConfigMap", "c", rev))
+            .collect();
+        changes.push(created("Pod", "p", 18));
+        let h = pod_history(changes, Reopen::Serve);
+        let lines = watch_lines(h.clone(), 10, false).await;
+        assert_eq!(line_types(&lines), ["ADDED"], "{lines:?}");
+        assert_eq!(line_rv(&lines[0]), "18");
+        assert_eq!(
+            h.opened(),
+            [10, 12, 14, 16].map(|rev| ResumePoint::At(Revision(rev))),
+            "one open, then a resume at every overflow's last_seen"
+        );
+    }
+
+    /// The client's resume point after a watch: the newest revision a line
+    /// carried, or where it started when none did.
+    fn resume_after(from: u64, lines: &[serde_json::Value]) -> u64 {
+        lines
+            .iter()
+            .filter(|l| l["type"] != "ERROR")
+            .map(|l| line_rv(l).parse::<u64>().unwrap())
+            .max()
+            .unwrap_or(from)
+    }
+
+    /// The loop a no-progress 429 made: the store's replay is decided by
+    /// history alone, so a client that retries from where the watch left it
+    /// meets the same end. Watch the same history twice, the second time
+    /// from where the first left the client: the client has moved, and the
+    /// second watch does not end the way the first did.
+    #[tokio::test]
+    async fn retrying_from_where_a_watch_left_the_client_never_meets_the_same_end() {
+        let history = || {
+            vec![
+                created("ConfigMap", "a", 11),
+                created("ConfigMap", "b", 12),
+                created("ConfigMap", "c", 13),
+                created("Pod", "p", 14),
+            ]
+        };
+        for bookmarks in [false, true] {
+            let first = watch_lines(pod_history(history(), Reopen::Serve), 10, bookmarks).await;
+            let resume = resume_after(10, &first);
+            let second =
+                watch_lines(pod_history(history(), Reopen::Serve), resume, bookmarks).await;
+            assert_ne!(first, second, "bookmarks={bookmarks}: the same end twice");
+            assert!(
+                resume > 10,
+                "bookmarks={bookmarks}: the client is left where it started: {first:?}"
+            );
+            assert!(
+                resume_after(resume, &second) >= resume,
+                "bookmarks={bookmarks}: {second:?}"
+            );
+        }
+    }
+
+    /// A resume point the store compacted away while the watch was
+    /// filtering its way forward ends the watch with the 410 a re-watch
+    /// from there would get.
+    #[tokio::test]
+    async fn a_resume_below_the_compaction_floor_ends_with_the_410_a_rewatch_would_get() {
+        let h = pod_history(
+            vec![
+                created("ConfigMap", "a", 11),
+                created("ConfigMap", "b", 12),
+                created("ConfigMap", "c", 13),
+                created("Pod", "p", 14),
+            ],
+            Reopen::CompactedBelow(Revision(13)),
+        );
+        let lines = watch_lines(h.clone(), 10, false).await;
         assert_eq!(line_types(&lines), ["ERROR"], "{lines:?}");
         let status = &lines[0]["object"];
+        assert_eq!(status["code"], 410, "{status}");
+        assert_eq!(status["reason"], "Expired");
+        assert_eq!(status["message"], "too old resource version: 12 (13)");
+        assert_eq!(
+            h.opened(),
+            [10, 12].map(|rev| ResumePoint::At(Revision(rev)))
+        );
+    }
+
+    /// A store that cannot open the resumed watch at all: the watch says so
+    /// in-band, with the Status the same error carries over HTTP.
+    #[tokio::test]
+    async fn a_resume_the_store_cannot_open_ends_with_its_error_in_band() {
+        let h = pod_history(
+            vec![
+                created("ConfigMap", "a", 11),
+                created("ConfigMap", "b", 12),
+                created("ConfigMap", "c", 13),
+            ],
+            Reopen::Fail,
+        );
+        let lines = watch_lines(h, 10, false).await;
+        assert_eq!(line_types(&lines), ["ERROR"], "{lines:?}");
+        let status = &lines[0]["object"];
+        assert_eq!(status["kind"], "Status");
+        assert_eq!(status["code"], 500, "{status}");
+        assert_eq!(status["reason"], "ServiceUnavailable");
+        assert_eq!(status["message"], "storage error: fake store stopped");
+    }
+
+    /// The one overflow a retry can change: the buffer filled with nothing
+    /// newer than the stream's opening revision, so timing decided it, not
+    /// history. A one-slot buffer holding the bookmark at 10 does that when
+    /// the change at 11 arrives. The watch forwards the bookmark and ends
+    /// with the 429.
+    #[tokio::test]
+    async fn an_overflow_with_nothing_past_the_opening_revision_ends_with_an_in_band_429() {
+        let mut registry = engenho_store::watch_backend::WatcherRegistry::new();
+        let opts = engenho_store::WatchOpts {
+            from: Revision(10),
+            buffer: 1,
+            bookmark_every: std::time::Duration::from_millis(1),
+        };
+        let stream = registry.register_captured(Vec::new(), Revision(10), &opts);
+        registry.tick_bookmarks(
+            Revision(10),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        );
+        registry.fan_change(&created("Pod", "p", 11));
+        drop(registry);
+
+        let lines = pod_watch_lines(stream, true).await;
+        assert_eq!(line_types(&lines), ["BOOKMARK", "ERROR"], "{lines:?}");
+        assert_eq!(line_rv(&lines[0]), "10");
+        let status = &lines[1]["object"];
         assert_eq!(status["kind"], "Status");
         assert_eq!(status["code"], 429, "{status}");
         assert_eq!(status["reason"], "TooManyRequests");

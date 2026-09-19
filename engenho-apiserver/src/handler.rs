@@ -1223,7 +1223,8 @@ impl ResourceHandler for StoreBackedHandler {
         //
         // Registration fails for nothing else: the store reports a replay
         // that overflows the buffer on the stream, after delivering what
-        // fitted, and `crate::watch_end` decides how that watch ends. An
+        // fitted, and `crate::watch_end` decides whether that watch ends or
+        // resumes. An
         // overflow reported here breaks that contract. It is a storage
         // error, never a 410: a 410 would send the client to relist for a
         // condition that is not a compaction.

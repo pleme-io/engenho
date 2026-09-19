@@ -94,7 +94,8 @@ pub use scale::{
 };
 pub use server::{ApiServer, ServerError};
 pub use watch_end::{
-    Compacted, NO_PROGRESS_RETRY_AFTER_SECONDS, NoProgress, Progressed, WatchEnd, WatchProgress,
+    AfterGone, Compacted, NO_PROGRESS_RETRY_AFTER_SECONDS, NoProgress, Progressed, Resume,
+    WatchEnd, WatchProgress,
 };
 pub use watch_start::{WatchRefusal, WatchStart};
 pub use webhook_admission::{

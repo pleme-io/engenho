@@ -752,8 +752,9 @@ pub fn status_410_line(compacted: Compacted) -> Bytes {
 /// Encode a `Status` object as a watch line of type `ERROR`, the shape
 /// kube-apiserver uses for an in-band terminal status. Every in-band end of a
 /// watch goes through here: the mid-stream 410 above, the no-progress 429
-/// ([`crate::watch_end::NoProgress::status_line`]) and a refused start
-/// ([`crate::watch_start::WatchRefusal::status_line`]).
+/// ([`crate::watch_end::NoProgress::status_line`]), a refused start or
+/// resume ([`crate::watch_start::WatchRefusal::status_line`]) and an error
+/// met while a watch resumes.
 #[must_use]
 pub(crate) fn error_line(status: &serde_json::Value) -> Bytes {
     #[derive(Serialize)]

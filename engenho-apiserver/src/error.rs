@@ -157,7 +157,8 @@ impl ApiError {
 /// A typed K8s `Status` FAILURE object. The single render surface for
 /// every failure body: the [`IntoResponse`] path (a real HTTP error), the
 /// in-band watch-stream ends (`params::status_410_line`, the 429 of
-/// `watch_end::NoProgress`) and the apply-conflict 409 all build their JSON
+/// `watch_end::NoProgress`, an [`ApiError`] met while a watch resumes) and
+/// the apply-conflict 409 all build their JSON
 /// through this struct, never `format!()` of JSON.
 ///
 /// `D` is the `details` block: [`NoDetails`] for the plain shape (the block
@@ -347,52 +348,67 @@ pub fn forbidden_message(attrs: &crate::authz::Attributes) -> String {
     )
 }
 
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        let code = self.status_code();
-        // The apply-conflict path renders a Status WITH `details.causes` —
-        // a distinct body shape from every other error (which has no
-        // details). Handle it first; the message names the conflict count.
-        if let ApiError::ApplyConflict(causes) = &self {
+impl ApiError {
+    /// The `Status.reason` this error carries on the wire.
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::NotFound(_) => "NotFound",
+            Self::Conflict(_, _) => "AlreadyExists",
+            // Optimistic-concurrency failure uses reason "Conflict" (K8s uses
+            // `.details` for these), distinct from the create-already-exists
+            // "AlreadyExists" above. An apply conflict shares the reason and
+            // adds `details.causes` (see `status`).
+            Self::ResourceVersionConflict(_) | Self::ApplyConflict(_) => "Conflict",
+            Self::BadRequest(_) => "BadRequest",
+            Self::Invalid(_) => "Invalid",
+            Self::NotAcceptable(_) => "NotAcceptable",
+            Self::Unauthorized(_) => "Unauthorized",
+            Self::UnsupportedMediaType(_) => "UnsupportedMediaType",
+            Self::Forbidden(_) | Self::AuthzForbidden(_) => "Forbidden",
+            Self::Gone(_) => "Expired",
+            Self::Internal(_) => "InternalError",
+            Self::StorageError(_) => "ServiceUnavailable",
+        }
+    }
+
+    /// This error as a K8s failure `Status`: the one body both an HTTP error
+    /// response and an in-band watch `ERROR` line carry.
+    fn status(&self) -> K8sStatus<StatusCauseDetails> {
+        let code = self.status_code().as_u16();
+        // The apply-conflict path renders a Status WITH `details.causes`, a
+        // distinct body shape from every other error (which has no details).
+        // The message names the conflict count.
+        if let Self::ApplyConflict(causes) = self {
             let n = causes.as_array().map_or(0, Vec::len);
             let message = if n == 1 {
                 "Apply failed with 1 conflict".to_string()
             } else {
                 format!("Apply failed with {n} conflicts")
             };
-            let payload = K8sStatus::failure(
-                code.as_u16(),
-                "Conflict",
+            return K8sStatus::failure(
+                code,
+                self.reason(),
                 message,
                 Some(StatusCauseDetails {
                     causes: causes.clone(),
                 }),
             );
-            return (code, Json(payload)).into_response();
         }
-        let reason = match self {
-            ApiError::NotFound(_) => "NotFound",
-            ApiError::Conflict(_, _) => "AlreadyExists",
-            // Optimistic-concurrency failure uses reason "Conflict"
-            // (K8s uses `.details` for these) — distinct from the
-            // create-already-exists "AlreadyExists" above. `ApplyConflict`
-            // is rendered by the early-return above (with `details.causes`)
-            // so its arm here is unreachable; it shares the "Conflict"
-            // reason for exhaustiveness.
-            ApiError::ResourceVersionConflict(_) | ApiError::ApplyConflict(_) => "Conflict",
-            ApiError::BadRequest(_) => "BadRequest",
-            ApiError::Invalid(_) => "Invalid",
-            ApiError::NotAcceptable(_) => "NotAcceptable",
-            ApiError::Unauthorized(_) => "Unauthorized",
-            ApiError::UnsupportedMediaType(_) => "UnsupportedMediaType",
-            ApiError::Forbidden(_) | ApiError::AuthzForbidden(_) => "Forbidden",
-            ApiError::Gone(_) => "Expired",
-            ApiError::Internal(_) => "InternalError",
-            ApiError::StorageError(_) => "ServiceUnavailable",
-        };
-        let payload =
-            K8sStatus::<NoDetails>::failure(code.as_u16(), reason, self.to_string(), None);
-        (code, Json(payload)).into_response()
+        K8sStatus::failure(code, self.reason(), self.to_string(), None)
+    }
+
+    /// This error as the object of an in-band watch `ERROR` line, for a
+    /// failure met after the watch's HTTP 200 has gone out: the same `Status`
+    /// its HTTP response would carry.
+    #[must_use]
+    pub(crate) fn to_status_object(&self) -> serde_json::Value {
+        self.status().to_value()
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (self.status_code(), Json(self.status())).into_response()
     }
 }
 
