@@ -24,12 +24,12 @@ use serde_json::{Value, json};
 
 use crate::error::ControllerError;
 use crate::event_recorder::Reason as EventReason;
-use crate::meta::{ObjectMeta, ShapeError};
+use crate::meta::{ObjectMeta, REPLICAS, ShapeError};
 use crate::owned_children::{
     ChildKind, OwnedChildrenReconciler, ParentGvk, ReconcileDelta, pod_from_template,
 };
 use crate::owner::{OwnerReference, owner_ref_for};
-use crate::status::{observed_generation, pod_is_ready};
+use crate::status::pod_is_ready;
 use crate::sweep::{Sweep, impl_sweep_event_sink};
 
 pub struct ReplicaSetController {
@@ -154,7 +154,10 @@ impl OwnedChildrenReconciler for ReplicaSetController {
         rs_value: &Value,
         owned_pods: &[(ResourceKey, Value)],
     ) -> Result<ReconcileDelta, ControllerError> {
-        let desired = rs_value.spec_i64("replicas", 1).max(0) as usize;
+        // A `spec.replicas` that is not an integer fails this ReplicaSet
+        // (an Event on it) with nothing created or evicted — never the
+        // default's count.
+        let desired = REPLICAS.read(rs_value)?.max(0) as usize;
         let observed = owned_pods.len();
 
         // Fixpoint — nothing to create or evict.
@@ -223,8 +226,9 @@ impl OwnedChildrenReconciler for ReplicaSetController {
 
     fn compute_status(
         &self,
-        rs_value: &Value,
+        _rs_value: &Value,
         owned_now: &[(ResourceKey, Value)],
+        observed_generation: i64,
     ) -> Option<Value> {
         // Status computed from the LIVE owned pods AFTER the reconcile
         // delta. readyReplicas counts Ready=True pods; availableReplicas
@@ -238,7 +242,7 @@ impl OwnedChildrenReconciler for ReplicaSetController {
             "readyReplicas": ready,
             "availableReplicas": ready,
             "fullyLabeledReplicas": replicas,
-            "observedGeneration": observed_generation(rs_value),
+            "observedGeneration": observed_generation,
         }))
     }
 }
@@ -250,13 +254,13 @@ mod tests {
     #[test]
     fn replicas_defaults_to_1() {
         let rs = json!({"metadata": {"name": "rs"}, "spec": {}});
-        assert_eq!(rs.spec_i64("replicas", 1), 1);
+        assert_eq!(REPLICAS.read(&rs), Ok(1));
     }
 
     #[test]
     fn replicas_reads_spec_field() {
         let rs = json!({"spec": {"replicas": 5}});
-        assert_eq!(rs.spec_i64("replicas", 1), 5);
+        assert_eq!(REPLICAS.read(&rs), Ok(5));
     }
 
     fn rs_owner() -> OwnerReference {

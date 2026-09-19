@@ -40,6 +40,7 @@ use serde_json::Value;
 use tracing::debug;
 
 use crate::error::ControllerError;
+use crate::meta::{DefaultedInt, ShapeError};
 
 /// Outcome of a [`write_status_cas`] call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,15 +84,19 @@ pub fn resource_version_of(value: &Value) -> Option<Revision> {
         .map(Revision)
 }
 
-/// Read `metadata.generation` off a stored object (the spec-intent
-/// revision `observedGeneration` reconciles against). `0` when absent.
-#[must_use]
-pub fn generation_of(value: &Value) -> i64 {
-    value
-        .get("metadata")
-        .and_then(|m| m.get("generation"))
-        .and_then(Value::as_i64)
-        .unwrap_or(0)
+/// `metadata.generation`, the spec-intent revision `observedGeneration`
+/// reconciles against. The store stamps it on every write; `0` (never
+/// stamped) when absent.
+pub const GENERATION: DefaultedInt = DefaultedInt::new(&["metadata", "generation"], 0);
+
+/// Read `metadata.generation` off a stored object. `0` when absent.
+///
+/// # Errors
+///
+/// [`ShapeError::NotAnInteger`] when the field holds anything but an
+/// integer: a status claiming to have observed it would be a guess.
+pub fn generation_of(value: &Value) -> Result<i64, ShapeError> {
+    GENERATION.read(value)
 }
 
 /// Borrow the live `.status` object, or a static empty object when
@@ -114,7 +119,8 @@ fn live_status(value: &Value) -> Value {
 /// existing `.status`). `desired_status` is the status object computed
 /// from the live owned children — it MUST already include
 /// `observedGeneration` set to the parent's `metadata.generation` (the
-/// shared `observed_generation_marker` helper does this).
+/// owned-children blanket reads it once through [`generation_of`] and
+/// hands it to `compute_status`).
 ///
 /// # Errors
 ///
@@ -170,15 +176,6 @@ pub async fn write_status_cas(
     Ok(StatusWriteOutcome::Written)
 }
 
-/// Build the `observedGeneration` field value from the parent's live
-/// `metadata.generation` — every workload status carries this so
-/// consumers (and the controller's own idempotent-skip) can tell whether
-/// the status reflects the current spec-intent.
-#[must_use]
-pub fn observed_generation(parent: &Value) -> i64 {
-    generation_of(parent)
-}
-
 /// True iff `pod` reports a `status.conditions[type=Ready,status=True]`.
 /// The shared readiness predicate for the replica-counting controllers.
 #[must_use]
@@ -216,8 +213,24 @@ mod tests {
 
     #[test]
     fn generation_reads_metadata_field() {
-        assert_eq!(generation_of(&json!({"metadata": {"generation": 3}})), 3);
-        assert_eq!(generation_of(&json!({"metadata": {}})), 0);
+        assert_eq!(
+            generation_of(&json!({"metadata": {"generation": 3}})),
+            Ok(3)
+        );
+        assert_eq!(generation_of(&json!({"metadata": {}})), Ok(0));
+    }
+
+    /// A generation that is not an integer is not generation 0: a status
+    /// stamped `observedGeneration: 0` from it would claim to have
+    /// observed a spec revision nobody can name.
+    #[test]
+    fn a_malformed_generation_is_an_error_not_zero() {
+        assert_eq!(
+            generation_of(&json!({"metadata": {"generation": "3"}}))
+                .unwrap_err()
+                .to_string(),
+            "metadata.generation is not an integer (found a string)"
+        );
     }
 
     #[test]

@@ -54,17 +54,28 @@ use serde_json::{Value, json};
 use crate::controller::{Controller, ReconcileOutcome};
 use crate::error::ControllerError;
 use crate::event_recorder::Reason as EventReason;
-use crate::meta::{ObjectMeta, ShapeError, object_mut};
+use crate::meta::{DefaultedInt, ObjectMeta, ShapeError, int_at, object_mut};
 use crate::owned_children::{
     ChildKind, OwnedChildrenReconciler, ParentGvk, ReconcileDelta, pod_from_template,
     template_object_mut,
 };
 use crate::owner::{OwnerReference, owner_ref_for, set_owner_reference};
-use crate::status::observed_generation;
 use crate::sweep::{ObjectOutcome, Sweep, impl_sweep_event_sink};
 
 /// Where a `CronJob`'s job labels are declared.
 const JOB_TEMPLATE_LABELS: &[&str] = &["spec", "jobTemplate", "metadata", "labels"];
+
+/// `batch/v1` `spec.completions`. Upstream leaves it unset (a work queue)
+/// when only `parallelism` is given; engenho reads an absent count as 1,
+/// the value upstream defaults it to when both are unset.
+pub const COMPLETIONS: DefaultedInt = DefaultedInt::new(&["spec", "completions"], 1);
+
+/// `batch/v1` `spec.parallelism`, defaulted to 1.
+pub const PARALLELISM: DefaultedInt = DefaultedInt::new(&["spec", "parallelism"], 1);
+
+/// `batch/v1` `CronJob` `spec.startingDeadlineSeconds`: absent means no
+/// deadline, so it has no default to read as.
+const STARTING_DEADLINE_SECONDS: &[&str] = &["spec", "startingDeadlineSeconds"];
 
 // Clock primitives previously defined here have been consolidated to
 // engenho_substrate::relogio (Clock + WallClock + FrozenClock). The
@@ -177,11 +188,14 @@ impl OwnedChildrenReconciler for JobController {
         job_value: &Value,
         owned: &[(ResourceKey, Value)],
     ) -> Result<ReconcileDelta, ControllerError> {
+        // A count that is not an integer fails this Job (an Event on it)
+        // with no pod created — never the default's count. Read before
+        // any early return, so `compute_status` never meets one.
+        let completions = COMPLETIONS.read(job_value)?.max(0) as usize;
+        let parallelism = PARALLELISM.read(job_value)?.max(0) as usize;
         let Some(owner_ref) = owner_ref_for(job_value, "batch/v1", "Job") else {
             return Ok(ReconcileDelta::none());
         };
-        let completions = job_value.spec_i64("completions", 1).max(0) as usize;
-        let parallelism = job_value.spec_i64("parallelism", 1).max(0) as usize;
         let ns = self.namespace.as_deref();
         let pod_ns = ns.unwrap_or("default");
 
@@ -247,10 +261,17 @@ impl OwnedChildrenReconciler for JobController {
         &self,
         job_value: &Value,
         owned_now: &[(ResourceKey, Value)],
+        observed_generation: i64,
     ) -> Option<Value> {
         // Computed from the LIVE owned-Pod phases AFTER the reconcile.
         // On `succeeded >= completions` set a Complete=True condition.
-        let completions = job_value.spec_i64("completions", 1).max(0) as usize;
+        // A malformed count already failed this Job in `reconcile_one`
+        // (with its Event), so the blanket never gets here with one; no
+        // status is written from a count nobody declared.
+        let Ok(completions) = COMPLETIONS.read(job_value) else {
+            return None;
+        };
+        let completions = completions.max(0) as usize;
         let succeeded_now = owned_now
             .iter()
             .filter(|(_, p)| Self::pod_phase_is(p, "Succeeded"))
@@ -269,7 +290,7 @@ impl OwnedChildrenReconciler for JobController {
             "active": i64::try_from(active_now).unwrap_or(i64::MAX),
             "succeeded": i64::try_from(succeeded_now).unwrap_or(i64::MAX),
             "failed": i64::try_from(failed_now).unwrap_or(i64::MAX),
-            "observedGeneration": observed_generation(job_value),
+            "observedGeneration": observed_generation,
         });
         if succeeded_now >= completions {
             desired_status["conditions"] = json!([{
@@ -507,11 +528,9 @@ impl CronJobController {
 
         // startingDeadlineSeconds: a due time older than the deadline is
         // "missed" — record the skip (advance lastScheduleTime) + no Job.
-        if let Some(deadline) = cj_value
-            .get("spec")
-            .and_then(|s| s.get("startingDeadlineSeconds"))
-            .and_then(Value::as_i64)
-        {
+        // A deadline that is not an integer fails this CronJob (an Event
+        // on it) before anything is written — never "no deadline".
+        if let Some(deadline) = int_at(cj_value, STARTING_DEADLINE_SECONDS)? {
             let deadline = u64::try_from(deadline.max(0)).unwrap_or(0);
             if now.saturating_sub(due) > deadline {
                 self.patch_last_schedule(cj_key, due, None).await?;
@@ -700,19 +719,19 @@ mod tests {
     #[test]
     fn job_completions_defaults_to_1() {
         let j = json!({"spec": {}});
-        assert_eq!(j.spec_i64("completions", 1), 1);
+        assert_eq!(COMPLETIONS.read(&j), Ok(1));
     }
 
     #[test]
     fn job_parallelism_defaults_to_1() {
         let j = json!({"spec": {}});
-        assert_eq!(j.spec_i64("parallelism", 1), 1);
+        assert_eq!(PARALLELISM.read(&j), Ok(1));
     }
 
     #[test]
     fn job_completions_reads_spec_field() {
         let j = json!({"spec": {"completions": 5}});
-        assert_eq!(j.spec_i64("completions", 1), 5);
+        assert_eq!(COMPLETIONS.read(&j), Ok(5));
     }
 
     #[test]
@@ -1214,6 +1233,59 @@ mod tests {
             recorded[0]
                 .message
                 .contains("spec.jobTemplate.metadata.labels is a string, expected an object"),
+            "{}",
+            recorded[0].message
+        );
+    }
+
+    // ── T1.6: an integer that is not an integer is not absent ──
+
+    /// A `startingDeadlineSeconds` of `"10"` is not "no deadline": the
+    /// `CronJob` fails with an Event naming the field and fires nothing,
+    /// while the `CronJob` after it still fires. Before T1.6 the string
+    /// read as absent and the slot fired regardless of any deadline.
+    #[tokio::test]
+    async fn a_quoted_starting_deadline_fails_that_cronjob_instead_of_dropping_the_deadline() {
+        let store = test_store("cronjob-t16").await;
+        let mut bad = cronjob_value("a-bad", "* * * * *", 0);
+        bad["spec"]["startingDeadlineSeconds"] = json!("10");
+        put(
+            &store,
+            ResourceKey::namespaced("batch", "v1", "CronJob", "default", "a-bad"),
+            bad,
+        )
+        .await;
+        put(
+            &store,
+            ResourceKey::namespaced("batch", "v1", "CronJob", "default", "b-clean"),
+            cronjob_value("b-clean", "* * * * *", 0),
+        )
+        .await;
+
+        let events = Arc::new(crate::event_recorder::CollectingEventSink::new());
+        let c = CronJobController::new(store.clone(), Arc::new(FrozenClock::at(120_000)), None)
+            .with_event_sink(events.clone());
+        let out = c
+            .tick()
+            .await
+            .expect("one malformed CronJob is not the tick's failure");
+        let sweep = out.sweep.expect("the CronJob tick runs through its sweep");
+        assert_eq!((sweep.failed(), sweep.changed()), (1, 1));
+
+        let names: Vec<String> = list_jobs(&store)
+            .await
+            .into_iter()
+            .map(|(k, _)| k.name)
+            .collect();
+        assert_eq!(names, ["b-clean-120"], "only the well-formed CronJob fired");
+
+        let recorded = events.drain();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].involved.name, "a-bad");
+        assert!(
+            recorded[0]
+                .message
+                .contains("spec.startingDeadlineSeconds is not an integer (found a string)"),
             "{}",
             recorded[0].message
         );

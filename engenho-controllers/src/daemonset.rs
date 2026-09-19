@@ -53,7 +53,7 @@ use crate::owned_children::{
     template_object_mut,
 };
 use crate::owner::{OwnerReference, owner_ref_for};
-use crate::status::{observed_generation, pod_is_ready};
+use crate::status::pod_is_ready;
 use crate::sweep::{Sweep, impl_sweep_event_sink};
 
 /// DaemonSet controller — one node-pinned Pod per schedulable node.
@@ -238,8 +238,9 @@ impl OwnedChildrenReconciler for DaemonSetController {
 
     fn compute_status(
         &self,
-        ds_value: &Value,
+        _ds_value: &Value,
         owned_now: &[(ResourceKey, Value)],
+        observed_generation: i64,
     ) -> Option<Value> {
         // Status from the LIVE owned pods AFTER the reconcile.
         //   desiredNumberScheduled = # schedulable nodes is NOT re-derived
@@ -257,7 +258,7 @@ impl OwnedChildrenReconciler for DaemonSetController {
             "numberReady": ready,
             "numberAvailable": ready,
             "updatedNumberScheduled": scheduled,
-            "observedGeneration": observed_generation(ds_value),
+            "observedGeneration": observed_generation,
         }))
     }
 }

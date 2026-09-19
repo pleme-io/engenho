@@ -66,7 +66,7 @@ use crate::create_stamp::{CreateClock, stamp_create_timestamp, wall_clock};
 use crate::error::ControllerError;
 use crate::meta::{ObjectMeta, ShapeError, object_mut};
 use crate::owner::{OwnerReference, is_owned_by, set_owner_reference};
-use crate::status::write_status_cas;
+use crate::status::{generation_of, write_status_cas};
 use crate::sweep::{ObjectOutcome, Sweep};
 
 /// The parent field a templated child is cloned from.
@@ -272,16 +272,24 @@ pub trait OwnedChildrenReconciler: Send + Sync {
     ) -> Result<ReconcileDelta, ControllerError>;
 
     /// Compute the parent's desired `.status` from the LIVE owned
-    /// children re-listed AFTER the delta committed. `None` means this
-    /// controller writes no status (none of the four owned-children
-    /// status-writers return `None`, but the surface is open for an
-    /// owned-children controller that legitimately has no status).
+    /// children re-listed AFTER the delta committed. `None` means no
+    /// status is written this pass: a controller that has no status, or
+    /// one whose inputs it cannot read (a child whose status count is
+    /// malformed) — it says so with a warning rather than aggregating a
+    /// guess.
     ///
     /// `owned_after` is the post-delta owned-children set; the status
     /// math is the per-controller logic (replica counting, phase
-    /// aggregation, …).
-    fn compute_status(&self, parent: &Value, owned_after: &[(ResourceKey, Value)])
-    -> Option<Value>;
+    /// aggregation, …). `observed_generation` is the parent's
+    /// `metadata.generation`, read once by the blanket before anything
+    /// was written for the parent; a parent whose generation is malformed
+    /// never reaches here.
+    fn compute_status(
+        &self,
+        parent: &Value,
+        owned_after: &[(ResourceKey, Value)],
+        observed_generation: i64,
+    ) -> Option<Value>;
 }
 
 /// Gather the owned children of `parent_uid` across every kind in
@@ -353,6 +361,10 @@ async fn reconcile_parent<T: OwnedChildrenReconciler + ?Sized>(
         return Ok(ObjectOutcome::SKIPPED);
     };
     let ns = parent_key.namespace.as_deref();
+    // The generation its status will claim to have observed, read before
+    // anything is written for it: a malformed one fails this parent (a
+    // Declarative Shape error — an Event on it) with nothing written.
+    let generation = generation_of(parent_value)?;
 
     // S3/S4 — gather the owned children (pre-delta) the per-parent logic
     // reconciles against. Owner-ref construction itself is the
@@ -388,7 +400,7 @@ async fn reconcile_parent<T: OwnedChildrenReconciler + ?Sized>(
     // tick's own creates/deletes. Then write the CAS status (the same
     // `write_status_cas` primitive the hand-written ticks used).
     let owned_after = gather_owned(store, child_kinds, uid, ns).await;
-    if let Some(desired_status) = this.compute_status(parent_value, &owned_after)
+    if let Some(desired_status) = this.compute_status(parent_value, &owned_after, generation)
         && write_status_cas(store, parent_key, parent_value, &desired_status)
             .await?
             .changed()
@@ -502,6 +514,7 @@ mod tests {
             &self,
             _parent: &Value,
             _owned_after: &[(ResourceKey, Value)],
+            _observed_generation: i64,
         ) -> Option<Value> {
             None
         }

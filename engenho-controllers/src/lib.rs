@@ -139,7 +139,10 @@ pub use engenho_substrate::FrozenClock;
 )]
 pub type FixedClock = engenho_substrate::FrozenClock;
 pub use curve::{Curve, Streak};
-pub use meta::{Container, FieldPath, JsonKind, ObjectMeta, ShapeError, array_mut, object_mut};
+pub use meta::{
+    Container, DefaultedInt, FieldPath, JsonKind, ObjectMeta, REPLICAS, ShapeError, array_mut,
+    int_at, object_mut,
+};
 pub use namespace::{NamespaceController, namespaced_kinds};
 pub use network_policy::{
     CiliumNetworkPolicyAdapter, Direction, FakeNetworkPolicyEnforcer, FakeNpEvent,
@@ -169,7 +172,7 @@ pub use service_router::{
 };
 pub use statefulset::StatefulSetController;
 pub use status::{
-    StatusWriteOutcome, generation_of, observed_generation, pod_is_ready, resource_version_of,
+    GENERATION, StatusWriteOutcome, generation_of, pod_is_ready, resource_version_of,
     write_status_cas,
 };
 pub use store_ledger::{DEFAULT_RECEIPT_NAMESPACE, StoreBackedLedger};

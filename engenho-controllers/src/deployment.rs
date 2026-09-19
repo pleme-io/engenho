@@ -31,11 +31,17 @@ use serde_json::{Value, json};
 
 use crate::error::ControllerError;
 use crate::event_recorder::Reason as EventReason;
-use crate::meta::ObjectMeta;
+use crate::meta::{DefaultedInt, ObjectMeta, REPLICAS, ShapeError, warn_unreadable};
 use crate::owned_children::{ChildKind, OwnedChildrenReconciler, ParentGvk, ReconcileDelta};
 use crate::owner::{owner_ref_for, set_owner_reference};
-use crate::status::observed_generation;
 use crate::sweep::{Sweep, impl_sweep_event_sink};
+
+/// The counts a `ReplicaSet`'s controller writes into its status, which a
+/// Deployment's status sums. Absent is 0: a `ReplicaSet` the controller
+/// has not reported on yet has observed no replicas.
+const RS_STATUS_REPLICAS: DefaultedInt = DefaultedInt::new(&["status", "replicas"], 0);
+const RS_STATUS_READY: DefaultedInt = DefaultedInt::new(&["status", "readyReplicas"], 0);
+const RS_STATUS_AVAILABLE: DefaultedInt = DefaultedInt::new(&["status", "availableReplicas"], 0);
 
 pub struct DeploymentController {
     store: Arc<StoreMesh>,
@@ -79,10 +85,12 @@ impl DeploymentController {
 
     /// Build a ReplicaSet object from a Deployment + chosen
     /// template hash. The RS's `spec.template` is the
-    /// Deployment's; the RS gets the deployment's labels +
+    /// Deployment's, and its `spec.replicas` is `replicas` — the
+    /// Deployment's count, already read (a malformed one never gets
+    /// here); the RS gets the deployment's labels +
     /// a `pod-template-hash` label for kubectl-rollout-friendly
     /// debugging.
-    fn build_replicaset_from(d: &Value, hash: &str) -> Option<(String, Value)> {
+    fn build_replicaset_from(d: &Value, hash: &str, replicas: i64) -> Option<(String, Value)> {
         let d_name = d.name()?;
         // The child ReplicaSet lives in the SAME namespace as its parent
         // Deployment — never the controller's scope namespace (an
@@ -93,7 +101,6 @@ impl DeploymentController {
             .namespace()
             .map_or_else(|| "default".to_string(), |c| c.to_owned());
         let template = d.get("spec").and_then(|s| s.get("template"))?.clone();
-        let replicas = d.spec_i64("replicas", 1);
         let rs_name = format!("{d_name}-{hash}");
         let value = json!({
             "kind": "ReplicaSet",
@@ -123,14 +130,18 @@ impl DeploymentController {
             .map(String::from)
     }
 
-    /// Read an i64 `status.<field>` off a ReplicaSet (the status the RS
-    /// controller wrote), defaulting to 0 — Deployment status aggregates
-    /// these across its current-template RS(es).
-    fn rs_status_field(rs: &Value, field: &str) -> i64 {
-        rs.get("status")
-            .and_then(|s| s.get(field))
-            .and_then(serde_json::Value::as_i64)
-            .unwrap_or(0)
+    /// The `(replicas, ready, available)` a `ReplicaSet`'s status reports
+    /// — Deployment status sums these across its current-template RS(es).
+    ///
+    /// # Errors
+    ///
+    /// [`ShapeError::NotAnInteger`] when one of them is not an integer.
+    fn rs_status_counts(rs: &Value) -> Result<(i64, i64, i64), ShapeError> {
+        Ok((
+            RS_STATUS_REPLICAS.read(rs)?,
+            RS_STATUS_READY.read(rs)?,
+            RS_STATUS_AVAILABLE.read(rs)?,
+        ))
     }
 }
 
@@ -166,6 +177,10 @@ impl OwnedChildrenReconciler for DeploymentController {
         d_value: &Value,
         owned_rs: &[(ResourceKey, Value)],
     ) -> Result<ReconcileDelta, ControllerError> {
+        // A `spec.replicas` that is not an integer fails this Deployment
+        // (an Event on it) with nothing created or scaled — never scaled
+        // to the default's 1.
+        let desired_replicas = REPLICAS.read(d_value)?;
         // No template / owner-ref → nothing to do this tick (the parent
         // is freshly minted; the blanket already skipped no-uid parents).
         let Some(desired_hash) = Self::template_hash(d_value) else {
@@ -176,19 +191,24 @@ impl OwnedChildrenReconciler for DeploymentController {
         };
 
         let ns = self.namespace.as_deref();
-        let desired_replicas = d_value.spec_i64("replicas", 1);
         let mut commands = Vec::new();
 
         // Scale stale RSes to 0 (revision history retained at replicas=0).
+        // An RS's absent count is the API's 1 — the count its own
+        // controller runs — so an absent one is still scaled down. An RS
+        // whose count is malformed is left alone: its controller does
+        // nothing with it either, and says so on it.
         for (rs_key, rs_value) in owned_rs {
             if Self::rs_template_hash(rs_value).as_deref() == Some(&desired_hash) {
                 continue;
             }
-            let current_replicas = rs_value
-                .get("spec")
-                .and_then(|s| s.get("replicas"))
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
+            let current_replicas = match REPLICAS.read(rs_value) {
+                Ok(n) => n,
+                Err(e) => {
+                    warn_unreadable("deployment", &rs_key.label(), &e);
+                    continue;
+                }
+            };
             if current_replicas != 0 {
                 commands.push(ResourceCommand::patch(
                     rs_key.clone(),
@@ -204,23 +224,21 @@ impl OwnedChildrenReconciler for DeploymentController {
             .iter()
             .find(|(_, r)| Self::rs_template_hash(r).as_deref() == Some(&desired_hash));
         match current {
-            Some((rs_key, rs_value)) => {
-                let current_replicas = rs_value
-                    .get("spec")
-                    .and_then(|s| s.get("replicas"))
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or(0);
-                if current_replicas != desired_replicas {
-                    commands.push(ResourceCommand::patch(
-                        rs_key.clone(),
-                        json!({"spec": {"replicas": desired_replicas}}),
-                        Reason::Controller,
-                    ));
+            Some((rs_key, rs_value)) => match REPLICAS.read(rs_value) {
+                Ok(current_replicas) => {
+                    if current_replicas != desired_replicas {
+                        commands.push(ResourceCommand::patch(
+                            rs_key.clone(),
+                            json!({"spec": {"replicas": desired_replicas}}),
+                            Reason::Controller,
+                        ));
+                    }
                 }
-            }
+                Err(e) => warn_unreadable("deployment", &rs_key.label(), &e),
+            },
             None => {
                 if let Some((rs_name, mut rs_value)) =
-                    Self::build_replicaset_from(d_value, &desired_hash)
+                    Self::build_replicaset_from(d_value, &desired_hash, desired_replicas)
                 {
                     set_owner_reference(&mut rs_value, owner_ref.clone())?;
                     // Key the RS under the PARENT Deployment's namespace —
@@ -251,34 +269,40 @@ impl OwnedChildrenReconciler for DeploymentController {
         &self,
         d_value: &Value,
         owned_rs_after: &[(ResourceKey, Value)],
+        observed_generation: i64,
     ) -> Option<Value> {
         // Aggregate over CURRENT-template owned RS(es) — read the status
         // the RS controller wrote. `replicas`/`ready`/`available` SUM
         // across every current-template owned RS; `updatedReplicas` ==
         // current-template RS replica count (single template at M0.1, so
-        // it equals `replicas`). Source of truth = the live RS status.
+        // it equals `replicas`). Source of truth = the live RS status. A
+        // count that cannot be read writes no status this pass: a sum
+        // with a guessed term would be reported as observed.
         let desired_hash = Self::template_hash(d_value)?;
-        let current_rses: Vec<&Value> = owned_rs_after
+        let (mut replicas, mut ready, mut available) = (0_i64, 0_i64, 0_i64);
+        for (rs_key, rs) in owned_rs_after
             .iter()
             .filter(|(_, r)| Self::rs_template_hash(r).as_deref() == Some(&desired_hash))
-            .map(|(_, r)| r)
-            .collect();
-        let sum = |field: &str| -> i64 {
-            current_rses
-                .iter()
-                .map(|r| Self::rs_status_field(r, field))
-                .sum()
-        };
-        let replicas = sum("replicas");
-        let ready = sum("readyReplicas");
-        let available = sum("availableReplicas");
+        {
+            match Self::rs_status_counts(rs) {
+                Ok((r, rd, av)) => {
+                    replicas = replicas.saturating_add(r);
+                    ready = ready.saturating_add(rd);
+                    available = available.saturating_add(av);
+                }
+                Err(e) => {
+                    warn_unreadable("deployment", &rs_key.label(), &e);
+                    return None;
+                }
+            }
+        }
         let updated = replicas;
         Some(json!({
             "replicas": replicas,
             "readyReplicas": ready,
             "availableReplicas": available,
             "updatedReplicas": updated,
-            "observedGeneration": observed_generation(d_value),
+            "observedGeneration": observed_generation,
         }))
     }
 }
@@ -331,7 +355,9 @@ mod tests {
                 "template": {"metadata": {"labels": {"app": "podinfo"}}, "spec": {}}
             }
         });
-        let (name, rs) = DeploymentController::build_replicaset_from(&d, "abcdef").unwrap();
+        let (name, rs) =
+            DeploymentController::build_replicaset_from(&d, "abcdef", REPLICAS.read(&d).unwrap())
+                .unwrap();
         assert_eq!(name, "podinfo-abcdef");
         assert_eq!(rs.get("spec").unwrap().get("replicas").unwrap(), 5);
         let selector = rs.get("spec").unwrap().get("selector").unwrap();
@@ -376,7 +402,9 @@ mod tests {
                 }
             }
         });
-        let (rs_name, rs) = DeploymentController::build_replicaset_from(&d, "hash01").unwrap();
+        let (rs_name, rs) =
+            DeploymentController::build_replicaset_from(&d, "hash01", REPLICAS.read(&d).unwrap())
+                .unwrap();
         assert_eq!(rs_name, "web-hash01");
         assert_eq!(
             rs.get("metadata").unwrap().get("namespace").unwrap(),
@@ -391,7 +419,7 @@ mod tests {
             "metadata": {"name": "web"},
             "spec": {"replicas": 1, "selector": {}, "template": {"spec": {"containers": []}}}
         });
-        let (_, rs) = DeploymentController::build_replicaset_from(&d, "h").unwrap();
+        let (_, rs) = DeploymentController::build_replicaset_from(&d, "h", 1).unwrap();
         assert_eq!(
             rs.get("metadata").unwrap().get("namespace").unwrap(),
             "default"

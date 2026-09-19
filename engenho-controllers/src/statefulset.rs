@@ -33,11 +33,11 @@ use tracing::debug;
 use crate::error::ControllerError;
 use crate::event_recorder::Reason as EventReason;
 use crate::meta::ObjectMeta;
-use crate::meta::{ShapeError, array_mut};
+use crate::meta::{REPLICAS, ShapeError, array_mut};
 use crate::owned_children::{ChildKind, OwnedChildrenReconciler, ParentGvk, ReconcileDelta};
 use crate::owned_children::{TEMPLATE, pod_from_template};
 use crate::owner::{OwnerReference, owner_ref_for};
-use crate::status::{observed_generation, pod_is_ready};
+use crate::status::pod_is_ready;
 use crate::sweep::{Sweep, impl_sweep_event_sink};
 
 /// Where a pod's volumes live.
@@ -282,6 +282,9 @@ impl OwnedChildrenReconciler for StatefulSetController {
         sts_value: &Value,
         owned: &[(ResourceKey, Value)],
     ) -> Result<ReconcileDelta, ControllerError> {
+        // Malformed `spec.replicas` → this StatefulSet fails (an Event on
+        // it) with no pod created or removed.
+        let desired = REPLICAS.read(sts_value)?.max(0) as usize;
         // No name / owner-ref → no-op (parent freshly minted; blanket
         // already skipped no-uid parents).
         let Some(sts_name) = sts_value.name() else {
@@ -290,8 +293,6 @@ impl OwnedChildrenReconciler for StatefulSetController {
         let Some(owner_ref) = owner_ref_for(sts_value, "apps/v1", "StatefulSet") else {
             return Ok(ReconcileDelta::none());
         };
-
-        let desired = sts_value.spec_i64("replicas", 1).max(0) as usize;
         // Pods go in the StatefulSet's OWN namespace (where owned-pod
         // gathering looks), not the controller scope ns — same fix as
         // deployment→RS and replicaset→pod. Keying under the scope ns
@@ -386,8 +387,9 @@ impl OwnedChildrenReconciler for StatefulSetController {
 
     fn compute_status(
         &self,
-        sts_value: &Value,
+        _sts_value: &Value,
         owned_now: &[(ResourceKey, Value)],
+        observed_generation: i64,
     ) -> Option<Value> {
         // Computed from the LIVE owned pods after the reconcile.
         // `replicas` = owned pod count; `readyReplicas`/`availableReplicas`
@@ -402,7 +404,7 @@ impl OwnedChildrenReconciler for StatefulSetController {
             "availableReplicas": ready,
             "updatedReplicas": replicas,
             "currentReplicas": replicas,
-            "observedGeneration": observed_generation(sts_value),
+            "observedGeneration": observed_generation,
         }))
     }
 }
@@ -436,13 +438,13 @@ mod tests {
     #[test]
     fn replicas_defaults_to_1() {
         let sts = json!({"metadata": {"name": "x"}, "spec": {}});
-        assert_eq!(sts.spec_i64("replicas", 1), 1);
+        assert_eq!(REPLICAS.read(&sts), Ok(1));
     }
 
     #[test]
     fn replicas_reads_spec_field() {
         let sts = json!({"spec": {"replicas": 3}});
-        assert_eq!(sts.spec_i64("replicas", 1), 3);
+        assert_eq!(REPLICAS.read(&sts), Ok(3));
     }
 
     #[test]

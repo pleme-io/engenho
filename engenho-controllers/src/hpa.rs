@@ -38,6 +38,13 @@ use tracing::debug;
 
 use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
 use crate::error::ControllerError;
+use crate::meta::{DefaultedInt, REPLICAS, warn_unreadable};
+
+/// `autoscaling/v2` `spec.minReplicas`, defaulted to 1.
+const MIN_REPLICAS: DefaultedInt = DefaultedInt::new(&["spec", "minReplicas"], 1);
+
+/// `spec.maxReplicas` is required upstream; an absent one reads as 1 here.
+const MAX_REPLICAS: DefaultedInt = DefaultedInt::new(&["spec", "maxReplicas"], 1);
 
 /// Metrics-provider error.
 #[derive(Debug, Clone, Error)]
@@ -145,20 +152,6 @@ impl HorizontalPodAutoscalerController {
         }
     }
 
-    fn min_replicas(hpa: &Value) -> i64 {
-        hpa.get("spec")
-            .and_then(|s| s.get("minReplicas"))
-            .and_then(|n| n.as_i64())
-            .unwrap_or(1)
-    }
-
-    fn max_replicas(hpa: &Value) -> i64 {
-        hpa.get("spec")
-            .and_then(|s| s.get("maxReplicas"))
-            .and_then(|n| n.as_i64())
-            .unwrap_or(1)
-    }
-
     fn target_value(hpa: &Value) -> f64 {
         hpa.get("spec")
             .and_then(|s| s.get("targetValue"))
@@ -230,8 +223,16 @@ impl Controller for HorizontalPodAutoscalerController {
                 .as_deref()
                 .unwrap_or("default")
                 .to_string();
-            let min = Self::min_replicas(hpa_value);
-            let max = Self::max_replicas(hpa_value);
+            // A bound that is not an integer leaves this HPA's target
+            // alone this pass — never clamped by a default nobody declared.
+            let (min, max) = match (MIN_REPLICAS.read(hpa_value), MAX_REPLICAS.read(hpa_value)) {
+                (Ok(min), Ok(max)) => (min, max),
+                (Err(e), _) | (_, Err(e)) => {
+                    warn_unreadable("hpa", &hpa_key.label(), &e);
+                    report.objects_skipped += 1;
+                    continue;
+                }
+            };
             let target_value = Self::target_value(hpa_value);
 
             let (g, v) = Self::target_gv(&target_kind);
@@ -240,11 +241,14 @@ impl Controller for HorizontalPodAutoscalerController {
                 report.objects_skipped += 1;
                 continue;
             };
-            let current = target
-                .get("spec")
-                .and_then(|s| s.get("replicas"))
-                .and_then(|r| r.as_i64())
-                .unwrap_or(1);
+            let current = match REPLICAS.read(&target) {
+                Ok(current) => current,
+                Err(e) => {
+                    warn_unreadable("hpa", &target_key.label(), &e);
+                    report.objects_skipped += 1;
+                    continue;
+                }
+            };
 
             let observed = match self
                 .metrics
@@ -297,17 +301,25 @@ mod tests {
 
     #[test]
     fn min_replicas_defaults_to_1() {
-        assert_eq!(
-            HorizontalPodAutoscalerController::min_replicas(&json!({})),
-            1
-        );
+        assert_eq!(MIN_REPLICAS.read(&json!({})), Ok(1));
     }
 
     #[test]
     fn max_replicas_defaults_to_1() {
-        assert_eq!(
-            HorizontalPodAutoscalerController::max_replicas(&json!({})),
-            1
+        assert_eq!(MAX_REPLICAS.read(&json!({})), Ok(1));
+    }
+
+    #[test]
+    fn a_malformed_bound_is_an_error_not_the_default() {
+        assert!(
+            MIN_REPLICAS
+                .read(&json!({"spec": {"minReplicas": "2"}}))
+                .is_err()
+        );
+        assert!(
+            MAX_REPLICAS
+                .read(&json!({"spec": {"maxReplicas": 9.5}}))
+                .is_err()
         );
     }
 

@@ -39,7 +39,9 @@ use serde_json::{Value, json};
 
 use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
 use crate::error::ControllerError;
+use crate::meta::warn_unreadable;
 use crate::selector::{matches_labels, selector_match_labels};
+use crate::status::generation_of;
 
 /// The five status numbers a PDB reconcile computes. Carrying them in
 /// one typed struct keeps the "compute" step (pure, unit-testable) and
@@ -78,16 +80,6 @@ impl PodDisruptionBudgetController {
 
     fn max_unavailable(pdb: &Value) -> Option<&Value> {
         pdb.get("spec").and_then(|s| s.get("maxUnavailable"))
-    }
-
-    /// `metadata.generation` off the stored PDB (the store stamps it on
-    /// every create/replace/patch). Absent (e.g. a hand-constructed test
-    /// object) → 0.
-    fn generation(pdb: &Value) -> i64 {
-        pdb.get("metadata")
-            .and_then(|m| m.get("generation"))
-            .and_then(serde_json::Value::as_i64)
-            .unwrap_or(0)
     }
 
     /// True iff `status.conditions` carries `type=Ready,status=True`.
@@ -213,6 +205,16 @@ impl Controller for PodDisruptionBudgetController {
                 report.objects_skipped += 1;
                 continue;
             };
+            // A generation that is not an integer leaves this PDB's status
+            // alone: `observedGeneration` would name a revision nobody can.
+            let generation = match generation_of(pdb_value) {
+                Ok(generation) => generation,
+                Err(e) => {
+                    warn_unreadable("pdb", &pdb_key.label(), &e);
+                    report.objects_skipped += 1;
+                    continue;
+                }
+            };
             let ns = pdb_key.namespace.as_deref();
             let pods = self.store.list("", "v1", "Pod", ns).await;
             let matching: Vec<&Value> = pods
@@ -233,7 +235,7 @@ impl Controller for PodDisruptionBudgetController {
                 Self::max_unavailable(pdb_value),
                 healthy,
                 total,
-                Self::generation(pdb_value),
+                generation,
             );
 
             // Idempotent: skip the patch when the live status already

@@ -7,18 +7,36 @@
 //!   * `metadata.uid`  — the object's stable identity (owner refs)
 //!   * `metadata.name` — the object's name (child naming, owner refs)
 //!   * `metadata.namespace` — scope
-//!   * `spec.<key>` as an `i64` — replica/completion/parallelism counts
 //!
 //! Before this trait each controller hand-copied byte-identical
-//! `*_uid` / `*_name` / `*_replicas` accessors. Per the Prime
-//! Directive the shape is solved ONCE here: [`ObjectMeta`] is the
-//! single accessor surface every controller consumes. Adding a new
-//! controller no longer re-derives these four accessors.
+//! `*_uid` / `*_name` accessors. Per the Prime Directive the shape is
+//! solved ONCE here: [`ObjectMeta`] is the single accessor surface every
+//! controller consumes. Adding a new controller no longer re-derives
+//! these accessors.
 //!
 //! The trait is implemented for [`serde_json::Value`] (so it is also
 //! available through any `&Value` deref); call sites read
-//! `obj.uid()` / `obj.name()` / `obj.namespace()` /
-//! `obj.spec_i64("replicas", 1)` directly.
+//! `obj.uid()` / `obj.name()` / `obj.namespace()` directly.
+//!
+//! ## Reading an integer: [`DefaultedInt`] and [`int_at`] (T1.6)
+//!
+//! A count (`spec.replicas`, `spec.completions`, `metadata.generation`)
+//! has three states — absent, an integer, or something else — and the
+//! old `spec_i64(key, default)` read the third as the first: a Deployment
+//! declaring `replicas: "3"` was scaled to one pod. Both readers go
+//! through [`engenho_types::SpecInt`] and keep the third state an error:
+//!
+//!   * [`int_at`] — `Ok(None)` absent, `Ok(Some(n))` an integer,
+//!     `Err(`[`ShapeError::NotAnInteger`]`)` anything else. For a field
+//!     whose absence means "off" (`startingDeadlineSeconds`).
+//!   * [`DefaultedInt::read`] — the same, with absence replaced by the
+//!     field's API default, declared once next to the field's path
+//!     ([`REPLICAS`]). For a count the apiserver would have defaulted.
+//!
+//! A malformed integer is a Declarative, Item-scoped [`ShapeError`]: the
+//! object it belongs to gets nothing written for it this pass and a
+//! Warning (an Event through the sweep, or [`warn_unreadable`] where
+//! there is no sweep), and every other object is reconciled as usual.
 //!
 //! ## Writing: [`object_mut`] and [`array_mut`] are total
 //!
@@ -47,6 +65,7 @@
 
 use std::fmt;
 
+use engenho_types::SpecInt;
 use serde_json::{Map, Value};
 
 /// Borrowed accessors over a K8s object's `metadata` + `spec`.
@@ -66,12 +85,6 @@ pub trait ObjectMeta {
     /// `metadata.namespace` — the object's namespace scope. `None`
     /// for cluster-scoped objects or before the field is set.
     fn namespace(&self) -> Option<&str>;
-
-    /// `spec.<key>` interpreted as an `i64`, falling back to `default`
-    /// when the field is absent or not an integer. Mirrors the
-    /// per-controller `replicas` / `desired_replicas` / `completions`
-    /// / `parallelism` accessors (each was `…unwrap_or(<default>)`).
-    fn spec_i64(&self, key: &str, default: i64) -> i64;
 }
 
 impl ObjectMeta for Value {
@@ -92,13 +105,81 @@ impl ObjectMeta for Value {
             .and_then(|m| m.get("namespace"))
             .and_then(|n| n.as_str())
     }
+}
 
-    fn spec_i64(&self, key: &str, default: i64) -> i64 {
-        self.get("spec")
-            .and_then(|s| s.get(key))
-            .and_then(serde_json::Value::as_i64)
-            .unwrap_or(default)
+/// `apps/v1` `spec.replicas` (Deployment, `ReplicaSet`, `StatefulSet`):
+/// the apiserver defaults an absent count to 1.
+pub const REPLICAS: DefaultedInt = DefaultedInt::new(&["spec", "replicas"], 1);
+
+/// An integer field whose absence means its API default.
+///
+/// The default is declared once, beside the path, so every controller
+/// reading the field applies the same one; the old `spec_i64(key,
+/// default)` took the default at each call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefaultedInt {
+    path: &'static [&'static str],
+    absent: i64,
+}
+
+impl DefaultedInt {
+    /// The field at `path`, reading as `absent` when missing or `null`.
+    #[must_use]
+    pub const fn new(path: &'static [&'static str], absent: i64) -> Self {
+        Self { path, absent }
     }
+
+    /// The field's path, outermost first.
+    #[must_use]
+    pub const fn path(self) -> &'static [&'static str] {
+        self.path
+    }
+
+    /// The field's value in `object`: the integer it holds, or the API
+    /// default when it is missing or `null`.
+    ///
+    /// # Errors
+    ///
+    /// [`ShapeError::NotAnInteger`] when the field holds anything else —
+    /// never the default.
+    pub fn read(self, object: &Value) -> Result<i64, ShapeError> {
+        Ok(int_at(object, self.path)?.unwrap_or(self.absent))
+    }
+}
+
+/// The integer at `path` in `object`, in its three states: `Ok(None)`
+/// when missing or `null`, `Ok(Some(n))` when it holds an integer.
+///
+/// # Errors
+///
+/// [`ShapeError::NotAnInteger`] naming `path` when the field — or a step
+/// above it that is not an object — holds anything else.
+pub fn int_at(object: &Value, path: &'static [&'static str]) -> Result<Option<i64>, ShapeError> {
+    match SpecInt::at(object, path) {
+        SpecInt::Absent => Ok(None),
+        SpecInt::Int(n) => Ok(Some(n)),
+        // `SpecInt::at` reads `null` as Absent, so a `null` here is a
+        // `SpecInt` built by hand; it means what Absent means.
+        SpecInt::Malformed(found) => JsonKind::of(found).map_or(Ok(None), |found| {
+            Err(ShapeError::NotAnInteger {
+                path: FieldPath(path.to_vec()),
+                found,
+            })
+        }),
+    }
+}
+
+/// Say that a field `object` declares cannot be read (`error` names it),
+/// so nothing is written from it this pass — the structured warning where
+/// there is no [`crate::sweep::Sweep`] to raise an Event on the object.
+pub fn warn_unreadable(controller: &'static str, object: &dyn fmt::Display, error: &ShapeError) {
+    tracing::warn!(
+        controller,
+        object = %object,
+        field = %error.path(),
+        error = %error,
+        "a field this object declares cannot be read; nothing is written from it this pass"
+    );
 }
 
 /// The container a write needs at a path.
@@ -128,6 +209,21 @@ pub enum JsonKind {
     String,
     Array,
     Object,
+}
+
+impl JsonKind {
+    /// The kind of `value`; `None` for `null`, which is never reported.
+    #[must_use]
+    pub const fn of(value: &Value) -> Option<Self> {
+        match value {
+            Value::Null => None,
+            Value::Bool(_) => Some(Self::Bool),
+            Value::Number(_) => Some(Self::Number),
+            Value::String(_) => Some(Self::String),
+            Value::Array(_) => Some(Self::Array),
+            Value::Object(_) => Some(Self::Object),
+        }
+    }
 }
 
 impl fmt::Display for JsonKind {
@@ -174,7 +270,8 @@ impl fmt::Display for FieldPath {
     }
 }
 
-/// A stored object does not have the shape a write needs.
+/// A stored object does not have the shape a controller needs: a write
+/// needs a container, or a read needs an integer.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ShapeError {
     /// `path` holds `found` where `expected` is required.
@@ -184,6 +281,11 @@ pub enum ShapeError {
         expected: Container,
         found: JsonKind,
     },
+    /// `path` cannot be read as an integer: `found` stands there, or at a
+    /// step above it that is not an object. `a number` here is one with a
+    /// fraction or beyond the `i64` range.
+    #[error("{path} is not an integer (found {found})")]
+    NotAnInteger { path: FieldPath, found: JsonKind },
 }
 
 impl ShapeError {
@@ -191,14 +293,20 @@ impl ShapeError {
     /// the one at `prefix` in the object the operator declared.
     #[must_use]
     pub fn under(self, prefix: &'static [&'static str]) -> Self {
+        let anchor =
+            |path: FieldPath| FieldPath(prefix.iter().chain(path.segments()).copied().collect());
         match self {
             Self::Wrong {
                 path,
                 expected,
                 found,
             } => Self::Wrong {
-                path: FieldPath(prefix.iter().chain(path.segments()).copied().collect()),
+                path: anchor(path),
                 expected,
+                found,
+            },
+            Self::NotAnInteger { path, found } => Self::NotAnInteger {
+                path: anchor(path),
                 found,
             },
         }
@@ -208,7 +316,7 @@ impl ShapeError {
     #[must_use]
     pub fn path(&self) -> &FieldPath {
         match self {
-            Self::Wrong { path, .. } => path,
+            Self::Wrong { path, .. } | Self::NotAnInteger { path, .. } => path,
         }
     }
 
@@ -463,27 +571,95 @@ mod tests {
     }
 
     #[test]
-    fn spec_i64_reads_value() {
+    fn a_declared_integer_is_read() {
         let obj = json!({"spec": {"replicas": 3}});
-        assert_eq!(obj.spec_i64("replicas", 1), 3);
+        assert_eq!(REPLICAS.read(&obj), Ok(3));
+        assert_eq!(int_at(&obj, &["spec", "replicas"]), Ok(Some(3)));
+        assert_eq!(REPLICAS.read(&json!({"spec": {"replicas": 0}})), Ok(0));
     }
 
     #[test]
-    fn spec_i64_falls_back_when_absent() {
-        let obj = json!({"spec": {}});
-        assert_eq!(obj.spec_i64("replicas", 1), 1);
-        let obj = json!({"metadata": {}});
-        assert_eq!(obj.spec_i64("completions", 7), 7);
+    fn an_absent_or_null_integer_is_the_api_default() {
+        for obj in [
+            json!({"spec": {}}),
+            json!({"spec": {"replicas": null}}),
+            json!({"spec": null}),
+            json!({"metadata": {}}),
+        ] {
+            assert_eq!(REPLICAS.read(&obj), Ok(1), "{obj}");
+            assert_eq!(int_at(&obj, REPLICAS.path()), Ok(None), "{obj}");
+        }
+        let seven = DefaultedInt::new(&["spec", "completions"], 7);
+        assert_eq!(seven.read(&json!({"spec": {}})), Ok(7));
+    }
+
+    /// T1.6 — `"3"` is not absent and is not 1. The old `spec_i64` read it
+    /// as the default and a Deployment declaring it was scaled to one pod.
+    #[test]
+    fn a_quoted_integer_is_an_error_naming_the_field_not_the_default() {
+        let obj = json!({"spec": {"replicas": "3"}});
+        let err = REPLICAS.read(&obj).unwrap_err();
+        assert_eq!(
+            err,
+            ShapeError::NotAnInteger {
+                path: FieldPath(vec!["spec", "replicas"]),
+                found: JsonKind::String,
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "spec.replicas is not an integer (found a string)"
+        );
+        assert_eq!(int_at(&obj, REPLICAS.path()), Err(err));
     }
 
     #[test]
-    fn spec_i64_falls_back_when_not_integer() {
-        // A non-integer (string / float) yields the default, matching
-        // the per-controller `as_i64().unwrap_or(default)` behavior.
-        let obj = json!({"spec": {"replicas": "two"}});
-        assert_eq!(obj.spec_i64("replicas", 1), 1);
-        let obj = json!({"spec": {"parallelism": 2.5}});
-        assert_eq!(obj.spec_i64("parallelism", 1), 1);
+    fn every_non_integer_is_an_error_never_a_value() {
+        for (value, found) in [
+            (json!("two"), JsonKind::String),
+            (json!(2.5), JsonKind::Number),
+            (json!(3.0), JsonKind::Number),
+            (json!(u64::MAX), JsonKind::Number),
+            (json!(true), JsonKind::Bool),
+            (json!([3]), JsonKind::Array),
+            (json!({"n": 3}), JsonKind::Object),
+        ] {
+            let obj = json!({"spec": {"replicas": value}});
+            assert!(
+                matches!(
+                    REPLICAS.read(&obj),
+                    Err(ShapeError::NotAnInteger { found: f, .. }) if f == found
+                ),
+                "{obj}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_object_above_the_integer_is_an_error_too() {
+        let obj = json!({"spec": "oops"});
+        assert_eq!(
+            REPLICAS.read(&obj).unwrap_err().to_string(),
+            "spec.replicas is not an integer (found a string)"
+        );
+    }
+
+    #[test]
+    fn null_has_no_reported_kind() {
+        assert_eq!(JsonKind::of(&Value::Null), None);
+        assert_eq!(JsonKind::of(&json!(1)), Some(JsonKind::Number));
+    }
+
+    #[test]
+    fn not_an_integer_re_anchors_under_a_parent() {
+        let err = REPLICAS
+            .read(&json!({"spec": {"replicas": "3"}}))
+            .unwrap_err()
+            .under(&["spec", "template"]);
+        assert_eq!(
+            err.path().segments(),
+            ["spec", "template", "spec", "replicas"]
+        );
     }
 
     #[test]

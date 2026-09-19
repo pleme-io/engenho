@@ -69,11 +69,13 @@ pub mod nomad_v1;
 pub mod openapi_v3;
 pub mod patch;
 pub mod primitives;
+pub mod spec_int;
 pub mod time;
 pub mod translator;
 pub mod watch;
 
 pub use consistency_tier::{CONSISTENCY_TIER_ANNOTATION, ConsistencyTier, tier_from_metadata};
+pub use spec_int::SpecInt;
 
 /// The single Kubernetes API surface version this engenho build vendors,
 /// as a `vMAJOR.MINOR.PATCH` string. EVERY surface that reports a
