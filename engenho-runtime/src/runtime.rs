@@ -433,7 +433,17 @@ impl Runtime {
 
     /// Graceful shutdown, one [`ShutdownStage`] at a time: abort + await
     /// every child task, stop the apiserver (2s grace), quiesce the store's
-    /// own background tasks, then take sole ownership and terminate it.
+    /// own background tasks, flush its durable image, then take sole
+    /// ownership and terminate it.
+    ///
+    /// The flush runs while the store is still behind the `Arc`, before the
+    /// unwrap: once it returns, the next boot replays nothing applied before
+    /// it, even if a leaked clone then makes the unwrap fail and `terminate`
+    /// never runs. `terminate` flushes again after `Raft::shutdown`, which
+    /// catches an entry a driver had in flight when it was aborted and that
+    /// raft applied after the first flush. Not covered: an entry openraft's
+    /// state-machine worker applies after that second flush (the worker is
+    /// not joined); it is durable in the log and replayed on the next boot.
     ///
     /// `terminate` consumes [`StoreMesh`] and requires the SOLE strong
     /// `Arc` ref. The child tasks + apiserver handlers each hold a
@@ -452,6 +462,9 @@ impl Runtime {
     /// # Errors
     ///
     /// [`RuntimeError::Server`] on apiserver shutdown failure,
+    /// [`RuntimeError::Store`] if the flush cannot write the durable image
+    /// (the stop ends there: the store is not terminated, and the log still
+    /// holds every applied entry for the next boot to replay),
     /// [`RuntimeError::StoreStillShared`] if a store clone leaked past
     /// shutdown, or [`RuntimeError::Store`] on `terminate` failure.
     pub async fn shutdown(self) -> Result<(), RuntimeError> {
@@ -485,10 +498,21 @@ impl Runtime {
                 "a store background task had panicked before shutdown stopped it"
             );
         }
+        let store_quiesced = Arc::strong_count(&store);
+
+        // Bring the durable image up to the applied state while the store is
+        // still behind the Arc, so the durability of this stop does not
+        // depend on the unwrap below succeeding. Nothing new is proposed any
+        // more (the drivers and the apiserver are gone, the pump is stopped);
+        // an entry already in flight may still land, and terminate's own
+        // flush catches it.
+        let flushed = store.flush().await?;
+        info!(?flushed, "store flushed at shutdown");
         let counts = StrongCounts {
             drivers_awaited,
             apiserver_stopped,
-            store_quiesced: Arc::strong_count(&store),
+            store_quiesced,
+            store_flushed: Arc::strong_count(&store),
         };
 
         // Now the Runtime should hold the only strong ref. Take it.
@@ -501,7 +525,8 @@ impl Runtime {
                 after_drivers_awaited = counts.after(ShutdownStage::DriversAwaited),
                 after_apiserver_stopped = counts.after(ShutdownStage::ApiserverStopped),
                 after_store_quiesced = counts.after(ShutdownStage::StoreQuiesced),
-                "store still shared at shutdown; strong count after each stage"
+                after_store_flushed = counts.after(ShutdownStage::StoreFlushed),
+                "store still shared at shutdown (already flushed); strong count after each stage"
             );
             RuntimeError::StoreStillShared {
                 strong_count,

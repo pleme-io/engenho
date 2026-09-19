@@ -2,8 +2,10 @@
 //! store was still shared.
 //!
 //! The stages, in order: every child awaited, the apiserver stopped, the
-//! store's own background tasks quiesced, then `Arc::try_unwrap` +
-//! `terminate`. These tests pin, through the public surface only:
+//! store's own background tasks quiesced, the store flushed, then
+//! `Arc::try_unwrap` + `terminate`. (What the flush leaves on disk is pinned
+//! by `tests/clean_stop_restart.rs`, on a durable node.) These tests pin,
+//! through the public surface only:
 //!
 //!   * a store clone that outlives the apiserver's stop is reported as
 //!     `StoreStillShared { strong_count: 2, after: ApiserverStopped }`: the
