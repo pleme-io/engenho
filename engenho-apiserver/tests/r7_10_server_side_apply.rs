@@ -1,9 +1,9 @@
 //! R7.10 server-side-apply integration tests — `application/apply-patch+yaml`
 //! routes through the real apiserver → `decode_patch` (Apply) +
-//! `?fieldManager=`/`?force=` extraction → `ResourceCommand::apply_ssa` →
-//! the store's `apply_ssa` interpreter (managedFields ownership + conflict
-//! detection + force + field-removal, reusing the strategic associative-list
-//! merge). Pins the full SSA surface end-to-end against a live `StoreMesh`:
+//! `?fieldManager=`/`?force=` extraction → the one write pipeline, which runs
+//! the store's pure `apply_ssa` interpreter (managedFields ownership +
+//! conflict detection + force + field-removal, reusing the strategic
+//! associative-list merge) and commits the result by compare-and-swap. Pins the full SSA surface end-to-end against a live `StoreMesh`:
 //!
 //!   1. APPLY CREATES + records ownership (managedFields).
 //!   2. RE-APPLY updates (same manager, no conflict).

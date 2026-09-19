@@ -65,8 +65,9 @@
 //! end of that branch, not a path a client is expected to meet. How the
 //! clients handle it (client-go's reflector backs off on a watch 429 and
 //! re-watches; kube-rs's watcher surfaces it as an error and re-watches when
-//! the stream closes) is read from their source and not yet pinned by a
-//! ported client table (T0.7).
+//! the stream closes) is pinned against upstream's `watch-429-clients` table
+//! in `tests/oracle_watch_429.rs`, which also checks that the revision both
+//! clients retry at is one engenho serves.
 //!
 //! ## What is sealed, and how
 //!
@@ -148,6 +149,19 @@ impl WatchProgress {
     #[must_use]
     pub fn bookmarks(&self) -> bool {
         self.bookmarks
+    }
+
+    /// Whether a store bookmark at `rev` goes to the client: only when it
+    /// asked for bookmarks, and only past the revision the watch started
+    /// from. A bookmark at the start moves the client nowhere, and
+    /// kube-apiserver's cacher drops it for that reason
+    /// (`cacheWatcher.process` sends only `event.ResourceVersion >
+    /// resourceVersion`). The store sends its first heartbeat at its
+    /// current revision even when that is where the watch opened; this is
+    /// where the router stops it.
+    #[must_use]
+    pub fn forwards_bookmark(&self, rev: Revision) -> bool {
+        self.bookmarks && rev > self.start
     }
 
     /// Record that a line carrying `rev` (an event or a bookmark) went to the
@@ -497,6 +511,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Upstream's `cacheWatcher.process` forwards a bookmark only past the
+    /// watch's start (oracle row
+    /// `bookmark.rv_equal_to_watcher_rv_is_dropped_for_plain_watch`).
+    #[test]
+    fn a_bookmark_is_forwarded_only_past_the_start_and_only_when_asked_for() {
+        let asked = WatchProgress::new(Revision(10), true);
+        assert!(!asked.forwards_bookmark(Revision(9)));
+        assert!(
+            !asked.forwards_bookmark(Revision(10)),
+            "a bookmark at the start moves the client nowhere"
+        );
+        assert!(asked.forwards_bookmark(Revision(11)));
+        let not_asked = WatchProgress::new(Revision(10), false);
+        assert!(!not_asked.forwards_bookmark(Revision(11)));
     }
 
     #[test]

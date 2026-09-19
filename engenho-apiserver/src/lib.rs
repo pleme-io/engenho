@@ -30,6 +30,7 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+pub mod accept;
 pub mod audit;
 pub mod authn;
 pub mod authz;
@@ -37,19 +38,24 @@ pub mod coords;
 pub mod defaulting;
 pub mod discovery;
 pub mod error;
+pub mod field_validation;
 pub mod handler;
 pub mod health;
+pub mod list_floor;
 pub mod metrics;
+pub mod object_body;
 pub mod openapi;
 pub mod params;
 pub mod pki;
 pub mod pod_logs;
+pub mod proto_transcode;
 pub mod router;
 pub mod sa_token;
 pub mod scale;
 pub mod schema_validation;
 pub mod server;
 pub mod table;
+pub mod typed_decode;
 pub mod validation;
 pub mod watch_end;
 pub mod watch_start;
@@ -80,9 +86,11 @@ pub use health::{ChildLiveness, DrainState, LivenessSource, VersionInfo};
 pub use metrics::{
     LastTick, MetricsSnapshot, MetricsSource, ObjectCount, ReconcileCount, ReconcileResult,
 };
+pub use object_body::{FieldPath, JsonKind, MetaShapeError, ObjectBody};
 pub use openapi::ApiDoc;
 pub use params::{
-    ListWatchParams, ResumePoint, Selectors, body_precondition, bookmark_line, gvk_ns_matches,
+    InitialEvents, InvalidListOptions, ListWatchParams, OptionViolation, ResumePoint, Selectors,
+    TooLargeResourceVersion, ViolationKind, body_precondition, bookmark_line, gvk_ns_matches,
     status_410_line, to_k8s_watch_line,
 };
 pub use pki::{
@@ -93,7 +101,8 @@ pub use pki::{
 pub use pod_logs::{LogQuery, PodLogReader};
 pub use router::{RouterState, build};
 pub use scale::{
-    Scale, ScaleMeta, ScaleSpec, ScaleStatus, label_selector_to_string, project_scale,
+    Scale, ScaleMeta, ScaleSpec, ScaleStatus, UnprojectableScale, label_selector_to_string,
+    project_scale,
 };
 pub use server::{ApiServer, ServerError};
 pub use watch_end::{

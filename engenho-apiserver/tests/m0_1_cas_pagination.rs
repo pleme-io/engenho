@@ -115,9 +115,10 @@ async fn cas_put_current_rv_succeeds_stale_conflicts_absent_unconditional() {
     // A. PUT (via PATCH route, since we have no PUT route; the K8s PUT
     // semantics for update map onto our merge Patch with the inbound rv).
     // PATCH with metadata.resourceVersion = N → 200 + new rv > N.
+    // A real Pod field: a PodSpec has no `image` (T4.6 drops an unknown
+    // field, so a patch of one changes nothing and advances no revision).
     let patch_ok = serde_json::json!({
-        "metadata": { "resourceVersion": n },
-        "spec": { "image": "v2" }
+        "metadata": { "resourceVersion": n, "labels": { "image": "v2" } }
     });
     let resp = client
         .patch(format!(
@@ -140,8 +141,7 @@ async fn cas_put_current_rv_succeeds_stale_conflicts_absent_unconditional() {
     // B. Re-PATCH with the STALE N → 409, reason "Conflict"; object
     // UNCHANGED (still at n2).
     let patch_stale = serde_json::json!({
-        "metadata": { "resourceVersion": n },
-        "spec": { "image": "v3" }
+        "metadata": { "resourceVersion": n, "labels": { "image": "v3" } }
     });
     let resp = client
         .patch(format!(
@@ -170,10 +170,10 @@ async fn cas_put_current_rv_succeeds_stale_conflicts_absent_unconditional() {
         .await
         .unwrap();
     assert_eq!(rv_of(&got), n2, "object unchanged after conflict");
-    assert_eq!(got.get("spec").unwrap().get("image").unwrap(), "v2");
+    assert_eq!(got["metadata"]["labels"]["image"], "v2");
 
     // C. PATCH with NO resourceVersion → unconditional success.
-    let patch_uncond = serde_json::json!({ "spec": { "image": "v4" } });
+    let patch_uncond = serde_json::json!({ "metadata": { "labels": { "image": "v4" } } });
     let resp = client
         .patch(format!(
             "http://{addr}/api/v1/namespaces/default/pods/cas-pod"
@@ -188,7 +188,7 @@ async fn cas_put_current_rv_succeeds_stale_conflicts_absent_unconditional() {
         "no-rv PATCH is unconditional"
     );
     let v: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(v.get("spec").unwrap().get("image").unwrap(), "v4");
+    assert_eq!(v["metadata"]["labels"]["image"], "v4");
 
     server.shutdown().await.unwrap();
 }

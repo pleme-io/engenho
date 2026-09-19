@@ -379,42 +379,24 @@ impl RequestTarget {
     }
 }
 
-/// Percent-decode a request path, once. Each `%XX` (two hex digits, either
-/// case) becomes that byte; anything else, including a malformed or truncated
-/// `%`, is kept as it is, and `+` stays `+` (it is a space only in a form
-/// body). These are the semantics of `percent_encoding::percent_decode_str`,
-/// the decoder axum's `Path` extractor uses, so every path dispatch used to
-/// decode decodes the same way here.
+/// Percent-decode a request path, once, with the decoder axum's `Path`
+/// extractor uses: `percent_encoding::percent_decode`, then a strict UTF-8
+/// check. Each `%XX` (two hex digits, either case) becomes that byte;
+/// anything else, including a malformed or truncated `%`, is kept as it is,
+/// and `+` stays `+` (it is a space only in a form body).
+///
+/// It is the same crate function, not a copy of its rules, so the path authz
+/// classifies and the path a `Path` extractor dispatches on (discovery's
+/// `/apis/{group}/{version}`) cannot decode differently.
 ///
 /// # Errors
 ///
 /// [`RequestInfoError::PathNotUtf8`] when the decoded bytes are not UTF-8.
 fn percent_decode_path(path: &str) -> Result<String, RequestInfoError> {
-    let mut out = Vec::with_capacity(path.len());
-    let mut rest = path.as_bytes();
-    while let Some((&byte, tail)) = rest.split_first() {
-        if byte == b'%'
-            && let [hi, lo, after @ ..] = tail
-            && let (Some(hi), Some(lo)) = (hex_value(*hi), hex_value(*lo))
-        {
-            out.push((hi << 4) | lo);
-            rest = after;
-            continue;
-        }
-        out.push(byte);
-        rest = tail;
-    }
-    String::from_utf8(out).map_err(|_| RequestInfoError::PathNotUtf8)
-}
-
-/// The value of one ASCII hex digit.
-fn hex_value(digit: u8) -> Option<u8> {
-    match digit {
-        b'0'..=b'9' => Some(digit - b'0'),
-        b'a'..=b'f' => Some(digit - b'a' + 10),
-        b'A'..=b'F' => Some(digit - b'A' + 10),
-        _ => None,
-    }
+    percent_encoding::percent_decode_str(path)
+        .decode_utf8()
+        .map(std::borrow::Cow::into_owned)
+        .map_err(|_| RequestInfoError::PathNotUtf8)
 }
 
 /// The request's `watch` flag, percent-decoded, read with the one truth table

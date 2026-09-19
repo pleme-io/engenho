@@ -39,6 +39,14 @@ pub struct Violation {
     pub message: String,
 }
 
+/// Upstream's cause rendering, `<field>: <message>` — the text a client
+/// shows next to the field it names.
+impl std::fmt::Display for Violation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.field, self.message)
+    }
+}
+
 impl Violation {
     fn new(field: impl Into<String>, message: impl Into<String>) -> Self {
         Self {

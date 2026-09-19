@@ -47,29 +47,41 @@ pub struct ListWatchParams {
     /// `fieldSelector=metadata.name=x,metadata.namespace=y`.
     #[serde(rename = "fieldSelector")]
     pub field_selector: Option<String>,
-    /// `allowWatchBookmarks=true` — K8s opt-in; defaults to `true` here.
+    /// `allowWatchBookmarks=true` — K8s opt-in. Absent is `false`, upstream's
+    /// default (the struct's `serde(default)`); a present key is `true`
+    /// unless its value is `false`, `0` or `no`, so an empty value is `true`.
     #[serde(
         rename = "allowWatchBookmarks",
         deserialize_with = "de_bool_default_true"
     )]
     pub allow_watch_bookmarks: bool,
-    /// `sendInitialEvents=true` — Kubernetes 1.27 **streaming lists**. The
-    /// server replays current state as `ADDED` events, then emits a BOOKMARK
-    /// annotated [`INITIAL_EVENTS_END_ANNOTATION`]; the client never issues a
-    /// separate LIST.
+    /// `sendInitialEvents=` — Kubernetes 1.27 **streaming lists**. `true`:
+    /// the server replays current state as `ADDED` events, then (when the
+    /// client asked for bookmarks) emits a BOOKMARK annotated
+    /// [`INITIAL_EVENTS_END_ANNOTATION`]; the client never issues a separate
+    /// LIST.
+    ///
+    /// Three states, because upstream draws the line at presence: absent
+    /// lets [`Self::watch_initial_events`] default it (a watch from `""` or
+    /// `"0"` gets the snapshot), and `false` is not the same as absent (a
+    /// watch from `"0"` with `false` starts now with no state). Read it only
+    /// through [`Self::watch_initial_events`] and [`Self::validate_list`].
     ///
     /// This is the DEFAULT path for `kube-rs`'s `watcher` under
     /// `Config::streaming_lists()`. Until 2026-08-08 engenho parsed no such
     /// param and silently ignored it, so a streaming-list client received a
     /// lone bookmark, zero objects, and never left its initializing state.
-    #[serde(rename = "sendInitialEvents", deserialize_with = "de_bool")]
-    pub send_initial_events: bool,
-    /// `resourceVersionMatch=NotOlderThan` — required by K8s alongside
-    /// `sendInitialEvents`. Accepted and recorded; engenho always serves the
-    /// most recent revision. That satisfies `NotOlderThan` whenever the store
-    /// has reached `resourceVersion`; a `resourceVersion` ahead of the
-    /// snapshot is refused in-band with a 410 instead
-    /// ([`crate::watch_start::WatchRefusal`]).
+    #[serde(rename = "sendInitialEvents", deserialize_with = "de_present_bool")]
+    pub send_initial_events: Option<bool>,
+    /// `resourceVersionMatch=` — `NotOlderThan` or `Exact`. On a watch it is
+    /// legal only as `NotOlderThan` alongside `sendInitialEvents`, and the
+    /// snapshot is then taken at the store's current revision, which is not
+    /// older than any `resourceVersion` the store has reached; one ahead of
+    /// the snapshot is refused in-band with a 410
+    /// ([`crate::watch_start::WatchRefusal`]). On a LIST, any
+    /// `resourceVersion` ahead of the store waits for it
+    /// ([`crate::list_floor`]); `Exact` is validated but served as
+    /// `NotOlderThan` (T3.9b).
     #[serde(rename = "resourceVersionMatch")]
     pub resource_version_match: Option<String>,
     /// Accepted + parsed, no-op at M0.1 (informer long-poll timeout).
@@ -107,6 +119,97 @@ impl ListWatchParams {
                     ))
                 }),
         }
+    }
+
+    /// The `resourceVersionMatch` the client sent, with an empty value read
+    /// as none (upstream tests `len(match) > 0`).
+    fn version_match(&self) -> Option<&str> {
+        self.resource_version_match
+            .as_deref()
+            .filter(|m| !m.is_empty())
+    }
+
+    /// Whether the client sent a `continue` token.
+    fn has_continue(&self) -> bool {
+        self.continue_.as_deref().is_some_and(|c| !c.is_empty())
+    }
+
+    /// Validate a WATCH's options and decide what it sends before its first
+    /// change. This is kube-apiserver v1.34's `SetListOptionsDefaults`
+    /// (`WatchList` is on by default) followed by `validateWatchOptions`,
+    /// evaluated once, here:
+    ///
+    ///   * a watch that names neither `sendInitialEvents` nor
+    ///     `resourceVersionMatch`, from `resourceVersion` absent, `""` or
+    ///     `"0"`, is defaulted to `sendInitialEvents=true` +
+    ///     `NotOlderThan`: it begins with a synthetic `ADDED` for every
+    ///     object, as the API docs promise for both;
+    ///   * `sendInitialEvents` (either value) requires
+    ///     `resourceVersionMatch=NotOlderThan`, and `resourceVersionMatch`
+    ///     requires `sendInitialEvents`;
+    ///   * the snapshot ends with an `initial-events-end` BOOKMARK only when
+    ///     the client asked for bookmarks.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidListOptions`] listing every rule the options break, which
+    /// the router answers with a 422 before any watch exists.
+    pub fn watch_initial_events(&self) -> Result<InitialEvents, InvalidListOptions> {
+        let legacy = matches!(self.resource_version.as_deref(), None | Some("" | "0"));
+        let (send, version_match) = match (self.send_initial_events, self.version_match()) {
+            (None, None) if legacy => (Some(true), Some(NOT_OLDER_THAN)),
+            given => given,
+        };
+        let mut violations = Vec::new();
+        if send.is_some() && version_match != Some(NOT_OLDER_THAN) {
+            violations.push(OptionViolation::InitialEventsNeedNotOlderThan);
+        }
+        if let Some(m) = version_match {
+            if send.is_none() {
+                violations.push(OptionViolation::MatchNeedsInitialEvents);
+            }
+            if m != NOT_OLDER_THAN {
+                violations.push(OptionViolation::WatchMatchNotSupported(m.to_owned()));
+            }
+            if self.has_continue() {
+                violations.push(OptionViolation::MatchWithContinue);
+            }
+        }
+        InvalidListOptions::check(violations)?;
+        Ok(match send {
+            Some(true) => InitialEvents::Snapshot {
+                end_bookmark: self.allow_watch_bookmarks,
+            },
+            Some(false) | None => InitialEvents::None,
+        })
+    }
+
+    /// Validate a LIST's options: kube-apiserver v1.34's
+    /// `ValidateListOptions` for a request that is not a watch.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidListOptions`] listing every rule the options break.
+    pub fn validate_list(&self) -> Result<(), InvalidListOptions> {
+        let mut violations = Vec::new();
+        if let Some(m) = self.version_match() {
+            if self.resource_version.as_deref().is_none_or(str::is_empty) {
+                violations.push(OptionViolation::MatchNeedsResourceVersion);
+            }
+            if self.has_continue() {
+                violations.push(OptionViolation::MatchWithContinue);
+            }
+            if m != EXACT && m != NOT_OLDER_THAN {
+                violations.push(OptionViolation::ListMatchNotSupported(m.to_owned()));
+            }
+            if m == EXACT && self.resource_version.as_deref() == Some("0") {
+                violations.push(OptionViolation::ExactAtZero);
+            }
+        }
+        if self.send_initial_events.is_some() {
+            violations.push(OptionViolation::InitialEventsOnList);
+        }
+        InvalidListOptions::check(violations)
     }
 
     /// Parse the label + field selectors into a typed [`Selectors`].
@@ -325,6 +428,11 @@ pub struct ApplyParams {
     /// [`DryRun::parse`], which REFUSES any value other than `All`.
     #[serde(rename = "dryRun")]
     pub dry_run: Option<String>,
+    /// `?fieldValidation=Ignore|Warn|Strict` — interpreted by
+    /// [`crate::field_validation::Directive::parse`], which refuses any other
+    /// value as upstream does.
+    #[serde(rename = "fieldValidation")]
+    pub field_validation: Option<String>,
 }
 
 /// The validated, typed server-side-apply options threaded from the router
@@ -403,14 +511,256 @@ pub fn body_precondition(body: &serde_json::Value) -> Result<Option<Revision>, A
 /// Where a WATCH (or the LIST snapshot) resumes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResumePoint {
-    /// `resourceVersion` absent or `"0"` — watch from the current
-    /// revision forward, NO historical replay.
+    /// `resourceVersion` absent, `""` or `"0"` — from the store's current
+    /// revision. Whether the watch first replays the current state as
+    /// `ADDED` is not this value's call: [`InitialEvents`] decides it.
     MostRecent,
     /// `resourceVersion="N"` (N > 0) — replay `changes_since(N)` then
     /// live. A WATCH at an `N` the store has not reached, or has compacted
     /// away, is refused in-band with a 410
-    /// ([`crate::watch_start::WatchRefusal`]).
+    /// ([`crate::watch_start::WatchRefusal`]); a LIST at an `N` the store
+    /// has not reached waits for it ([`crate::list_floor`]).
     At(Revision),
+}
+
+impl ResumePoint {
+    /// The refusal for a resume point the store has not reached, or `None`
+    /// when a store at `current` can serve it. The one comparison both a
+    /// WATCH ([`crate::watch_start::WatchRefusal::ahead_of`]) and a LIST
+    /// ([`crate::list_floor`]) make.
+    ///
+    /// `MostRecent` is never ahead: it means "from wherever the store is
+    /// now". An explicit `At(current)` is servable too.
+    #[must_use]
+    pub fn ahead_of(self, current: Revision) -> Option<TooLargeResourceVersion> {
+        match self {
+            Self::At(requested) if requested > current => {
+                Some(TooLargeResourceVersion { requested, current })
+            }
+            Self::At(_) | Self::MostRecent => None,
+        }
+    }
+}
+
+/// A `resourceVersion` the store has not reached. Built only by
+/// [`ResumePoint::ahead_of`], so `requested > current` always holds.
+///
+/// The text is kube-apiserver's (`storage.NewTooLargeResourceVersionError`).
+/// A LIST renders it as upstream does, a 504 `Timeout` whose cause is
+/// `ResourceVersionTooLarge`; a WATCH renders it as an in-band 410, a
+/// deliberate deviation ([`crate::watch_start`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("Too large resource version: {requested}, current: {current}")]
+pub struct TooLargeResourceVersion {
+    requested: Revision,
+    current: Revision,
+}
+
+impl TooLargeResourceVersion {
+    /// The revision the client named.
+    #[must_use]
+    pub fn requested(&self) -> Revision {
+        self.requested
+    }
+
+    /// Where the store stood.
+    #[must_use]
+    pub fn current(&self) -> Revision {
+        self.current
+    }
+}
+
+/// `resourceVersionMatch=NotOlderThan`.
+const NOT_OLDER_THAN: &str = "NotOlderThan";
+/// `resourceVersionMatch=Exact`.
+const EXACT: &str = "Exact";
+
+/// What a WATCH sends before its first change, as
+/// [`ListWatchParams::watch_initial_events`] decides it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitialEvents {
+    /// Nothing: the watch streams the changes after its resume point.
+    None,
+    /// A synthetic `ADDED` for every object in a snapshot taken at the
+    /// store's current revision, then the changes after that revision.
+    Snapshot {
+        /// Whether a BOOKMARK annotated [`INITIAL_EVENTS_END_ANNOTATION`]
+        /// closes the snapshot: only for a client that asked for bookmarks.
+        end_bookmark: bool,
+    },
+}
+
+/// How a violated option is reported: upstream's `field.ErrorType`, for the
+/// two types list/watch validation uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViolationKind {
+    /// `field.Forbidden`.
+    Forbidden,
+    /// `field.NotSupported`.
+    NotSupported,
+}
+
+/// One rule of kube-apiserver v1.34's `ValidateListOptions`
+/// (`apimachinery/pkg/apis/meta/internalversion/validation`) that a request
+/// broke. Each variant carries upstream's field and text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OptionViolation {
+    /// `sendInitialEvents` (either value) without
+    /// `resourceVersionMatch=NotOlderThan`.
+    InitialEventsNeedNotOlderThan,
+    /// `resourceVersionMatch` on a watch that sets no `sendInitialEvents`.
+    MatchNeedsInitialEvents,
+    /// A watch's `resourceVersionMatch` other than `NotOlderThan`.
+    WatchMatchNotSupported(String),
+    /// `resourceVersionMatch` together with `continue`.
+    MatchWithContinue,
+    /// A LIST's `resourceVersionMatch` without a `resourceVersion`.
+    MatchNeedsResourceVersion,
+    /// A LIST's `resourceVersionMatch` other than `Exact` or `NotOlderThan`.
+    ListMatchNotSupported(String),
+    /// `resourceVersionMatch=Exact` with `resourceVersion=0`.
+    ExactAtZero,
+    /// `sendInitialEvents` on a LIST.
+    InitialEventsOnList,
+}
+
+impl OptionViolation {
+    /// The query parameter at fault.
+    #[must_use]
+    pub fn field(&self) -> &'static str {
+        match self {
+            Self::InitialEventsOnList => "sendInitialEvents",
+            _ => "resourceVersionMatch",
+        }
+    }
+
+    /// Forbidden or not supported.
+    #[must_use]
+    pub fn kind(&self) -> ViolationKind {
+        match self {
+            Self::WatchMatchNotSupported(_) | Self::ListMatchNotSupported(_) => {
+                ViolationKind::NotSupported
+            }
+            _ => ViolationKind::Forbidden,
+        }
+    }
+
+    /// For a not-supported value, the values that are.
+    #[must_use]
+    pub fn supported_values(&self) -> &'static [&'static str] {
+        match self {
+            Self::WatchMatchNotSupported(_) => &[NOT_OLDER_THAN],
+            Self::ListMatchNotSupported(_) => &[EXACT, NOT_OLDER_THAN, ""],
+            _ => &[],
+        }
+    }
+
+    /// For a forbidden combination, upstream's detail text.
+    #[must_use]
+    pub fn forbidden_detail(&self) -> Option<&'static str> {
+        match self {
+            Self::InitialEventsNeedNotOlderThan => {
+                Some("sendInitialEvents requires setting resourceVersionMatch to NotOlderThan")
+            }
+            Self::MatchNeedsInitialEvents => Some(
+                "resourceVersionMatch is forbidden for watch unless sendInitialEvents is provided",
+            ),
+            Self::MatchWithContinue => {
+                Some("resourceVersionMatch is forbidden when continue is provided")
+            }
+            Self::MatchNeedsResourceVersion => {
+                Some("resourceVersionMatch is forbidden unless resourceVersion is provided")
+            }
+            Self::ExactAtZero => {
+                Some("resourceVersionMatch \"exact\" is forbidden for resourceVersion \"0\"")
+            }
+            Self::InitialEventsOnList => Some("sendInitialEvents is forbidden for list"),
+            Self::WatchMatchNotSupported(_) | Self::ListMatchNotSupported(_) => None,
+        }
+    }
+}
+
+/// Upstream's `field.Error.Error()`: `<field>: Forbidden: <detail>`, or
+/// `<field>: Unsupported value: "<value>": supported values: "<a>", "<b>"`.
+impl std::fmt::Display for OptionViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WatchMatchNotSupported(value) | Self::ListMatchNotSupported(value) => {
+                write!(
+                    f,
+                    "{}: Unsupported value: {value:?}: supported values: ",
+                    self.field()
+                )?;
+                for (i, supported) in self.supported_values().iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{supported:?}")?;
+                }
+                Ok(())
+            }
+            _ => write!(
+                f,
+                "{}: Forbidden: {}",
+                self.field(),
+                self.forbidden_detail().unwrap_or_default()
+            ),
+        }
+    }
+}
+
+/// A request whose list/watch options break at least one of upstream's
+/// rules. Never empty: [`Self::check`] is the only constructor, and it
+/// returns `Ok` for no violations. Rendered as kube-apiserver renders
+/// `errors.NewInvalid(ListOptions.meta.k8s.io, "", errs)`, a 422 `Invalid`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidListOptions(Vec<OptionViolation>);
+
+impl InvalidListOptions {
+    /// `Ok` when nothing was violated, otherwise the violations in the order
+    /// upstream checks them.
+    fn check(violations: Vec<OptionViolation>) -> Result<(), Self> {
+        if violations.is_empty() {
+            Ok(())
+        } else {
+            Err(Self(violations))
+        }
+    }
+
+    /// Every rule broken, in upstream's order.
+    #[must_use]
+    pub fn violations(&self) -> &[OptionViolation] {
+        &self.0
+    }
+}
+
+/// `ListOptions.meta.k8s.io "" is invalid: <e>` for one violation, and
+/// `... is invalid: [<e1>, <e2>]` for several (`utilerrors.NewAggregate`).
+impl std::fmt::Display for InvalidListOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ListOptions.meta.k8s.io \"\" is invalid: ")?;
+        match self.0.as_slice() {
+            [one] => write!(f, "{one}"),
+            many => {
+                f.write_str("[")?;
+                for (i, violation) in many.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{violation}")?;
+                }
+                f.write_str("]")
+            }
+        }
+    }
+}
+
+impl std::error::Error for InvalidListOptions {}
+
+impl From<InvalidListOptions> for ApiError {
+    fn from(invalid: InvalidListOptions) -> Self {
+        Self::Invalid(invalid.to_string())
+    }
 }
 
 /// One typed label-selector requirement — the FULL K8s label selector
@@ -794,6 +1144,14 @@ pub(crate) fn query_flag(value: &str) -> bool {
 fn de_bool<'de, D: serde::Deserializer<'de>>(de: D) -> Result<bool, D::Error> {
     let s = String::deserialize(de)?;
     Ok(query_flag(&s))
+}
+
+/// A flag whose ABSENCE means something of its own: present → `Some` of the
+/// [`query_flag`] truth table, absent → `None` (serde `default`; this runs
+/// only for a present key).
+fn de_present_bool<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<bool>, D::Error> {
+    let s = String::deserialize(de)?;
+    Ok(Some(query_flag(&s)))
 }
 
 /// Same, but absent / empty defaults to `true` (allowWatchBookmarks
@@ -1528,16 +1886,156 @@ mod tests {
             "watch=true&sendInitialEvents=true&resourceVersionMatch=NotOlderThan",
         )
         .expect("streaming-list params parse");
-        assert!(p.send_initial_events, "sendInitialEvents=true must parse");
+        assert_eq!(
+            p.send_initial_events,
+            Some(true),
+            "sendInitialEvents=true must parse"
+        );
         assert_eq!(p.resource_version_match.as_deref(), Some("NotOlderThan"));
 
         let p: ListWatchParams =
+            serde_urlencoded::from_str("sendInitialEvents=false").expect("explicit false parses");
+        assert_eq!(p.send_initial_events, Some(false), "false is not absent");
+
+        let p: ListWatchParams =
             serde_urlencoded::from_str("watch=true").expect("plain watch params parse");
-        assert!(
-            !p.send_initial_events,
-            "absent sendInitialEvents must default false — a plain watch must \
-             not silently become a streaming list",
+        assert_eq!(
+            p.send_initial_events, None,
+            "absent sendInitialEvents stays absent, for watch_initial_events to default"
         );
+    }
+
+    fn initial(query: &str) -> Result<InitialEvents, InvalidListOptions> {
+        serde_urlencoded::from_str::<ListWatchParams>(query)
+            .expect("params parse")
+            .watch_initial_events()
+    }
+
+    /// kube-apiserver v1.34 defaults a watch from `""`/`"0"` that names
+    /// neither option to `sendInitialEvents=true` + `NotOlderThan`
+    /// (`SetListOptionsDefaults`), so it begins with the current state.
+    #[test]
+    fn a_legacy_watch_is_defaulted_to_a_snapshot() {
+        for rv in ["", "resourceVersion=", "resourceVersion=0"] {
+            assert_eq!(
+                initial(rv),
+                Ok(InitialEvents::Snapshot {
+                    end_bookmark: false
+                }),
+                "{rv:?}: no allowWatchBookmarks, no end bookmark (upstream's default is false)"
+            );
+            let bookmarks = format!("{rv}&allowWatchBookmarks=true");
+            assert_eq!(
+                initial(&bookmarks),
+                Ok(InitialEvents::Snapshot { end_bookmark: true }),
+                "{bookmarks:?}: the end bookmark for a client that asked"
+            );
+        }
+        assert_eq!(
+            initial("resourceVersion=7"),
+            Ok(InitialEvents::None),
+            "a watch from an explicit revision replays changes, not state"
+        );
+        assert_eq!(
+            initial("resourceVersion=0&sendInitialEvents=false&resourceVersionMatch=NotOlderThan"),
+            Ok(InitialEvents::None),
+            "an explicit false is honoured: from now, no state"
+        );
+        assert_eq!(
+            initial(
+                "resourceVersion=7&sendInitialEvents=true&resourceVersionMatch=NotOlderThan\
+                 &allowWatchBookmarks=true"
+            ),
+            Ok(InitialEvents::Snapshot { end_bookmark: true }),
+            "kube-rs's streaming list, from a revision"
+        );
+    }
+
+    fn rendered(result: Result<(), InvalidListOptions>) -> String {
+        result.map_or_else(|e| e.to_string(), |()| "valid".to_owned())
+    }
+
+    #[test]
+    fn watch_options_break_upstreams_rules_with_upstreams_text() {
+        assert_eq!(
+            rendered(initial("sendInitialEvents=true").map(drop)),
+            "ListOptions.meta.k8s.io \"\" is invalid: resourceVersionMatch: Forbidden: \
+             sendInitialEvents requires setting resourceVersionMatch to NotOlderThan"
+        );
+        assert_eq!(
+            rendered(initial("sendInitialEvents=false").map(drop)),
+            "ListOptions.meta.k8s.io \"\" is invalid: resourceVersionMatch: Forbidden: \
+             sendInitialEvents requires setting resourceVersionMatch to NotOlderThan",
+            "either value of sendInitialEvents needs NotOlderThan"
+        );
+        assert_eq!(
+            rendered(initial("resourceVersionMatch=NotOlderThan").map(drop)),
+            "ListOptions.meta.k8s.io \"\" is invalid: resourceVersionMatch: Forbidden: \
+             resourceVersionMatch is forbidden for watch unless sendInitialEvents is provided"
+        );
+        assert_eq!(
+            rendered(initial("sendInitialEvents=true&resourceVersionMatch=Exact").map(drop)),
+            "ListOptions.meta.k8s.io \"\" is invalid: [resourceVersionMatch: Forbidden: \
+             sendInitialEvents requires setting resourceVersionMatch to NotOlderThan, \
+             resourceVersionMatch: Unsupported value: \"Exact\": supported values: \
+             \"NotOlderThan\"]"
+        );
+    }
+
+    #[test]
+    fn list_options_break_upstreams_rules() {
+        let list = |query: &str| {
+            rendered(
+                serde_urlencoded::from_str::<ListWatchParams>(query)
+                    .expect("params parse")
+                    .validate_list(),
+            )
+        };
+        assert_eq!(
+            list("resourceVersion=5&resourceVersionMatch=Exact"),
+            "valid"
+        );
+        assert_eq!(
+            list("resourceVersion=5&resourceVersionMatch=NotOlderThan"),
+            "valid"
+        );
+        assert_eq!(
+            list("sendInitialEvents=true"),
+            "ListOptions.meta.k8s.io \"\" is invalid: sendInitialEvents: Forbidden: \
+             sendInitialEvents is forbidden for list"
+        );
+        assert_eq!(
+            list("resourceVersionMatch=NotOlderThan"),
+            "ListOptions.meta.k8s.io \"\" is invalid: resourceVersionMatch: Forbidden: \
+             resourceVersionMatch is forbidden unless resourceVersion is provided"
+        );
+        assert_eq!(
+            list("resourceVersion=0&resourceVersionMatch=Exact"),
+            "ListOptions.meta.k8s.io \"\" is invalid: resourceVersionMatch: Forbidden: \
+             resourceVersionMatch \"exact\" is forbidden for resourceVersion \"0\""
+        );
+        assert_eq!(
+            list("resourceVersion=5&resourceVersionMatch=Newest"),
+            "ListOptions.meta.k8s.io \"\" is invalid: resourceVersionMatch: Unsupported \
+             value: \"Newest\": supported values: \"Exact\", \"NotOlderThan\", \"\""
+        );
+    }
+
+    #[test]
+    fn only_a_resume_point_past_the_store_is_too_large() {
+        let too_large = ResumePoint::At(Revision(9))
+            .ahead_of(Revision(8))
+            .expect("one past the store is ahead");
+        assert_eq!(
+            (too_large.requested(), too_large.current()),
+            (Revision(9), Revision(8))
+        );
+        assert_eq!(
+            too_large.to_string(),
+            "Too large resource version: 9, current: 8"
+        );
+        assert_eq!(ResumePoint::At(Revision(8)).ahead_of(Revision(8)), None);
+        assert_eq!(ResumePoint::MostRecent.ahead_of(Revision(0)), None);
     }
 
     #[test]

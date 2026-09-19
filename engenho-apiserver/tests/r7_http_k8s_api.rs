@@ -153,14 +153,15 @@ async fn patch_pod_merges_into_existing() {
 
     let body = serde_json::json!({
         "metadata": { "name": "p" },
-        // `replicas`/`image` are not PodSpec fields — they are merge
-        // probes, kept because this test is about PATCH semantics. The
-        // container list is what makes the object VALID; without it the
-        // create is a 422 and the patch then 404s.
+        // `hostname`/`activeDeadlineSeconds` are the merge probes: real
+        // PodSpec fields, because an unknown one is dropped at the border
+        // (T4.6) and could probe nothing. The container list is what makes
+        // the object VALID; without it the create is a 422 and the patch
+        // then 404s.
         "spec": {
             "containers": [ { "name": "c", "image": "busybox:1.36" } ],
-            "replicas": 1,
-            "image": "v1"
+            "activeDeadlineSeconds": 1,
+            "hostname": "v1"
         }
     });
     client
@@ -170,8 +171,8 @@ async fn patch_pod_merges_into_existing() {
         .await
         .unwrap();
 
-    // PATCH the image only
-    let patch = serde_json::json!({"spec": {"image": "v2"}});
+    // PATCH the hostname only
+    let patch = serde_json::json!({"spec": {"hostname": "v2"}});
     let resp = client
         .patch(format!("http://{addr}/api/v1/namespaces/default/pods/p"))
         .json(&patch)
@@ -180,9 +181,16 @@ async fn patch_pod_merges_into_existing() {
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let patched: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(patched.get("spec").unwrap().get("image").unwrap(), "v2");
-    // replicas survived the merge
-    assert_eq!(patched.get("spec").unwrap().get("replicas").unwrap(), 1);
+    assert_eq!(patched.get("spec").unwrap().get("hostname").unwrap(), "v2");
+    // activeDeadlineSeconds survived the merge
+    assert_eq!(
+        patched
+            .get("spec")
+            .unwrap()
+            .get("activeDeadlineSeconds")
+            .unwrap(),
+        1
+    );
 
     server.shutdown().await.unwrap();
 }

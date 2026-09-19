@@ -44,25 +44,28 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use bytes::Bytes;
-use engenho_kube_proto::{
-    self as kube_proto, CONTENT_TYPE_PROTOBUF, Gvk, is_protobuf_content_type,
-    response_wants_protobuf,
-};
+use engenho_kube_proto::{CONTENT_TYPE_PROTOBUF, Gvk, is_protobuf_content_type};
 use engenho_store::{Revision, WatchEventKind, WatchSignal, WatchStream};
 use engenho_types::auth::UserInfo;
 use engenho_types::generated_v1_34::Subresource;
 use engenho_types::patch::PatchType;
 use utoipa::OpenApi;
 
+use crate::accept::{self, Served};
 use crate::discovery;
 use crate::error::ApiError;
+use crate::field_validation::{
+    Directive, KindRef, PatchBytes, PatchFields, Warnings, WriteOptions, subresource_directive,
+};
 use crate::handler::ResourceHandler;
 use crate::health;
+use crate::object_body::ObjectBody;
 use crate::openapi::ApiDoc;
 use crate::params::{
-    DryRun, ListWatchParams, ResumePoint, Selectors, WatchGvk, bookmark_line, error_line,
-    event_line, gvk_ns_matches,
+    DryRun, InitialEvents, ListWatchParams, ResumePoint, Selectors, WatchGvk, bookmark_line,
+    error_line, event_line, gvk_ns_matches,
 };
+use crate::proto_transcode::{self, Decoded, Losses};
 use crate::watch_end::{AfterGone, WatchProgress};
 use crate::watch_start::{WatchRefusal, WatchStart};
 
@@ -823,10 +826,11 @@ fn serve_openapi_v3_document(group: &str, version: &str) -> Result<Response, Api
 // client construction and never renegotiates — a 415 is a TERMINAL error,
 // not a fall-back-to-JSON trigger (proven empirically). So the write
 // handlers extract the raw body + headers themselves and dispatch on
-// Content-Type through the typed `engenho-kube-proto` codec, with a
-// proper ApiError-rendered 415 K8s Status for anything else (NEVER axum's
-// built-in plain-text JsonRejection). The downstream handler/store/
-// admission/read-back pipeline stays serde_json::Value-typed.
+// Content-Type through the descriptor-driven transcoder
+// (`crate::proto_transcode`), with a proper ApiError-rendered 415 K8s Status
+// for anything else (NEVER axum's built-in plain-text JsonRejection). The
+// downstream handler/store/admission/read-back pipeline stays
+// serde_json::Value-typed.
 
 /// The codec to use for a RESPONSE body, negotiated from the request
 /// `Accept` header. kubectl's typed clientset sends
@@ -836,7 +840,9 @@ fn serve_openapi_v3_document(group: &str, version: &str) -> Result<Response, Api
 #[derive(Clone, Copy)]
 enum ResponseCodec {
     Json,
-    Protobuf,
+    /// Protobuf preferred, and whether the same `Accept` also takes JSON:
+    /// the answer when this object has no exact protobuf form.
+    Protobuf(JsonFallback),
     /// `Accept: application/json;as=Table;v=1;g=meta.k8s.io` — server-side
     /// printing. kubectl and k9s BOTH default to this for list views and let
     /// the server choose the columns; without it they receive a plain List and
@@ -850,9 +856,9 @@ enum ResponseCodec {
 }
 
 impl ResponseCodec {
-    /// Negotiate from the request headers' `Accept`. Defaults to JSON
-    /// when `Accept` is absent or does not list protobuf.
-    /// Negotiate from the request's `Accept`.
+    /// Negotiate from the request's `Accept`: protobuf when upstream's
+    /// ranking puts a protobuf range first ([`accept::negotiate`]), JSON
+    /// otherwise and when `Accept` is absent.
     ///
     /// # Errors
     /// [`ApiError::NotAcceptable`] (HTTP 406) when `Accept` is present and
@@ -868,7 +874,8 @@ impl ResponseCodec {
         // An absent or empty Accept means "anything" — default to JSON, never
         // 406. Only an Accept that is PRESENT and names nothing servable is a
         // failed negotiation.
-        if !accept.trim().is_empty() && !accept_is_servable(accept) {
+        let negotiated = accept::negotiate(accept);
+        if !accept.trim().is_empty() && negotiated.is_none() {
             return Err(ApiError::NotAcceptable(
                 [
                     "only the following media types are acceptable: application/json, \
@@ -902,33 +909,42 @@ impl ResponseCodec {
             // response Content-Type, so this is honest negotiation rather
             // than ignoring the preference.
             Ok(ResponseCodec::PartialMetadata)
-        } else if response_wants_protobuf(accept) {
-            Ok(ResponseCodec::Protobuf)
+        } else if negotiated == Some(Served::Protobuf) {
+            Ok(ResponseCodec::Protobuf(JsonFallback::from_accept(accept)))
         } else {
             Ok(ResponseCodec::Json)
         }
     }
 }
 
-/// Whether ANY media range in `accept` names something this server produces.
+/// Whether a protobuf-preferring `Accept` also takes JSON.
 ///
-/// Per-range, because `Accept` is a list and one servable range is enough.
-/// `*/*` and `application/*` are wildcards every real client sends, and
-/// rejecting them would break kubectl before it made a single call.
-fn accept_is_servable(accept: &str) -> bool {
-    accept.split(',').any(|range| {
-        let media = range
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_ascii_lowercase();
-        media == "*/*"
-            || media == "application/*"
-            || media == "application/json"
-            || media == "application/yaml"
-            || media == CONTENT_TYPE_PROTOBUF
-    })
+/// Every client-go protobuf client sends
+/// `application/vnd.kubernetes.protobuf,application/json` and picks its
+/// decoder from the RESPONSE `Content-Type`, so for it a JSON answer is a
+/// correct answer. That is what lets a kind with no vendored message (a
+/// custom resource, `batch/v1`, …) and an object whose protobuf would lose
+/// data both be served exactly, instead of a 400 or a silently smaller body.
+///
+/// Any range that takes JSON admits it, `q=0` included: upstream's
+/// negotiator uses `q` only to rank, so it answers a kind with no protobuf
+/// form in JSON even when JSON's range says `q=0` ([`accept`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JsonFallback {
+    /// `Accept` also names `application/json`, `application/*` or `*/*`.
+    Admitted,
+    /// `Accept` names protobuf and nothing JSON satisfies.
+    Refused,
+}
+
+impl JsonFallback {
+    fn from_accept(accept: &str) -> Self {
+        if accept::admits(accept, Served::Json) {
+            Self::Admitted
+        } else {
+            Self::Refused
+        }
+    }
 }
 
 /// The GVK a handler speaks, as the K8s wire `(apiVersion, kind)` —
@@ -937,16 +953,31 @@ fn handler_gvk(h: &Arc<dyn ResourceHandler>) -> Gvk {
     Gvk::new(h.api_version(), h.kind())
 }
 
+/// Decode a write request body that is not stored as the object (a
+/// `/status` or `/scale` PUT, a `TokenRequest`). See [`decode_body`]; what a
+/// protobuf transcode could not carry is answered with warnings only where
+/// the body IS the object ([`decode_object_body`]).
+fn decode_write_body(headers: &HeaderMap, raw: &[u8]) -> Result<serde_json::Value, ApiError> {
+    decode_body(headers, raw).map(|decoded| decoded.value)
+}
+
+/// Decode a protobuf request body through the descriptor-driven transcoder.
+/// A kind with no vendored message is a 415, as a custom resource's
+/// protobuf body is upstream.
+pub(crate) fn decode_protobuf_body(raw: &[u8]) -> Result<Decoded, ApiError> {
+    proto_transcode::decode(raw).map_err(proto_transcode::TranscodeError::into_request_error)
+}
+
 /// Decode a write request body into the `serde_json::Value` the handler
 /// pipeline expects, dispatching on `Content-Type`:
 ///
 ///   * `application/json` (or absent → JSON) → `serde_json::from_slice`.
-///   * `application/vnd.kubernetes.protobuf` → the typed
-///     `engenho-kube-proto` codec (magic + `runtime.Unknown` + per-kind
-///     `DynamicMessage` → Value).
+///   * `application/vnd.kubernetes.protobuf` → [`decode_protobuf_body`]
+///     (magic + `runtime.Unknown` + the kind's message, transcoded to the
+///     JSON upstream serves).
 ///   * anything else → a typed [`ApiError::UnsupportedMediaType`] (HTTP
 ///     415, proper K8s `Status` body) — NOT axum's plain-text rejection.
-fn decode_write_body(headers: &HeaderMap, raw: &[u8]) -> Result<serde_json::Value, ApiError> {
+fn decode_body(headers: &HeaderMap, raw: &[u8]) -> Result<Decoded, ApiError> {
     let content_type = headers
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -954,9 +985,13 @@ fn decode_write_body(headers: &HeaderMap, raw: &[u8]) -> Result<serde_json::Valu
     let media = content_type.split(';').next().unwrap_or("").trim();
     if media.is_empty() || media.eq_ignore_ascii_case("application/json") {
         serde_json::from_slice(raw)
+            .map(|value| Decoded {
+                value,
+                losses: Losses::default(),
+            })
             .map_err(|e| ApiError::BadRequest(format!("invalid JSON request body: {e}")))
     } else if is_protobuf_content_type(content_type) {
-        Ok(kube_proto::decode_protobuf(raw)?)
+        decode_protobuf_body(raw)
     } else {
         Err(ApiError::UnsupportedMediaType(format!(
             "the body of the request was in an unsupported format - \
@@ -964,6 +999,111 @@ fn decode_write_body(headers: &HeaderMap, raw: &[u8]) -> Result<serde_json::Valu
              {CONTENT_TYPE_PROTOBUF}; got {media:?}"
         )))
     }
+}
+
+/// Decode the body of a write that IS the stored object — a POST (create)
+/// or a PUT on the main object (replace) — and normalize it at the border
+/// (see [`crate::object_body`]). A mis-shaped `metadata` is upstream's 400.
+///
+/// Only these two verbs come through here. A PATCH body goes through
+/// [`decode_patch`] and is never normalized: in a merge patch `null` means
+/// "delete this field" (plan edge 9). A `/status` or `/scale` PUT body is not
+/// the stored object either (only its status, or its replica count, is taken),
+/// so it stays on [`decode_write_body`].
+fn decode_object_body(
+    h: &Arc<dyn ResourceHandler>,
+    headers: &HeaderMap,
+    raw: &[u8],
+    border: &mut Border<'_>,
+) -> Result<ObjectBody, ApiError> {
+    let normalize = |body| {
+        ObjectBody::normalize(h.group(), h.kind(), body)
+            .map_err(|e| e.request_error(h.version(), h.kind()))
+    };
+    let Decoded { value, losses } = decode_body(headers, raw)?;
+    // A protobuf body can carry what the transcode cannot keep (a field
+    // number newer than the vendored descriptors): stored without it, and
+    // the client is told, as a dropped JSON field is told under `Warn`.
+    for loss in losses.iter() {
+        border.warnings.add(&loss);
+    }
+    // A mis-shaped body is refused before its fields are judged: upstream's
+    // decoder reports a type error instead of any strict error it collected.
+    let mut body = normalize(value)?.into_value();
+    border.check_object(h, headers, raw, &mut body)?;
+    // Dropping a field leaves a normalized object normalized; this only
+    // re-seals it as the `ObjectBody` the pipeline takes.
+    let body = normalize(body)?;
+    border.typed_decode(h, body.as_value())?;
+    Ok(body)
+}
+
+/// A write's border, for the checks that answer to the client's
+/// `?fieldValidation=` (T4.6): the directive, the warnings the response
+/// carries, and the rollout ledger the typed decode counts into.
+struct Border<'a> {
+    directive: Directive,
+    warnings: Warnings,
+    ledger: &'a engenho_substrate::WouldRejectLedger,
+}
+
+impl<'a> Border<'a> {
+    fn new(directive: Directive, state: &'a RouterState) -> Self {
+        Self {
+            directive,
+            warnings: Warnings::default(),
+            ledger: &state.would_reject,
+        }
+    }
+
+    /// Judge a body that IS an object (POST, PUT, apply) and drop its
+    /// unknown fields. Only JSON bytes are scanned: a protobuf body cannot
+    /// name a field its message lacks, nor repeat one.
+    fn check_object(
+        &mut self,
+        h: &Arc<dyn ResourceHandler>,
+        headers: &HeaderMap,
+        raw: &[u8],
+        body: &mut serde_json::Value,
+    ) -> Result<(), ApiError> {
+        let api_version = h.api_version();
+        crate::field_validation::check_object(
+            self.directive,
+            KindRef {
+                group: h.group(),
+                version: h.version(),
+                kind: h.kind(),
+                api_version: &api_version,
+            },
+            json_bytes(headers, raw),
+            body,
+            &mut self.warnings,
+        )
+    }
+
+    /// Decode an object body into its row's generated struct, through the
+    /// shadow gate: counted, never refused while the gate is Shadow.
+    fn typed_decode(
+        &self,
+        h: &Arc<dyn ResourceHandler>,
+        body: &serde_json::Value,
+    ) -> Result<(), ApiError> {
+        crate::typed_decode::judge(h.group(), h.version(), h.kind(), body, self.ledger)
+    }
+
+    /// The response for `result`, carrying the warnings.
+    fn answer(self, result: Result<Response, ApiError>) -> Response {
+        self.warnings.attach(result)
+    }
+}
+
+/// The request's bytes when they are JSON; `None` for a protobuf body.
+fn json_bytes<'r>(headers: &HeaderMap, raw: &'r [u8]) -> Option<&'r [u8]> {
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    (!is_protobuf_content_type(content_type)).then_some(raw)
 }
 
 /// Decode a PATCH request body AND resolve the typed patch algorithm from the
@@ -1000,10 +1140,12 @@ fn decode_patch(
     }
 
     if is_protobuf_content_type(content_type) {
-        // A protobuf full-object replace (rare): decode via the codec, typed
-        // as a merge (full-object replace).
+        // A protobuf full-object replace (rare): decode via the transcoder,
+        // typed as a merge (full-object replace). A patch has no warnings
+        // channel here, so a loss (a wire field newer than the descriptors)
+        // is dropped exactly as an upstream v1.34 apiserver drops it.
         let _ = gvk;
-        let v = kube_proto::decode_protobuf(raw)?;
+        let v = decode_protobuf_body(raw)?.value;
         return Ok((v, PatchType::Merge));
     }
 
@@ -1080,15 +1222,44 @@ fn render_object(
             let projected = crate::table::to_partial_object_metadata(&value);
             Ok((status, Json(projected)).into_response())
         }
-        ResponseCodec::Protobuf => {
-            // The read-back Value carries apiVersion+kind from
-            // inject_type_meta; the codec re-derives the per-kind
-            // descriptor from `gvk` (the handler's GVK), so the response
-            // wraps correctly even if the stored object omitted TypeMeta.
-            let bytes = kube_proto::encode_response(gvk, &value)?;
-            Ok((status, [(CONTENT_TYPE, CONTENT_TYPE_PROTOBUF)], bytes).into_response())
-        }
+        // The transcoder derives the kind's message from `gvk` (the
+        // handler's GVK), so the response wraps correctly even if the stored
+        // object omitted TypeMeta. JSON answers whenever protobuf would not
+        // be exact and the client takes JSON: a kind with no vendored
+        // message, a stored value with no protobuf form, or a known loss.
+        ResponseCodec::Protobuf(fallback) => match (proto_transcode::encode(gvk, &value), fallback)
+        {
+            (Ok(encoded), JsonFallback::Admitted) if encoded.losses.is_empty() => {
+                Ok(protobuf_response(status, encoded.bytes))
+            }
+            (Ok(encoded), JsonFallback::Admitted) => {
+                tracing::debug!(
+                    kind = %gvk.kind,
+                    losses = ?encoded.losses,
+                    "protobuf would not be exact; answering JSON"
+                );
+                Ok((status, Json(value)).into_response())
+            }
+            (Err(error), JsonFallback::Admitted) => {
+                tracing::debug!(kind = %gvk.kind, %error, "no protobuf form; answering JSON");
+                Ok((status, Json(value)).into_response())
+            }
+            // The client reads nothing else: the closest protobuf there is,
+            // with what it lost named in warnings.
+            (Ok(encoded), JsonFallback::Refused) => {
+                let mut warnings = Warnings::default();
+                for loss in encoded.losses.iter() {
+                    warnings.add(&loss);
+                }
+                Ok(warnings.attach(Ok(protobuf_response(status, encoded.bytes))))
+            }
+            (Err(error), JsonFallback::Refused) => Err(error.into_response_error()),
+        },
     }
+}
+
+fn protobuf_response(status: StatusCode, bytes: Bytes) -> Response {
+    (status, [(CONTENT_TYPE, CONTENT_TYPE_PROTOBUF)], bytes).into_response()
 }
 
 // ── shared per-verb bodies (core + grouped wrappers reuse these) ───────
@@ -1115,13 +1286,15 @@ async fn do_create(
     raw: &[u8],
     user_info: &UserInfo,
     dry_run: DryRun,
+    border: &mut Border<'_>,
 ) -> Result<Response, ApiError> {
-    let body = decode_write_body(headers, raw)?;
+    let body = decode_object_body(h, headers, raw, border)?;
     let v = h.create(ns, body, user_info, dry_run).await?;
     let codec = ResponseCodec::from_headers(headers)?;
     render_object(codec, &handler_gvk(h), StatusCode::CREATED, v)
 }
 
+#[allow(clippy::too_many_arguments)] // the request, its target, and its border
 async fn do_replace(
     h: &Arc<dyn ResourceHandler>,
     ns: Option<&str>,
@@ -1130,13 +1303,15 @@ async fn do_replace(
     raw: &[u8],
     user_info: &UserInfo,
     dry_run: DryRun,
+    border: &mut Border<'_>,
 ) -> Result<Response, ApiError> {
-    let body = decode_write_body(headers, raw)?;
+    let body = decode_object_body(h, headers, raw, border)?;
     let v = h.replace(ns, name, body, user_info, dry_run).await?;
     let codec = ResponseCodec::from_headers(headers)?;
     render_object(codec, &handler_gvk(h), StatusCode::OK, v)
 }
 
+#[allow(clippy::too_many_arguments)] // the request, its target, and its border
 async fn do_patch(
     h: &Arc<dyn ResourceHandler>,
     ns: Option<&str>,
@@ -1145,20 +1320,39 @@ async fn do_patch(
     raw: &[u8],
     apply_params: &crate::params::ApplyParams,
     user_info: &UserInfo,
+    border: &mut Border<'_>,
 ) -> Result<Response, ApiError> {
     let gvk = handler_gvk(h);
     // Resolve the typed patch algorithm from the Content-Type FIRST — the
     // media type is the load-bearing signal the store dispatches on. Erasing
     // it here (the old `decode_patch_body` did) made every patch a merge.
-    let (patch, patch_type) = decode_patch(headers, raw, &gvk)?;
+    let (mut patch, patch_type) = decode_patch(headers, raw, &gvk)?;
     // Server-side apply (Content-Type application/apply-patch+yaml) → validate
     // the `?fieldManager=`/`?force=` query into typed ApplyOptions. A missing
-    // fieldManager is a typed 400 here (matching upstream). For EVERY other
+    // fieldManager is a typed 400 here (matching upstream), before the body is
+    // judged: upstream validates the options first. For EVERY other
     // patch algorithm `apply_opts` is None — the non-SSA path is UNCHANGED.
     let apply_opts = if patch_type == engenho_types::patch::PatchType::Apply {
         Some(crate::params::ApplyOptions::from_params(apply_params)?)
     } else {
         None
+    };
+    // FIELD VALIDATION (T4.6). An apply configuration IS an object: judged
+    // whole here, its unknown fields dropped before the merge can record an
+    // owner for them. Any other patch is not the object: its own bytes are
+    // scanned here, and the object it would store is judged in the pipeline.
+    let json = json_bytes(headers, raw);
+    let mut fields = match (patch_type, json) {
+        (PatchType::Apply, _) => {
+            border.check_object(h, headers, raw, &mut patch)?;
+            border.typed_decode(h, &patch)?;
+            PatchFields::unasked()
+        }
+        (PatchType::Json, Some(raw)) => PatchFields::scan(border.directive, raw, PatchBytes::Json)?,
+        (PatchType::Merge | PatchType::Strategic, Some(raw)) => {
+            PatchFields::scan(border.directive, raw, PatchBytes::Merge)?
+        }
+        (_, None) => PatchFields::scan(border.directive, raw, PatchBytes::Opaque)?,
     };
     let v = h
         .patch(
@@ -1169,8 +1363,13 @@ async fn do_patch(
             apply_opts,
             user_info,
             DryRun::parse(apply_params.dry_run.as_deref())?,
+            &mut fields,
         )
-        .await?;
+        .await;
+    for warning in fields.warnings().texts() {
+        border.warnings.add(warning);
+    }
+    let v = v?;
     // An apply that CREATES the object returns 201; an apply/patch that
     // updates returns 200. The store reports Created vs Patched; the handler
     // surfaces the status via the response — here we keep 200 for parity with
@@ -1205,7 +1404,7 @@ async fn do_delete(
     // — Deployment, ConfigMap, … — is in the proto pool). The Status-Success
     // fallback only arises when no object existed; `Status` lives in
     // meta/v1, NOT the core/v1 package the kube-proto map reaches, so
-    // encoding it as protobuf would hit `CodecError::UncatalogedKind`.
+    // encoding it as protobuf would hit `TranscodeError::Uncataloged`.
     // Render that one value as JSON regardless of Accept. This is invisible
     // to conformance: the conformance DELETE always targets an existing
     // object (object path → protobuf works).
@@ -1260,11 +1459,26 @@ async fn do_list_or_watch(
     if watch {
         watch_response(h, namespace, p, sel, codec).await
     } else {
+        p.validate_list()?;
         // Paged path when `limit` or `continue` is present; otherwise the
         // unbounded atomic-rv LIST envelope (back-compat: no continue /
         // remainingItemCount fields emitted).
         let limit = p.limit()?;
         let continue_token = p.continue_token()?;
+        // A LIST that names a revision is served from state at least that
+        // fresh: wait for the store to reach it, or answer upstream's 504
+        // (crate::list_floor). A continued page reads the snapshot its token
+        // carries, which the first page already held to this floor.
+        if continue_token.is_none()
+            && let ResumePoint::At(floor) = p.resume_point()?
+        {
+            crate::list_floor::await_revision(
+                h.as_ref(),
+                floor,
+                crate::list_floor::LIST_WAIT_FOR_REVISION,
+            )
+            .await?;
+        }
         if limit > 0 || continue_token.is_some() {
             let (items, rv, cont, remaining) = h
                 .list_page(namespace.as_deref(), &sel, limit, continue_token)
@@ -1362,18 +1576,22 @@ async fn watch_response(
     // while their LIST (already projected) succeeded.
     let partial = matches!(codec, ResponseCodec::PartialMetadata);
     let requested: ResumePoint = p.resume_point()?;
+    let initial = p.watch_initial_events()?;
     let mut from = requested;
 
-    // ── streaming lists (K8s 1.27 `sendInitialEvents`) ──
+    // ── initial state as events (streaming lists, K8s 1.27 ──
+    // ── `sendInitialEvents`, and the legacy watch it defaults to) ──
     //
     // The client asked for the current state to arrive AS watch events
-    // instead of issuing a separate LIST. Snapshot first, then open the
-    // stream AT that snapshot's revision — opening the stream first would
-    // leave a window in which a change lands after the stream registers but
-    // before the snapshot is taken, and the client would see it twice; the
-    // reverse order can only ever REPLAY, never drop.
+    // instead of issuing a separate LIST, or sent a legacy watch from ""/"0"
+    // that kube-apiserver defaults to the same (params::InitialEvents).
+    // Snapshot first, then open the stream AT that snapshot's revision —
+    // opening the stream first would leave a window in which a change lands
+    // after the stream registers but before the snapshot is taken, and the
+    // client would see it twice; the reverse order can only ever REPLAY,
+    // never drop.
     let mut prelude: Vec<Bytes> = Vec::new();
-    if p.send_initial_events {
+    if let InitialEvents::Snapshot { end_bookmark } = initial {
         let (items, rv) = h.list_at(namespace.as_deref(), &sel).await?;
         // The snapshot answers "state not older than resourceVersion". A
         // resourceVersion the snapshot has not reached would get older state
@@ -1395,10 +1613,13 @@ async fn watch_response(
                 watch_gvk(gvk, partial),
             ));
         }
-        // The terminator. Without this annotation a kube-rs `watcher` /
-        // client-go reflector stays in its initializing state forever even
-        // though every object above was delivered.
-        prelude.push(bookmark_line(rv, gvk, true));
+        // The terminator, for a client that asked for bookmarks. Without
+        // this annotation a kube-rs `watcher` / client-go reflector stays in
+        // its initializing state forever even though every object above was
+        // delivered. A client that did not ask gets none, as upstream.
+        if end_bookmark {
+            prelude.push(bookmark_line(rv, gvk, true));
+        }
         from = ResumePoint::At(rv);
     }
 
@@ -1473,7 +1694,7 @@ async fn watch_response(
                     return Some((Ok::<Bytes, Infallible>(line), st));
                 }
                 Some(Ok(WatchSignal::Bookmark(rev))) => {
-                    if st.progress.bookmarks() {
+                    if st.progress.forwards_bookmark(rev) {
                         let api_version = st.handler.api_version();
                         let gvk = WatchGvk {
                             api_version: &api_version,
@@ -1483,7 +1704,8 @@ async fn watch_response(
                         st.progress.delivered(rev);
                         return Some((Ok(line), st));
                     }
-                    // Bookmarks not requested → drop + keep streaming.
+                    // Bookmarks not requested, or one at the watch's start
+                    // that moves the client nowhere → drop + keep streaming.
                     continue;
                 }
                 Some(Err(gone)) => {
@@ -1547,8 +1769,7 @@ async fn watch_response(
     });
 
     // The initial-events replay, then the live stream. `prelude` is empty
-    // unless `sendInitialEvents=true`, so the ordinary watch path is
-    // byte-for-byte what it was.
+    // unless the watch sends its initial state (params::InitialEvents).
     let body = Body::from_stream(futures::StreamExt::chain(
         futures::stream::iter(prelude.into_iter().map(Ok::<Bytes, Infallible>)),
         live,
@@ -2005,6 +2226,10 @@ async fn resource_get_or_list(
 pub struct WriteParams {
     #[serde(rename = "dryRun")]
     pub dry_run: Option<String>,
+    /// `?fieldValidation=Ignore|Warn|Strict` (T4.6), interpreted by
+    /// [`Directive::parse`].
+    #[serde(rename = "fieldValidation")]
+    pub field_validation: Option<String>,
 }
 
 async fn resource_create(
@@ -2016,6 +2241,7 @@ async fn resource_create(
     raw: Bytes,
 ) -> Result<Response, ApiError> {
     let dry_run = DryRun::parse(write.dry_run.as_deref())?;
+    let raw_directive = write.field_validation.as_deref();
     // POST on a subresource is not a K8s CREATE shape — status/scale/log are
     // get/patch/update shapes. `/token` is the ONE exception: it is defined as
     // a POST that mints rather than persists, so it is dispatched here rather
@@ -2029,7 +2255,9 @@ async fn resource_create(
             name,
         })) = resolve_subresource(&coords, &h)
         {
-            return do_token_request(
+            let mut warnings = Warnings::default();
+            subresource_directive(raw_directive, WriteOptions::Create, "token", &mut warnings)?;
+            let result = do_token_request(
                 &state,
                 &h,
                 coords.namespace.as_deref(),
@@ -2038,6 +2266,7 @@ async fn resource_create(
                 &raw,
             )
             .await;
+            return Ok(warnings.attach(result));
         }
         return Err(ApiError::BadRequest(format!(
             "the {sub:?} subresource does not support create (POST)"
@@ -2049,15 +2278,21 @@ async fn resource_create(
         ));
     }
     let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
-    do_create(
+    let mut border = Border::new(
+        Directive::parse(raw_directive, WriteOptions::Create)?,
+        &state,
+    );
+    let result = do_create(
         &h,
         coords.namespace.as_deref(),
         &headers,
         &raw,
         &user_info.0,
         dry_run,
+        &mut border,
     )
-    .await
+    .await;
+    Ok(border.answer(result))
 }
 
 /// PUT on a resource path. PUT is the kubectl full-object-replace verb for
@@ -2077,14 +2312,20 @@ async fn resource_put(
         ApiError::BadRequest("PUT requires a resource name (instance path)".into())
     })?;
     let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
+    let raw_directive = write.field_validation.as_deref();
+    let mut warnings = Warnings::default();
     // The target's name IS `name` (both read `coords.name`); only the variant
     // is needed here because the main-object arm needs the name as well.
     match resolve_subresource(&coords, &h)?.map(|t| t.subresource) {
         Some(Subresource::Status) => {
-            do_put_status(&h, coords.namespace.as_deref(), name, &headers, &raw).await
+            subresource_directive(raw_directive, WriteOptions::Update, "status", &mut warnings)?;
+            let result = do_put_status(&h, coords.namespace.as_deref(), name, &headers, &raw).await;
+            Ok(warnings.attach(result))
         }
         Some(Subresource::Scale) => {
-            do_put_scale(&h, coords.namespace.as_deref(), name, &headers, &raw).await
+            subresource_directive(raw_directive, WriteOptions::Update, "scale", &mut warnings)?;
+            let result = do_put_scale(&h, coords.namespace.as_deref(), name, &headers, &raw).await;
+            Ok(warnings.attach(result))
         }
         // `/token` is create-only; PUT has no meaning on a thing that is
         // minted rather than stored.
@@ -2100,16 +2341,23 @@ async fn resource_put(
         // update verb. Store-backed handlers do a real optimistic-concurrency
         // replace; handlers that don't override `replace` keep the typed 400.
         None => {
-            do_replace(
+            let dry_run = DryRun::parse(write.dry_run.as_deref())?;
+            let mut border = Border::new(
+                Directive::parse(raw_directive, WriteOptions::Update)?,
+                &state,
+            );
+            let result = do_replace(
                 &h,
                 coords.namespace.as_deref(),
                 name,
                 &headers,
                 &raw,
                 &user_info.0,
-                DryRun::parse(write.dry_run.as_deref())?,
+                dry_run,
+                &mut border,
             )
-            .await
+            .await;
+            Ok(border.answer(result))
         }
     }
 }
@@ -2131,13 +2379,21 @@ async fn resource_patch(
         ApiError::BadRequest("PATCH requires a resource name (instance path)".into())
     })?;
     let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
+    let raw_directive = apply_params.field_validation.as_deref();
+    let mut warnings = Warnings::default();
     // As in `resource_put`: the target's name is `name`, needed by every arm.
     match resolve_subresource(&coords, &h)?.map(|t| t.subresource) {
         Some(Subresource::Status) => {
-            do_patch_status(&h, coords.namespace.as_deref(), name, &headers, &raw).await
+            subresource_directive(raw_directive, WriteOptions::Patch, "status", &mut warnings)?;
+            let result =
+                do_patch_status(&h, coords.namespace.as_deref(), name, &headers, &raw).await;
+            Ok(warnings.attach(result))
         }
         Some(Subresource::Scale) => {
-            do_patch_scale(&h, coords.namespace.as_deref(), name, &headers, &raw).await
+            subresource_directive(raw_directive, WriteOptions::Patch, "scale", &mut warnings)?;
+            let result =
+                do_patch_scale(&h, coords.namespace.as_deref(), name, &headers, &raw).await;
+            Ok(warnings.attach(result))
         }
         // `/token` is create-only; PATCH has no meaning on a thing that is
         // minted rather than stored.
@@ -2149,7 +2405,11 @@ async fn resource_patch(
             "the log subresource is read-only (GET only)".into(),
         )),
         None => {
-            do_patch(
+            let mut border = Border::new(
+                Directive::parse(raw_directive, WriteOptions::Patch)?,
+                &state,
+            );
+            let result = do_patch(
                 &h,
                 coords.namespace.as_deref(),
                 name,
@@ -2157,8 +2417,10 @@ async fn resource_patch(
                 &raw,
                 &apply_params,
                 &user_info.0,
+                &mut border,
             )
-            .await
+            .await;
+            Ok(border.answer(result))
         }
     }
 }
@@ -2553,6 +2815,15 @@ mod tests {
                 "fake handler: list_page not exercised".into(),
             ))
         }
+        async fn current_revision(&self) -> engenho_store::Revision {
+            // The head of a fake history, or where an unused fake stands.
+            match self.watch.lock().as_deref() {
+                Ok(FakeWatch::History(history)) => {
+                    history.changes.last().map_or(Revision(10), |c| c.revision)
+                }
+                _ => Revision::ZERO,
+            }
+        }
         async fn watch_stream(
             &self,
             _ns: Option<&str>,
@@ -2574,7 +2845,7 @@ mod tests {
         async fn create(
             &self,
             _ns: Option<&str>,
-            _body: serde_json::Value,
+            _body: crate::object_body::ObjectBody,
             _user_info: &engenho_types::auth::UserInfo,
             _dry_run: crate::params::DryRun,
         ) -> Result<serde_json::Value, ApiError> {
@@ -2591,6 +2862,7 @@ mod tests {
             _apply_opts: Option<crate::params::ApplyOptions>,
             _user_info: &engenho_types::auth::UserInfo,
             _dry_run: crate::params::DryRun,
+            _fields: &mut crate::field_validation::PatchFields,
         ) -> Result<serde_json::Value, ApiError> {
             Err(ApiError::Internal(
                 "fake handler: patch not exercised".into(),
@@ -2869,8 +3141,8 @@ mod tests {
     /// The one overflow a retry can change: the buffer filled with nothing
     /// newer than the stream's opening revision, so timing decided it, not
     /// history. A one-slot buffer holding the bookmark at 10 does that when
-    /// the change at 11 arrives. The watch forwards the bookmark and ends
-    /// with the 429.
+    /// the change at 11 arrives. The watch drops that bookmark (it is at the
+    /// watch's start, so it moves the client nowhere) and ends with the 429.
     #[tokio::test]
     async fn an_overflow_with_nothing_past_the_opening_revision_ends_with_an_in_band_429() {
         let mut registry = engenho_store::watch_backend::WatcherRegistry::new();
@@ -2888,9 +3160,8 @@ mod tests {
         drop(registry);
 
         let lines = pod_watch_lines(stream, true).await;
-        assert_eq!(line_types(&lines), ["BOOKMARK", "ERROR"], "{lines:?}");
-        assert_eq!(line_rv(&lines[0]), "10");
-        let status = &lines[1]["object"];
+        assert_eq!(line_types(&lines), ["ERROR"], "{lines:?}");
+        let status = &lines[0]["object"];
         assert_eq!(status["kind"], "Status");
         assert_eq!(status["code"], 429, "{status}");
         assert_eq!(status["reason"], "TooManyRequests");

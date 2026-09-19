@@ -90,6 +90,16 @@ pub enum ApiError {
     /// so the body is serde-rendered, never `format!()`ed.
     #[error("Apply failed with conflicts")]
     ApplyConflict(serde_json::Value),
+    /// A LIST named a `resourceVersion` the store did not reach within
+    /// [`crate::list_floor::LIST_WAIT_FOR_REVISION`]. Rendered as upstream's
+    /// `storage.NewTooLargeResourceVersionError`: 504, reason `Timeout`,
+    /// message `Timeout: Too large resource version: N, current: M`,
+    /// `details.causes = [ResourceVersionTooLarge]`,
+    /// `details.retryAfterSeconds` and the same value in `Retry-After`.
+    /// client-go's reflector reads the cause and relists with no
+    /// `resourceVersion`.
+    #[error("Timeout: {0}")]
+    TooLargeResourceVersion(crate::params::TooLargeResourceVersion),
     #[error("internal error: {0}")]
     Internal(String),
     #[error("storage error: {0}")]
@@ -111,6 +121,7 @@ pub enum ErrorKind {
     AuthzForbidden,
     Gone,
     ApplyConflict,
+    TooLargeResourceVersion,
     Internal,
     StorageError,
 }
@@ -131,6 +142,7 @@ impl ApiError {
             Self::AuthzForbidden(_) => ErrorKind::AuthzForbidden,
             Self::Gone(_) => ErrorKind::Gone,
             Self::ApplyConflict(_) => ErrorKind::ApplyConflict,
+            Self::TooLargeResourceVersion(_) => ErrorKind::TooLargeResourceVersion,
             Self::Internal(_) => ErrorKind::Internal,
             Self::StorageError(_) => ErrorKind::StorageError,
         }
@@ -149,6 +161,7 @@ impl ApiError {
             Self::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::Forbidden(_) | Self::AuthzForbidden(_) => StatusCode::FORBIDDEN,
             Self::Gone(_) => StatusCode::GONE,
+            Self::TooLargeResourceVersion(_) => StatusCode::GATEWAY_TIMEOUT,
             Self::Internal(_) | Self::StorageError(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -245,6 +258,23 @@ struct StatusCauseDetails {
     causes: serde_json::Value,
 }
 
+/// The `metav1.StatusDetails` of upstream's
+/// `storage.NewTooLargeResourceVersionError`: one `ResourceVersionTooLarge`
+/// cause, and how long to wait before retrying.
+#[derive(Serialize)]
+struct TooLargeDetails {
+    causes: [TooLargeCause; 1],
+    #[serde(rename = "retryAfterSeconds")]
+    retry_after_seconds: u32,
+}
+
+/// A `metav1.StatusCause`. Its Go field `Type` is serialized as `reason`.
+#[derive(Serialize)]
+struct TooLargeCause {
+    reason: &'static str,
+    message: &'static str,
+}
+
 /// Build the typed `metav1.Status{status:"Success"}` value DELETE returns
 /// when there was no object to hand back (idempotent delete of an absent
 /// name). kubectl's delete codepath decodes this body and treats it as a
@@ -304,17 +334,11 @@ pub(crate) fn too_many_requests_object(
     .to_value()
 }
 
-/// A protobuf-codec failure at the HTTP boundary becomes an
-/// [`ApiError::BadRequest`] — bad magic, an uncataloged kind, or an
-/// undecodable object body are all malformed-request conditions (HTTP
-/// 400 with a proper K8s `Status`), never a panic. The codec is a TOTAL
-/// function returning typed errors; this is the single mapping into the
-/// apiserver's error surface.
-impl From<engenho_kube_proto::CodecError> for ApiError {
-    fn from(e: engenho_kube_proto::CodecError) -> Self {
-        ApiError::BadRequest(e.to_string())
-    }
-}
+// A protobuf transcode failure has no `From` into `ApiError` on purpose: the
+// same failure is a client error on a request body and the server's on a
+// response, so the mapping is chosen by direction
+// (`proto_transcode::TranscodeError::{into_request_error,
+// into_response_error}`), never by a `?` that cannot tell them apart.
 
 /// Build the standard Kubernetes RBAC forbidden message for a denied request —
 /// the exact `forbidden: User "<u>" cannot <verb> resource "<resource>" in API
@@ -366,6 +390,7 @@ impl ApiError {
             Self::UnsupportedMediaType(_) => "UnsupportedMediaType",
             Self::Forbidden(_) | Self::AuthzForbidden(_) => "Forbidden",
             Self::Gone(_) => "Expired",
+            Self::TooLargeResourceVersion(_) => "Timeout",
             Self::Internal(_) => "InternalError",
             Self::StorageError(_) => "ServiceUnavailable",
         }
@@ -373,28 +398,58 @@ impl ApiError {
 
     /// This error as a K8s failure `Status`: the one body both an HTTP error
     /// response and an in-band watch `ERROR` line carry.
-    fn status(&self) -> K8sStatus<StatusCauseDetails> {
+    fn status(&self) -> serde_json::Value {
         let code = self.status_code().as_u16();
-        // The apply-conflict path renders a Status WITH `details.causes`, a
-        // distinct body shape from every other error (which has no details).
-        // The message names the conflict count.
-        if let Self::ApplyConflict(causes) = self {
-            let n = causes.as_array().map_or(0, Vec::len);
-            let message = if n == 1 {
-                "Apply failed with 1 conflict".to_string()
-            } else {
-                format!("Apply failed with {n} conflicts")
-            };
-            return K8sStatus::failure(
+        match self {
+            // The apply-conflict path renders a Status WITH
+            // `details.causes`, a distinct body shape from every other error.
+            // The message names the conflict count.
+            Self::ApplyConflict(causes) => {
+                let n = causes.as_array().map_or(0, Vec::len);
+                let message = if n == 1 {
+                    "Apply failed with 1 conflict".to_string()
+                } else {
+                    format!("Apply failed with {n} conflicts")
+                };
+                K8sStatus::failure(
+                    code,
+                    self.reason(),
+                    message,
+                    Some(StatusCauseDetails {
+                        causes: causes.clone(),
+                    }),
+                )
+                .to_value()
+            }
+            Self::TooLargeResourceVersion(_) => K8sStatus::failure(
                 code,
                 self.reason(),
-                message,
-                Some(StatusCauseDetails {
-                    causes: causes.clone(),
+                self.to_string(),
+                Some(TooLargeDetails {
+                    causes: [TooLargeCause {
+                        reason: "ResourceVersionTooLarge",
+                        message: "Too large resource version",
+                    }],
+                    retry_after_seconds: crate::list_floor::TOO_LARGE_RETRY_AFTER_SECONDS,
                 }),
-            );
+            )
+            .to_value(),
+            _ => K8sStatus::<NoDetails>::failure(code, self.reason(), self.to_string(), None)
+                .to_value(),
         }
-        K8sStatus::failure(code, self.reason(), self.to_string(), None)
+    }
+
+    /// The `details.retryAfterSeconds` this error's `Status` carries, which
+    /// its HTTP response repeats as `Retry-After`, as kube-apiserver's
+    /// `ErrorNegotiated` does for any code. client-go's REST layer reads only
+    /// the header.
+    fn retry_after_seconds(&self) -> Option<u32> {
+        match self {
+            Self::TooLargeResourceVersion(_) => {
+                Some(crate::list_floor::TOO_LARGE_RETRY_AFTER_SECONDS)
+            }
+            _ => None,
+        }
     }
 
     /// This error as the object of an in-band watch `ERROR` line, for a
@@ -402,13 +457,27 @@ impl ApiError {
     /// its HTTP response would carry.
     #[must_use]
     pub(crate) fn to_status_object(&self) -> serde_json::Value {
-        self.status().to_value()
+        self.status()
+    }
+}
+
+/// A LIST ahead of the store, after the wait ([`crate::list_floor`]).
+impl From<crate::params::TooLargeResourceVersion> for ApiError {
+    fn from(too_large: crate::params::TooLargeResourceVersion) -> Self {
+        Self::TooLargeResourceVersion(too_large)
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status_code(), Json(self.status())).into_response()
+        let mut response = (self.status_code(), Json(self.status())).into_response();
+        if let Some(seconds) = self.retry_after_seconds() {
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from(seconds),
+            );
+        }
+        response
     }
 }
 

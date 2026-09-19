@@ -10,7 +10,7 @@ use engenho_controllers::admission::{
 };
 use engenho_store::{
     ContinueToken, Revision, StoreMesh, WatchOpts,
-    command::{ApplyMeta, Reason, ResourceCommand, ResourceOp},
+    command::{Reason, ResourceCommand, ResourceOp},
     resource::ResourceKey,
     watch_backend::WATCH_CHANNEL_CAPACITY,
 };
@@ -18,11 +18,17 @@ use engenho_types::auth::UserInfo;
 use engenho_types::generated_v1_34::{RESOURCE_CATALOG, ResourceDescriptor, Subresource};
 
 use crate::error::ApiError;
+use crate::field_validation::PatchFields;
+use crate::object_body::ObjectBody;
 use crate::params::{DryRun, ResumePoint, Selectors, body_precondition};
 use crate::pod_logs::{LogQuery, PodLogReader};
 use crate::scale::{Scale, project_scale};
 use crate::watch_end::Compacted;
 use crate::watch_start::{WatchRefusal, WatchStart};
+
+mod write_plan;
+
+use write_plan::WriteRequest;
 
 /// Bookmark cadence handed to `watch_from` when the client opted into
 /// bookmarks (`allowWatchBookmarks=true`). Mirrors the store default.
@@ -184,6 +190,11 @@ pub trait ResourceHandler: Send + Sync + 'static {
 
     async fn list(&self, namespace: Option<&str>) -> Result<Value, ApiError>;
 
+    /// The store's current revision, read without reading any object: what a
+    /// LIST that names a `resourceVersion` waits on
+    /// ([`crate::list_floor::await_revision`]).
+    async fn current_revision(&self) -> Revision;
+
     /// LIST the items + the snapshot resourceVersion captured ATOMICALLY
     /// from the SAME catalog clone, with selectors applied apiserver-side.
     ///
@@ -255,10 +266,15 @@ pub trait ResourceHandler: Send + Sync + 'static {
     /// from the request's `Extension<UserInfo>`); it travels into the
     /// admission chain's `AdmissionRequest.user_info` so a webhook sees WHO is
     /// creating.
+    ///
+    /// `body` is an [`ObjectBody`]: a POST body is the object that will be
+    /// stored, so it arrives already normalized (null `labels`,
+    /// `annotations`, `ownerReferences`, `finalizers` dropped; mis-shaped
+    /// metadata refused). There is no way to hand this method raw bytes.
     async fn create(
         &self,
         namespace: Option<&str>,
-        body: Value,
+        body: ObjectBody,
         user_info: &UserInfo,
         dry_run: DryRun,
     ) -> Result<Value, ApiError>;
@@ -267,17 +283,20 @@ pub trait ResourceHandler: Send + Sync + 'static {
     ///
     /// The default is UNSUPPORTED (a typed 400 mirroring the pre-M0 router
     /// contract), so a handler that hasn't wired a store-backed replace keeps
-    /// the old behavior. [`StoreBackedHandler`] overrides it with a real
-    /// optimistic-concurrency replace over [`ResourceCommand::Put`]:
-    /// existence-required (404 otherwise), server-owned metadata
-    /// (creationTimestamp/uid) preserved, CAS on `metadata.resourceVersion`
-    /// when present (absent → unconditional). `user_info` is the
-    /// authenticated identity threaded into admission.
+    /// the old behavior. [`StoreBackedHandler`] overrides it through the one
+    /// write pipeline (`handler/write_plan.rs`) every write verb shares:
+    /// existence-required (404 otherwise), every rule a create gets
+    /// (defaulting, validation, CRD schema, admission as UPDATE), server-owned
+    /// metadata preserved, and a compare-and-swap at the revision it read —
+    /// the client's `metadata.resourceVersion` when present, else re-planned
+    /// on a lost race. `user_info` is the authenticated identity threaded into
+    /// admission. `body` is an [`ObjectBody`] for the same reason as in
+    /// [`Self::create`]: a PUT body is the object that will be stored.
     async fn replace(
         &self,
         _namespace: Option<&str>,
         _name: &str,
-        _body: Value,
+        _body: ObjectBody,
         _user_info: &UserInfo,
         _dry_run: DryRun,
     ) -> Result<Value, ApiError> {
@@ -289,17 +308,33 @@ pub trait ResourceHandler: Send + Sync + 'static {
 
     /// Apply a PATCH. `patch_type` is the typed discriminant of the
     /// request's `Content-Type` (resolved by the router from the media type)
-    /// — it travels into the store's [`ResourceCommand::Patch`] so the
-    /// deterministic apply path dispatches the correct algorithm (RFC 7396
-    /// merge / RFC 6902 json-patch / strategic list-merge / server-side
-    /// apply). The raw `patch` `Value` is the decoded body; for json-patch
-    /// it is the RFC 6902 op array.
+    /// and selects the algorithm (RFC 7396 merge / RFC 6902 json-patch /
+    /// strategic list-merge / server-side apply). The raw `patch` `Value` is
+    /// the decoded body; for json-patch it is the RFC 6902 op array.
+    ///
+    /// [`StoreBackedHandler`] computes the merged object with the store's own
+    /// pure algorithm, then runs it through the one write pipeline
+    /// (`handler/write_plan.rs`) every write verb shares — defaulting,
+    /// validation, CRD schema, admission over the WHOLE object — and commits
+    /// it by compare-and-swap, so `dryRun` returns the merged result.
     ///
     /// `apply_opts` is `Some(_)` ONLY when `patch_type ==
     /// PatchType::Apply` (server-side apply) — it carries the validated
     /// `fieldManager` + `force`. For EVERY other patch algorithm it is
-    /// `None` and the path is byte-identical to before SSA landed.
-    /// `user_info` is the authenticated identity threaded into admission.
+    /// `None`. `user_info` is the authenticated identity threaded into
+    /// admission.
+    ///
+    /// ★ `patch` stays a raw `Value`, never an [`ObjectBody`]: in a merge
+    /// patch `null` means "delete this field", so normalizing it away would
+    /// turn `kubectl label x-` into a no-op (plan edge 9).
+    ///
+    /// `fields` is the request's `?fieldValidation=` context (T4.6): the
+    /// directive and what the router found in the patch's own bytes. For a
+    /// merge, strategic or JSON patch, [`StoreBackedHandler`] judges the
+    /// PATCHED object's unknown fields against it and leaves the warnings
+    /// the response carries in it. A server-side apply configuration was
+    /// judged whole at the border, so it is not judged again.
+    #[allow(clippy::too_many_arguments)]
     async fn patch(
         &self,
         namespace: Option<&str>,
@@ -309,6 +344,7 @@ pub trait ResourceHandler: Send + Sync + 'static {
         apply_opts: Option<crate::params::ApplyOptions>,
         user_info: &UserInfo,
         dry_run: DryRun,
+        fields: &mut PatchFields,
     ) -> Result<Value, ApiError>;
 
     /// DELETE a resource. Returns the response BODY as the K8s wire
@@ -414,29 +450,6 @@ pub trait ResourceHandler: Send + Sync + 'static {
     }
 }
 
-/// The admission actions that carry an object body — the domain of
-/// [`StoreBackedHandler::admit_object`]. [`AdmissionAction::Delete`] has no
-/// arm here: a delete carries no body, so it is reviewed by
-/// [`StoreBackedHandler::admit_delete`], which returns no object. Routing a
-/// delete through the object path, and then having to assert an object came
-/// back, is therefore not expressible.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ObjectAction {
-    /// A create (POST) or full replace (PUT).
-    Put,
-    /// A partial update (PATCH of any algorithm).
-    Patch,
-}
-
-impl From<ObjectAction> for AdmissionAction {
-    fn from(action: ObjectAction) -> Self {
-        match action {
-            ObjectAction::Put => Self::Put,
-            ObjectAction::Patch => Self::Patch,
-        }
-    }
-}
-
 /// Default implementation backed by [`StoreMesh`]. Handles every
 /// kind uniformly — the kind-specific intelligence (defaulters,
 /// validators, finalizers) is left to controllers + admission
@@ -489,6 +502,10 @@ pub struct StoreBackedHandler {
     /// delegates to it; when `None`, `/log` returns a typed `NotFound` (no
     /// fake-empty log). Installed by the runtime via [`Self::with_log_reader`].
     log_reader: Option<Arc<dyn PodLogReader>>,
+    /// How often a watch that asked for bookmarks gets one while the store's
+    /// revision advances. [`WATCH_BOOKMARK_EVERY`] unless
+    /// [`Self::with_bookmark_every`] set it.
+    bookmark_every: Duration,
 }
 
 impl StoreBackedHandler {
@@ -562,7 +579,21 @@ impl StoreBackedHandler {
             namespace_lifecycle: false,
             crd_schema: None,
             log_reader: None,
+            bookmark_every: WATCH_BOOKMARK_EVERY,
         }
+    }
+
+    /// Set how often a watch that asked for bookmarks gets one (builder
+    /// style). The runtime keeps [`WATCH_BOOKMARK_EVERY`]; a test that
+    /// observes bookmarks shortens it rather than waiting five seconds per
+    /// bookmark. A zero cadence would disable bookmarks for every client that
+    /// asked for them, so it is refused: the cadence stays unchanged.
+    #[must_use]
+    pub fn with_bookmark_every(mut self, every: Duration) -> Self {
+        if !every.is_zero() {
+            self.bookmark_every = every;
+        }
+        self
     }
 
     /// Install an in-process [`PodLogReader`] (the kubelet adapter) so this
@@ -603,8 +634,9 @@ impl StoreBackedHandler {
     }
 
     /// Attach an [`AdmissionChain`] to this handler (builder style). The
-    /// chain is dispatched on every create / patch / delete BEFORE the
-    /// store proposal; an empty chain is a no-op (admits everything).
+    /// chain reviews every write — the whole candidate object of a create or
+    /// update, whatever its verb, and every delete — BEFORE the store
+    /// proposal; an empty chain is a no-op (admits everything).
     #[must_use]
     pub fn with_admission(mut self, admission: Arc<AdmissionChain>) -> Self {
         self.admission = Some(admission);
@@ -621,7 +653,9 @@ impl StoreBackedHandler {
         self
     }
 
-    /// Enforce a CRD's `openAPIV3Schema` on create. See
+    /// Enforce a CRD's `openAPIV3Schema` (defaults, then validation) on
+    /// every write's candidate object — POST, PUT, PATCH and server-side
+    /// apply alike. See
     /// [`crate::schema_validation`] for exactly which keywords are checked —
     /// it is type-checking, not full JSON Schema.
     #[must_use]
@@ -634,42 +668,6 @@ impl StoreBackedHandler {
         self
     }
 
-    /// Run the admission chain over a write that CARRIES an object and return
-    /// the object to actually propose (possibly mutated). No chain, or an
-    /// empty one, returns `body` unchanged. A `Deny` becomes a typed
-    /// [`ApiError::Forbidden`] (HTTP 403).
-    ///
-    /// The body goes in as a `Value` and comes out as a `Value`: there is no
-    /// `Option` for a caller to re-check, so "an object write whose admitted
-    /// body vanished" has no code path. `action` is an [`ObjectAction`], which
-    /// has no `Delete` arm — a delete cannot be routed through here and asked
-    /// for an object back.
-    ///
-    /// `user_info` is the AUTHENTICATED identity threaded from the request's
-    /// `Extension<UserInfo>` (the authenticator chain's output) — it lands on
-    /// `AdmissionRequest.user_info` so a webhook can policy-decide on WHO is
-    /// acting, not just WHAT. Authorize-ALL is retained: identity is carried
-    /// for webhooks, but no authn-driven deny is added here.
-    async fn admit_object(
-        &self,
-        action: ObjectAction,
-        key: &ResourceKey,
-        body: Value,
-        user_info: &UserInfo,
-    ) -> Result<Value, ApiError> {
-        let Some(chain) = &self.admission else {
-            return Ok(body);
-        };
-        let request = self
-            .admission_request(action.into(), key, Some(body.clone()), user_info)
-            .await;
-        match chain.review(request).await {
-            AdmissionDecision::Allow => Ok(body),
-            AdmissionDecision::Mutate(v) => Ok(v),
-            AdmissionDecision::Deny(reason) => Err(ApiError::Forbidden(reason)),
-        }
-    }
-
     /// Run the admission chain over a DELETE of `key`. A delete has no body,
     /// so the review carries `value: None` and the only outcome that matters
     /// is whether the chain denies: `Deny` → typed [`ApiError::Forbidden`]
@@ -680,31 +678,11 @@ impl StoreBackedHandler {
         let Some(chain) = &self.admission else {
             return Ok(());
         };
-        let request = self
-            .admission_request(AdmissionAction::Delete, key, None, user_info)
-            .await;
+        let current = self.store.get(key).await;
+        let request = admission_request(AdmissionAction::Delete, key, None, current, user_info);
         match chain.review(request).await {
             AdmissionDecision::Allow | AdmissionDecision::Mutate(_) => Ok(()),
             AdmissionDecision::Deny(reason) => Err(ApiError::Forbidden(reason)),
-        }
-    }
-
-    /// The ONE [`AdmissionRequest`] shape both admit paths hand the chain:
-    /// the live object as `current` (absent for a create), the proposed
-    /// `value` (absent for a delete), and the authenticated identity.
-    async fn admission_request(
-        &self,
-        action: AdmissionAction,
-        key: &ResourceKey,
-        value: Option<Value>,
-        user_info: &UserInfo,
-    ) -> AdmissionRequest {
-        AdmissionRequest {
-            action,
-            key: key.clone(),
-            value,
-            current: self.store.get(key).await,
-            user_info: user_info.clone(),
         }
     }
 
@@ -900,8 +878,9 @@ impl ResourceHandler for StoreBackedHandler {
             .await
             .ok_or_else(|| ApiError::NotFound(format!("{}/{}", self.kind, name)))?;
         // Project the parent into its autoscaling/v1 Scale view. Serde →
-        // Value (typed emission; no format! of the wire).
-        let scale = project_scale(&live);
+        // Value (typed emission; no format! of the wire). A count the parent
+        // declares but that is not an integer is a 500, never the default.
+        let scale = project_scale(&live)?;
         serde_json::to_value(&scale)
             .map_err(|e| ApiError::Internal(format!("scale projection serialize: {e}")))
     }
@@ -918,6 +897,10 @@ impl ResourceHandler for StoreBackedHandler {
             .get(&key)
             .await
             .ok_or_else(|| ApiError::NotFound(format!("{}/{}", self.kind, name)))?;
+        // The parent must be projectable BEFORE anything is written, as
+        // upstream converts the old object to a Scale first: otherwise the
+        // write lands and the re-projection below answers 500 for it.
+        project_scale(&live)?;
         // Deserialize the incoming autoscaling/v1 Scale + take spec.replicas.
         let scale: Scale = serde_json::from_value(incoming)
             .map_err(|e| ApiError::BadRequest(format!("invalid Scale body: {e}")))?;
@@ -948,9 +931,13 @@ impl ResourceHandler for StoreBackedHandler {
         _patch_type: engenho_types::patch::PatchType,
     ) -> Result<Value, ApiError> {
         let key = self.key(namespace, name)?;
-        if self.store.get(&key).await.is_none() {
-            return Err(ApiError::NotFound(format!("{}/{}", self.kind, name)));
-        }
+        let live = self
+            .store
+            .get(&key)
+            .await
+            .ok_or_else(|| ApiError::NotFound(format!("{}/{}", self.kind, name)))?;
+        // Projectable before anything is written (see `put_scale`).
+        project_scale(&live)?;
         // Translate the Scale-shaped patch's spec.replicas into a scoped
         // `{"spec":{"replicas":N}}` merge patch on the parent. A scale patch
         // that doesn't carry spec.replicas is a no-op replica change → leave
@@ -1008,6 +995,11 @@ impl ResourceHandler for StoreBackedHandler {
         // direct caller share ONE body.
         let (items, rv) = self.list_at(namespace, &Selectors::default()).await?;
         Ok(self.list_response(items, rv, None, None))
+    }
+
+    async fn current_revision(&self) -> Revision {
+        // A scalar read under the store's lock: no catalog clone (T3.2b).
+        self.store.current_revision().await
     }
 
     async fn list_at(
@@ -1212,7 +1204,7 @@ impl ResourceHandler for StoreBackedHandler {
             from: from_rev,
             buffer: WATCH_CHANNEL_CAPACITY,
             bookmark_every: if allow_bookmarks {
-                WATCH_BOOKMARK_EVERY
+                self.bookmark_every
             } else {
                 Duration::ZERO
             },
@@ -1240,307 +1232,49 @@ impl ResourceHandler for StoreBackedHandler {
     async fn create(
         &self,
         namespace: Option<&str>,
-        body: Value,
+        body: ObjectBody,
         user_info: &UserInfo,
         dry_run: DryRun,
     ) -> Result<Value, ApiError> {
+        // A POST names its object in the body, not the URL. Every other rule
+        // — name format, NamespaceLifecycle, defaulting, validation, the CRD
+        // schema, admission, the create stamps and the create-only CAS — is
+        // the write pipeline's, shared with every other verb.
         let name = body
+            .as_value()
             .get("metadata")
             .and_then(|m| m.get("name"))
-            .and_then(|n| n.as_str())
+            .and_then(Value::as_str)
             .ok_or_else(|| ApiError::BadRequest("missing metadata.name in request body".into()))?
             .to_string();
-        // ── NAME VALIDATION (DNS-1123). ────────────────────────────────
-        // Measured 2026-08-28: `UPPERCASE`, `has spaces`, `-leading-dash`,
-        // `has_underscore` and a 64-char name were ALL accepted with 201 —
-        // there was no name validation anywhere in the workspace. A name is
-        // the primary key of the REST path, so `has spaces` is addressable
-        // only through percent-encoding and `UPPERCASE` collides with
-        // `uppercase` for any consumer that case-folds.
-        //
-        // The rule is chosen by KIND (Namespace/Service take the stricter
-        // DNS-1123 LABEL because their names become DNS labels), so a call
-        // site cannot pick the wrong strictness. 422 Invalid, not 400: the
-        // request was understood and is simply not a legal object, and
-        // client-go's `IsInvalid` keys on that reason — collapsing the two
-        // would make a permanently-invalid object look transient and be
-        // retried forever.
-        if let Err(e) = engenho_types::name::ResourceName::parse_for_kind(&name, &self.kind) {
-            return Err(ApiError::Invalid(
-                [
-                    &self.kind,
-                    " \"",
-                    name.as_str(),
-                    "\" is invalid: metadata.name: ",
-                    &e.to_string(),
-                ]
-                .concat(),
-            ));
-        }
-        // ── NamespaceLifecycle admission. ──────────────────────────────
-        // Measured 2026-08-28: a ConfigMap POSTed into `ghost-namespace`, a
-        // namespace that did not exist, returned 201. The object was stored,
-        // listable, and permanently orphaned — nothing would ever collect it,
-        // because namespace deletion is what collects a namespace's contents
-        // and there was no namespace to delete.
-        //
-        // Upstream's NamespaceLifecycle plugin rejects this with 404
-        // NotFound naming the NAMESPACE (not the object), which is what
-        // kubectl renders as `Error from server (NotFound): namespaces "x"
-        // not found`.
-        //
-        // Scoped to namespaced kinds, and `Namespace` itself is necessarily
-        // exempt — it is cluster-scoped, so it never reaches this branch.
-        if self.namespace_lifecycle
-            && let Some(ns) = namespace
-        {
-            let ns_key = ResourceKey::cluster_scoped("", "v1", "Namespace", ns.to_string());
-            if self.store.get(&ns_key).await.is_none() {
-                return Err(ApiError::NotFound(
-                    ["namespaces \"", ns, "\" not found"].concat(),
-                ));
-            }
-        }
-        // ── API DEFAULTING (upstream's `scheme.Default(obj)`). ─────────
-        // Upstream's pipeline is `decode → DEFAULT → validate → admit →
-        // persist`, and engenho had every stage but this one. Order is
-        // load-bearing and this position is the reason: BEFORE validation,
-        // so a validator judges the object that will actually be stored
-        // rather than rejecting every client that merely omitted a field;
-        // and BEFORE admission, so a mutating webhook can see and override
-        // a default, which it can only do if the default is already there.
-        //
-        // Measured on cid 2026-08-29: `default/final-check` read back with
-        // NO `restartPolicy` while the kubelet restarted it 160 times — the
-        // runtime already behaved as `Always` while the stored object
-        // declined to say so. Nothing crashed and nothing logged, which is
-        // exactly the class defaulting exists to close.
-        let mut body = body;
-        crate::defaulting::apply(&self.group, &self.version, &self.kind, &mut body);
-
-        // ── API VALIDATION (upstream's `validation.ValidateX`). ────────
-        // AFTER defaulting, and the order is what makes the enum checks
-        // legal: `restartPolicy` is optional on the wire, so a validator
-        // running first would have to accept absent-or-valid and every rule
-        // would carry an "or missing" arm that hides real typos. Because
-        // defaulting has already filled it, validation can demand a legal
-        // value outright.
-        //
-        // BEFORE admission, so a webhook sees an object that is already
-        // known well-formed rather than having to re-check it.
-        //
-        // Before this stage a built-in could be stored with a
-        // `restartPolicy` of "Sometimes" or a containerPort of 99999 and be
-        // rejected by nothing — surfacing later as a confusing runtime
-        // error on a node instead of a 422 to whoever typed it.
-        {
-            let violations =
-                crate::validation::validate(&self.group, &self.version, &self.kind, &body);
-            if !violations.is_empty() {
-                let detail = violations
-                    .iter()
-                    .map(|v| [v.field.as_str(), ": ", v.message.as_str()].concat())
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                return Err(ApiError::Invalid(
-                    [&self.kind, " \"", name.as_str(), "\" is invalid: ", &detail].concat(),
-                ));
-            }
-        }
-
-        // ── CRD structural-schema DEFAULTING, then validation. ─────────
-        // Defaulting runs first, exactly as upstream orders it: a default
-        // must be able to satisfy a `required` field, which it cannot once
-        // validation has already rejected the object.
-        //
-        // Measured on rio 2026-09-15 — the cost of not doing this is not a
-        // missing field, it is a crash loop in somebody else's binary.
-        // Flux's GitRepository CRD declares `spec.timeout` default `60s`;
-        // engenho stored the object without it; source-controller v1.8.5
-        // dereferenced the nil `*metav1.Duration` and panicked on every
-        // reconcile. The GitRepository sat reporting "building artifact" and
-        // nothing anywhere named the apiserver as the cause.
-        let mut body = body;
-        if let Some(schema) = &self.crd_schema {
-            crate::schema_validation::apply_defaults(schema, &mut body);
-        }
-
-        // ── CRD structural-schema validation. ──────────────────────────
-        // Measured 2026-08-28: a CRD declaring `spec.size: {type: integer}`
-        // accepted a CR with `spec.size: "NOT-AN-INT"` and returned 201. The
-        // schema was captured all along (crd.rs called it "validation
-        // DEFERRED") but never reached the handler. An unvalidated CR is worse
-        // than an unschema'd one: every controller downstream was written
-        // against the declared types.
-        if let Some(schema) = &self.crd_schema {
-            let violations = crate::schema_validation::validate(schema, &body);
-            if !violations.is_empty() {
-                let detail = violations
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                return Err(ApiError::Invalid(
-                    [&self.kind, " \"", name.as_str(), "\" is invalid: ", &detail].concat(),
-                ));
-            }
-        }
-        let key = self.key(namespace, &name)?;
-        // Admission runs at the API boundary BEFORE any store proposal.
-        // A Mutate replaces the body; a Deny short-circuits with 403. The
-        // authenticated identity travels into AdmissionRequest.user_info.
-        let mut body = self
-            .admit_object(ObjectAction::Put, &key, body, user_info)
-            .await?;
-        // ── creationTimestamp stamp (DETERMINISM boundary clock read). ──
-        // Inject `metadata.creationTimestamp` (if absent) from ONE typed
-        // RFC3339 render at the apiserver boundary — the frozen string
-        // travels inside the single replicated `Put`, so every Raft replica
-        // replays the identical value (the clock is NOT a replicated input,
-        // so it MUST be frozen here, never inside the deterministic
-        // store-apply path). kubectl AGE then renders a real duration
-        // instead of `<unknown>`.
-        stamp_creation_timestamp(&mut body);
-        // ── metadata.namespace stamp (K8s namespaced-object invariant). ──
-        // A namespaced object's `metadata.namespace` ALWAYS reflects the
-        // namespace it lives in — upstream k8s defaults it from the request
-        // namespace at create (and rejects a body whose metadata.namespace
-        // disagrees with the URL). Without this, the stored body carried the
-        // KEY's namespace but NO `metadata.namespace`, so a controller that
-        // reads `metadata.namespace` (the deployment→RS / RS→Pod namespace
-        // inheritance) saw `None` and fell back to "default" — the workload
-        // landed in the wrong namespace. Stamp it from the request namespace
-        // (the `self.namespaced` handlers only; cluster-scoped objects have
-        // no namespace).
-        if let Some(ns) = namespace {
-            stamp_namespace(&mut body, ns);
-        }
-        // ── Namespace lifecycle stamp (Active + kubernetes finalizer). ──
-        // Real k8s seeds these via the namespace-lifecycle admission plugin;
-        // engenho stamps them at create so a Namespace is born Active with
-        // the `kubernetes` finalizer (so its delete goes Terminating + the
-        // NamespaceController cascade owns the teardown).
-        if self.kind == "Namespace" {
-            stamp_namespace_create_defaults(&mut body);
-        }
-        // Optimistic-concurrency precondition from the (post-admission)
-        // body's metadata.resourceVersion. For a CREATE (POST) of a NEW
-        // object the rv is absent → None (unconditional create); a
-        // re-PUT-style body carrying an rv threads CAS into the proposal.
-        let expected = body_precondition(&body)?;
-        // Reject if already exists (POST semantics). The no-rv POST keeps
-        // its existing already-exists Conflict/"AlreadyExists" path.
-        if self.store.get(&key).await.is_some() {
-            return Err(ApiError::Conflict(
-                format!("{}/{}", self.kind, name),
-                "resource already exists".into(),
-            ));
-        }
-        // DRY-RUN GATE. Everything above ran — decode, admission, the
-        // already-exists conflict check, the CAS precondition — because that
-        // is exactly what makes a dry run worth asking for. Only the PERSIST
-        // is skipped, and the would-be object is returned instead of a
-        // read-back. Before 2026-08-09 this parameter was not parsed at all
-        // and a `--dry-run=server` create was COMMITTED.
-        if dry_run.is_dry() {
-            return Ok(inject_type_meta(&body, self.api_version(), &self.kind));
-        }
-        let result = self
-            .store
-            .propose(ResourceCommand::Put {
-                key: key.clone(),
-                value: body,
-                expected,
-                reason: Reason::Operator,
-            })
-            .await
-            .map_err(|e| ApiError::StorageError(e.to_string()))?;
-        // A CAS conflict from the deterministic apply path → typed 409
-        // "Conflict" (distinct from the already-exists path above).
-        if result.op == ResourceOp::Conflict {
-            return Err(self.rv_conflict(&name, expected));
-        }
-        // Read back the committed resource (with resourceVersion).
-        let stored = self
-            .store
-            .get(&key)
-            .await
-            .ok_or_else(|| ApiError::Internal("created but not readable".into()))?;
-        Ok(inject_type_meta(&stored, self.api_version(), &self.kind))
+        self.write(
+            namespace,
+            &name,
+            WriteRequest::Create(body),
+            user_info,
+            dry_run,
+            &mut PatchFields::unasked(),
+        )
+        .await
     }
 
     async fn replace(
         &self,
         namespace: Option<&str>,
         name: &str,
-        body: Value,
+        body: ObjectBody,
         user_info: &UserInfo,
         dry_run: DryRun,
     ) -> Result<Value, ApiError> {
-        let key = self.key(namespace, name)?;
-        // A PUT/replace of an absent name is a 404 — `kubectl replace`
-        // requires the object to exist (unlike an apply, which upserts).
-        let existing = self
-            .store
-            .get(&key)
-            .await
-            .ok_or_else(|| ApiError::NotFound(format!("{}/{}", self.kind, name)))?;
-        // Admission (Put) at the API boundary BEFORE any store proposal. A
-        // Mutate replaces the body, a Deny short-circuits with 403. The
-        // authenticated identity travels into AdmissionRequest.user_info.
-        let mut body = self
-            .admit_object(ObjectAction::Put, &key, body, user_info)
-            .await?;
-        // A namespaced object's metadata.namespace ALWAYS reflects the ns it
-        // lives in (same invariant the create path stamps).
-        if let Some(ns) = namespace {
-            stamp_namespace(&mut body, ns);
-        }
-        // Preserve the server-owned immutable metadata (creationTimestamp +
-        // uid) from the LIVE object — a replace wholesale-overwrites the
-        // stored value, but these are assigned once at create and must never
-        // be rewritten by a client PUT.
-        preserve_immutable_meta(&mut body, &existing);
-        // A main-object PUT on a status-bearing kind MUST NOT change `.status`
-        // — k8s writes status only through `/status`. Preserve the live status
-        // so a client PUT that carries a status cannot clobber it (the
-        // symmetric peer of `put_status` scoping the /status endpoint to
-        // `.status` only). Kinds without a Status subresource (ConfigMap,
-        // Secret) are unaffected — the whole body is written as before.
-        if self.subresources.contains(&Subresource::Status) {
-            preserve_status(&mut body, &existing);
-        }
-        // Optimistic-concurrency precondition from the (post-admission) body's
-        // metadata.resourceVersion. A body carrying an rv threads CAS into the
-        // proposal (a stale rv → typed 409); an absent rv → unconditional
-        // replace. This reuses the SAME `ResourceCommand::Put` the create path
-        // proposes — extend the primitive, don't fork it.
-        let expected = body_precondition(&body)?;
-        // DRY-RUN GATE — existence, admission and the CAS precondition all
-        // ran above; only the persist is skipped.
-        if dry_run.is_dry() {
-            return Ok(inject_type_meta(&body, self.api_version(), &self.kind));
-        }
-        let result = self
-            .store
-            .propose(ResourceCommand::Put {
-                key: key.clone(),
-                value: body,
-                expected,
-                reason: Reason::Operator,
-            })
-            .await
-            .map_err(|e| ApiError::StorageError(e.to_string()))?;
-        if result.op == ResourceOp::Conflict {
-            return Err(self.rv_conflict(name, expected));
-        }
-        // Read back the committed resource (with the bumped resourceVersion).
-        let stored = self
-            .store
-            .get(&key)
-            .await
-            .ok_or_else(|| ApiError::Internal("replaced but not readable".into()))?;
-        Ok(inject_type_meta(&stored, self.api_version(), &self.kind))
+        self.write(
+            namespace,
+            name,
+            WriteRequest::Replace(body),
+            user_info,
+            dry_run,
+            &mut PatchFields::unasked(),
+        )
+        .await
     }
 
     async fn patch(
@@ -1552,149 +1286,11 @@ impl ResourceHandler for StoreBackedHandler {
         apply_opts: Option<crate::params::ApplyOptions>,
         user_info: &UserInfo,
         dry_run: DryRun,
+        fields: &mut PatchFields,
     ) -> Result<Value, ApiError> {
-        let key = self.key(namespace, name)?;
-        // Admission runs at the API boundary BEFORE the store proposal. The
-        // authenticated identity travels into AdmissionRequest.user_info.
-        let patch = self
-            .admit_object(ObjectAction::Patch, &key, patch, user_info)
-            .await?;
-        // Precondition from the (post-admission) patch body's
-        // metadata.resourceVersion (absent → unconditional). Only a
-        // merge/strategic body is an object carrying metadata; a json-patch
-        // op array has no precondition (the K8s wire never carries one on a
-        // json-patch), so `body_precondition` over a non-object → None.
-        let expected = body_precondition(&patch)?;
-
-        // ── Server-side apply branch ──────────────────────────────────────
-        //
-        // An apply is an UPSERT (create-if-absent + merge-if-present), so it
-        // does NOT take the not-found early-return below. The frozen RFC3339
-        // `time` is captured ONCE here at the apiserver boundary (the one
-        // non-deterministic input) and threaded into the replicated
-        // ApplyMeta, so every Raft replica stamps the identical managedFields
-        // `time`. NON-apply patches skip this entire block — byte-identical
-        // to before SSA landed (BEHAVIOR PRESERVATION).
-        if let Some(opts) = apply_opts {
-            // DRY-RUN GATE. The persist is refused — which is the safety
-            // property — but unlike create/replace/delete the WOULD-BE object
-            // is not computable here: the SSA merge needs the store's
-            // field-ownership state and a `PatchSchemaEnv` the handler does
-            // not hold. Returning the unmodified current object would be a
-            // wrong answer dressed as a right one, so this refuses BY NAME.
-            // `pending-engenho: dryrun-patch-result`.
-            if dry_run.is_dry() {
-                return Err(ApiError::BadRequest(
-                    "dryRun=All on server-side apply is not yet supported: the \
-                     merged result cannot be computed without persisting. The \
-                     write was NOT performed."
-                        .into(),
-                ));
-            }
-            let time = engenho_types::time::now_rfc3339_utc();
-            let result = self
-                .store
-                .propose(ResourceCommand::apply_ssa(
-                    key.clone(),
-                    patch,
-                    ApplyMeta {
-                        manager: opts.manager,
-                        force: opts.force,
-                        time,
-                    },
-                    expected,
-                    Reason::Operator,
-                ))
-                .await
-                .map_err(|e| ApiError::StorageError(e.to_string()))?;
-            if result.op == ResourceOp::Conflict {
-                return Err(self.rv_conflict(name, expected));
-            }
-            // Unforced field-ownership conflicts → typed 409 with
-            // details.causes (NEVER a silent overwrite). The serialized
-            // causes array rides on patch_error.
-            if result.op == ResourceOp::ApplyConflict {
-                let causes: Value = result
-                    .patch_error
-                    .as_deref()
-                    .and_then(|s| serde_json::from_str(s).ok())
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
-                return Err(ApiError::ApplyConflict(causes));
-            }
-            if result.op == ResourceOp::PatchRejected {
-                let msg = result
-                    .patch_error
-                    .unwrap_or_else(|| "apply rejected".to_string());
-                return Err(ApiError::BadRequest(msg));
-            }
-            // An apply that emptied finalizers on a Terminating object is
-            // converted to a removal by the store (same finalizer-release
-            // rule) — return the typed Success Status.
-            if result.op == ResourceOp::Deleted {
-                return Ok(crate::error::delete_status_success(name, &self.kind));
-            }
-            let stored = self
-                .store
-                .get(&key)
-                .await
-                .ok_or_else(|| ApiError::Internal("apply lost during commit".into()))?;
-            return Ok(inject_type_meta(&stored, self.api_version(), &self.kind));
-        }
-
-        if self.store.get(&key).await.is_none() {
-            return Err(ApiError::NotFound(format!("{}/{}", self.kind, name)));
-        }
-        // DRY-RUN GATE — same reasoning as the apply arm above: nothing is
-        // persisted, and the merged result is not invented.
-        if dry_run.is_dry() {
-            return Err(ApiError::BadRequest(
-                "dryRun=All on PATCH is not yet supported: the merged result \
-                 cannot be computed without persisting. The write was NOT \
-                 performed."
-                    .into(),
-            ));
-        }
-        let result = self
-            .store
-            .propose(ResourceCommand::Patch {
-                key: key.clone(),
-                patch,
-                patch_type,
-                apply: None,
-                expected,
-                reason: Reason::Operator,
-            })
+        let request = WriteRequest::patch(patch, patch_type, apply_opts)?;
+        self.write(namespace, name, request, user_info, dry_run, fields)
             .await
-            .map_err(|e| ApiError::StorageError(e.to_string()))?;
-        if result.op == ResourceOp::Conflict {
-            return Err(self.rv_conflict(name, expected));
-        }
-        // The patch interpreter REFUSED the patch (RFC6902 test failure, bad
-        // pointer, missing strategic merge-key, or a bad $patch directive).
-        // Surface the typed 422/400 Status. NEVER a corrupted object.
-        if result.op == ResourceOp::PatchRejected {
-            let msg = result
-                .patch_error
-                .unwrap_or_else(|| "patch rejected".to_string());
-            return Err(ApiError::BadRequest(msg));
-        }
-        // A patch that EMPTIED the finalizers on a Terminating object is
-        // converted by the store into a REMOVAL (the finalizer-release rule
-        // in apply_patch) — the object is intentionally gone now. The store
-        // reports `ResourceOp::Deleted` for that case; the read-back is
-        // (correctly) None. Return a typed Success Status, NOT an Internal
-        // error — this is `kubectl patch …finalizers:null` completing the
-        // delete. (A plain not-found read-back without a Deleted op stays
-        // the genuine "lost during commit" internal error.)
-        if result.op == ResourceOp::Deleted {
-            return Ok(crate::error::delete_status_success(name, &self.kind));
-        }
-        let stored = self
-            .store
-            .get(&key)
-            .await
-            .ok_or_else(|| ApiError::Internal("patch lost during commit".into()))?;
-        Ok(inject_type_meta(&stored, self.api_version(), &self.kind))
     }
 
     async fn delete(
@@ -1735,20 +1331,6 @@ impl ResourceHandler for StoreBackedHandler {
         // through `ApplyResult` is a larger store-layer change deferred to
         // a later brick.
         let prior = self.store.get(&key).await;
-        // DETERMINISM: freeze ONE boundary clock read into the replicated
-        // command IFF the live object bears finalizers (only then does the
-        // store's finalizer gate stamp `metadata.deletionTimestamp`). The
-        // timestamp is captured here, at the apiserver boundary, via the
-        // typed RFC3339 render (`engenho_types::time`) — the one
-        // non-deterministic input — so every Raft replica replays the
-        // identical bytes. A no-finalizer object threads `None` (the gate
-        // removes it immediately, BEHAVIOR-PRESERVATION).
-        let deletion_timestamp = prior
-            .as_ref()
-            .filter(|v| object_has_finalizers(v))
-            .map(|_| engenho_types::time::now_rfc3339_utc());
-        // Keep a clone for the DeletionPending re-read (the original is
-        // moved into the proposed command).
         // DRY-RUN GATE. THE dangerous one: before this existed a
         // `kubectl delete --dry-run=server` really deleted. The pre-delete
         // image is exactly what a real delete returns, so the dry response is
@@ -1759,14 +1341,26 @@ impl ResourceHandler for StoreBackedHandler {
                 None => crate::error::delete_status_success(name, &self.kind),
             });
         }
+        // Keep a clone for the DeletionPending re-read (the original is
+        // moved into the proposed command).
         let key_for_reread = key.clone();
+        // ★ EVERY DELETE CARRIES ITS CLOCK (T3.6). Whether the object is
+        // removed or goes Terminating is decided by the store at APPLY time,
+        // from the object as it stands then — never from `prior`, which was
+        // read at a different moment. A finalizer that landed between that
+        // read and this proposal used to reach the store with no timestamp,
+        // and the store kept the object live while this DELETE answered
+        // success. The clock is read ONCE here, at the boundary, through the
+        // typed RFC3339 render (the one non-deterministic input), and frozen
+        // into the replicated command so every replica stamps the same bytes.
+        // A finalizer-free object ignores it and is removed immediately.
         let result = self
             .store
             .propose(ResourceCommand::delete_at(
                 key,
                 expected,
                 Reason::Operator,
-                deletion_timestamp,
+                Some(engenho_types::time::now_rfc3339_utc()),
             ))
             .await
             .map_err(|e| ApiError::StorageError(e.to_string()))?;
@@ -2157,6 +1751,28 @@ struct ListMeta {
     remaining_item_count: Option<i64>,
 }
 
+/// The ONE [`AdmissionRequest`] shape both admit paths hand the chain — the
+/// write pipeline's object review and [`StoreBackedHandler::admit_delete`]:
+/// the live object as `current` (absent for a create), the proposed `value`
+/// (absent for a delete), and the AUTHENTICATED identity threaded from the
+/// request's `Extension<UserInfo>`, so a webhook can decide on WHO is acting
+/// as well as WHAT.
+fn admission_request(
+    action: AdmissionAction,
+    key: &ResourceKey,
+    value: Option<Value>,
+    current: Option<Value>,
+    user_info: &UserInfo,
+) -> AdmissionRequest {
+    AdmissionRequest {
+        action,
+        key: key.clone(),
+        value,
+        current,
+        user_info: user_info.clone(),
+    }
+}
+
 /// Remove `kind` + `apiVersion` from a LIST item. The `<Kind>List` envelope
 /// carries the GVK (`ConfigMapList` / `v1`); each item is TypeMeta-less on
 /// the wire — kube-apiserver's codec clears item-level TypeMeta when encoding
@@ -2185,24 +1801,14 @@ fn inject_type_meta(v: &Value, api_version: String, kind: &str) -> Value {
     out
 }
 
-/// `true` iff the object carries a NON-EMPTY `metadata.finalizers` array —
-/// the apiserver-side gate that decides whether to freeze a boundary
-/// `deletionTimestamp` into the Delete command (mirrors the store-side
-/// `has_finalizers`; the two agree because both read the same opaque body).
-fn object_has_finalizers(value: &Value) -> bool {
-    value
-        .get("metadata")
-        .and_then(|m| m.get("finalizers"))
-        .and_then(Value::as_array)
-        .is_some_and(|a| !a.is_empty())
-}
-
-/// Inject `metadata.creationTimestamp` (if absent) from the typed RFC3339
-/// boundary render. Idempotent: a body that already carries one (a re-PUT,
-/// or a client that set it) is left untouched. The store-apply path never
-/// touches creationTimestamp, so this single boundary stamp is the
-/// authoritative value carried into the replicated `Put`.
-fn stamp_creation_timestamp(body: &mut Value) {
+/// Inject `metadata.creationTimestamp` (if absent) from `now`, the write's
+/// ONE boundary clock read (the typed RFC3339 render, frozen before the
+/// write is planned). Idempotent: a body that already carries one (a client
+/// that set it) is left untouched. The store-apply path never reads a clock,
+/// so this boundary stamp is the authoritative value carried into the
+/// replicated command, and a server-side apply that creates stamps the same
+/// instant its `managedFields` entry records.
+fn stamp_creation_timestamp(body: &mut Value, now: &str) {
     if let Some(obj) = body.as_object_mut() {
         let metadata = obj
             .entry("metadata".to_string())
@@ -2211,7 +1817,7 @@ fn stamp_creation_timestamp(body: &mut Value) {
             if creation_timestamp_is_unset(meta_obj.get("creationTimestamp")) {
                 meta_obj.insert(
                     "creationTimestamp".to_string(),
-                    Value::String(engenho_types::time::now_rfc3339_utc()),
+                    Value::String(now.to_string()),
                 );
             }
         }
@@ -2241,11 +1847,25 @@ fn stamp_namespace(body: &mut Value, namespace: &str) {
     }
 }
 
-/// Preserve the server-owned immutable metadata (`creationTimestamp`, `uid`)
-/// from the live object into an incoming REPLACE body. A PUT replaces the
-/// whole object, but these two fields are assigned once at create and must
-/// survive a replace unchanged — a client PUT that omits or alters them must
-/// not win. Pure JSON mutation; idempotent when the live object lacks a field.
+/// Preserve the server-owned metadata of the live object across an UPDATE
+/// (PUT, PATCH, server-side apply): the candidate is whatever the client's
+/// write produced, and these fields are not the client's to write.
+///
+///   * `creationTimestamp` and `uid` are assigned once at create. A write
+///     that omits or alters them keeps the live values; when the live object
+///     lacks one, the candidate's stands (as before).
+///   * `deletionTimestamp` is upstream's `rest.BeforeUpdate` rule, "an update
+///     can never remove/change a deletion timestamp": only DELETE starts
+///     termination, and only emptying the finalizers ends it. The candidate
+///     carries exactly the live value — kept when the live object is
+///     Terminating, dropped when it is not. Before the one write pipeline a
+///     PUT that omitted it, or a merge patch that nulled it, brought a
+///     Terminating object back to life; and a patch that SET one on a
+///     finalizer-free object deleted it through the store's finalizer
+///     release. (Upstream answers that last case 422; engenho corrects the
+///     field silently, as it does `uid`.)
+///
+/// Pure JSON mutation; idempotent.
 fn preserve_immutable_meta(body: &mut Value, existing: &Value) {
     let existing_meta = existing.get("metadata");
     if let Some(obj) = body.as_object_mut() {
@@ -2258,13 +1878,22 @@ fn preserve_immutable_meta(body: &mut Value, existing: &Value) {
                     meta_obj.insert(field.to_string(), v.clone());
                 }
             }
+            match existing_meta.and_then(|m| m.get("deletionTimestamp")) {
+                Some(live) => {
+                    meta_obj.insert("deletionTimestamp".to_string(), live.clone());
+                }
+                None => {
+                    meta_obj.remove("deletionTimestamp");
+                }
+            }
         }
     }
 }
 
-/// For a kind that declares a `/status` subresource, a main-object PUT MUST
-/// NOT change `.status` — k8s writes status ONLY through `/status` and drops
-/// any status a client sends to the base-object endpoint. Preserve the LIVE
+/// For a kind that declares a `/status` subresource, a main-object update
+/// (PUT, PATCH, server-side apply) MUST NOT change `.status` — k8s writes
+/// status ONLY through `/status` and drops any status a client sends to the
+/// base-object endpoint. Preserve the LIVE
 /// status into the incoming REPLACE body: copy the live `.status` in when the
 /// object has one, otherwise drop whatever status the client sent. The
 /// symmetric peer of [`StoreBackedHandler::put_status`] scoping a status write
@@ -2522,15 +2151,18 @@ mod tests {
     fn stamp_creation_timestamp_is_idempotent() {
         // Stamped when absent; never bumped when present.
         let mut body = serde_json::json!({"metadata": {"name": "x"}});
-        stamp_creation_timestamp(&mut body);
+        stamp_creation_timestamp(&mut body, "2026-09-19T00:00:00Z");
         let first = body
             .get("metadata")
             .unwrap()
             .get("creationTimestamp")
             .unwrap()
             .clone();
-        assert!(first.as_str().unwrap().ends_with('Z'));
-        stamp_creation_timestamp(&mut body);
+        assert_eq!(
+            first, "2026-09-19T00:00:00Z",
+            "stamped from the frozen instant"
+        );
+        stamp_creation_timestamp(&mut body, "2030-01-01T00:00:00Z");
         let second = body
             .get("metadata")
             .unwrap()
