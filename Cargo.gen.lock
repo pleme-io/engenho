@@ -2,7 +2,7 @@
   "schema_version": 2,
   "cargo_lock_sha256": "1966c7a2af4c79bd3e15ed9f790a9632ef689ccb7ec76505f5a973630018ea62",
   "manifest_sha256": {
-    "Cargo.toml": "04cf79221801b8562c19d8a3bcbf45a55f2886ba7d654cd6a523bd856736a98c",
+    "Cargo.toml": "566bc85d70b240f7e5a1cc55eddf82501c2ee299b137bfc861d72a166adf2b2a",
     "engenho-apiserver/Cargo.toml": "be7d04cd80fe124f3094eb3f147cbde15e2eabe2975858e18f9ed7ab6c190ab1",
     "engenho-cluster-config-render/Cargo.toml": "5f5f6d40c2b9a572f18418d12e568412517972684259f34a9aa3d34de0a5dc8c",
     "engenho-cluster-config/Cargo.toml": "49d8ea7131956ec2d6323ae41968f624fab66bbbbca1afbb0537b2327a683391",
@@ -4410,10 +4410,14 @@
             "package_key": "reqwest-0.12.28",
             "kind": "normal",
             "features": [
+              "charset",
+              "http2",
               "json",
               "json",
               "rustls-tls",
-              "rustls-tls"
+              "rustls-tls",
+              "rustls-tls-native-roots",
+              "system-proxy"
             ],
             "uses_default_features": false,
             "optional": false,
@@ -6262,8 +6266,12 @@
             "package_key": "reqwest-0.12.28",
             "kind": "normal",
             "features": [
+              "charset",
+              "http2",
               "json",
-              "rustls-tls"
+              "rustls-tls",
+              "rustls-tls-native-roots",
+              "system-proxy"
             ],
             "uses_default_features": false,
             "optional": false,
@@ -15161,6 +15169,16 @@
             "tree": "target"
           },
           {
+            "name": "rustls_native_certs",
+            "package_key": "rustls-native-certs-0.8.3",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": true,
+            "target": null,
+            "tree": "target"
+          },
+          {
             "name": "tokio",
             "package_key": "tokio-1.52.3",
             "kind": "normal",
@@ -15206,7 +15224,9 @@
           "aws-lc-rs",
           "http1",
           "http2",
+          "native-tokio",
           "ring",
+          "rustls-native-certs",
           "tls12",
           "webpki-roots",
           "webpki-tokio"
@@ -20932,6 +20952,16 @@
             "tree": "target"
           },
           {
+            "name": "rustls_native_certs",
+            "package_key": "rustls-native-certs-0.8.3",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": true,
+            "target": "cfg(not(target_arch = \"wasm32\"))",
+            "tree": "target"
+          },
+          {
             "name": "rustls_pki_types",
             "package_key": "rustls-pki-types-1.14.1",
             "kind": "normal",
@@ -21111,6 +21141,8 @@
           "http2",
           "json",
           "rustls-tls",
+          "rustls-tls-native-roots",
+          "rustls-tls-native-roots-no-provider",
           "rustls-tls-webpki-roots",
           "rustls-tls-webpki-roots-no-provider",
           "stream",

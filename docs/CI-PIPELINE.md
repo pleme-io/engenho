@@ -134,6 +134,26 @@ push + helm chart push would fail with `unauthorized`.
     table with a `Source` column names a path. Declarations are matched
     by text, so an item declared through a macro is not seen. The suite
     also fails if `engenho-machines` comes back (improvement plan T5.3).
+  * `ci/no-c-tls.test.tlisp` (test.yml, job `ci-contract-tests`) runs
+    `ci/no-c-tls.tlisp` against the real `Cargo.toml`, every member
+    manifest and `Cargo.lock` (improvement plan T0.8). The workspace
+    `reqwest` line turns reqwest's default features off and names
+    `rustls-tls`, `rustls-tls-native-roots`, `charset`, `http2` and
+    `system-proxy`; no member asks reqwest for its default or native-tls
+    features; `Cargo.lock` holds reqwest, rustls and hyper-rustls; and
+    `openssl-sys`, `openssl`, `native-tls`, `hyper-tls` and
+    `tokio-native-tls` are locked only through a source the check's
+    attribution table names. It reads `Cargo.lock` because that is
+    resolved for every target at once: a host-only
+    `cargo tree -i openssl-sys` prints nothing on darwin, where
+    native-tls uses Security.framework. **Not closed yet:** sui-store
+    0.1.153 (through `engenho-fonte-cli`'s `with-sui-eval`) still asks
+    reqwest for its defaults, so feature unification turns `default-tls`
+    on in every workspace build, and `Cargo.gen.lock`'s resolve, which
+    Nix builds the daemon from, carries it. The fix is sui 66a289f; no
+    published sui release has it as of 0.1.219. Once one does, move the
+    lock to it and delete the attribution rows; the check then fails
+    until every row is gone, and from then on it is a plain ban.
   * `ci/release-contract.tlisp` (test.yml, job `release-contract`)
     checks that release.yml moves `:latest` only in `promote-latest`,
     after `release-assets`; `ci/release-contract.test.tlisp` (job

@@ -88,7 +88,34 @@ hyper                  = { version = "1", features = ["client", "http1"] }
 hyper-util             = { version = "0.1", features = ["tokio"] }
 http-body-util         = "0.1"
 tower                  = "0.5"
-reqwest                = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# HTTP client, rustls only. `default-features = false` keeps reqwest's
+# `default-tls` out: native-tls, which links OpenSSL through openssl-sys on
+# Linux. Wherever `default-tls` is on, reqwest's `TlsBackend::default()` picks
+# native-tls even with `rustls-tls` enabled too, so `Client::new()` and a bare
+# `Client::builder()` (the webhook-admission and kubelet HTTPS-probe clients)
+# run on native-tls. The other defaults (`charset`, `http2`, `system-proxy`)
+# are named back so TLS is the only thing this line turns off; engenho got
+# them only through a dependency that asks for all of reqwest's defaults.
+# `rustls-tls-native-roots` keeps the OS trust store that native-tls read (a
+# private CA keeps working), and `rustls-tls` adds the bundled webpki roots.
+# The same line as pleme-io/sui 66a289f.
+#
+# NOT DONE YET: cargo unifies features, so the one dependency that still asks
+# for the defaults turns `default-tls` back on for every crate in a workspace
+# build, and Cargo.gen.lock's resolve (what Nix builds the daemon from)
+# carries it. That dependency is sui-store 0.1.153, through
+# engenho-fonte-cli -> engenho-fonte/with-sui-eval -> sui-eval. The fix is in
+# sui 66a289f and in no published release as of 0.1.219. ci/no-c-tls.tlisp
+# names it as the one attributed source and fails on any other, and on this
+# line losing `default-features = false`.
+reqwest                = { version = "0.12", default-features = false, features = [
+  "json",
+  "rustls-tls",
+  "rustls-tls-native-roots",
+  "charset",
+  "http2",
+  "system-proxy",
+] }
 utoipa                 = { version = "5", features = ["axum_extras"] }
 async-nats             = "0.38"
 futures                = "0.3"

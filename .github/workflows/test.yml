@@ -278,10 +278,10 @@ jobs:
   # .github/workflows/mutation.yml.
   # Second step: pleme-io/actions/tlisp-test runs each ci/<name>.test.tlisp
   # against ci/<name>.tlisp. min-files is the number of suites that exist
-  # (release-contract, mutation-gate, cargo-profiles, doc-sources), so
-  # losing one is red, not a smaller green; mutation-gate's suite fails if
-  # the floor and the count disagree. The first step pins the tatara-script tlisp-test reuses
-  # from PATH.
+  # (release-contract, mutation-gate, cargo-profiles, doc-sources,
+  # no-c-tls), so losing one is red, not a smaller green; mutation-gate's
+  # suite fails if the floor and the count disagree. The first step pins the
+  # tatara-script tlisp-test reuses from PATH.
   # cargo-profiles has no job of its own: its suite's first test runs the
   # whole check against the real Cargo.toml, .cargo/config.toml and every
   # workflow (improvement plan T0.9). It fails if [profile.release] leaves
@@ -296,6 +296,17 @@ jobs:
   # into a crate that is not a workspace member, a `path.rs::Item` that file
   # does not declare, or an index row with no source; and if
   # engenho-machines comes back.
+  # no-c-tls has no job of its own either: its suite's first tests run the
+  # check against the real Cargo.toml, every member manifest and Cargo.lock
+  # (improvement plan T0.8). They fail if the workspace reqwest line stops
+  # turning reqwest's default features off or stops naming rustls-tls,
+  # rustls-tls-native-roots, charset, http2 and system-proxy; if a member
+  # asks reqwest for its default or native-tls features; if Cargo.lock loses
+  # reqwest, rustls or hyper-rustls; or if openssl-sys, openssl, native-tls,
+  # hyper-tls or tokio-native-tls is locked through a source the check's
+  # attribution table does not name. Today one named source remains:
+  # sui-store 0.1.153 asks reqwest for its defaults (fixed in sui 66a289f,
+  # unreleased).
   # ───────────────────────────────────────────────────────────────────────────
   ci-contract-tests:
     name: ci/*.test.tlisp + mutation-gate lists
@@ -310,4 +321,4 @@ jobs:
           MUTATION_GATE_MODE: lint
       - uses: pleme-io/actions/tlisp-test@main
         with:
-          min-files: 4
+          min-files: 5

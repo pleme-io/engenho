@@ -64,12 +64,23 @@
       # successfully-published tag (ghcr.io/pleme-io/engenho-mcp:0.7.0,
       # commit 3c1432e): that image was built from a Dockerfile
       # (`FROM gcr.io/distroless/cc-debian12`, deleted in 78be81e) —
-      # the libssl3 CVEs were the Debian base image's package, not
-      # anything engenho pins (`cargo tree -p engenho-mcp` shows zero
-      # openssl-sys/native-tls; engenho-kube-client's reqwest is
-      # `rustls-tls` only). This dockerTools image carries no distro
-      # base and no dpkg package database at all — the whole libssl3
-      # CVE class is structurally absent, not merely patched.
+      # the libssl3 CVEs were the Debian base image's package. This
+      # dockerTools image carries no distro base and no dpkg package
+      # database, so that package is gone.
+      #
+      # OpenSSL itself is NOT gone (measured 2026-09-19). `cargo tree -p
+      # engenho-mcp` shows no openssl-sys because cargo resolves features
+      # per package, but this image is built by lockfile-builder from
+      # Cargo.gen.lock's ONE workspace-wide resolve. There, sui-store
+      # 0.1.153 (engenho-fonte-cli -> with-sui-eval -> sui-eval) asks
+      # reqwest for its default features, so reqwest carries
+      # `default-tls`. The x86_64-linux engenho-mcp derivation depends
+      # on rust_openssl-sys 0.9.116, built against
+      # openssl-static-x86_64-unknown-linux-musl-3.6.2, so the binary
+      # links OpenSSL statically, where no package database lists it.
+      # The fix is sui 66a289f, which is in no sui release yet.
+      # ci/no-c-tls.tlisp records sui-store as the one known source and
+      # fails on any other.
       #
       # `genBuild = true` drives substrate's lockfile-builder (the
       # same gen-based engine `base`/`mcpBase` already use above) —
