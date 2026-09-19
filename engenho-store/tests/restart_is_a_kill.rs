@@ -51,7 +51,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-use engenho_store::command::{ApplyMeta, PatchType, TxnCompare, TxnOp};
+use engenho_store::command::{ApplyMeta, LoggedCommand, PatchType, TxnCompare, TxnOp};
 use engenho_store::{
     ApplyResult, FjallStore, Flushed, InMemoryStore, InProcessRouter, MeshFlushed, Reason,
     ResourceCommand, ResourceKey, Revision, StoreError, StoreMesh, TypeConfig, WatchGone,
@@ -145,7 +145,7 @@ async fn commit_to_durable_log(dir: &Path, names: &[String]) -> Vec<Ack> {
     let mut acks = Vec::with_capacity(names.len());
     for name in names {
         let resp = raft
-            .client_write(put_pod(name))
+            .client_write(LoggedCommand::proposed(put_pod(name)))
             .await
             .expect("an acknowledged write");
         acks.push(Ack {
@@ -912,7 +912,8 @@ impl Recorder {
     }
 
     async fn write(&mut self, cmd: ResourceCommand) -> ApplyResult {
-        self.push(EntryPayload::Normal(cmd)).await
+        self.push(EntryPayload::Normal(LoggedCommand::proposed(cmd)))
+            .await
     }
 }
 

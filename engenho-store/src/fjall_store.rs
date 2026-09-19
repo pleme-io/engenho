@@ -1302,10 +1302,11 @@ impl RaftStateMachine<TypeConfig> for FjallStore {
             }
             let (op, patch_error) = match entry.payload {
                 EntryPayload::Blank => (crate::command::ResourceOp::NoOp, None),
-                EntryPayload::Normal(ref cmd) => {
-                    let outcome = state
-                        .catalog
-                        .apply(cmd, log_id.leader_id.term, log_id.index);
+                EntryPayload::Normal(ref logged) => {
+                    let outcome =
+                        state
+                            .catalog
+                            .apply_logged(logged, log_id.leader_id.term, log_id.index);
                     let op = outcome.op;
                     let patch_error = outcome.patch_error.clone();
                     if let Some(change) = outcome.change {
@@ -1478,7 +1479,7 @@ mod tests {
                 leader_id: CommittedLeaderId::new(1, 0),
                 index: idx,
             },
-            payload: EntryPayload::Normal(cmd),
+            payload: EntryPayload::Normal(crate::command::LoggedCommand::proposed(cmd)),
         }
     }
 

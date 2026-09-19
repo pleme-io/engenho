@@ -10,7 +10,10 @@
 //! (patch-missing, delete-not-found) and the Raft-internal entries
 //! (blank on init, membership changes) do NOT consume a revision —
 //! they are filtered out before `apply` is ever called for them, and
-//! a no-op outcome here leaves the revision untouched.
+//! a no-op outcome here leaves the revision untouched. Nor does a Put or
+//! Patch whose result equals the stored object ([`unchanged`], T3.5): it
+//! answers [`ResourceOp::Unchanged`] under [`ApplySemantics::V1`], the rules
+//! every entry this binary proposes carries.
 //!
 //! Per key the catalog stores `(value, VersionMeta)` where
 //! [`VersionMeta`] carries `(create_revision, mod_revision,
@@ -32,7 +35,9 @@ use std::sync::Arc;
 
 use engenho_types::patch::PatchType;
 
-use crate::command::{ApplyMeta, ResourceCommand, ResourceOp, TxnCompare, TxnOp};
+use crate::command::{
+    ApplyMeta, ApplySemantics, LoggedCommand, ResourceCommand, ResourceOp, TxnCompare, TxnOp,
+};
 use crate::pagination::{ListPage, PageAtRevision};
 use crate::patch_apply::{self, Gvk, OpenApiPatchEnv, PatchBody, PatchError, PatchSchemaEnv};
 use crate::resource::{ListScope, ResourceKey, ResourceValue};
@@ -60,6 +65,140 @@ pub fn check_precondition(expected: Option<Revision>, live: Option<VersionMeta>)
     match expected {
         None => true,
         Some(n) => live.is_some_and(|m| m.mod_revision == n),
+    }
+}
+
+/// The `metadata` fields no writer sets: the store stamps both from the
+/// revision a write commits at, so they differ on every write and say
+/// nothing about whether the object changed.
+const COMPUTED_METADATA: [&str; 2] = ["resourceVersion", "generation"];
+
+/// The field of a managedFields entry the apiserver boundary stamps on every
+/// server-side apply: when the apply happened, not what it owns.
+const MANAGED_FIELDS_TIME: &str = "time";
+
+/// ★ A REVISION MEANS A CHANGE (T3.5). `true` when storing `candidate` over
+/// `prior` would leave the object as it is, so the write must consume no
+/// revision and wake no watcher.
+///
+/// Pure and total. Equality is structural over everything except what is
+/// stamped on every write whether or not anything changed:
+///
+///   * `metadata.resourceVersion` and `metadata.generation` — the store
+///     computes both from the revision the write would commit at;
+///   * the `time` of `manager`'s own `metadata.managedFields` entries — the
+///     instant of a server-side apply (upstream ignores it the same way, in
+///     `IgnoreManagedFieldsTimestampsTransformer`). `None`, for a Put or a
+///     non-apply Patch, ignores no managedFields time.
+///
+/// Everything else counts, ownership included: a second manager applying
+/// values already present adds a managedFields entry, and that is a change.
+/// Entries compare by position, because the apply path keeps each entry in
+/// place.
+///
+/// `candidate` is the object as it would be stored short of those stamps —
+/// after the merge, and with the identity the store preserves across updates
+/// (`uid`, `creationTimestamp`) already carried over.
+#[must_use]
+pub fn unchanged(
+    prior: &serde_json::Value,
+    candidate: &serde_json::Value,
+    manager: Option<&str>,
+) -> bool {
+    objects_equal_except(prior, candidate, &[], |field, p, c| match field {
+        "metadata" => objects_equal_except(p, c, &COMPUTED_METADATA, |field, p, c| match field {
+            "managedFields" => managed_fields_unchanged(p, c, manager),
+            _ => p == c,
+        }),
+        _ => p == c,
+    })
+}
+
+/// Structural equality of two JSON objects that skips the `ignored` keys and
+/// compares every other key with `field_eq`. Values that are not both objects
+/// compare with plain `==`.
+fn objects_equal_except(
+    prior: &serde_json::Value,
+    candidate: &serde_json::Value,
+    ignored: &[&str],
+    field_eq: impl Fn(&str, &serde_json::Value, &serde_json::Value) -> bool,
+) -> bool {
+    let (Some(before), Some(after)) = (prior.as_object(), candidate.as_object()) else {
+        return prior == candidate;
+    };
+    let kept = |key: &String| !ignored.contains(&key.as_str());
+    // Same number of kept keys, and every kept key of `before` present and
+    // equal in `after`: the kept key sets are identical.
+    before.keys().filter(|k| kept(k)).count() == after.keys().filter(|k| kept(k)).count()
+        && before
+            .iter()
+            .filter(|(key, _)| kept(key))
+            .all(|(key, b)| after.get(key).is_some_and(|a| field_eq(key, b, a)))
+}
+
+/// `metadata.managedFields` equality with `manager`'s entries compared
+/// without their `time`.
+fn managed_fields_unchanged(
+    prior: &serde_json::Value,
+    candidate: &serde_json::Value,
+    manager: Option<&str>,
+) -> bool {
+    let (Some(manager), Some(before), Some(after)) =
+        (manager, prior.as_array(), candidate.as_array())
+    else {
+        return prior == candidate;
+    };
+    let callers = |entry: &serde_json::Value| {
+        entry.get("manager").and_then(serde_json::Value::as_str) == Some(manager)
+    };
+    before.len() == after.len()
+        && before.iter().zip(after).all(|(b, a)| {
+            if callers(b) && callers(a) {
+                objects_equal_except(b, a, &[MANAGED_FIELDS_TIME], |_, b, a| b == a)
+            } else {
+                b == a
+            }
+        })
+}
+
+/// What a Put or Patch does when its result equals the stored object — the
+/// rule an [`ApplySemantics`] version selects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OnIdentical {
+    /// Commit it anyway: a revision, a history entry, a MODIFIED event.
+    /// [`ApplySemantics::V0`], and etcd's rule for a `Txn` Put.
+    Commit,
+    /// Write nothing and answer [`ResourceOp::Unchanged`]
+    /// ([`ApplySemantics::V1`]).
+    Skip,
+}
+
+impl OnIdentical {
+    /// The rule `semantics` names. Exhaustive on purpose: a new version must
+    /// decide here, never inherit one by a wildcard.
+    const fn under(semantics: ApplySemantics) -> Self {
+        match semantics {
+            ApplySemantics::V0 => Self::Commit,
+            ApplySemantics::V1 => Self::Skip,
+        }
+    }
+
+    /// `true` when the write is to be skipped: the rule says so, it updates
+    /// an object that exists, the result is [`unchanged`], and it does not
+    /// release the object's finalizers. A release removes the object, and a
+    /// removal is a change even when the content is the same.
+    fn skips(
+        self,
+        prior: Option<&serde_json::Value>,
+        candidate: &serde_json::Value,
+        manager: Option<&str>,
+    ) -> bool {
+        match self {
+            Self::Commit => false,
+            Self::Skip => prior.is_some_and(|prior| {
+                unchanged(prior, candidate, manager) && !finalizers_released(candidate)
+            }),
+        }
     }
 }
 
@@ -102,7 +241,7 @@ pub struct HistoricalEntry {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ApplyOutcome {
     /// Created / Replaced / Patched / Deleted / Conflict / PatchRejected /
-    /// NoOp.
+    /// Unchanged / NoOp.
     pub op: ResourceOp,
     /// The committed change — `Some` for every real mutation, `None`
     /// for a no-op. Carries the post-image, the prior object (so the
@@ -354,6 +493,20 @@ impl ResourceCatalog {
         }
     }
 
+    /// Apply a command this binary proposes, under
+    /// [`ApplySemantics::CURRENT`]. A Raft log entry replays through
+    /// [`Self::apply_logged`] instead, under the rules it was written with.
+    pub fn apply(&mut self, cmd: &ResourceCommand, term: u64, index: u64) -> ApplyOutcome {
+        self.apply_under(cmd, ApplySemantics::CURRENT, term, index)
+    }
+
+    /// Apply one committed Raft log entry, under the [`ApplySemantics`] it
+    /// carries — an entry written before the marker replays under V0, so
+    /// replaying an old log reproduces its revisions exactly.
+    pub fn apply_logged(&mut self, entry: &LoggedCommand, term: u64, index: u64) -> ApplyOutcome {
+        self.apply_under(entry.command(), entry.semantics(), term, index)
+    }
+
     /// Apply a single committed command. Pure function. Returns the
     /// [`ApplyOutcome`] — operation + committed [`Change`].
     ///
@@ -361,23 +514,32 @@ impl ResourceCatalog {
     ///
     ///   * A NoOp outcome (delete-not-found, patch-missing) does NOT
     ///     advance `current_revision` and emits no `Change`.
+    ///   * Under [`ApplySemantics::V1`], neither does a Put or Patch whose
+    ///     result is [`unchanged`]: it answers [`ResourceOp::Unchanged`].
     ///   * Any real mutation advances `current_revision` by exactly
     ///     1, stamps `metadata.resourceVersion = <revision>` (NOT the
     ///     Raft index), preserves/sets `metadata.uid`, updates the
     ///     per-key [`VersionMeta`], and pushes a [`Change`] onto the
     ///     history ring (evicting the front + advancing
     ///     `compacted_revision` when over capacity).
-    pub fn apply(&mut self, cmd: &ResourceCommand, term: u64, index: u64) -> ApplyOutcome {
+    fn apply_under(
+        &mut self,
+        cmd: &ResourceCommand,
+        semantics: ApplySemantics,
+        term: u64,
+        index: u64,
+    ) -> ApplyOutcome {
         // Tentatively reserve the next revision; only committed if the
         // mutation is real (not a no-op).
         let rev = self.current_revision.next();
+        let on_identical = OnIdentical::under(semantics);
         let outcome = match cmd {
             ResourceCommand::Put {
                 key,
                 value,
                 expected,
                 ..
-            } => self.apply_put(key, value, *expected, rev),
+            } => self.apply_put(key, value, *expected, on_identical, rev),
             ResourceCommand::Patch {
                 key,
                 patch,
@@ -385,7 +547,15 @@ impl ResourceCatalog {
                 apply,
                 expected,
                 ..
-            } => self.apply_patch(key, patch, *patch_type, apply.as_ref(), *expected, rev),
+            } => self.apply_patch(
+                key,
+                patch,
+                *patch_type,
+                apply.as_ref(),
+                *expected,
+                on_identical,
+                rev,
+            ),
             ResourceCommand::Delete {
                 key,
                 expected,
@@ -462,7 +632,11 @@ impl ResourceCatalog {
         let mut changes: Vec<Change> = Vec::new();
         for op in branch {
             let outcome = match op {
-                TxnOp::Put { key, value } => self.apply_put(key, value, None, rev),
+                // etcd: a Put is a revision even when the value is the same,
+                // so a transaction keeps committing identical writes.
+                TxnOp::Put { key, value } => {
+                    self.apply_put(key, value, None, OnIdentical::Commit, rev)
+                }
                 TxnOp::Delete {
                     key,
                     deletion_timestamp,
@@ -503,6 +677,7 @@ impl ResourceCatalog {
         key: &ResourceKey,
         value: &ResourceValue,
         expected: Option<Revision>,
+        on_identical: OnIdentical,
         rev: Revision,
     ) -> ApplyOutcome {
         // Capture the pre-image BEFORE mutating — this is the prior
@@ -517,12 +692,32 @@ impl ResourceCatalog {
             return ApplyOutcome::no_change(ResourceOp::Conflict);
         }
 
-        let prior_value = prior_entry.as_ref().map(|(v, _)| v.clone());
+        let (prior_value, prior_meta) = prior_entry.unzip();
 
-        let version_meta = match &prior_entry {
-            Some((_, meta)) => meta.bumped_at(rev),
+        let version_meta = match prior_meta {
+            Some(meta) => meta.bumped_at(rev),
             None => VersionMeta::created_at(rev),
         };
+
+        // The object this write would store, short of the revision stamp:
+        // the body plus the identity the store owns. uid and
+        // creationTimestamp are create-time, IMMUTABLE fields, so a
+        // controller that re-Puts a rebuilt body without them neither loses
+        // them nor reads as a change for having dropped them.
+        let mut new_value = value.clone();
+        stamp_identity(
+            &mut new_value,
+            key,
+            version_meta.create_revision,
+            prior_value.as_ref(),
+        );
+
+        // ★ A REVISION MEANS A CHANGE (T3.5), decided before anything is
+        // stamped or committed: an identical write leaves the catalog
+        // byte-identical, like a Conflict.
+        if on_identical.skips(prior_value.as_ref(), &new_value, None) {
+            return ApplyOutcome::no_change(ResourceOp::Unchanged);
+        }
 
         // generation reflects SPEC-INTENT revisions (the K8s contract
         // `observedGeneration` reconciles against), NOT every mutation.
@@ -532,52 +727,8 @@ impl ResourceCatalog {
         // common via Patch) thus leaves generation untouched. Computed in
         // the deterministic apply path so every Raft node stamps the
         // identical value.
-        let next_generation =
-            compute_generation_on_put(prior_entry.as_ref().map(|(v, _)| v), value);
-
-        let mut new_value = value.clone();
-        if let Some(obj) = new_value.as_object_mut() {
-            let metadata = obj
-                .entry("metadata".to_string())
-                .or_insert_with(|| serde_json::json!({}));
-            if let Some(meta_obj) = metadata.as_object_mut() {
-                meta_obj.insert(
-                    "resourceVersion".to_string(),
-                    serde_json::Value::String(rev.to_string()),
-                );
-                meta_obj.insert(
-                    "generation".to_string(),
-                    serde_json::Value::Number(next_generation.into()),
-                );
-                // Preserve uid across updates; mint a deterministic
-                // one (from key + create_revision) on first create.
-                let prior_uid = prior_entry
-                    .as_ref()
-                    .and_then(|(v, _)| v.get("metadata"))
-                    .and_then(|m| m.get("uid"))
-                    .cloned();
-                if let Some(prior_uid) = prior_uid {
-                    meta_obj.insert("uid".to_string(), prior_uid);
-                } else if !meta_obj.contains_key("uid") {
-                    let uid = mint_uid(&key.label(), version_meta.create_revision);
-                    meta_obj.insert("uid".to_string(), serde_json::Value::String(uid));
-                }
-                // Preserve creationTimestamp across updates (K8s: a create-
-                // time, IMMUTABLE field — like uid). A Put of a fresh body
-                // that drops the field (controllers re-Put a rebuilt object)
-                // must NOT lose it: thread the prior object's value back in.
-                // First create leaves whatever the (boundary-stamped) body
-                // carries.
-                let prior_creation = prior_entry
-                    .as_ref()
-                    .and_then(|(v, _)| v.get("metadata"))
-                    .and_then(|m| m.get("creationTimestamp"))
-                    .cloned();
-                if let Some(prior_creation) = prior_creation {
-                    meta_obj.insert("creationTimestamp".to_string(), prior_creation);
-                }
-            }
-        }
+        let next_generation = compute_generation_on_put(prior_value.as_ref(), value);
+        stamp_revision(&mut new_value, rev, next_generation);
 
         // Finalizer release: a Put that empties `metadata.finalizers` on a
         // deletionTimestamp-bearing object is the trigger that ACTUALLY
@@ -613,6 +764,7 @@ impl ResourceCatalog {
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // one per replicated command field, plus the rule and the revision
     fn apply_patch(
         &mut self,
         key: &ResourceKey,
@@ -620,6 +772,7 @@ impl ResourceCatalog {
         patch_type: PatchType,
         apply: Option<&ApplyMeta>,
         expected: Option<Revision>,
+        on_identical: OnIdentical,
         rev: Revision,
     ) -> ApplyOutcome {
         // ── Server-side apply branch ──────────────────────────────────────
@@ -641,7 +794,7 @@ impl ResourceCatalog {
                     "server-side apply requires a fieldManager".to_string(),
                 );
             };
-            return self.apply_ssa_command(key, patch, meta, expected, rev);
+            return self.apply_ssa_command(key, patch, meta, expected, on_identical, rev);
         }
 
         let Some((existing_value, existing_meta)) = self.resources.get(key) else {
@@ -663,7 +816,7 @@ impl ResourceCatalog {
         }
         // Capture pre-image before the merge.
         let prior_value = existing_value.clone();
-        let version_meta = existing_meta.bumped_at(rev);
+        let prior_meta = *existing_meta;
 
         // ── Typed patch dispatch (the load-bearing fix) ────────────────────
         //
@@ -692,6 +845,14 @@ impl ResourceCatalog {
             }
             Err(e) => return ApplyOutcome::patch_rejected(e.to_string()),
         };
+        // ★ A REVISION MEANS A CHANGE (T3.5): a patch whose merge leaves the
+        // object as it is commits nothing. Decided on the merged object,
+        // before the version is bumped or any field stamped.
+        if on_identical.skips(Some(&prior_value), &merged, None) {
+            return ApplyOutcome::no_change(ResourceOp::Unchanged);
+        }
+        let version_meta = prior_meta.bumped_at(rev);
+
         // generation bumps iff the MERGED `spec` differs from the prior
         // `spec`. A patch touching ONLY `status` (or only metadata) leaves
         // `spec` unchanged → generation preserved. This is the
@@ -699,21 +860,7 @@ impl ResourceCatalog {
         // convergence relies on: a status-only write never advances the
         // generation it is meant to be catching up to.
         let next_generation = compute_generation_on_put(Some(&prior_value), &merged);
-        if let Some(obj) = merged.as_object_mut() {
-            let metadata = obj
-                .entry("metadata".to_string())
-                .or_insert_with(|| serde_json::json!({}));
-            if let Some(meta_obj) = metadata.as_object_mut() {
-                meta_obj.insert(
-                    "resourceVersion".to_string(),
-                    serde_json::Value::String(rev.to_string()),
-                );
-                meta_obj.insert(
-                    "generation".to_string(),
-                    serde_json::Value::Number(next_generation.into()),
-                );
-            }
-        }
+        stamp_revision(&mut merged, rev, next_generation);
 
         // Finalizer release (same rule as apply_put): a patch that empties
         // `metadata.finalizers` on a deletionTimestamp-bearing object
@@ -759,6 +906,7 @@ impl ResourceCatalog {
         body: &ResourceValue,
         meta: &ApplyMeta,
         expected: Option<Revision>,
+        on_identical: OnIdentical,
         rev: Revision,
     ) -> ApplyOutcome {
         let prior_entry = self.resources.get(key).cloned();
@@ -770,7 +918,7 @@ impl ResourceCatalog {
             return ApplyOutcome::no_change(ResourceOp::Conflict);
         }
 
-        let prior_value = prior_entry.as_ref().map(|(v, _)| v.clone());
+        let (prior_value, prior_meta) = prior_entry.unzip();
         let gvk = Gvk::from(key);
 
         // Run the PURE SSA interpreter (reuses strategic_merge + the env).
@@ -795,23 +943,32 @@ impl ResourceCatalog {
 
         let mut merged = ssa_out.merged().clone();
 
-        // Stamp resourceVersion + generation + uid — the SAME metadata the
-        // create/patch paths stamp, computed deterministically in the apply
-        // path so every Raft replica is byte-identical. (managedFields was
-        // already written by apply_ssa into the merged object.)
-        let version_meta = match &prior_entry {
-            Some((_, m)) => m.bumped_at(rev),
+        // Stamp uid + creationTimestamp, then resourceVersion + generation —
+        // the SAME metadata the create/patch paths stamp, computed
+        // deterministically in the apply path so every Raft replica is
+        // byte-identical. (managedFields was already written by apply_ssa
+        // into the merged object.)
+        let version_meta = match prior_meta {
+            Some(m) => m.bumped_at(rev),
             None => VersionMeta::created_at(rev),
         };
-        let next_generation = compute_generation_on_put(prior_value.as_ref(), &merged);
-        stamp_object_metadata(
+        stamp_identity(
             &mut merged,
             key,
-            rev,
-            next_generation,
-            version_meta,
-            prior_entry.as_ref().map(|(v, _)| v),
+            version_meta.create_revision,
+            prior_value.as_ref(),
         );
+
+        // ★ A REVISION MEANS A CHANGE (T3.5): re-applying what is already
+        // there commits nothing. The manager's managedFields `time` is the
+        // one field every apply restamps, so it is not a change by itself;
+        // the stored entry keeps the time of the apply that changed it.
+        if on_identical.skips(prior_value.as_ref(), &merged, Some(&meta.manager)) {
+            return ApplyOutcome::no_change(ResourceOp::Unchanged);
+        }
+
+        let next_generation = compute_generation_on_put(prior_value.as_ref(), &merged);
+        stamp_revision(&mut merged, rev, next_generation);
 
         // Finalizer release (same rule as apply_put/apply_patch): an apply
         // that empties finalizers on a Terminating object converts to a
@@ -865,10 +1022,7 @@ impl ResourceCatalog {
         prior: Option<&ResourceValue>,
         rev: Revision,
     ) -> Option<ApplyOutcome> {
-        if prior.is_none() {
-            return None;
-        }
-        if deletion_timestamp_of(post).is_none() || has_finalizers(post) {
+        if prior.is_none() || !finalizers_released(post) {
             return None;
         }
         // Terminating + finalizers cleared ⇒ remove now. The version_meta
@@ -1402,28 +1556,65 @@ fn deletion_timestamp_of(value: &serde_json::Value) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
-/// Stamp `metadata.resourceVersion` + `metadata.generation` + `metadata.uid`
-/// on `value` — the deterministic apiserver-owned-metadata pass shared by
-/// the SSA path (and modeled on the identical inline block in `apply_put`):
-/// resourceVersion from the global `rev`, generation from
-/// `compute_generation_on_put`, uid preserved from the prior object or minted
-/// deterministically (from key + create_revision) on first create. Pure JSON
-/// mutation — no clock, no RNG — so every Raft replica is byte-identical.
-fn stamp_object_metadata(
+/// `true` when `post` is Terminating (`metadata.deletionTimestamp`) with no
+/// finalizers left — the state in which the write that produced it removes
+/// the object instead of storing it (see
+/// [`ResourceCatalog::finalizer_release_removal`]).
+fn finalizers_released(post: &serde_json::Value) -> bool {
+    deletion_timestamp_of(post).is_some() && !has_finalizers(post)
+}
+
+/// The `metadata` object of `value`, created empty when absent. `None` when
+/// `value` is not an object or its `metadata` is not one (a shape the stamps
+/// below leave alone rather than overwrite).
+fn metadata_mut(
+    value: &mut serde_json::Value,
+) -> Option<&mut serde_json::Map<String, serde_json::Value>> {
+    value
+        .as_object_mut()?
+        .entry("metadata".to_string())
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+}
+
+/// Stamp the identity the store owns on `value`, shared by the Put and
+/// server-side-apply paths: `uid` preserved from the prior object, else kept
+/// from the body, else minted deterministically from key + `create_revision`;
+/// `creationTimestamp` preserved from the prior object when it has one (a
+/// K8s create-time, IMMUTABLE field, like uid — a re-Put that dropped it must
+/// not lose it; a first create keeps whatever the boundary-stamped body
+/// carries). Pure JSON mutation — no clock, no RNG — so every Raft replica is
+/// byte-identical.
+///
+/// Stamped BEFORE the T3.5 [`unchanged`] gate: identity is part of the
+/// object a write would store, not of the revision it would commit at.
+fn stamp_identity(
     value: &mut serde_json::Value,
     key: &ResourceKey,
-    rev: Revision,
-    next_generation: i64,
-    version_meta: VersionMeta,
+    create_revision: Revision,
     prior_value: Option<&serde_json::Value>,
 ) {
-    let Some(obj) = value.as_object_mut() else {
+    let Some(meta_obj) = metadata_mut(value) else {
         return;
     };
-    let metadata = obj
-        .entry("metadata".to_string())
-        .or_insert_with(|| serde_json::json!({}));
-    let Some(meta_obj) = metadata.as_object_mut() else {
+    let prior_meta = prior_value.and_then(|v| v.get("metadata"));
+    if let Some(prior_uid) = prior_meta.and_then(|m| m.get("uid")) {
+        meta_obj.insert("uid".to_string(), prior_uid.clone());
+    } else if !meta_obj.contains_key("uid") {
+        let uid = mint_uid(&key.label(), create_revision);
+        meta_obj.insert("uid".to_string(), serde_json::Value::String(uid));
+    }
+    if let Some(prior_creation) = prior_meta.and_then(|m| m.get("creationTimestamp")) {
+        meta_obj.insert("creationTimestamp".to_string(), prior_creation.clone());
+    }
+}
+
+/// Stamp `metadata.resourceVersion` (the global `rev`) and
+/// `metadata.generation` (from [`compute_generation_on_put`]) on `value` —
+/// the per-revision pass every Put, Patch and server-side apply shares, run
+/// only once the write is known to commit.
+fn stamp_revision(value: &mut serde_json::Value, rev: Revision, generation: i64) {
+    let Some(meta_obj) = metadata_mut(value) else {
         return;
     };
     meta_obj.insert(
@@ -1432,28 +1623,8 @@ fn stamp_object_metadata(
     );
     meta_obj.insert(
         "generation".to_string(),
-        serde_json::Value::Number(next_generation.into()),
+        serde_json::Value::Number(generation.into()),
     );
-    let prior_uid = prior_value
-        .and_then(|v| v.get("metadata"))
-        .and_then(|m| m.get("uid"))
-        .cloned();
-    if let Some(prior_uid) = prior_uid {
-        meta_obj.insert("uid".to_string(), prior_uid);
-    } else if !meta_obj.contains_key("uid") {
-        let uid = mint_uid(&key.label(), version_meta.create_revision);
-        meta_obj.insert("uid".to_string(), serde_json::Value::String(uid));
-    }
-    // Preserve creationTimestamp across updates (K8s create-time IMMUTABLE
-    // field — mirrors the uid preservation above + the inline `apply_put`
-    // block). A re-Put that dropped the field must not lose it.
-    let prior_creation = prior_value
-        .and_then(|v| v.get("metadata"))
-        .and_then(|m| m.get("creationTimestamp"))
-        .cloned();
-    if let Some(prior_creation) = prior_creation {
-        meta_obj.insert("creationTimestamp".to_string(), prior_creation);
-    }
 }
 
 /// Set `metadata.deletionTimestamp` to the REPLICATED `ts` string,
@@ -2510,6 +2681,431 @@ mod tests {
             va, vb,
             "Terminating object is byte-identical across replays"
         );
+    }
+}
+
+// ── T3.5 — a revision means a change ─────────────────────────────────────
+
+#[cfg(test)]
+mod a_revision_means_a_change {
+    use super::*;
+    use crate::command::Reason;
+    use serde_json::json;
+
+    const T1: &str = "2026-09-19T00:00:00Z";
+    const T2: &str = "2026-09-19T00:05:00Z";
+
+    fn cm(name: &str) -> ResourceKey {
+        ResourceKey::namespaced("", "v1", "ConfigMap", "default", name)
+    }
+
+    fn lease() -> ResourceKey {
+        ResourceKey::namespaced(
+            "coordination.k8s.io",
+            "v1",
+            "Lease",
+            "kube-node-lease",
+            "n1",
+        )
+    }
+
+    /// Apply `cmd` as this binary proposes it, at the next index.
+    fn step(cat: &mut ResourceCatalog, cmd: &ResourceCommand) -> ApplyOutcome {
+        let index = cat.last_applied_index + 1;
+        cat.apply(cmd, 1, index)
+    }
+
+    fn put(key: &ResourceKey, value: serde_json::Value) -> ResourceCommand {
+        ResourceCommand::put(key.clone(), value, Reason::Operator)
+    }
+
+    fn merge(key: &ResourceKey, patch: serde_json::Value) -> ResourceCommand {
+        ResourceCommand::patch(key.clone(), patch, Reason::Operator)
+    }
+
+    fn ssa(
+        key: &ResourceKey,
+        body: serde_json::Value,
+        manager: &str,
+        time: &str,
+    ) -> ResourceCommand {
+        ResourceCommand::apply_ssa(
+            key.clone(),
+            body,
+            ApplyMeta {
+                manager: manager.into(),
+                force: false,
+                time: time.into(),
+            },
+            None,
+            Reason::Operator,
+        )
+    }
+
+    /// The entry a pre-T3.5 binary logged for `cmd`: the bare command.
+    fn unmarked(cmd: &ResourceCommand) -> LoggedCommand {
+        serde_json::from_value(serde_json::to_value(cmd).unwrap()).unwrap()
+    }
+
+    fn rv(cat: &ResourceCatalog, key: &ResourceKey) -> String {
+        cat.get(key).unwrap()["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// Everything a skipped write must leave as it was.
+    fn assert_nothing_committed(
+        before: &ResourceCatalog,
+        out: &ApplyOutcome,
+        after: &ResourceCatalog,
+    ) {
+        assert_eq!(out.op, ResourceOp::Unchanged);
+        assert!(out.change.is_none(), "an unchanged write emits no change");
+        assert_eq!(after.revision(), before.revision(), "no revision consumed");
+        assert_eq!(after.history, before.history, "no history entry");
+        assert_eq!(
+            after.resources, before.resources,
+            "stored objects untouched"
+        );
+    }
+
+    // ── the pure gate ──────────────────────────────────────────────────────
+
+    #[test]
+    fn unchanged_ignores_only_what_every_write_restamps() {
+        let prior = json!({
+            "metadata": {
+                "name": "a", "uid": "u", "resourceVersion": "5", "generation": 2,
+                "labels": {"app": "x"},
+                "managedFields": [
+                    {"manager": "kubectl", "operation": "Apply", "time": T1, "fieldsV1": {"f:data": {}}},
+                    {"manager": "helm", "operation": "Apply", "time": T1, "fieldsV1": {"f:spec": {}}}
+                ]
+            },
+            "spec": {"replicas": 3},
+            "data": {"k": "v"}
+        });
+        let with = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut v = prior.clone();
+            edit(&mut v);
+            v
+        };
+
+        // Restamped on every write: not a change.
+        let restamped = with(&|v| {
+            v["metadata"]["resourceVersion"] = json!("9");
+            v["metadata"]["generation"] = json!(3);
+        });
+        assert!(unchanged(&prior, &restamped, None));
+        let unstamped = with(&|v| {
+            let m = v["metadata"].as_object_mut().unwrap();
+            m.remove("resourceVersion");
+            m.remove("generation");
+        });
+        assert!(unchanged(&prior, &unstamped, None));
+        let reapplied = with(&|v| v["metadata"]["managedFields"][0]["time"] = json!(T2));
+        assert!(unchanged(&prior, &reapplied, Some("kubectl")));
+
+        // Everything else is a change.
+        assert!(
+            !unchanged(&prior, &reapplied, None),
+            "no manager: no time is ignored"
+        );
+        let other_time = with(&|v| v["metadata"]["managedFields"][1]["time"] = json!(T2));
+        assert!(
+            !unchanged(&prior, &other_time, Some("kubectl")),
+            "only the caller's own entry's time is ignored"
+        );
+        let other_fields = with(&|v| v["metadata"]["managedFields"][0]["fieldsV1"] = json!({}));
+        assert!(
+            !unchanged(&prior, &other_fields, Some("kubectl")),
+            "ownership is content"
+        );
+        let new_owner = with(&|v| {
+            v["metadata"]["managedFields"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"manager": "flux", "operation": "Apply", "time": T2}));
+        });
+        assert!(!unchanged(&prior, &new_owner, Some("flux")));
+        let relabelled = with(&|v| v["metadata"]["labels"]["app"] = json!("y"));
+        assert!(!unchanged(&prior, &relabelled, None));
+        let unlabelled = with(&|v| {
+            v["metadata"].as_object_mut().unwrap().remove("labels");
+        });
+        assert!(!unchanged(&prior, &unlabelled, None));
+        let rescaled = with(&|v| v["spec"]["replicas"] = json!(4));
+        assert!(!unchanged(&prior, &rescaled, None));
+        let with_status = with(&|v| v["status"] = json!({}));
+        assert!(
+            !unchanged(&prior, &with_status, None),
+            "an added top-level key"
+        );
+        let dropped_data = with(&|v| {
+            v.as_object_mut().unwrap().remove("data");
+        });
+        assert!(
+            !unchanged(&prior, &dropped_data, None),
+            "a removed top-level key"
+        );
+        let unowned_rv = with(&|v| v["spec"]["resourceVersion"] = json!("1"));
+        assert!(
+            !unchanged(&prior, &unowned_rv, None),
+            "resourceVersion is ignored under metadata only"
+        );
+
+        // Total over non-objects.
+        assert!(unchanged(&json!(1), &json!(1), None));
+        assert!(!unchanged(&json!(1), &json!("1"), None));
+        assert!(!unchanged(&prior, &json!(null), None));
+    }
+
+    // ── Put ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn an_identical_put_keeps_its_resource_version_and_commits_nothing() {
+        let mut cat = ResourceCatalog::default();
+        let body = json!({"metadata": {"name": "a"}, "data": {"k": "v"}});
+        assert_eq!(
+            step(&mut cat, &put(&cm("a"), body.clone())).op,
+            ResourceOp::Created
+        );
+        let before = cat.clone();
+
+        let out = step(&mut cat, &put(&cm("a"), body));
+
+        assert_nothing_committed(&before, &out, &cat);
+        assert_eq!(rv(&cat, &cm("a")), "1");
+        assert_eq!(
+            cat.get_with_meta(&cm("a")).unwrap().1,
+            VersionMeta::created_at(Revision(1)),
+            "mod_revision and version stay put"
+        );
+    }
+
+    #[test]
+    fn a_rebuilt_body_missing_the_identity_the_store_owns_is_unchanged() {
+        // Controllers re-Put a rebuilt object without uid, creationTimestamp
+        // or resourceVersion. The store would carry uid and creationTimestamp
+        // over, so the stored object would come out identical.
+        let mut cat = ResourceCatalog::default();
+        let first = json!({
+            "metadata": {"name": "a", "creationTimestamp": T1},
+            "data": {"k": "v"}
+        });
+        step(&mut cat, &put(&cm("a"), first));
+        let before = cat.clone();
+
+        let rebuilt = json!({"metadata": {"name": "a"}, "data": {"k": "v"}});
+        let out = step(&mut cat, &put(&cm("a"), rebuilt));
+        assert_nothing_committed(&before, &out, &cat);
+
+        // A real edit still commits, and still keeps the identity.
+        let uid = cat.get(&cm("a")).unwrap()["metadata"]["uid"].clone();
+        let edited = json!({"metadata": {"name": "a"}, "data": {"k": "w"}});
+        assert_eq!(
+            step(&mut cat, &put(&cm("a"), edited)).op,
+            ResourceOp::Replaced
+        );
+        let stored = cat.get(&cm("a")).unwrap();
+        assert_eq!(stored["metadata"]["uid"], uid);
+        assert_eq!(stored["metadata"]["creationTimestamp"], T1);
+        assert_eq!(rv(&cat, &cm("a")), "2");
+    }
+
+    #[test]
+    fn the_precondition_is_judged_before_the_gate() {
+        let mut cat = ResourceCatalog::default();
+        let body = json!({"data": {"k": "v"}});
+        step(&mut cat, &put(&cm("a"), body.clone()));
+        let stale = ResourceCommand::Put {
+            key: cm("a"),
+            value: body.clone(),
+            expected: Some(Revision(99)),
+            reason: Reason::Operator,
+        };
+        assert_eq!(step(&mut cat, &stale).op, ResourceOp::Conflict);
+        let current = ResourceCommand::Put {
+            key: cm("a"),
+            value: body,
+            expected: Some(Revision(1)),
+            reason: Reason::Operator,
+        };
+        assert_eq!(step(&mut cat, &current).op, ResourceOp::Unchanged);
+    }
+
+    #[test]
+    fn a_lease_renewal_still_bumps() {
+        // A heartbeat changes renewTime on every write, so it is a change.
+        let mut cat = ResourceCatalog::default();
+        let lease_at = |t: &str| json!({"spec": {"holderIdentity": "n1", "renewTime": t}});
+        step(&mut cat, &put(&lease(), lease_at(T1)));
+        let out = step(&mut cat, &put(&lease(), lease_at(T2)));
+        assert_eq!(out.op, ResourceOp::Replaced);
+        assert_eq!(cat.revision(), Revision(2));
+
+        let renew = json!({"spec": {"renewTime": "2026-09-19T00:10:00Z"}});
+        assert_eq!(
+            step(&mut cat, &merge(&lease(), renew.clone())).op,
+            ResourceOp::Patched
+        );
+        assert_eq!(cat.revision(), Revision(3));
+        assert_eq!(rv(&cat, &lease()), "3");
+        // The same renewal twice is not.
+        assert_eq!(
+            step(&mut cat, &merge(&lease(), renew)).op,
+            ResourceOp::Unchanged
+        );
+        assert_eq!(cat.revision(), Revision(3));
+    }
+
+    // ── Patch ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_patch_that_sets_what_is_already_there_is_unchanged() {
+        let mut cat = ResourceCatalog::default();
+        let seeded = json!({"data": {"k": "v"}, "status": {"phase": "Ready"}});
+        step(&mut cat, &put(&cm("a"), seeded));
+        for noop in [
+            json!({"data": {"k": "v"}}),
+            json!({"status": {"phase": "Ready"}}),
+            json!({}),
+            // A client echoing a stale resourceVersion in the body changes
+            // nothing the store keeps.
+            json!({"metadata": {"resourceVersion": "0"}}),
+        ] {
+            let before = cat.clone();
+            let out = step(&mut cat, &merge(&cm("a"), noop));
+            assert_nothing_committed(&before, &out, &cat);
+        }
+        let gone = merge(&cm("a"), json!({"status": {"phase": "Gone"}}));
+        assert_eq!(step(&mut cat, &gone).op, ResourceOp::Patched);
+        assert_eq!(cat.revision(), Revision(2));
+    }
+
+    // ── server-side apply ──────────────────────────────────────────────────
+
+    #[test]
+    fn a_reapplied_config_is_unchanged_and_keeps_the_time_it_changed_at() {
+        let mut cat = ResourceCatalog::default();
+        let config = json!({"apiVersion": "v1", "kind": "ConfigMap", "data": {"k": "v"}});
+        assert_eq!(
+            step(&mut cat, &ssa(&cm("a"), config.clone(), "kubectl", T1)).op,
+            ResourceOp::Created
+        );
+        let before = cat.clone();
+
+        let out = step(&mut cat, &ssa(&cm("a"), config, "kubectl", T2));
+
+        assert_nothing_committed(&before, &out, &cat);
+        assert_eq!(
+            cat.get(&cm("a")).unwrap()["metadata"]["managedFields"][0]["time"],
+            T1,
+            "the stored entry keeps the time of the apply that changed it"
+        );
+    }
+
+    #[test]
+    fn a_second_manager_claiming_the_same_values_is_a_change() {
+        let mut cat = ResourceCatalog::default();
+        let config = json!({"apiVersion": "v1", "kind": "ConfigMap", "data": {"k": "v"}});
+        step(&mut cat, &ssa(&cm("a"), config.clone(), "kubectl", T1));
+        let out = step(&mut cat, &ssa(&cm("a"), config, "flux", T2));
+        assert_eq!(out.op, ResourceOp::Patched, "managedFields gained an owner");
+        assert_eq!(cat.revision(), Revision(2));
+    }
+
+    // ── what the gate leaves alone ─────────────────────────────────────────
+
+    #[test]
+    fn an_identical_write_that_releases_the_last_finalizer_still_removes() {
+        // A Terminating object with no finalizers left is removed by the next
+        // write that stores it — even one that changes nothing else. Only a
+        // create can store one, so seed it that way.
+        let mut cat = ResourceCatalog::default();
+        let terminating = json!({"metadata": {"deletionTimestamp": T1}, "data": {"k": "v"}});
+        step(&mut cat, &put(&cm("a"), terminating.clone()));
+        let out = step(&mut cat, &put(&cm("a"), terminating));
+        assert_eq!(out.op, ResourceOp::Deleted);
+        assert!(cat.get(&cm("a")).is_none());
+    }
+
+    #[test]
+    fn a_transaction_put_commits_identical_content_as_etcd_does() {
+        let mut cat = ResourceCatalog::default();
+        let body = json!({"data": {"k": "v"}});
+        step(&mut cat, &put(&cm("a"), body.clone()));
+        let txn = ResourceCommand::Txn {
+            compares: Vec::new(),
+            success: vec![TxnOp::Put {
+                key: cm("a"),
+                value: body,
+            }],
+            failure: Vec::new(),
+            reason: Reason::Operator,
+        };
+        assert_eq!(step(&mut cat, &txn).op, ResourceOp::Replaced);
+        assert_eq!(cat.revision(), Revision(2));
+    }
+
+    // ── replay ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn an_unmarked_log_entry_replays_under_the_old_rules() {
+        // Every write shape a pre-T3.5 log holds, replayed through
+        // apply_logged: each identical rewrite still commits a revision,
+        // exactly as it did when the entry was written.
+        let config = json!({"apiVersion": "v1", "kind": "ConfigMap", "data": {"k": "v"}});
+        let log = [
+            put(&cm("a"), json!({"data": {"k": "v"}})),
+            put(&cm("a"), json!({"data": {"k": "v"}})),
+            merge(&cm("a"), json!({"data": {"k": "v"}})),
+            ssa(&cm("b"), config.clone(), "kubectl", T1),
+            ssa(&cm("b"), config, "kubectl", T2),
+        ];
+        let expected = [
+            ResourceOp::Created,
+            ResourceOp::Replaced,
+            ResourceOp::Patched,
+            ResourceOp::Created,
+            ResourceOp::Patched,
+        ];
+
+        let mut old = ResourceCatalog::default();
+        for (i, (cmd, op)) in log.iter().zip(expected).enumerate() {
+            let entry = unmarked(cmd);
+            assert_eq!(entry.semantics(), ApplySemantics::V0);
+            assert_eq!(
+                old.apply_logged(&entry, 1, i as u64 + 1).op,
+                op,
+                "entry {i}"
+            );
+        }
+        assert_eq!(old.revision(), Revision(5));
+        assert_eq!(rv(&old, &cm("a")), "3");
+
+        // The same writes proposed today: only the real changes commit.
+        let mut new = ResourceCatalog::default();
+        let ops: Vec<ResourceOp> = log
+            .iter()
+            .enumerate()
+            .map(|(i, cmd)| {
+                new.apply_logged(&LoggedCommand::proposed(cmd.clone()), 1, i as u64 + 1)
+                    .op
+            })
+            .collect();
+        assert_eq!(
+            ops,
+            [
+                ResourceOp::Created,
+                ResourceOp::Unchanged,
+                ResourceOp::Unchanged,
+                ResourceOp::Created,
+                ResourceOp::Unchanged,
+            ]
+        );
+        assert_eq!(new.revision(), Revision(2));
     }
 }
 

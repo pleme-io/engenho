@@ -341,14 +341,17 @@ async fn put(mesh: &StoreMesh, key: ResourceKey, value: serde_json::Value) {
 /// Fill the catalog with bulk a page of ConfigMaps must not pay for:
 /// one Secret rewritten until the replay ring holds megabytes of its
 /// images, as Helm's release Secrets filled it on rio. Then one ConfigMap.
+///
+/// Each rewrite changes the Secret (as each Helm release does): since T3.5
+/// an identical rewrite commits nothing, so it would add nothing to the ring.
 async fn seed_bulk_then_one_configmap(mesh: &StoreMesh) {
     let body = "A".repeat(16 * 1024);
     let release = ResourceKey::namespaced("", "v1", "Secret", "default", "release");
-    for _ in 0..200 {
+    for version in 0..200u32 {
         put(
             mesh,
             release.clone(),
-            json!({ "data": { "payload": body } }),
+            json!({ "data": { "payload": body, "version": version } }),
         )
         .await;
     }

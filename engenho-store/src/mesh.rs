@@ -14,7 +14,7 @@ use openraft::raft::ClientWriteResponse;
 use openraft::{BasicNode, Config, Raft};
 use tokio::sync::mpsc;
 
-use crate::command::ResourceCommand;
+use crate::command::{LoggedCommand, ResourceCommand};
 use crate::fjall_store::{FjallStore, Flushed, ImageTripwire};
 use crate::network::{InProcessRouter, RpcRequest};
 use crate::owned_task::{OwnedTask, TaskStop};
@@ -407,10 +407,15 @@ impl StoreMesh {
         Ok(())
     }
 
+    /// Replicate `cmd` and return what the state machine did with it.
+    ///
+    /// Every proposal is logged under [`crate::command::ApplySemantics::CURRENT`]:
+    /// an identical `Put` or `Patch` comes back
+    /// [`crate::ResourceOp::Unchanged`] with the revision untouched.
     pub async fn propose(&self, cmd: ResourceCommand) -> Result<ApplyResult, StoreError> {
         let resp: ClientWriteResponse<TypeConfig> = self
             .raft
-            .client_write(cmd)
+            .client_write(LoggedCommand::proposed(cmd))
             .await
             .map_err(|e| StoreError::ClientWriteFailed(e.to_string()))?;
         Ok(resp.data)

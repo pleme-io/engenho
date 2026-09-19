@@ -302,6 +302,89 @@ impl ResourceCommand {
     }
 }
 
+/// Which apply rules a logged command is replayed under.
+///
+/// ★ A LOG ENTRY IS REPLAYED BY WHATEVER BINARY OPENS THE LOG, not by the
+/// one that wrote it. Changing what `apply` does with an old entry would
+/// renumber every revision after it, so a change to the rules is a new
+/// version here, and each entry names the version it was proposed under.
+///
+/// ★ ABSENCE MEANS V0. Every entry written before the marker existed
+/// deserializes as [`Self::V0`] and replays exactly as it did then — the
+/// same optional-field pattern `patch_type` and `apply` use on
+/// [`ResourceCommand::Patch`]. An older binary ignores the field and reads
+/// every entry as V0, which is why a rollback across a version starts only
+/// from a clean stop (nothing left to replay).
+///
+/// Only `Put` and `Patch` (server-side apply included) read it; `Delete`
+/// and `Txn` apply the same way under every version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplySemantics {
+    /// Before T3.5: a `Put` or `Patch` that passes its precondition consumes
+    /// a revision even when the stored object comes out identical.
+    V0,
+    /// T3.5 — a revision means a change. A `Put` or `Patch` whose result
+    /// equals the stored object (see [`crate::state::unchanged`]) returns
+    /// [`ResourceOp::Unchanged`]: no revision, no history, no watch event.
+    V1,
+}
+
+impl ApplySemantics {
+    /// The rules this binary proposes under.
+    pub const CURRENT: Self = Self::V1;
+
+    /// The rules an entry written before the marker existed was applied
+    /// under (the `#[serde(default)]` for [`LoggedCommand`]).
+    const fn unmarked() -> Self {
+        Self::V0
+    }
+}
+
+/// A [`ResourceCommand`] as the Raft log carries it: the command plus the
+/// [`ApplySemantics`] it was proposed under.
+///
+/// The marker is flattened into the command's own JSON object, so a logged
+/// `Put` is `{"kind":"put", …, "semantics":"v1"}`: an older binary decodes it
+/// as a plain `ResourceCommand` (the extra field is ignored), and an entry
+/// written before the marker decodes here as [`ApplySemantics::V0`].
+///
+/// The fields are private and [`Self::proposed`] is the only constructor, so
+/// this binary cannot write an entry under old rules; V0 exists only as
+/// decoded history.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoggedCommand {
+    #[serde(flatten)]
+    command: ResourceCommand,
+    #[serde(default = "ApplySemantics::unmarked")]
+    semantics: ApplySemantics,
+}
+
+impl LoggedCommand {
+    /// Log `command` under the rules this binary proposes under
+    /// ([`ApplySemantics::CURRENT`]).
+    #[must_use]
+    pub fn proposed(command: ResourceCommand) -> Self {
+        Self {
+            command,
+            semantics: ApplySemantics::CURRENT,
+        }
+    }
+
+    /// The rules this entry replays under.
+    #[must_use]
+    pub fn semantics(&self) -> ApplySemantics {
+        self.semantics
+    }
+
+    /// The logged command. Crate-private: applying it without its
+    /// [`Self::semantics`] is the one way to replay an entry wrongly, so the
+    /// only consumer is [`crate::state::ResourceCatalog::apply_logged`].
+    pub(crate) fn command(&self) -> &ResourceCommand {
+        &self.command
+    }
+}
+
 /// Why this command was issued — telemetry + audit chain anchor
 /// (matches the shape of `engenho-revoada::consensus::Reason`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -368,6 +451,19 @@ pub enum ResourceOp {
     /// 409 `Status` (reason "Conflict" + per-field causes) — NEVER a silent
     /// overwrite.
     ApplyConflict,
+    /// A `Put` or `Patch` (server-side apply included) whose result equals
+    /// the stored object — T3.5, a revision means a change. Nothing is
+    /// written: no revision consumed, no history entry, no watch event, and
+    /// the stored `resourceVersion` stays what it was. Distinct from
+    /// [`Self::NoOp`], which names a write that had nothing to act on (a
+    /// patch or delete of a missing key); this one acted and found nothing
+    /// to change. The apiserver answers it like a successful write, with
+    /// the stored object read back.
+    ///
+    /// A response, never a log entry: `ResourceOp` is what `apply` returns,
+    /// so adding it changes no replayed bytes. Only entries under
+    /// [`ApplySemantics::V1`] can produce it.
+    Unchanged,
     /// Idempotent no-op (delete-not-found, etc.).
     #[default]
     NoOp,
@@ -492,6 +588,62 @@ mod tests {
                 deletion_timestamp, ..
             } => assert_eq!(deletion_timestamp, None),
             other => panic!("expected Delete, got {other:?}"),
+        }
+    }
+
+    fn cm_put() -> ResourceCommand {
+        ResourceCommand::put(
+            ResourceKey::namespaced("", "v1", "ConfigMap", "default", "cm"),
+            serde_json::json!({"data": {"k": "v"}}),
+            Reason::Operator,
+        )
+    }
+
+    #[test]
+    fn a_log_entry_written_before_the_marker_replays_under_v0() {
+        // The exact shape every pre-T3.5 log entry has: a bare command.
+        let legacy = serde_json::to_value(cm_put()).unwrap();
+        assert!(legacy.get("semantics").is_none());
+        let entry: LoggedCommand = serde_json::from_value(legacy).unwrap();
+        assert_eq!(entry.semantics(), ApplySemantics::V0);
+        assert_eq!(entry.command(), &cm_put());
+    }
+
+    #[test]
+    fn this_binary_proposes_under_v1_and_the_marker_round_trips() {
+        assert_eq!(ApplySemantics::CURRENT, ApplySemantics::V1);
+        let entry = LoggedCommand::proposed(cm_put());
+        assert_eq!(entry.semantics(), ApplySemantics::V1);
+        let wire = serde_json::to_value(&entry).unwrap();
+        // Flat: the marker sits beside the command's own fields.
+        assert_eq!(wire["kind"], "put");
+        assert_eq!(wire["semantics"], "v1");
+        let back: LoggedCommand = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, entry);
+    }
+
+    #[test]
+    fn an_older_binary_still_decodes_a_marked_entry_as_its_command() {
+        // What a pre-T3.5 binary does with a V1 entry: decode it as a plain
+        // ResourceCommand, ignoring the marker. Rollback relies on the entry
+        // at least decoding.
+        for cmd in [
+            cm_put(),
+            ResourceCommand::apply_ssa(
+                ResourceKey::namespaced("", "v1", "ConfigMap", "default", "cm"),
+                serde_json::json!({"data": {"a": "1"}}),
+                ApplyMeta {
+                    manager: "kubectl".into(),
+                    force: false,
+                    time: "2026-09-19T00:00:00Z".into(),
+                },
+                Some(crate::revision::Revision(7)),
+                Reason::Operator,
+            ),
+        ] {
+            let wire = serde_json::to_string(&LoggedCommand::proposed(cmd.clone())).unwrap();
+            let old: ResourceCommand = serde_json::from_str(&wire).unwrap();
+            assert_eq!(old, cmd);
         }
     }
 

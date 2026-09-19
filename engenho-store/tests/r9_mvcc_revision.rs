@@ -9,6 +9,9 @@
 //!     increasing with no gaps in `history`, across any interleaving.
 //!   * I2 no-op neutrality — delete-not-found / patch-missing advance
 //!     neither `current_revision` nor `history`.
+//!   * I7 a revision means a change (T3.5) — a write whose result equals
+//!     the stored object answers `Unchanged` and advances nothing; every
+//!     other write still commits.
 //!   * I5 changes_since correctness + the CompactedTooOld boundary.
 //!   * I6 determinism — identical command sequence ⇒ byte-identical
 //!     serde output.
@@ -34,14 +37,24 @@ fn delete_cmd(key: ResourceKey) -> ResourceCommand {
     ResourceCommand::delete(key, Reason::Operator)
 }
 
-// One generated op kind. 4 keys + 3 verbs keeps the state space dense
+// One generated op kind. 4 keys + 6 verbs keeps the state space dense
 // enough to hit creates, replaces, patches-on-existing, patches-on-
-// missing, deletes, and delete-not-found in the same run.
+// missing, deletes, delete-not-found and identical writes in the same run.
 #[derive(Clone, Debug)]
 enum Op {
+    /// A Put whose body differs from every earlier one.
     Put(usize),
+    /// A merge Patch whose value differs from every earlier one.
     Patch(usize),
     Delete(usize),
+    /// A Put of one fixed body: identical whenever the key already holds it.
+    PutSame(usize),
+    /// A merge Patch of one fixed value: identical whenever it already holds.
+    PatchSame(usize),
+    /// Read the stored object and Put it back verbatim — the get-then-put a
+    /// reconciler with nothing to change does. Identical whenever the key
+    /// exists; a create of the fixed body otherwise.
+    Rewrite(usize),
 }
 
 fn op_strategy() -> impl Strategy<Value = Op> {
@@ -49,29 +62,67 @@ fn op_strategy() -> impl Strategy<Value = Op> {
     prop_oneof![
         key.clone().prop_map(Op::Put),
         key.clone().prop_map(Op::Patch),
-        key.prop_map(Op::Delete),
+        key.clone().prop_map(Op::Delete),
+        key.clone().prop_map(Op::PutSame),
+        key.clone().prop_map(Op::PatchSame),
+        key.prop_map(Op::Rewrite),
     ]
 }
 
-fn apply_op(cat: &mut ResourceCatalog, op: &Op, index: u64) -> engenho_store::ApplyOutcome {
-    let key = match op {
-        Op::Put(k) | Op::Patch(k) | Op::Delete(k) => pod_key(&format!("p{k}")),
+/// Apply `op`, returning the outcome and whether the write was identical
+/// to what the key already stored — judged from the state BEFORE the
+/// apply, independently of the store's own gate.
+fn apply_op(cat: &mut ResourceCatalog, op: &Op, index: u64) -> (engenho_store::ApplyOutcome, bool) {
+    let (Op::Put(k)
+    | Op::Patch(k)
+    | Op::Delete(k)
+    | Op::PutSame(k)
+    | Op::PatchSame(k)
+    | Op::Rewrite(k)) = op;
+    let key = pod_key(&format!("p{k}"));
+    let same_body = serde_json::json!({"spec": {"same": true}});
+    let prior = cat.get(&key).cloned();
+    let (cmd, identical) = match op {
+        Op::Put(_) => (
+            put_cmd(key, serde_json::json!({"spec": {"i": index}})),
+            false,
+        ),
+        Op::Patch(_) => (
+            patch_cmd(key, serde_json::json!({"spec": {"patched": index}})),
+            false,
+        ),
+        Op::Delete(_) => (delete_cmd(key), false),
+        Op::PutSame(_) => {
+            let identical = prior
+                .as_ref()
+                .is_some_and(|p| p["spec"] == same_body["spec"]);
+            (put_cmd(key, same_body), identical)
+        }
+        Op::PatchSame(_) => {
+            let identical = prior
+                .as_ref()
+                .is_some_and(|p| p["spec"]["patched"] == serde_json::json!(0));
+            (
+                patch_cmd(key, serde_json::json!({"spec": {"patched": 0}})),
+                identical,
+            )
+        }
+        Op::Rewrite(_) => match prior {
+            Some(stored) => (put_cmd(key, stored), true),
+            None => (put_cmd(key, same_body), false),
+        },
     };
-    let cmd = match op {
-        Op::Put(_) => put_cmd(key, serde_json::json!({"spec": {"i": index}})),
-        Op::Patch(_) => patch_cmd(key, serde_json::json!({"spec": {"patched": index}})),
-        Op::Delete(_) => delete_cmd(key),
-    };
-    cat.apply(&cmd, 1, index)
+    (cat.apply(&cmd, 1, index), identical)
 }
 
 proptest! {
-    /// I1 + I2 + the current_revision == non-noop-count property.
+    /// I1 + I2 + I7 + the current_revision == real-mutation-count property.
     ///
-    /// Across any arbitrary interleaving of Put/Patch/Delete on any
-    /// keys: the sequence of stamped revisions in `history` is
-    /// strictly increasing by exactly 1 with no gaps, and
-    /// `current_revision == count of non-NoOp ops`.
+    /// Across any arbitrary interleaving of writes on any keys: the
+    /// sequence of stamped revisions in `history` is strictly increasing
+    /// by exactly 1 with no gaps, an identical write commits nothing and
+    /// keeps the key's resourceVersion, and `current_revision == count of
+    /// ops that committed a change`.
     #[test]
     fn revision_sequence_is_dense_and_monotonic(ops in prop::collection::vec(op_strategy(), 0..200)) {
         let mut cat = ResourceCatalog::default();
@@ -80,7 +131,16 @@ proptest! {
 
         for (i, op) in ops.iter().enumerate() {
             let raft_index = (i as u64) + 1;
-            let outcome = apply_op(&mut cat, op, raft_index);
+            let before = cat.clone();
+            let (outcome, identical) = apply_op(&mut cat, op, raft_index);
+            // I7: the store's verdict matches the independent one, both ways.
+            prop_assert_eq!(
+                outcome.op == engenho_store::ResourceOp::Unchanged,
+                identical,
+                "op {:?} answered {:?}",
+                op,
+                outcome.op
+            );
             match outcome.change {
                 Some(change) => {
                     real_mutations += 1;
@@ -101,14 +161,21 @@ proptest! {
                     }
                 }
                 None => {
-                    // I2: a no-op advances nothing.
-                    prop_assert_eq!(outcome.op, engenho_store::ResourceOp::NoOp);
+                    // I2 + I7: a no-op or an identical write advances
+                    // nothing, and leaves every stored object — its
+                    // resourceVersion included — exactly as it was.
+                    prop_assert!(matches!(
+                        outcome.op,
+                        engenho_store::ResourceOp::NoOp | engenho_store::ResourceOp::Unchanged
+                    ));
                     prop_assert_eq!(cat.revision().0, prev_revision);
+                    prop_assert_eq!(&cat.resources, &before.resources);
+                    prop_assert_eq!(&cat.history, &before.history);
                 }
             }
         }
 
-        // current_revision == count of non-NoOp ops.
+        // current_revision == count of ops that committed a change.
         prop_assert_eq!(cat.revision(), Revision(real_mutations));
 
         // The history ring (when not compacted) is a dense, strictly
@@ -127,8 +194,8 @@ proptest! {
         let mut b = ResourceCatalog::default();
         for (i, op) in ops.iter().enumerate() {
             let raft_index = (i as u64) + 1;
-            apply_op(&mut a, op, raft_index);
-            apply_op(&mut b, op, raft_index);
+            let _ = apply_op(&mut a, op, raft_index);
+            let _ = apply_op(&mut b, op, raft_index);
         }
         let bytes_a = serde_json::to_vec(&a).unwrap();
         let bytes_b = serde_json::to_vec(&b).unwrap();

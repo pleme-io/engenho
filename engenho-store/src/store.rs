@@ -412,10 +412,11 @@ impl RaftStateMachine<TypeConfig> for InMemoryStore {
             let log_id = entry.log_id;
             let (op, patch_error) = match entry.payload {
                 EntryPayload::Blank => (crate::command::ResourceOp::NoOp, None),
-                EntryPayload::Normal(ref cmd) => {
-                    let outcome = guard
-                        .catalog
-                        .apply(cmd, log_id.leader_id.term, log_id.index);
+                EntryPayload::Normal(ref logged) => {
+                    let outcome =
+                        guard
+                            .catalog
+                            .apply_logged(logged, log_id.leader_id.term, log_id.index);
                     // Fan the committed change to live watchers WHILE
                     // STILL HOLDING the catalog lock — this closes the
                     // replay→live race window entirely (the legacy
@@ -507,7 +508,7 @@ mod tests {
                 leader_id: CommittedLeaderId::new(1, 0),
                 index: idx,
             },
-            payload: EntryPayload::Normal(cmd),
+            payload: EntryPayload::Normal(crate::command::LoggedCommand::proposed(cmd)),
         }
     }
 

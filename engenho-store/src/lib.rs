@@ -75,7 +75,7 @@ pub mod type_config;
 pub mod watch;
 pub mod watch_backend;
 
-pub use command::{Reason, ResourceCommand, ResourceOp};
+pub use command::{ApplySemantics, LoggedCommand, Reason, ResourceCommand, ResourceOp};
 pub use drv_committal::{
     DRV_GROUP, DRV_KIND, DRV_VERSION, delete_drv_command, drv_resource_key, put_drv_command,
     render_drv_resource,
@@ -94,7 +94,9 @@ pub use patch_apply::{
 pub use resource::{ListScope, ResourceKey, ResourceValue};
 pub use revision::{Change, ChangeKind, CompactedTooOld, Revision, VersionMeta};
 pub use ssa::{ApplyConflicts, Conflict, FieldSet, PathElement, SsaOutcome, apply_ssa};
-pub use state::{ApplyOutcome, DEFAULT_HISTORY_CAPACITY, ResourceCatalog, check_precondition};
+pub use state::{
+    ApplyOutcome, DEFAULT_HISTORY_CAPACITY, ResourceCatalog, check_precondition, unchanged,
+};
 pub use store::InMemoryStore;
 pub use type_config::{ApplyResult, RaftNodeId, TypeConfig};
 pub use watch::{WatchEvent, WatchEventKind};
