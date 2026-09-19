@@ -55,6 +55,17 @@
 //! panic in the process, caught or not, is counted by the hook behind
 //! [`PanicCounter`], which [`Runtime::start`] installs.
 //!
+//! ## Health (T2.8)
+//!
+//! `/livez`, `/healthz`, `/readyz` and the runtime's `/metrics` families are
+//! read from one [`Health`], built before the apiserver binds and handed the
+//! spawned children: each child is judged from its heartbeat and its task
+//! handle (never asserted), each driver's ticks are counted by how they
+//! ended, and a propose-rate detector flags a controller that lands writes
+//! in almost every second ([`ProposeRate::Continuous`]). The stuck-tick
+//! threshold a driver logs BLOCKED at and the one liveness judges against
+//! are one value ([`Windows`]).
+//!
 //! ## Dormant controllers (T5.11)
 //!
 //! Every type that implements [`engenho_controllers::Controller`] is either
@@ -91,6 +102,7 @@ pub mod etcd_facade;
 mod child;
 mod dormant;
 mod error;
+mod health;
 #[cfg(test)]
 mod impl_census;
 mod node_registration;
@@ -107,6 +119,7 @@ pub use child::{
 pub use dormant::{Dormant, DormantReason};
 pub use error::{RuntimeError, ShutdownStage};
 pub use etcd_facade::MeshEtcdStore;
+pub use health::{CONTINUOUS_AFTER, Health, ProposeRate, ProposeWindow, Pulse, SPAN, Windows};
 pub use node_registration::NodeRegistrationError;
 pub use panics::PanicCounter;
 pub use runtime::Runtime;

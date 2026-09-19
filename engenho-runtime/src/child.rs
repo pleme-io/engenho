@@ -60,8 +60,10 @@ use std::sync::Arc;
 use engenho_config::{ControllerEnable, EngenhoConfig};
 pub use engenho_controllers::TickState;
 use engenho_controllers::{ControllerType, Heartbeat, KindFilter, PanicMessage, Reads};
-use tokio::task::{Id, JoinSet};
+use tokio::task::{AbortHandle, Id, JoinSet};
 use tracing::error;
+
+use crate::health::{Row, Tally};
 
 engenho_controllers::closed_enum! {
     /// Every controller loop the runtime runs, each behind a
@@ -345,10 +347,11 @@ impl Wiring {
 }
 
 /// A child's body, ready to spawn: the future, the heartbeat it writes and,
-/// for a driver, its [`Wiring`].
+/// for a driver, its [`Wiring`] and the [`Tally`] its ticks are counted in.
 pub(crate) struct ChildTask {
     beat: Arc<Heartbeat>,
     wiring: Option<Wiring>,
+    tally: Option<Arc<Tally>>,
     run: Pin<Box<dyn Future<Output = Infallible> + Send + 'static>>,
 }
 
@@ -362,19 +365,23 @@ impl ChildTask {
         Self {
             beat,
             wiring: None,
+            tally: None,
             run: Box::pin(run),
         }
     }
 
-    /// A driver's body: as [`Self::new`], plus what wakes it and why.
+    /// A driver's body: as [`Self::new`], plus what wakes it and why, and
+    /// the tally its controller's ticks are counted in.
     pub(crate) fn driver(
         beat: Arc<Heartbeat>,
         wiring: Wiring,
+        tally: Arc<Tally>,
         run: impl Future<Output = Infallible> + Send + 'static,
     ) -> Self {
         Self {
             beat,
             wiring: Some(wiring),
+            tally: Some(tally),
             run: Box::pin(run),
         }
     }
@@ -428,6 +435,10 @@ pub struct DeadChild {
 pub struct ChildHandle {
     beat: Arc<Heartbeat>,
     wiring: Option<Wiring>,
+    /// The task's handle: whether it has ended is read off it directly, so
+    /// liveness sees a dead task before [`Children::next_dead`] is polled.
+    task: AbortHandle,
+    tally: Option<Arc<Tally>>,
     state: ChildState,
 }
 
@@ -491,9 +502,27 @@ impl Children {
             ChildHandle {
                 beat: task.beat,
                 wiring: task.wiring,
+                task: abort,
+                tally: task.tally,
                 state: ChildState::Running,
             },
         );
+    }
+
+    /// Every spawned child as health reads it, in catalog order: what it
+    /// beats into, its task's handle and, for a driver, its tally. Clones
+    /// of handles, so health reads them without borrowing the set.
+    pub(crate) fn rows(&self) -> Vec<Row> {
+        self.iter()
+            .map(|(child, entry)| {
+                Row::new(
+                    child,
+                    entry.beat.clone(),
+                    entry.task.clone(),
+                    entry.tally.clone(),
+                )
+            })
+            .collect()
     }
 
     /// Wait for the next child whose task ends, mark it

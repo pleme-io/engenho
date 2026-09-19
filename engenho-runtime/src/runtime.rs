@@ -48,6 +48,7 @@ use tracing::{error, info, warn};
 
 use crate::child::{Child, ChildTask, Children, DeadChild, Driver, Listener, Wiring};
 use crate::error::{RuntimeError, ShutdownStage, StrongCounts};
+use crate::health::{Health, Tallied, Tally, Windows};
 use crate::node_registration::{HostOwned, register_node};
 use crate::panics::PanicCounter;
 use crate::rebind::serve_rebinding;
@@ -62,6 +63,10 @@ pub struct Runtime {
     children: Children,
     /// Every panic in the process, counted by the hook `start` installs.
     panics: PanicCounter,
+    /// What `/livez`, `/healthz`, `/readyz` and the runtime's `/metrics`
+    /// families are derived from (T2.8): the children's heartbeats and task
+    /// handles, the drain state, the store. See [`Runtime::health`].
+    health: Arc<Health>,
     /// The daemon's one rollout-gate ledger (T0.11): what every gate in
     /// `Rollout::Shadow` allowed that `Enforce` would have refused. The
     /// apiserver's `/metrics` renders THIS ledger as
@@ -142,6 +147,15 @@ impl Runtime {
             return Err(RuntimeError::LeadershipTimeout { seconds: timeout_s });
         }
         info!(node = %config.runtime.node_name, "store reached leadership");
+
+        // 3b. What health and the runtime's metrics are read from (T2.8).
+        //     Built before the apiserver binds, so the router holds it from
+        //     its first request; it reports no children (every health check
+        //     fails) until step 7 hands it the spawned set. The windows are
+        //     built ONCE and given to the drivers as well, so a tick the
+        //     driver logs BLOCKED is the tick liveness reports stalled.
+        let windows = Windows::of(&config.controllers);
+        let health = Arc::new(Health::new(&store, windows, panics));
 
         // 4. Register THIS node so the scheduler has a target: create its
         //    Node if absent, else merge only the host-owned fields — a
@@ -317,7 +331,12 @@ impl Runtime {
         ))
         .with_authenticator(authenticator)
         .with_authorizer(authorizer)
-        .with_would_reject_ledger(Arc::clone(&would_reject));
+        .with_would_reject_ledger(Arc::clone(&would_reject))
+        // Health and the runtime's metric families, derived from observation
+        // (T2.8). Installed here with the ledger, before any clone, for the
+        // same reason.
+        .with_liveness_source(health.clone())
+        .with_metrics_source(health.clone());
         // The minting half, from the SAME key the authenticator verifies with.
         // Without it RBAC is decorative: the authorizer, the Roles and the
         // bindings all work, but nothing can present a non-admin identity to
@@ -382,8 +401,11 @@ impl Runtime {
         //    listeners, into ONE owned set that `main` watches. Returns the
         //    Arc<Kubelet> so the Pod `/log` reader can be wired in.
         let (children, kubelet) =
-            spawn_children(&config, &store, &backend, strategy, &handler_sink);
+            spawn_children(&config, &store, &backend, strategy, &handler_sink, windows);
         info!(count = children.len(), "children spawned");
+        // From here the health endpoints report every spawned child, each
+        // Unknown until its first beat.
+        health.adopt(children.rows());
 
         // 7b. Register the Pod `/log` handler — a StoreBackedHandler for the
         //     Pod kind whose `logs` delegates to the in-process kubelet (the
@@ -406,9 +428,18 @@ impl Runtime {
             apiserver,
             children,
             panics,
+            health,
             would_reject,
             backend,
         })
+    }
+
+    /// What the health endpoints and the runtime's metric families are
+    /// derived from: every spawned child judged from its heartbeat and its
+    /// task, and every driver's reconcile tally and propose rate (T2.8).
+    #[must_use]
+    pub fn health(&self) -> &Arc<Health> {
+        &self.health
     }
 
     /// The process's panic count: every panic since the runtime started,
@@ -503,8 +534,12 @@ impl Runtime {
             mut children,
             apiserver,
             store,
+            health,
             ..
         } = self;
+        // Readiness fails first, so a load balancer stops routing here
+        // before anything below stops serving.
+        health.begin_drain();
         // Abort every child then await it, so its captured Arc<StoreMesh>
         // (and the controller it owns) is actually dropped before we try
         // to unwrap the store.
@@ -2548,15 +2583,6 @@ const CNI_CONFIG_DIR: &str = "/etc/cni/net.d";
 /// sandbox creation, and not before.
 const CNI_INSTALL: engenho_cni::exec::CniInstall = engenho_cni::exec::CniInstall::Planned;
 
-/// How long a single reconcile may run before the driver starts saying,
-/// once per window, that it is BLOCKED. It is never cancelled — see
-/// `watch_driver::tick_observed`, which copies the kubelet's
-/// `syncLoopHealthCheck` posture: make a stalled loop LOUD rather than abort
-/// it half-done. Measured motivation: engenho's kubelet controller was
-/// retired for 12 hours on ryn (2026-09-18) and the only evidence was the
-/// ABSENCE of its tick line among three healthy controllers.
-const STUCK_TICK_AFTER: Duration = Duration::from_secs(120);
-
 /// Build + spawn every child the catalog enables (T2.6) into ONE owned
 /// [`Children`] set: the drivers gated on `controllers.enable.*`, the
 /// always-on scheduler + kubelet (a single-node runtime that can't schedule
@@ -2572,8 +2598,9 @@ fn spawn_children(
     backend: &Arc<dyn ContainerRuntime>,
     strategy: Box<dyn engenho_scheduler::SchedulingStrategy>,
     handler_sink: &Arc<dyn DynamicHandlerSink>,
+    windows: Windows,
 ) -> (Children, Arc<Kubelet>) {
-    let parts = Parts::assemble(config, store, backend, strategy, handler_sink);
+    let parts = Parts::assemble(config, store, backend, strategy, handler_sink, windows);
     let children = Children::spawn_catalog(config, |child| parts.task(child));
     (children, parts.kubelet)
 }
@@ -2660,6 +2687,9 @@ struct Parts<'a> {
     ns: Option<String>,
     debounce: Duration,
     fallback: Duration,
+    /// The liveness windows; each driver's stuck-tick threshold is read
+    /// from here, so it is the one liveness judges against.
+    windows: Windows,
     /// ★ ONE CSI driver table, shared by three consumers: the registrar
     /// fills it, the PV binder provisions through it, and the kubelet's
     /// materializer publishes through it. Two tables would let a driver be
@@ -2681,6 +2711,7 @@ impl<'a> Parts<'a> {
         backend: &Arc<dyn ContainerRuntime>,
         strategy: Box<dyn engenho_scheduler::SchedulingStrategy>,
         handler_sink: &'a Arc<dyn DynamicHandlerSink>,
+        windows: Windows,
     ) -> Self {
         let ns = Some(&config.controllers.namespace)
             .filter(|n| !n.is_empty())
@@ -2704,6 +2735,7 @@ impl<'a> Parts<'a> {
             ns,
             debounce: Duration::from_millis(u64::from(config.controllers.debounce_milliseconds)),
             fallback: Duration::from_secs(u64::from(config.controllers.fallback_interval_seconds)),
+            windows,
             csi_drivers,
             events,
             scheduler,
@@ -2727,7 +2759,14 @@ impl<'a> Parts<'a> {
         driver: Driver,
         controller: C,
     ) -> ChildTask {
-        drive(driver, controller, self.store, self.debounce, self.fallback)
+        drive(
+            driver,
+            controller,
+            self.store,
+            self.debounce,
+            self.fallback,
+            self.windows,
+        )
     }
 
     #[allow(
@@ -2971,6 +3010,11 @@ impl<'a> Parts<'a> {
 /// * A panic in its tick is handled by the driver's catalog [`TickState`]
 ///   (T2.7): contained and re-ticked for a Stateless driver, fatal to the
 ///   child for a Stateful one. The catalog row is the only source of it.
+/// * Its ticks are counted ([`Tallied`], T2.8): by how each ended, for
+///   `controller_runtime_reconcile_total`, and by whether it landed a write,
+///   for the propose-rate detector. A tick it has run longer than the
+///   windows' stuck threshold is logged BLOCKED by the driver and reported
+///   stalled by liveness: one threshold, from `windows`.
 ///
 /// [`TickState`]: crate::TickState
 fn drive<C: Controller + DeclaresReads + 'static>(
@@ -2979,19 +3023,27 @@ fn drive<C: Controller + DeclaresReads + 'static>(
     store: &Arc<StoreMesh>,
     debounce: Duration,
     fallback: Duration,
+    windows: Windows,
 ) -> ChildTask {
     let reads = controller.reads();
     let config = WatchDriverConfig {
         filter: reads.filter(),
         debounce,
         fallback_interval: fallback,
-        stuck_tick_after: STUCK_TICK_AFTER,
+        stuck_tick_after: windows.stuck_tick_after(),
         tick_state: driver.tick_state(),
     };
     let controller_type = controller.controller_type();
-    let watch = WatchDriver::new(controller, store.clone(), config);
+    // Named by the catalog, like its liveness row and its last-tick gauge,
+    // so every family says `controller="<driver>"` in one vocabulary.
+    let tally = Arc::new(Tally::new(driver.name()));
+    let watch = WatchDriver::new(
+        Tallied::new(controller, tally.clone()),
+        store.clone(),
+        config,
+    );
     let wiring = Wiring::new(controller_type, reads, watch.wakes().clone());
-    ChildTask::driver(watch.heartbeat(), wiring, watch.run())
+    ChildTask::driver(watch.heartbeat(), wiring, tally, watch.run())
 }
 
 /// Build the ONE kubelet, with its event sink, `ServiceAccount` projection
@@ -3637,6 +3689,7 @@ mod tests {
                     &store,
                     Duration::from_millis(10),
                     PANIC_FALLBACK,
+                    Windows::of(&config.controllers),
                 )
             })
         });
@@ -4044,6 +4097,7 @@ mod tests {
     const FORWARDING: &[(&str, &str)] = &[
         ("engenho_controllers", "Arc"),
         ("engenho_runtime", "DeclaredHere"),
+        ("engenho_runtime", "Tallied"),
     ];
 
     #[tokio::test]
