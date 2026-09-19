@@ -1020,88 +1020,64 @@ impl Kubelet {
     /// multi-node engenho (`engenho-revoada` carries the membership layer)
     /// peers can judge each other's leases; single-node cannot, and no amount
     /// of code here changes that.
+    ///
+    /// ── ★ WHY THE WRITE CARRIES A PRECONDITION (T1.3b) ────────────────────
+    /// The publish rewrites the WHOLE Node. Written unconditionally, it
+    /// reverted anything that committed between its read and its write — a
+    /// cordon, a taint, a label. [`crate::node_readiness`] writes at the
+    /// revision it read and, on a lost race, re-reads and re-derives once.
     async fn publish_node_readiness(&self) {
-        let lease_key = crate::node_lease::lease_key(&self.node_name);
-        // Age of the heartbeat AS THE STORE HAS IT.
-        let since_renew = match self.store.get(&lease_key).await {
-            Some(lease) => lease
-                .get("spec")
-                .and_then(|s| s.get("renewTime"))
-                .and_then(|t| t.as_str())
-                .and_then(engenho_types::time::age_since_rfc3339),
-            // No lease in the store at all — never written, or lost.
-            None => None,
-        };
-        let state = crate::node_lease::readiness(since_renew);
+        use crate::node_readiness::{ReadinessPublish, publish_ready};
 
-        let node_key = ResourceKey::cluster_scoped("", "v1", "Node", &self.node_name);
-        let Some(node) = self.store.get(&node_key).await else {
-            // No Node object yet: registration has not landed. Not an error —
-            // the next tick will find it.
-            return;
-        };
-        let previous = crate::node_lease::find_ready_condition(&node);
-        let condition = crate::node_lease::ready_condition(
-            state,
-            &engenho_types::time::now_rfc3339_utc(),
-            previous,
-        );
-
-        // Skip the write when nothing an operator would act on has changed.
-        // `lastHeartbeatTime` moves every tick by design, so comparing whole
-        // conditions would write on every single tick forever — which is how
-        // the store journal grows without bound while the cluster is idle.
-        let unchanged = previous.is_some_and(|p| {
-            p.get("status") == condition.get("status") && p.get("reason") == condition.get("reason")
-        });
-        if unchanged {
-            return;
-        }
-
-        // Merge BY TYPE. Replacing `status.conditions` wholesale would drop
-        // every condition this kubelet does not own — the same array-replacement
-        // defect the Pod status path has.
-        let mut conditions: Vec<serde_json::Value> = node
-            .get("status")
-            .and_then(|s| s.get("conditions"))
-            .and_then(|c| c.as_array())
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|c| c.get("type").and_then(|t| t.as_str()) != Some("Ready"))
-            .collect();
-        conditions.push(condition);
-
-        let mut desired = node.clone();
-        if let Some(obj) = desired.as_object_mut() {
-            let status = obj.entry("status").or_insert_with(|| serde_json::json!({}));
-            if let Some(status_obj) = status.as_object_mut() {
-                status_obj.insert("conditions".to_string(), serde_json::json!(conditions));
-            }
-        }
-
-        if let Err(e) = self
+        // The heartbeat AS THE STORE HAS IT — absent when never written or lost.
+        let lease = self
             .store
-            .propose(engenho_store::command::ResourceCommand::Put {
-                key: node_key,
-                value: desired,
-                expected: None,
-                reason: engenho_store::command::Reason::Controller,
-            })
-            .await
+            .get(&crate::node_lease::lease_key(&self.node_name))
+            .await;
+        let node_key = ResourceKey::cluster_scoped("", "v1", "Node", &self.node_name);
+
+        match publish_ready(
+            &self.store,
+            &node_key,
+            lease.as_ref(),
+            &engenho_types::time::now_rfc3339_utc(),
+        )
+        .await
         {
-            warn!(
+            ReadinessPublish::Published { retried, condition } => {
+                let field = |name: &str| condition.get(name).and_then(Value::as_str);
+                info!(
+                    node = %self.node_name,
+                    status = field("status"),
+                    reason = field("reason"),
+                    retried,
+                    "node Ready condition published"
+                );
+            }
+            // Unchanged: nothing an operator acts on changed (see
+            // `ReadinessPublish`). NoNode: registration has not landed. Not an
+            // error — the next tick finds it, and a readiness publish never
+            // creates a Node.
+            ReadinessPublish::Unchanged | ReadinessPublish::NoNode => {}
+            ReadinessPublish::Contended => debug!(
+                node = %self.node_name,
+                "node Ready condition lost two writes in a row to concurrent Node \
+                 updates; the next tick re-derives from the current Node"
+            ),
+            ReadinessPublish::Unversioned => warn!(
+                node = %self.node_name,
+                "the stored Node carries no resourceVersion, so the Ready condition \
+                 cannot be written with a precondition and was not written"
+            ),
+            ReadinessPublish::Malformed => warn!(
+                node = %self.node_name,
+                "the stored Node is not a JSON object; the Ready condition was not written"
+            ),
+            ReadinessPublish::Store(e) => warn!(
                 node = %self.node_name,
                 error = %e,
                 "could not publish the node Ready condition"
-            );
-        } else {
-            info!(
-                node = %self.node_name,
-                status = state.condition_status(),
-                reason = state.reason(),
-                "node Ready condition published"
-            );
+            ),
         }
     }
 

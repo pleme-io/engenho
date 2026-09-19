@@ -53,6 +53,8 @@ pub mod image_source;
 pub mod kubelet;
 pub mod lifecycle;
 pub mod native_backend;
+/// Publishing the node `Ready` condition with a precondition (T1.3b).
+mod node_readiness;
 /// Node lease + readiness derivation.
 ///
 /// ── ★ MOVED TO `engenho-controllers` 2026-09-14, RE-EXPORTED HERE ─────────
