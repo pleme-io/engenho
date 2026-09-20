@@ -1,5 +1,7 @@
-//! Safety claims the docs made about revoada and the store, which the
-//! code does not deliver (IMPROVEMENT-PLAN T5.4).
+//! Claims the docs made about revoada, the store and the fabric, which
+//! the code does not deliver (IMPROVEMENT-PLAN T5.4). Most are safety
+//! claims; the FABRIC.md row is an architecture one — a document
+//! describing a NATS fabric engenho decided not to have (§5.1).
 //!
 //! Each row names a file, the sentence that was retracted, a phrase from
 //! the corrected text, and what would have to exist in code before the
@@ -43,6 +45,17 @@ const RETRACTED: &[Retracted] = &[
         retracted: "reads are linearizable;",
         corrected: "so they are not\n   linearizable.",
         until: "revoada reads that go through a read-index round or a leader lease",
+    },
+    Retracted {
+        file: "../docs/FABRIC.md",
+        // The whole document is a draft for a fabric engenho does not have.
+        // The phrase is matched short of "spine" on purpose: the claim is
+        // written on one line at the top and wrapped after "messaging" in
+        // "What this is NOT", and both wordings are the same claim.
+        retracted: "NATS is the messaging",
+        corrected: "This document is a fenced-off draft. NATS is not engenho's fabric.",
+        until: "`Fabric` has an arm other than `InBinary` — a broker engenho \
+                actually runs, which edge 18 gates",
     },
     Retracted {
         file: "src/fabric.rs",

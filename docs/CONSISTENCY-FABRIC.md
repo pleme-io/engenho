@@ -106,7 +106,7 @@ from memory; disk is read only on restart for replay.
 
 Each transport has a sweet spot. Per-write, engenho chooses one:
 
-### Transport 1 — openraft (STRONG writes, local reads; in-process today, NATS R10)
+### Transport 1 — openraft (STRONG writes, local reads; in-process, and staying there)
 
   **Use for:** resource CRUD (pods, services, etc.), role
   assignments, anything kubectl-apply-shaped.
@@ -130,9 +130,13 @@ Each transport has a sweet spot. Per-write, engenho chooses one:
   **Where:** `engenho-store::StoreMesh::propose` +
   `engenho-revoada::consensus::RaftMesh::propose`.
 
-  **F2 (in flight):** the InProcessRouter becomes
-  `engenho-teia::RaftTransport` riding NATS subjects per
-  FABRIC.md. Same semantics, cross-process transport.
+  **F2 (DRAFT, not in flight):** the plan was for InProcessRouter to
+  become `engenho-teia::RaftTransport` riding NATS subjects per
+  [FABRIC.md](FABRIC.md). It is not being built. NATS is not
+  engenho's fabric (IMPROVEMENT-PLAN §5.1): a NATS server is a second
+  process every node would need, so the multi-node transport will
+  live inside the binary instead, and no second voter ships until
+  edge 18 holds. What runs today is the InProcessRouter.
 
 ### Transport 2 — chitchat gossip (EVENTUAL)
 

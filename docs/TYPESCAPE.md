@@ -117,7 +117,9 @@ is the one everything else in that domain hangs off.
 ### 8. Config
 | Type | Where | Shape |
 |---|---|---|
-| `EngenhoConfig` | `engenho-config/src/lib.rs` | `{cluster, revoada, teia, scheduler, controllers, consistency}` (shikumi `TieredConfig`) |
+| `EngenhoConfig` | `engenho-config/src/lib.rs` | `{cluster, revoada, fabric, scheduler, controllers, consistency, networking, runtime}` (shikumi `TieredConfig`, `deny_unknown_fields`). The retired `teia:` key is still *accepted*, for one release, as an inert `LegacyTeiaSection` — private fields, no accessor, read by nothing — and reported by `deprecations()`. |
+| `Fabric` | `engenho-config/src/fabric.rs` | `InBinary`. One arm, so "this node's fabric is a NATS server" has no representation: `fabric: nats` is refused at parse. NATS is not engenho's fabric ([IMPROVEMENT-PLAN](IMPROVEMENT-PLAN.md) §5.1); the multi-node transport arrives as a second arm here, gated by edge 18. |
+| `ConfigDeprecation` | fabric.rs | `TeiaSection` — a typed variant a caller or test matches, not log text; carries `key` / `replacement` / `kind` |
 | `TopologyStrategyKind` | revoada.rs | mirrors the 6 strategies |
 | `SchedulerStrategyKind` · `ControllerEnable` | scheduler.rs, controllers.rs | tunables + per-controller toggles |
 
