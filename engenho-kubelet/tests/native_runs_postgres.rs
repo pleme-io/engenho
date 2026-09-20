@@ -158,15 +158,35 @@ async fn postgres_runs_natively_under_the_kubelet_from_a_nix_closure() {
     });
 
     // ★ THE CLAIM. Not "a process started" — a real PostgreSQL answered a real
-    // query, and it is a darwin binary, so nothing here went through a VM.
+    // query, and the binary that answered is NATIVE TO THIS HOST, so nothing
+    // here went through a VM.
     assert!(
         version.contains("PostgreSQL 16"),
         "expected PostgreSQL 16, got: {version}"
     );
+    // The property is native-to-this-host, not the literal word "darwin".
+    // `version` is the `version()` string, which names the platform the server
+    // was BUILT for: "…on aarch64-apple-darwin…" or "…on x86_64-pc-linux-gnu…".
+    //
+    // This used to assert `darwin` unconditionally. It was written on macOS,
+    // where a linux server can only have come from a VM — the exact thing this
+    // backend exists to avoid. On a Linux host, though, a linux server IS the
+    // native one, so the assertion failed a correct result: engenho's CI has
+    // been red on this single test while the other 5,056 passed.
+    //
+    // Naming the host's own platform keeps the claim on BOTH: a macOS runner
+    // still rejects a linux binary (a VM), and a Linux runner rejects a darwin
+    // one (which could not have executed there at all).
+    let native = if cfg!(target_os = "macos") {
+        "darwin"
+    } else {
+        "linux"
+    };
     assert!(
-        version.contains("darwin"),
-        "the server must be a DARWIN build — if this says linux, the workload \
-         is in a VM and the whole point of this backend is unmet: {version}"
+        version.contains(native),
+        "the server must be a {native} build, native to this host — anything \
+         else means the workload went through a VM and the whole point of this \
+         backend is unmet: {version}"
     );
 
     // Still tracked as running while it serves.
