@@ -1,7 +1,13 @@
-;; no-c-tls — engenho asks for no C TLS stack: reqwest is rustls-only, and no
-;; OpenSSL or native-tls crate enters Cargo.lock from a source nobody named.
+;; no-c-tls — engenho asks for no C TLS stack: reqwest is rustls-only, rustls
+;; runs on ring, and no OpenSSL, native-tls or AWS-LC crate enters Cargo.lock
+;; through an edge nobody has read.
 ;;
-;; WHY (improvement plan T0.8, buildci-5; integration row I34).
+;; TWO C stacks, not one. `tls:BANNED-NATIVE` is reqwest's native-tls backend
+;; and the OpenSSL it links; `tls:BANNED-AWS-LC` is AWS-LC, the C library
+;; aws-lc-sys builds with `cc` and aws-lc-rs binds. They arrive by different
+;; feature paths, from the same upstream project, and both are recorded below.
+;;
+;; WHY (improvement plan T0.8, buildci-5; integration rows I34, tls-02).
 ;;   reqwest's default features include `default-tls`, which is native-tls:
 ;;   OpenSSL through openssl-sys on Linux, Security.framework on darwin.
 ;;   Wherever `default-tls` is on, reqwest's `TlsBackend::default()` picks
@@ -34,38 +40,85 @@
 ;;     query prints nothing. It needs `--target all`. Cargo.lock is resolved
 ;;     for every target at once, which is why this check reads it.
 ;;
+;; WHY, AWS-LC (tls-02). aws-lc-sys 0.41.0 is AWS-LC's C, compiled by its
+;;   build script; aws-lc-rs 1.17.0 is the binding, and rustls's DEFAULT
+;;   crypto provider. The workspace rustls line has asked for `ring` with
+;;   `default-features = false` throughout, and the daemon installs ring as
+;;   the process provider at boot — and aws-lc-sys is in Cargo.lock anyway,
+;;   because feature unification does not care what our line says.
+;;   Measured 2026-09-19 with
+;;     cargo tree --workspace --all-features --target all -i aws-lc-rs -e features
+;;   and again with default features. Both give ONE root, four edges:
+;;     aws-lc-rs 1.17.0  -> aws-lc-sys, through aws-lc-rs's own `aws-lc-sys`
+;;                          feature, which rustls's `aws_lc_rs` turns on.
+;;     rustls 0.23.40    <- feature `aws_lc_rs` (its aliases: `aws-lc-rs`;
+;;                          implied by `default`, `prefer-post-quantum`,
+;;                          `fips`).
+;;     rustls-webpki 0.103.13 <- feature `aws-lc-rs`, which rustls's
+;;                          `aws_lc_rs` enables as `webpki/aws-lc-rs`.
+;;     quinn-proto 0.11.14 <- its optional `aws-lc-rs` dependency. NOT
+;;                          activated in any engenho build: it appears in the
+;;                          lock because Cargo.lock is resolved with every
+;;                          optional dependency, and in no `cargo tree` run.
+;;   The one root that turns rustls's `aws_lc_rs` on:
+;;     sui-eval 0.1.153 (default)
+;;       -> gix `blocking-http-transport-reqwest-rust-tls`
+;;       -> gix-transport 0.57.1 `http-client-reqwest-rust-tls`
+;;       -> reqwest 0.13.4 `rustls` = `__rustls-aws-lc-rs`
+;;       -> rustls/aws-lc-rs + tokio-rustls/aws-lc-rs + hyper-rustls/aws-lc-rs
+;;   Two traps in that chain. reqwest 0.13 renamed its backends: `default-tls`
+;;   there is `["rustls"]`, and the plain `rustls` feature is the aws-lc-rs
+;;   one, while `rustls-tls` (what the workspace line asks reqwest 0.12 for)
+;;   is the ring one. And engenho reaches this through reqwest 0.13.4, a
+;;   SECOND reqwest in the lock, not the 0.12.28 the workspace line pins —
+;;   so the attribution table below, which reads dependents of the reqwest
+;;   that carries native-tls, never sees it. That is why the aws-lc family is
+;;   recorded as tls:CARRIERS rows over the edge, not as attribution rows.
+;;   Nothing in this workspace can turn it off: cargo unifies rustls's
+;;   features across the build, and gix-transport asks for the aws-lc one.
+;;
 ;; RULES:
-;;   workspace   [workspace.dependencies] reqwest is a table with
-;;               `default-features = false` (the boolean), names each of
-;;               tls:WORKSPACE-WANTS, and names no feature in
-;;               tls:NATIVE-FEATURES.
-;;   members     no member manifest asks reqwest for its default or
-;;               native-tls features. Every reqwest entry, also one renamed
-;;               through `package = "reqwest"`, in [dependencies],
+;;   workspace   every [workspace.dependencies] line in tls:WORKSPACE-LINES
+;;               (reqwest, rustls) is a table with `default-features = false`
+;;               (the boolean), names each feature that line wants, and names
+;;               none of that dependency's tls:C-FEATURES.
+;;   members     no member manifest asks a guarded dependency for its default
+;;               or C-crypto features. Every reqwest and rustls entry, also
+;;               one renamed through `package = "…"`, in [dependencies],
 ;;               [dev-dependencies], [build-dependencies] or a
 ;;               [target.*.…] form of them: either inherits the workspace
 ;;               line (`workspace = true`) without setting
 ;;               `default-features = true`, or sets `default-features =
-;;               false` itself. No entry lists a tls:NATIVE-FEATURES
-;;               feature, and no [features] entry enables one through
-;;               `reqwest/…` or `reqwest?/…`.
+;;               false` itself. No entry lists a tls:C-FEATURES feature of
+;;               that dependency, and no [features] entry enables one through
+;;               `reqwest/…`, `rustls/…` or their `?/…` forms.
 ;;   present     (positive control) Cargo.lock resolves each of
 ;;               tls:REQUIRED. Without them the ban would pass because there
 ;;               is no rustls HTTP client at all.
 ;;   direct      every Cargo.lock package that depends on a tls:BANNED crate
-;;               is itself banned, or is reqwest (whose `default-tls`
-;;               feature is attributed below). Anything else pulls C TLS by
-;;               itself and fails.
-;;   attributed  while a banned crate is in Cargo.lock, every non-workspace
-;;               package that depends on a reqwest carrying a banned edge
-;;               has a tls:ATTRIBUTION row for its exact locked version, and
-;;               at least one of those rows says `asks`. A package with no
-;;               row fails: Cargo.lock does not record which dependent turned
-;;               `default-tls` on, so a dependent nobody has read is treated
-;;               as a new source.
+;;               is itself banned, or has a tls:CARRIERS row for that exact
+;;               (package, version, banned crate) edge. Anything else pulls a
+;;               C crypto stack in by itself and fails.
+;;   attributed  while a tls:BANNED-NATIVE crate is in Cargo.lock, every
+;;               non-workspace package that depends on a reqwest carrying a
+;;               banned edge has a tls:ATTRIBUTION row for its exact locked
+;;               version, and at least one of those rows says `asks`. A
+;;               package with no row fails: Cargo.lock does not record which
+;;               dependent turned `default-tls` on, so a dependent nobody has
+;;               read is treated as a new source.
 ;;   stale       an attribution row that matches no such dependent fails.
-;;               Once no banned crate is in Cargo.lock, that is every row:
-;;               a row left behind would excuse the next regression.
+;;               Once no tls:BANNED-NATIVE crate is in Cargo.lock, that is
+;;               every row: a row left behind would excuse the next
+;;               regression.
+;;
+;; THE CARRIER TABLE. Each row is (package version banned-crate why): one
+;; read edge from a crate that is not itself C into one that is, with the
+;; feature that opens it. It permits that EDGE and nothing else — not the
+;; package at another version, not another banned crate — so a lock bump
+;; leaves the bumped package unattributed and fails, which is the prompt to
+;; read the new manifest. A row whose edge has left the lock is inert rather
+;; than a hole, because it cannot excuse a different dependent; delete it
+;; when the reading it records stops being true.
 ;;
 ;; THE ATTRIBUTION TABLE. Each row is (package version kind why). The kind
 ;; is `asks` (the package's own manifest asks reqwest for its default
@@ -81,15 +134,23 @@
 ;; Cargo.lock this check then fails on the `clean` rows; delete those too,
 ;; and from then on it is a plain ban.
 ;;
+;; WHEN GIX-TRANSPORT STOPS ASKING FOR reqwest's `rustls`: whether that is a
+;; sui-eval release built on a gix that asks for `rustls-tls`, or engenho
+;; dropping sui-eval, `cargo tree -i aws-lc-rs` goes empty and aws-lc-rs and
+;; aws-lc-sys leave Cargo.lock. Delete the three aws-lc tls:CARRIERS rows
+;; then; `direct` no longer reaches them, so nothing else has to change.
+;;
 ;; TIER: a CI gate, not a type. It reads the TOML cargo reads: a manifest
-;; edited to ask for reqwest's defaults, a new dependency that pulls
-;; native-tls or OpenSSL, or a lock bump to an unread dependent fails before
-;; merge. It does not see per-binary feature resolution: Cargo.lock is a
-;; superset of every build, so it can fail on a crate that one binary never
-;; links. Attribution rows are hand-recorded readings of upstream manifests,
-;; not something this check can verify. It says nothing about C linked by
-;; other means (a `-sys` crate that is not TLS, or a system library a build
-;; script finds).
+;; edited to ask for reqwest's defaults or rustls's, a new dependency that
+;; pulls native-tls, OpenSSL or AWS-LC, or a lock bump to an unread dependent
+;; or an unread carrier edge fails before merge. It does not see per-binary
+;; feature resolution: Cargo.lock is a superset of every build, so it can
+;; fail on a crate that one binary never links, and — the other direction —
+;; it reports quinn-proto's aws-lc-rs edge, which no engenho build activates.
+;; Carrier and attribution rows are hand-recorded readings of upstream
+;; manifests and of `cargo tree -e features`, not something this check can
+;; verify. It says nothing about C linked by other means (a `-sys` crate that
+;; is not TLS, or a system library a build script finds).
 ;;
 ;; Exit codes: 0 clean · 1 a rule is broken · 3 nothing was examined (no
 ;; Cargo.lock package, or no workspace member manifest): the check proved
@@ -104,27 +165,73 @@
 (define tls:MANIFEST "Cargo.toml")
 (define tls:LOCK "Cargo.lock")
 
-;; The C TLS crates. native-tls is the reqwest backend; openssl and
+;; The native-tls family. native-tls is the reqwest backend; openssl and
 ;; openssl-sys are what it links on Linux; hyper-tls and tokio-native-tls are
 ;; reqwest's adapters to it.
-(define tls:BANNED (list "openssl-sys" "openssl" "native-tls" "hyper-tls" "tokio-native-tls"))
+(define tls:BANNED-NATIVE (list "openssl-sys" "openssl" "native-tls" "hyper-tls" "tokio-native-tls"))
+
+;; The AWS-LC family. aws-lc-sys carries AWS-LC's C and compiles it with
+;; `cc`; aws-lc-rs is its Rust binding, and rustls's default crypto provider.
+;; The binding is banned beside the -sys crate for the same reason openssl is
+;; banned beside openssl-sys: a new dependent then fails on its own edge,
+;; not one level down where the name no longer says who asked.
+(define tls:BANNED-AWS-LC (list "aws-lc-sys" "aws-lc-rs"))
+
+(define tls:BANNED (append tls:BANNED-NATIVE tls:BANNED-AWS-LC))
 
 ;; What the ban is measured against: a rustls HTTP client in the resolve.
 (define tls:REQUIRED (list "reqwest" "rustls" "hyper-rustls"))
 
-;; reqwest features that turn native-tls on. `default` is here because
-;; naming it in a feature list is the same as leaving the defaults on.
-(define tls:NATIVE-FEATURES
-  (list "default" "default-tls" "native-tls" "native-tls-alpn" "native-tls-vendored"))
-
-;; What the workspace line must name, and why, as (feature why) pairs.
-(define tls:WORKSPACE-WANTS
+;; Features of a guarded dependency that turn a C crypto stack on, as
+;; (dependency feature why) rows. `default` is in each because naming it in a
+;; feature list is the same as leaving that dependency's defaults on.
+(define tls:C-FEATURES
   (list
-    (list "rustls-tls" "the rustls backend, with the bundled webpki roots")
-    (list "rustls-tls-native-roots" "the OS trust store native-tls read; without it a private CA stops verifying")
-    (list "charset" "one of reqwest's defaults, named back so that TLS is the only thing the line turns off")
-    (list "http2" "one of reqwest's defaults, named back so that TLS is the only thing the line turns off")
-    (list "system-proxy" "one of reqwest's defaults, named back so that TLS is the only thing the line turns off")))
+    (list "reqwest" "default" "reqwest's defaults, `default-tls` among them")
+    (list "reqwest" "default-tls" "native-tls in reqwest 0.12; in 0.13 it is `[\"rustls\"]`, which is aws-lc-rs")
+    (list "reqwest" "native-tls" "native-tls, the backend that links OpenSSL")
+    (list "reqwest" "native-tls-alpn" "native-tls, with ALPN")
+    (list "reqwest" "native-tls-vendored" "native-tls, with its OpenSSL vendored")
+    (list "reqwest" "rustls" "reqwest 0.13's `__rustls-aws-lc-rs` backend; the ring one is `rustls-tls`")
+    (list "rustls" "default" "rustls's defaults, `aws_lc_rs` and `prefer-post-quantum` among them")
+    (list "rustls" "aws-lc-rs" "aws-lc-rs, rustls's C crypto provider")
+    (list "rustls" "aws_lc_rs" "aws-lc-rs, rustls's C crypto provider")
+    (list "rustls" "prefer-post-quantum" "aws_lc_rs: rustls's X25519MLKEM768 preference is aws-lc-rs only")
+    (list "rustls" "fips" "aws-lc-rs, in FIPS mode")))
+
+;; What each guarded [workspace.dependencies] line must name, and why, as
+;; (dependency (feature why) …). The dependency names here are the guarded
+;; set: the member rules read the same list.
+(define tls:WORKSPACE-LINES
+  (list
+    (list "reqwest"
+      (list "rustls-tls" "the rustls backend, with the bundled webpki roots")
+      (list "rustls-tls-native-roots" "the OS trust store native-tls read; without it a private CA stops verifying")
+      (list "charset" "one of reqwest's defaults, named back so that TLS is the only thing the line turns off")
+      (list "http2" "one of reqwest's defaults, named back so that TLS is the only thing the line turns off")
+      (list "system-proxy" "one of reqwest's defaults, named back so that TLS is the only thing the line turns off"))
+    (list "rustls"
+      (list "ring" "the crypto provider engenho installs at boot, in place of rustls's default aws-lc-rs")
+      (list "std" "one of rustls's defaults, named back so that the provider is the only thing the line turns off")
+      (list "tls12" "one of rustls's defaults, named back so that the provider is the only thing the line turns off")
+      (list "logging" "one of rustls's defaults, named back so that the provider is the only thing the line turns off"))))
+
+;; Every read edge from a crate that is not itself C into one that is, as
+;; (package version banned-crate why). See THE CARRIER TABLE above.
+(define tls:CARRIERS
+  (list
+    (list "reqwest" "0.12.28" "native-tls"
+      "feature `default-tls`; which dependent asks for it is in tls:ATTRIBUTION")
+    (list "reqwest" "0.12.28" "hyper-tls"
+      "feature `default-tls`; which dependent asks for it is in tls:ATTRIBUTION")
+    (list "reqwest" "0.12.28" "tokio-native-tls"
+      "feature `default-tls`; which dependent asks for it is in tls:ATTRIBUTION")
+    (list "rustls" "0.23.40" "aws-lc-rs"
+      "feature `aws_lc_rs` (one of rustls's defaults, and implied by `prefer-post-quantum`), turned on here by reqwest 0.13.4's `__rustls-aws-lc-rs` <- gix-transport 0.57.1 `http-client-reqwest-rust-tls` <- gix <- sui-eval 0.1.153")
+    (list "rustls-webpki" "0.103.13" "aws-lc-rs"
+      "feature `aws-lc-rs`, which rustls's `aws_lc_rs` enables as `webpki/aws-lc-rs`")
+    (list "quinn-proto" "0.11.14" "aws-lc-rs"
+      "its optional `aws-lc-rs` dependency, activated by no engenho build; Cargo.lock resolves every optional dependency, and `cargo tree -i aws-lc-rs` shows no quinn-proto branch")))
 
 ;; Every non-workspace reqwest dependent in Cargo.lock while a banned crate
 ;; is there, as (package version kind why). See THE ATTRIBUTION TABLE above.
@@ -162,7 +269,7 @@
 
 (define (tls:strings v) (filter (fn (s) (string? s)) (tls:as-list v)))
 
-;; ── One reqwest dependency entry ─────────────────────────────────────────
+;; ── One guarded dependency entry ─────────────────────────────────────────
 
 ;; An entry's `default-features` as written: true, false, another value, or
 ;; "unset" when the key is absent.
@@ -175,66 +282,85 @@
 (define (tls:false? v) (and (boolean? v) (equal? v false)))
 (define (tls:true? v) (and (boolean? v) (equal? v true)))
 
-;; Is the entry `key = value` a reqwest dependency? Either the key is
-;; `reqwest` and no `package` renames it away, or `package = "reqwest"`.
-(define (tls:reqwest-entry? key value)
-  (let ((pkg (if (and (list? value) (tls:has-key? value "package")) (tls:get value "package") "")))
-    (or (equal? pkg "reqwest") (and (equal? key "reqwest") (equal? pkg "")))))
+;; The dependencies these rules read: the ones tls:WORKSPACE-LINES governs.
+(define tls:GUARDED (map car tls:WORKSPACE-LINES))
 
-;; Violations for one reqwest entry `key = entry`, found at `where`.
-(define (tls:entry-violations where key entry)
+;; `dep`'s features that turn a C crypto stack on, and why one of them does.
+(define (tls:c-features dep)
+  (map (fn (r) (car (cdr r))) (filter (fn (r) (equal? (car r) dep)) tls:C-FEATURES)))
+
+(define (tls:c-why dep f)
+  (reduce (fn (acc r) (if (and (equal? (car r) dep) (equal? (car (cdr r)) f)) (car (cdr (cdr r))) acc))
+    "" tls:C-FEATURES))
+
+(define (tls:c-feature-line at dep f)
+  (string-append at "names the feature `" f "`, which turns on " (tls:c-why dep f)))
+
+;; Is the entry `key = value` a `dep` dependency? Either the key is `dep`
+;; and no `package` renames it away, or `package = "<dep>"`.
+(define (tls:dep-entry? dep key value)
+  (let ((pkg (if (and (list? value) (tls:has-key? value "package")) (tls:get value "package") "")))
+    (or (equal? pkg dep) (and (equal? key dep) (equal? pkg "")))))
+
+;; Violations for one `dep` entry `key = entry`, found at `where`.
+(define (tls:entry-violations where dep key entry)
   (let ((at (string-append where " `" key "`: ")))
     (cond
       ((string? entry)
-        (list (string-append at "is the bare version \"" entry "\", which takes reqwest's default features, default-tls among them; write `{ workspace = true }` or a table with `default-features = false`")))
+        (list (string-append at "is the bare version \"" entry "\", which takes " dep "'s default features, a C crypto stack among them; write `{ workspace = true }` or a table with `default-features = false`")))
       ((not (list? entry))
         (list (string-append at "is neither a version nor a table")))
       (else
         (let* ((df (tls:default-features entry))
-               (native (filter (fn (f) (tls:in? f tls:NATIVE-FEATURES)) (tls:strings (tls:get entry "features")))))
+               (c (filter (fn (f) (tls:in? f (tls:c-features dep))) (tls:strings (tls:get entry "features")))))
           (append
             (cond
               ((tls:true? (tls:get entry "workspace"))
                 (if (tls:true? df)
-                  (list (string-append at "inherits the workspace line but sets `default-features = true`, which turns reqwest's defaults, default-tls among them, back on"))
+                  (list (string-append at "inherits the workspace line but sets `default-features = true`, which turns " dep "'s defaults, a C crypto stack among them, back on"))
                   (list)))
               ((tls:false? df) (list))
               (else
-                (list (string-append at "does not set `default-features = false`, so it takes reqwest's default features, default-tls among them; inherit the workspace line with `workspace = true`"))))
-            (map (fn (f) (string-append at "names the feature `" f "`, which turns native-tls on")) native)))))))
+                (list (string-append at "does not set `default-features = false`, so it takes " dep "'s default features, a C crypto stack among them; inherit the workspace line with `workspace = true`"))))
+            (map (fn (f) (tls:c-feature-line at dep f)) c)))))))
 
 ;; ── Rules over the manifests ─────────────────────────────────────────────
 
-(define (tls:workspace-violations manifest)
+;; One [workspace.dependencies] line: `dep`, wanting each of `wants`.
+(define (tls:line-violations manifest dep wants)
   (let* ((deps (tls:table (tls:table manifest "workspace") "dependencies"))
-         (at (string-append tls:MANIFEST " [workspace.dependencies] reqwest: ")))
+         (at (string-append tls:MANIFEST " [workspace.dependencies] " dep ": ")))
     (cond
-      ((not (tls:has-key? deps "reqwest"))
+      ((not (tls:has-key? deps dep))
         (list (string-append at "missing; the members' `workspace = true` entries would have no line to inherit")))
-      ((not (list? (tls:get deps "reqwest")))
-        (list (string-append at "is a bare version, which takes reqwest's default features, default-tls among them")))
+      ((not (list? (tls:get deps dep)))
+        (list (string-append at "is a bare version, which takes " dep "'s default features, a C crypto stack among them")))
       (else
-        (let* ((entry (tls:get deps "reqwest"))
+        (let* ((entry (tls:get deps dep))
                (features (tls:strings (tls:get entry "features"))))
           (append
             (if (tls:false? (tls:default-features entry))
               (list)
-              (list (string-append at "needs `default-features = false` (the boolean); reqwest's defaults include default-tls, which is native-tls")))
+              (list (string-append at "needs `default-features = false` (the boolean); the `default` feature turns on " (tls:c-why dep "default"))))
             (map (fn (w) (string-append at "does not name `" (car w) "`, " (car (cdr w))))
-              (filter (fn (w) (not (tls:in? (car w) features))) tls:WORKSPACE-WANTS))
-            (map (fn (f) (string-append at "names the feature `" f "`, which turns native-tls on"))
-              (filter (fn (f) (tls:in? f tls:NATIVE-FEATURES)) features))))))))
+              (filter (fn (w) (not (tls:in? (car w) features))) wants))
+            (map (fn (f) (tls:c-feature-line at dep f))
+              (filter (fn (f) (tls:in? f (tls:c-features dep))) features))))))))
 
-;; Every (where key entry) for a reqwest entry in one dependency table.
-(define (tls:reqwest-entries where table)
+(define (tls:workspace-violations manifest)
+  (reduce (fn (acc line) (append acc (tls:line-violations manifest (car line) (cdr line))))
+    (list) tls:WORKSPACE-LINES))
+
+;; Every (where key entry) for a `dep` entry in one dependency table.
+(define (tls:dep-entries dep where table)
   (map (fn (e) (list where (car e) (car (cdr e))))
-    (filter (fn (e) (and (list? e) (string? (car e)) (tls:reqwest-entry? (car e) (car (cdr e))))) (tls:as-list table))))
+    (filter (fn (e) (and (list? e) (string? (car e)) (tls:dep-entry? dep (car e) (car (cdr e))))) (tls:as-list table))))
 
-;; Every (where key entry) for a reqwest entry anywhere in a member manifest.
-(define (tls:manifest-entries path manifest)
+;; Every (where key entry) for a `dep` entry anywhere in a member manifest.
+(define (tls:manifest-entries dep path manifest)
   (append
     (reduce
-      (fn (acc t) (append acc (tls:reqwest-entries (string-append path " [" t "]") (tls:table manifest t))))
+      (fn (acc t) (append acc (tls:dep-entries dep (string-append path " [" t "]") (tls:table manifest t))))
       (list) tls:DEP-TABLES)
     (reduce
       (fn (acc target)
@@ -242,37 +368,46 @@
           (reduce
             (fn (acc2 t)
               (append acc2
-                (tls:reqwest-entries (string-append path " [target." (tls:n (car target)) "." t "]")
+                (tls:dep-entries dep (string-append path " [target." (tls:n (car target)) "." t "]")
                   (tls:table (car (cdr target)) t))))
             (list) tls:DEP-TABLES)))
       (list) (tls:table manifest "target"))))
 
-;; A [features] value `reqwest/<f>` or `reqwest?/<f>` (for any key that
-;; names reqwest) enabling a native-tls feature.
-(define (tls:feature-violations path manifest keys)
+;; A [features] value `<key>/<f>` or `<key>?/<f>` (for any key that names
+;; `dep`) enabling one of `dep`'s C features.
+(define (tls:feature-violations dep path manifest keys)
   (reduce
     (fn (acc feature)
       (append acc
-        (map (fn (v) (string-append path " [features] `" (tls:n (car feature)) "` enables `" v "`, which turns native-tls on"))
+        (map
+          (fn (v)
+            (string-append path " [features] `" (tls:n (car feature)) "` enables `" v
+              "`, which turns on " (tls:c-why dep (car (cdr (string-split v "/"))))))
           (filter
             (fn (v)
               (let ((parts (string-split v "/")))
                 (and (= (length parts) 2)
                      (tls:in? (string-replace (car parts) "?" "") keys)
-                     (tls:in? (car (cdr parts)) tls:NATIVE-FEATURES))))
+                     (tls:in? (car (cdr parts)) (tls:c-features dep)))))
             (tls:strings (car (cdr feature)))))))
     (list)
     (filter (fn (f) (and (list? f) (string? (car f)))) (tls:table manifest "features"))))
+
+;; Every rule over one member manifest, for one guarded dependency.
+(define (tls:member-dep-violations dep path manifest)
+  (let* ((entries (tls:manifest-entries dep path manifest))
+         (keys (map (fn (e) (car (cdr e))) entries)))
+    (append
+      (reduce (fn (acc e) (append acc (tls:entry-violations (car e) dep (car (cdr e)) (car (cdr (cdr e)))))) (list) entries)
+      (tls:feature-violations dep path manifest (if (tls:in? dep keys) keys (append keys (list dep)))))))
 
 ;; `members` is a list of (path parsed-manifest).
 (define (tls:member-violations members)
   (reduce
     (fn (acc m)
-      (let* ((entries (tls:manifest-entries (car m) (car (cdr m))))
-             (keys (map (fn (e) (car (cdr e))) entries)))
-        (append acc
-          (reduce (fn (acc2 e) (append acc2 (tls:entry-violations (car e) (car (cdr e)) (car (cdr (cdr e)))))) (list) entries)
-          (tls:feature-violations (car m) (car (cdr m)) (if (tls:in? "reqwest" keys) keys (append keys (list "reqwest")))))))
+      (append acc
+        (reduce (fn (acc2 dep) (append acc2 (tls:member-dep-violations dep (car m) (car (cdr m)))))
+          (list) tls:GUARDED)))
     (list) members))
 
 ;; ── Reading Cargo.lock ───────────────────────────────────────────────────
@@ -305,14 +440,23 @@
   (map (fn (r) (string-append tls:LOCK ": no `" r "` package; the ban below would pass for want of a rustls HTTP client, not because of one"))
     (filter (fn (r) (not (any? (fn (p) (equal? (tls:p-name p) r)) pkgs))) tls:REQUIRED)))
 
-(define (tls:direct-violations pkgs)
+;; Does a tls:CARRIERS row read this package's edge into `banned-name`?
+(define (tls:carried? p banned-name carriers)
+  (any?
+    (fn (row)
+      (and (equal? (car row) (tls:p-name p))
+           (equal? (car (cdr row)) (tls:p-version p))
+           (equal? (car (cdr (cdr row))) banned-name)))
+    carriers))
+
+(define (tls:direct-violations pkgs carriers)
   (reduce
     (fn (acc p)
       (append acc
-        (map (fn (d) (string-append tls:LOCK ": " (tls:p-label p) " depends on `" (car d) "` directly; no reqwest feature explains it"))
-          (tls:banned-deps p))))
+        (map (fn (d) (string-append tls:LOCK ": " (tls:p-label p) " depends on `" (car d) "` directly, and no tls:CARRIERS row reads that edge; read the feature that opens it, or the crate pulls a C crypto stack in by itself"))
+          (filter (fn (d) (not (tls:carried? p (car d) carriers))) (tls:banned-deps p)))))
     (list)
-    (filter (fn (p) (and (not (tls:in? (tls:p-name p) tls:BANNED)) (not (equal? (tls:p-name p) "reqwest")))) pkgs)))
+    (filter (fn (p) (not (tls:in? (tls:p-name p) tls:BANNED))) pkgs)))
 
 ;; The versions of reqwest that depend on a banned crate.
 (define (tls:tainted-reqwests pkgs)
@@ -334,9 +478,12 @@
 (define (tls:row-matches? row p)
   (and (equal? (car row) (tls:p-name p)) (equal? (car (cdr row)) (tls:p-version p))))
 
-;; Violations of `attributed` and `stale`, over the rows `rows`.
+;; Violations of `attributed` and `stale`, over the rows `rows`. The table
+;; reads dependents of the reqwest that carries native-tls, so its liveness
+;; keys on tls:BANNED-NATIVE: the aws-lc family arrives through rustls, on a
+;; reqwest the workspace line does not pin, and is recorded in tls:CARRIERS.
 (define (tls:attribution-violations pkgs rows)
-  (let* ((banned (filter (fn (p) (tls:in? (tls:p-name p) tls:BANNED)) pkgs))
+  (let* ((banned (filter (fn (p) (tls:in? (tls:p-name p) tls:BANNED-NATIVE)) pkgs))
          (tainted (tls:tainted-reqwests pkgs))
          (dependents (filter (fn (p) (and (not (tls:p-local? p)) (tls:uses-tainted? p tainted))) pkgs))
          (live (filter (fn (row) (any? (fn (p) (tls:row-matches? row p)) dependents)) rows))
@@ -361,17 +508,17 @@
             (list (string-append at "C TLS is locked (" (string-join ", " (map tls:p-label banned))
                     ") and no attributed dependent asks reqwest for its defaults; a `clean` row is wrong, or the source is not a reqwest dependent"))))))))
 
-(define (tls:lock-violations lock rows)
+(define (tls:lock-violations lock rows carriers)
   (let ((pkgs (tls:packages lock)))
-    (append (tls:present-violations pkgs) (tls:direct-violations pkgs) (tls:attribution-violations pkgs rows))))
+    (append (tls:present-violations pkgs) (tls:direct-violations pkgs carriers) (tls:attribution-violations pkgs rows))))
 
 ;; ── Everything, as one list of violation lines ──────────────────────────
 
-(define (tls:violations manifest members lock rows)
+(define (tls:violations manifest members lock rows carriers)
   (append
     (tls:workspace-violations manifest)
     (tls:member-violations members)
-    (tls:lock-violations lock rows)))
+    (tls:lock-violations lock rows carriers)))
 
 ;; ── Loading the real files ───────────────────────────────────────────────
 
@@ -398,7 +545,7 @@
          (members (tls:load-members manifest))
          (lock (tls:load-lock))
          (pkgs (tls:packages lock))
-         (vs (append (tls:unread-members manifest) (tls:violations manifest members lock tls:ATTRIBUTION)))
+         (vs (append (tls:unread-members manifest) (tls:violations manifest members lock tls:ATTRIBUTION tls:CARRIERS)))
          (banned (filter (fn (p) (tls:in? (tls:p-name p) tls:BANNED)) pkgs)))
     (when (or (= (length pkgs) 0) (= (length members) 0))
       (print-line (string-append "FATAL: no package in " tls:LOCK ", or no member manifest; the check proved nothing"))
@@ -406,7 +553,8 @@
     (for-each (fn (v) (print-line (string-append "FAIL " v))) vs)
     (print-line
       (string-append "no-c-tls: " (tls:n (length pkgs)) " locked packages · " (tls:n (length members)) " member manifests · "
-        "C TLS locked: " (if (= (length banned) 0) "none" (string-join ", " (map tls:p-label banned)))
+        "C crypto locked: " (if (= (length banned) 0) "none" (string-join ", " (map tls:p-label banned)))
+        " · carrier rows: " (tls:n (length tls:CARRIERS))
         " · attribution rows: " (tls:n (length tls:ATTRIBUTION)) " · violations: " (tls:n (length vs))))
     (exit (if (> (length vs) 0) 1 0))))
 
