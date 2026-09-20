@@ -49,6 +49,68 @@
     (assert (not (any? (fn (m) (equal? m "engenho-machines")) members)) "engenho-machines is not a workspace member")
     (assert (not (path-exists? "engenho-machines")) "engenho-machines has no directory")))
 
+;; The variant names of a top-level `enum <name>`: every identifier opening
+;; a line at one level of indentation, from `enum <name> {` to the first `}`
+;; in column 0. Doc comments, attributes and field lines do not qualify.
+;; Text-matched like the check's own item rule, and used the same way: to
+;; tell a name that exists from one that does not.
+(define (t:enum-variants text name)
+  (car
+    (reduce
+      (fn (acc line)
+        (let ((vs (car acc)) (state (car (cdr acc))))
+          (cond
+            ((equal? state "before")
+              (if (re-match? (string-append "\\benum\\s+" name "\\s*\\{") line) (list vs "inside") acc))
+            ((equal? state "done") acc)
+            ((string-starts-with? line "}") (list vs "done"))
+            (else
+              (let ((m (re-captures "^    ([A-Z][A-Za-z0-9_]*)\\s*([,({]|$)" line)))
+                (if (nil? m) acc (list (append vs (list (car (cdr m)))) state)))))))
+      (list (list) "before")
+      (string-split text "\n"))))
+
+;; The variant each `Enum::Variant` item reference in `items` names.
+(define (t:variants-named items enum)
+  (map (fn (i) (car (cdr (string-split i "::"))))
+       (filter (fn (i) (string-starts-with? i (string-append enum "::"))) items)))
+
+;; docs/CNI-CSI-PROGRAMME.md is not in src:DOCS yet, so its references are
+;; read here directly. Its A.3 bullets said a CSI publish yields a
+;; `MountSource::HostDir` and left teardown as work still to wire. They name
+;; `MountSource::PvcHostDir` and `VolumeTeardown::ReleaseClaim` in
+;; `path.rs::Item` form now.
+;;
+;; The item rule alone does NOT catch the defect that was there: `HostDir`
+;; is an arm of `PvcBacking` in the same file, and the rule matches a
+;; variant line anywhere in the file, not one belonging to the named enum
+;; (ci/doc-sources.tlisp, TIER). So this case reads the two enums and
+;; requires every variant the document names to be an arm OF THAT enum.
+(deftest "CNI-CSI-PROGRAMME.md's CSI node path names the volume code that implements it"
+  (let* ((doc "docs/CNI-CSI-PROGRAMME.md")
+         (refs (filter (fn (r) (string-starts-with? (nth 2 r) "engenho-kubelet/"))
+                       (src:refs doc (read-file doc))))
+         (items (map (fn (r) (nth 3 r)) refs))
+         (vols (read-file "engenho-kubelet/src/pod_volume.rs"))
+         (sources (t:enum-variants vols "MountSource"))
+         (teardowns (t:enum-variants vols "VolumeTeardown"))
+         (named-sources (t:variants-named items "MountSource"))
+         (named-teardowns (t:variants-named items "VolumeTeardown"))
+         (vs (reduce (fn (acc r) (append acc (src:ref-violations doc (src:real-fs) (src:load-members) r)))
+                     (list) refs)))
+    (for-each (fn (v) (print-line v)) vs)
+    (assert (and (> (length sources) 3) (> (length teardowns) 2))
+      "both enums were read out of pod_volume.rs")
+    (assert (> (length named-sources) 0)
+      "the publish bullet names the `MountSource` variant a CSI publish yields")
+    (assert (every? (fn (v) (any? (fn (a) (equal? a v)) sources)) named-sources)
+      "every `MountSource` variant the document names is an arm of that enum")
+    (assert (> (length named-teardowns) 0)
+      "the teardown bullet names the `VolumeTeardown` that publish owes")
+    (assert (every? (fn (v) (any? (fn (a) (equal? a v)) teardowns)) named-teardowns)
+      "every `VolumeTeardown` variant the document names is an arm of that enum")
+    (assert (= (length vs) 0) "every kubelet path the document names resolves")))
+
 ;; ── A fixture repository ─────────────────────────────────────────────────
 ;; A filesystem built from (path text) pairs: a path exists when it is a
 ;; file or a directory holding one.
