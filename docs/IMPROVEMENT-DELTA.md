@@ -18,10 +18,10 @@ illegal state has no code path — a compile error, an absent method, a rejectio
 at the parse boundary. Where it says **caught**, a test or a lint finds it after
 the fact. The two are not rounded together anywhere in this document.
 
-> **Status, 2026-09-19.** Sections 1 and 2 are complete and measured. Section 3
-> is partial: the wave-3 pass over 162 triaged deferred items is still running,
-> and its per-item outcomes land here when it finishes. Nothing in sections 1
-> and 2 is waiting on that.
+> **Status, 2026-09-20.** Sections 1 and 2 are complete and measured. Section 3
+> carries what the wave-3 pass has established so far; that pass is still
+> running, and its remaining per-item outcomes land here when it finishes.
+> Nothing in sections 1 and 2 is waiting on it.
 
 ## 1. Not possible here — the precondition is a machine, a release or a decision this session does not have
 
@@ -178,6 +178,66 @@ cases, not a fixture tree (oracle-01). revoada's `federation.rs` leaks one
 detached thread per member and fonte's pump discards transport errors — both
 crates are unshipped and mock-only, which §9 refuses to harden (hard-01).
 ## 3. Remaining — possible, intended, not done
+
+### 3.0 The shape of what is left, measured rather than estimated
+
+A wave-3 pass is working 162 triaged deferred items across seven crate-disjoint
+lanes. As of 2026-09-20 it has resolved 69, and the distribution is the useful
+part:
+
+| outcome | count | what it means |
+|---|---|---|
+| `already_done` | 52 | the work was already in the tree |
+| `done` | 10 | implemented here, with a test and a red run |
+| `partial` | 5 | this lane's half done, the rest named for wave 4 |
+| `deferred` / `not_possible` | 2 | belongs to another repo or another lane |
+
+**`already_done` dominating is a finding, not an anomaly.** Spot-checked
+against the code rather than the commit messages: `MAX_PAGE_PREALLOC` bounds
+the LIST reservation at handler.rs:55/:1249; `engenho-store/src/owned_task.rs`
+is gone with lib.rs:139 re-exporting the substrate type; the `ProbeBlind`
+condition exists with exactly one `Reason::Unhealthy` left on the
+observed-failure path. The triaged list was built from deferred NOTES, and
+waves 1 and 2 had already closed much of what those notes described. So the
+162 substantially overstates the work that remained.
+
+### 3.1 Wave 4 — the cross-boundary halves
+
+**71 of the 162 items name crates in more than one lane**, so a lane can only
+ever do its own half; the rest is recorded in its `deferred` field. 57 items
+carry such deferrals today. Counted by the crate each names, the work
+concentrates sharply:
+
+    engenho-apiserver 15 · engenho-controllers 13 · engenho-scheduler 6
+    engenho-runtime 6 · engenho-kubelet 6 · engenho-substrate-core 4 · …
+
+Build that list from the deferred fields, deduped — not from the
+cross-boundary census, which over-counts items one lane owned both sides of.
+Run it SERIALLY on merged main: every item in it edits across a crate boundary
+by definition, which is exactly what the lane discipline forbids.
+
+### 3.2 The two serial gates
+
+- **T0.5 / I17 — the panic-site ratchet. These are the SAME item**; doing both
+  would do it twice. The plan's T0.5 asks for
+  `#![cfg_attr(not(test), deny(clippy::unwrap_used, expect_used, panic))]` in
+  the six daemon-core crates. Measured on non-test code only (inline
+  `#[cfg(test)]` modules stripped by brace matching): controllers 22, runtime
+  20, store 13, kubelet 10, apiserver 3, types 2 — and four candidate crates
+  are already at zero, so the deny can land there with no code change at all.
+  The raw count overstates: several hits are doc comments naming the macros,
+  and the dominant real shape is `.lock().expect("… poisoned")`, which wants
+  one decision applied uniformly rather than 30 judgements.
+- **I16 — `[lints] workspace = true` on every member.** 13 of 29 members opt
+  in. **The literal change breaks CI in the way §9 refuses**: the workspace
+  lint table sets `pedantic = warn` and CI runs `clippy --workspace … -D
+  warnings`, so opting in the other 16 enacts the very "pedantic lints as a
+  gate over ~3,800 warnings" that §9 rules out. So I16 is reshaped: membership
+  becomes DECLARED and TESTED — every member either opts in or appears in an
+  `EXEMPT` table with a measured warning count. What becomes impossible is a
+  member skipping the lint set *silently*, which is today's state.
+
+
 
 These are ordinary backlog: no missing machine, no plan refusal. Each row says
 what it is and what it would take.
