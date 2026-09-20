@@ -182,6 +182,33 @@ crates are unshipped and mock-only, which §9 refuses to harden (hard-01).
 These are ordinary backlog: no missing machine, no plan refusal. Each row says
 what it is and what it would take.
 
+### The gen-lock hook watches the lock, not the manifests
+
+Found 2026-09-20 by the rest-a merge going red on `ci`. A commit changed
+`Cargo.toml` only — the rustls line naming back what `default-features = false`
+turns off — and `ci`'s delta-freshness job failed with
+
+    { "status": "manifest-drift",
+      "changed": [ { "path": "Cargo.toml",
+                     "expected": "e04778f4…", "actual": "d15a4e27…" } ] }
+
+**Why the local hook did not catch it.** The pre-commit hook refuses a
+`Cargo.lock` that moves without its `Cargo.gen.lock`. A feature-flag edit
+resolves to the same dependency versions, so `Cargo.lock` never moved and the
+hook had nothing to fire on. The CI gate hashes the MANIFESTS as well as the
+lock, so it sees what the hook does not watch. Any manifest-only edit —
+features, lints, profile, workspace members — can pass locally and fail there.
+
+**It self-healed.** `reusable-autoheal` regenerated the lock and pushed
+`f451098` before this could be fixed by hand, which is the intended behaviour
+and worth stating: the gap is real but it is *repaired automatically after the
+fact*, not left open. The residue is a wasted CI cycle and a red main for a few
+minutes, not a broken tree.
+
+The durable fix is to widen the hook to the manifest set the gen lock records.
+It is not done here because that hook lives in the repo-forge archetype and
+changing it reaches every consumer — a fleet change that wants its own census.
+
 ### Found outside engenho — what was fixed, and what was not
 
 The triage pulled in items living in `pleme-io/substrate` and
