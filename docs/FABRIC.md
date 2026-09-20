@@ -1,11 +1,37 @@
-# engenho — the fabric layer (NATS + Vector global web)
+# engenho — the NATS fabric layer (FENCED DRAFT)
+
+> ## ⚠ Fenced draft — this is not what engenho does
+>
+> This document is a fenced-off draft. NATS is not engenho's fabric.
+>
+> The decision is [`IMPROVEMENT-PLAN.md`](IMPROVEMENT-PLAN.md) §5.1: a
+> NATS server is a second process every node would need, which is a
+> sidecar under another name. engenho's fabric is `fabric: in_binary`
+> — `engenho-config`'s `Fabric`, which has exactly one arm, so
+> `fabric: nats` has no representation and is refused at parse. The
+> retired `teia:` config section is accepted for one release as an
+> inert `LegacyTeiaSection` (private fields, no accessor) and reported
+> by `EngenhoConfig::deprecations`; nothing reads it.
+>
+> `engenho-teia` is not deleted (MODULARIZE, DON'T DELETE). Its
+> subject grammar and connection config build with no feature; the
+> client that dials NATS, and every crate it pulls in, exists only
+> under the `teia-nats` feature, which is **off by default**
+> (`engenho-teia/Cargo.toml`). `engenho-teia/tests/nats_fence.rs`
+> fails if a default build can reach `async-nats` again.
+>
+> Everything below is the draft design, stated in the conditional.
+> The multi-node transport will live inside the binary; it is named
+> here, not built, and gated by edge 18 (§5.1 (d)) — no second voter
+> until the in-binary transport, durable votes, read fences and a
+> per-role `/readyz` all exist.
 
 > **Codename: `teia`** (Portuguese: *web/weave*) — the unifying
-> transport substrate ALL engenho layers ride on. Where revoada
+> transport substrate ALL engenho layers would ride on. Where revoada
 > handles the cluster shape and store handles the K8s data,
-> `teia` carries every byte between processes, between clusters,
-> between regions. NATS is the messaging spine; Vector is the
-> observability spine; together they make a globally-meshed
+> `teia` would carry every byte between processes, between clusters,
+> between regions. NATS would be the messaging spine; Vector the
+> observability spine; together they would make a globally-meshed
 > engenho web that survives partitions, region failures, and
 > intermittent links.
 >
@@ -362,7 +388,7 @@ the router via dependency injection at `RaftMesh::start`.
   only the RPC transport changes.
 - **Not** a replacement for Vector. We standardize Vector
   source configs; we don't reimplement.
-- **Not** a centralized state store. NATS is the messaging
+- **Not** a centralized state store. NATS would be the messaging
   spine; engenho-store remains the typed source of truth.
 
 ## Open design questions

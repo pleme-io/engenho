@@ -9,7 +9,7 @@
 //!
 //! | Crate | Holds | Who may depend on it |
 //! |---|---|---|
-//! | `engenho-substrate-core` (this crate) | the nine modules below | anyone |
+//! | `engenho-substrate-core` (this crate) | the ten modules below | anyone |
 //! | `engenho-substrate` (the leaf) | every module a shipped crate references; re-exports this crate whole | shipped crates |
 //! | `engenho-substrate-incubator` | modules no shipped crate references | tests and drafts only |
 //!
@@ -19,6 +19,8 @@
 //!
 //! ## Modules
 //!
+//!   * [`closed_enum`] — `closed_enum!`, a fieldless enum and its `ALL`
+//!     (and optionally its `name()`) generated from one variant list
 //!   * [`error_kind`] — `ErrorKind` + `impl_error_kind!`, the stable tag
 //!     every typed error reports
 //!   * [`named`] — `Named` + `define_named!` / `impl_named_field!`
@@ -35,6 +37,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod atomic_write;
+pub mod closed_enum;
 pub mod error_kind;
 pub mod fingerprint;
 pub mod hash_newtype;

@@ -109,7 +109,9 @@ OpenSSL.
         │  per-resource consistency tier:
         │  Strong(raft) · EventualGossip(chitchat) · DurableStream(jetstream) · Content(iroh)
         ▼
-   revoada (gossip + raft + content + attest) over teia (NATS, 5 channels, multi-region leaf nodes)
+   revoada (gossip + raft + content + attest) over the in-binary fabric
+        │  `fabric: in_binary` — teia/NATS is a fenced DRAFT, not this path
+        │  (IMPROVEMENT-PLAN §5.1; multi-node transport gated by edge 18)
         ▼
    SUBSTRATE:  Drv ─hash─▶ build ─▶ Realisation ─quorum(K independent rebuilds)─▶
                ─shape-render─▶ {OciImage | NixClosure | Qcow2 | Wasm | StaticBinary | HelmChart}
@@ -136,8 +138,8 @@ real cluster** until engenho-native lands (M0.4).
 | Per-subsystem series | Lives in |
 |---|---|
 | `R0–R7` revoada (membership → raft → policy → attest → content → consume) | [`DISTRIBUTED.md`](DISTRIBUTED.md) |
-| `F0–F9` teia/fabric (NATS transport, watch, content, attest, observ, topology, helm, federation) | [`FABRIC.md`](FABRIC.md) |
-| `C0–C7` consistency (in-mem → attest → watch → NATS raft → disk → tier-hints → content → observ) | [`CONSISTENCY-FABRIC.md`](CONSISTENCY-FABRIC.md) |
+| `F0–F9` teia/fabric (NATS transport, watch, content, attest, observ, topology, helm, federation) — **DRAFT, not scheduled.** NATS is not engenho's fabric (§5.1); the multi-node transport lives inside the binary and is gated by edge 18 | [`FABRIC.md`](FABRIC.md) |
+| `C0–C7` consistency (in-mem → attest → watch → *NATS raft — draft, edge 18* → disk → tier-hints → content → observ) | [`CONSISTENCY-FABRIC.md`](CONSISTENCY-FABRIC.md) |
 | `R-TOPO.0–7` resilience (typed strategies → policy wiring → madsim → maelstrom → chaos-mesh → openraft-maelstrom → jepsen) | [`RESILIENCE.md`](RESILIENCE.md) |
 | `R-K8S` / `R-NOMAD` faces (typed admission, `-o yaml`, HCL parse/emit, translator) | [`MANY-FACES.md`](MANY-FACES.md) |
 | `M1.1–M1.5` fonte real integrations (shikumi/sui/revoada/tameshi/mirante) | `engenho-fonte` |

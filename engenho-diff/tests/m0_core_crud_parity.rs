@@ -1,9 +1,9 @@
 //! M0 — the core CRUD differential run.
 //!
-//! Boots engenho IN-PROCESS and diffs it against the LIVE k3s reference
-//! oracle (`~/.kube/engenho-local-tunnel.yaml`, k3s v1.34.x) across a full
-//! object lifecycle (create Namespace → create/get/list/patch ConfigMap →
-//! the sharp PUT/replace verb probe → delete) plus a core/v1 discovery diff.
+//! Boots engenho IN-PROCESS and diffs it against the LIVE reference oracle
+//! (`ENGENHO_ORACLE_KUBECONFIG`; see [`common`]) across a full object
+//! lifecycle (create Namespace → create/get/list/patch ConfigMap → the sharp
+//! PUT/replace verb probe → delete) plus a core/v1 discovery diff.
 //!
 //! **Fail loud, never silent-skip.** If the oracle is unreachable the test
 //! PANICS with `Verdict::ReferenceUnreachable` — a live differential harness
@@ -12,19 +12,21 @@
 //! `cargo test -p engenho-diff --test m0_core_crud_parity -- --nocapture`
 //! exercises it directly.)
 //!
+//! The boot → oracle → run → report scaffold is [`common`]'s, not this
+//! file's. It used to be inlined here, hint and all, which is how this
+//! binary came to tell the operator to check a tunnel to a k3s VM that was
+//! decommissioned on 2026-08-08.
+//!
 //! **The ratchet.** The observed HARD divergences must be a SUBSET of
 //! [`KNOWN_DIVERGENCES`]; the test is green on the known pre-conformance gaps
 //! and goes red only when a NEW (unlisted) hard divergence appears. Cosmetic
 //! (masked) diffs are reported for auditability but never ratchet.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use engenho_diff::{
-    DiffTarget, Divergence, EngenhoTarget, HttpMethod, K3sTarget, Operation, Severity, Verdict,
-    cotejo, volatile_meta,
-};
+use engenho_diff::{Divergence, Operation, volatile_meta};
+
+mod common;
 
 /// Baseline of engenho-vs-k3s divergence *signatures* known to exist before
 /// conformance. Recorded from a live run (see the report the test prints).
@@ -112,59 +114,17 @@ const KNOWN_DIVERGENCES: &[&str] = &[
     "MissingSubresource:v1/namespaces:finalize:k3s",
 ];
 
-fn oracle_kubeconfig() -> PathBuf {
-    // ENGENHO_ORACLE_KUBECONFIG first. The path was hardcoded to a hand-built
-    // k3s VM's tunnel, and that VM is GONE (192.168.64.10 unreachable
-    // 2026-08-08) — which is why all four engenho-diff binaries fail with
-    // `Verdict::ReferenceUnreachable` rather than for any engenho defect. A
-    // harness whose oracle cannot be repointed dies with the machine that
-    // built it; `k3d cluster create` is reproducible where that VM was not.
-    if let Ok(p) = std::env::var("ENGENHO_ORACLE_KUBECONFIG") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
-        }
-    }
-    let home = std::env::var("HOME").expect("HOME set");
-    PathBuf::from(home).join(".kube/engenho-local-tunnel.yaml")
-}
-
-fn unique_suffix() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    nanos.to_string()
-}
-
-struct OpFindings {
-    op_id: String,
-    hard: Vec<Divergence>,
-    cosmetic: Vec<Divergence>,
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn m0_core_crud_parity() {
     // ── Boot the two targets ─────────────────────────────────────────────
-    let engenho = EngenhoTarget::boot_in_process(&["ConfigMap", "Namespace", "Pod"])
-        .await
-        .expect("engenho boots in-process");
-
-    let kubeconfig = oracle_kubeconfig();
-    let k3s = K3sTarget::from_kubeconfig(&kubeconfig)
-        .unwrap_or_else(|e| panic!("cannot load oracle kubeconfig {kubeconfig:?}: {e}"));
-
-    // ── Fail loud if the oracle is down ──────────────────────────────────
-    if let Some(Verdict::ReferenceUnreachable) = k3s.preflight().await {
-        panic!(
-            "Verdict::ReferenceUnreachable — the k3s oracle at {kubeconfig:?} did not answer \
-             GET /api/v1. A live differential run cannot proceed. (Is the tunnel up? \
-             `kubectl --kubeconfig {} --tls-server-name 127.0.0.1 get ns`)",
-            kubeconfig.display()
-        );
-    }
+    // Both through `common`: it owns the oracle's kubeconfig resolution AND
+    // the fail-loud hint for an oracle that does not answer, so this binary
+    // cannot drift away from its three siblings.
+    let engenho = common::boot_engenho(&["ConfigMap", "Namespace", "Pod"]).await;
+    let k3s = common::load_oracle().await;
 
     let norm = volatile_meta();
-    let suffix = unique_suffix();
+    let suffix = common::unique_suffix();
     let ns = {
         let mut s = String::from("engenho-diff-");
         s.push_str(&suffix);
@@ -187,9 +147,9 @@ async fn m0_core_crud_parity() {
 
     // Run the pre-PUT ops so the object exists on both sides, capturing
     // findings. Then fetch k3s's live object to build the replace body.
-    let mut findings: Vec<OpFindings> = Vec::new();
+    let mut findings: Vec<common::OpFindings> = Vec::new();
     for op in &ops {
-        findings.push(run_one(op, &engenho, &k3s, &norm).await);
+        findings.push(common::run_one(op, &engenho, &k3s, &norm).await);
     }
 
     // Build + run the PUT/replace verb probe. A MINIMAL body WITHOUT a
@@ -204,32 +164,29 @@ async fn m0_core_crud_parity() {
         "data": {"greeting": "ola", "tchau": "bye"},
     });
     let put_op = Operation::replace_configmap(&ns, cm, put_body);
-    findings.push(run_one(&put_op, &engenho, &k3s, &norm).await);
+    findings.push(common::run_one(&put_op, &engenho, &k3s, &norm).await);
     ops.push(put_op);
 
     // Delete + discovery.
     let delete_op = Operation::delete_configmap(&ns, cm);
-    findings.push(run_one(&delete_op, &engenho, &k3s, &norm).await);
+    findings.push(common::run_one(&delete_op, &engenho, &k3s, &norm).await);
     ops.push(delete_op);
 
     let disc_op = Operation::discovery_core_v1();
-    findings.push(run_one(&disc_op, &engenho, &k3s, &norm).await);
+    findings.push(common::run_one(&disc_op, &engenho, &k3s, &norm).await);
     ops.push(disc_op);
 
     // ── Cleanup the shared cluster (best-effort, not diffed) ──────────────
-    let _ = k3s
-        .raw(
-            HttpMethod::Delete,
-            &Operation::delete_namespace(&ns).path,
-            None,
-            None,
-        )
-        .await;
+    common::cleanup(&k3s, &Operation::delete_namespace(&ns).path).await;
 
     // ── Report ───────────────────────────────────────────────────────────
-    print_report(&findings);
+    common::print_report("M0", &findings);
 
     // ── Ratchet ──────────────────────────────────────────────────────────
+    // NOT `common::assert_ratchet`: that one asserts EQUALITY (no new AND no
+    // stale), this one asserts the observed set is a SUBSET of the baseline.
+    // Different guards. Folding them together is a decision about m0's
+    // contract, not a de-duplication.
     let observed_hard: BTreeSet<String> = findings
         .iter()
         .flat_map(|f| f.hard.iter())
@@ -260,47 +217,5 @@ async fn m0_core_crud_parity() {
             })
             .collect::<Vec<_>>()
             .join("\n")
-    );
-}
-
-async fn run_one(
-    op: &Operation,
-    engenho: &EngenhoTarget,
-    k3s: &K3sTarget,
-    norm: &engenho_diff::Normalizer,
-) -> OpFindings {
-    let (hard, cosmetic) = cotejo::run_strict(op, engenho, k3s, norm)
-        .await
-        .unwrap_or_else(|e| panic!("op {} failed: {e}", op.id));
-    OpFindings {
-        op_id: op.id.clone(),
-        hard,
-        cosmetic,
-    }
-}
-
-fn print_report(findings: &[OpFindings]) {
-    eprintln!("\n════════════ engenho-diff M0: engenho vs k3s v1.34 ════════════");
-    let mut total_hard = 0usize;
-    let mut total_cosmetic = 0usize;
-    for f in findings {
-        let verdict = if f.hard.is_empty() {
-            "PARITY"
-        } else {
-            "DIVERGENT"
-        };
-        eprintln!("\n▶ {} — {verdict}", f.op_id);
-        for d in &f.hard {
-            eprintln!("    {d}   [owner: {}]", d.owning_crate());
-            total_hard += 1;
-        }
-        for d in &f.cosmetic {
-            debug_assert_eq!(d.severity(), Severity::Cosmetic);
-            eprintln!("    (masked) {d}");
-            total_cosmetic += 1;
-        }
-    }
-    eprintln!(
-        "\n──────────── {total_hard} hard divergence(s), {total_cosmetic} cosmetic (masked) ────────────\n"
     );
 }

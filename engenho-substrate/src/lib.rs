@@ -34,6 +34,24 @@
 //!     contract; a verifier with no outcome for a predicate refuses it
 //!     rather than issuing a receipt for a check that never ran
 //!
+//! ## The core's macros resolve through the leaf
+//!
+//! A glob re-export carries `#[macro_export]` macros, but it carries them in
+//! the macro namespace, which no `pub use` list names — so nothing in the
+//! item lists below would go red if it stopped. This doctest is the pin: a
+//! consumer that reaches the core's `closed_enum!` through this crate keeps
+//! compiling.
+//!
+//! ```
+//! engenho_substrate::closed_enum! {
+//!     #[named]
+//!     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+//!     pub enum Colour { Red, Green }
+//! }
+//! assert_eq!(Colour::ALL, &[Colour::Red, Colour::Green]);
+//! assert_eq!(Colour::Green.name(), "Green");
+//! ```
+//!
 //! ## What this crate does not hold
 //!
 //! None of the incubator's modules is reachable through this crate. Each

@@ -2,7 +2,7 @@
   "schema_version": 2,
   "cargo_lock_sha256": "100394f2985b33477d425787e2a7737e043d4d10150faa2354437724e6d76ac4",
   "manifest_sha256": {
-    "Cargo.toml": "8332a2d94b1671c5cf0841dc7e18819b41b16aeab29f2caaff1b43e5b2394ac2",
+    "Cargo.toml": "e04778f4a754409f6135e6fb9c6c801c90903e3c858150cd8b68edc07a5135bb",
     "engenho-apiserver/Cargo.toml": "95b6377538af933cc2ffb4135b0ac3baeaf6609c0df8b06eccb9a25796bbf27f",
     "engenho-cluster-config-render/Cargo.toml": "5f5f6d40c2b9a572f18418d12e568412517972684259f34a9aa3d34de0a5dc8c",
     "engenho-cluster-config/Cargo.toml": "49d8ea7131956ec2d6323ae41968f624fab66bbbbca1afbb0537b2327a683391",
@@ -4146,7 +4146,10 @@
             "package_key": "rustls-0.23.40",
             "kind": "normal",
             "features": [
-              "ring"
+              "logging",
+              "ring",
+              "std",
+              "tls12"
             ],
             "uses_default_features": false,
             "optional": false,

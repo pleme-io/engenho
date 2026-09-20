@@ -126,8 +126,15 @@ Wire `PodVolumeSource::PersistentVolumeClaim` to route on the bound PV's source:
 - PV has `hostPath`/`local` → today's behavior, unchanged (byte-identical argv).
 - PV has `csi` → `NodeStageVolume` (if the driver declares
   `STAGE_UNSTAGE_VOLUME`) then `NodePublishVolume` at the pod's mount dir, then
-  a `MountSource::HostDir` pointing at it.
-- Teardown: `NodeUnpublishVolume` / `NodeUnstageVolume` on pod delete, in the
+  the published target as
+  `engenho-kubelet/src/pod_volume.rs::MountSource::PvcHostDir` — the same
+  variant a node-local PV resolves to, so no CSI-shaped case reaches the argv
+  builder.
+- Teardown: `NodeUnpublishVolume`, and `NodeUnstageVolume` when the driver
+  staged, run on pod delete.
+  `engenho-kubelet/src/pod_volume.rs::VolumeTeardown::ReleaseClaim` is the
+  obligation `teardown_obligation` records for every `PvcHostDir`, and
+  `engenho-kubelet/src/kubelet.rs::cleanup_pod_containers` discharges it in the
   same place `remove_empty_dir` already runs.
 
 This is where `VolumeRuntime` finally gets its producer — and the `CsiVolumeBackend`

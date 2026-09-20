@@ -151,14 +151,42 @@ fjall                  = "2"
 # Apiserver TLS — self-generated, data_dir-persisted cluster CA + a
 # per-boot server cert (rcgen), served over HTTPS via axum-server's
 # rustls acceptor. rustls is pinned to the 0.23 line fleet-wide and the
-# `ring` provider is installed explicitly at boot so a single crypto
-# provider closure unifies with reqwest's rustls-tls (no aws-lc-rs/ring
-# double-install panic). `tls-rustls-no-provider` keeps the provider
+# `ring` provider is installed explicitly at boot, so the process has one
+# provider whatever is linked and rustls never has to guess between
+# aws-lc-rs and ring. `tls-rustls-no-provider` keeps the provider
 # choice in our hands (we install ring); rcgen needs x509-parser to
 # reload a persisted CA from its PEM.
+#
+# The rustls line names back what `default-features = false` turns off, the
+# way the reqwest line above does. rustls 0.23's defaults are `aws_lc_rs`,
+# `logging`, `prefer-post-quantum`, `std` and `tls12`. Two of those are the C
+# crypto stack — `aws_lc_rs` pulls aws-lc-rs -> aws-lc-sys (AWS-LC's C,
+# compiled by its build script), and `prefer-post-quantum` is defined as
+# `["aws_lc_rs"]` — so both stay off and `ring` takes their place. The other
+# three are named here rather than inherited: they reached engenho only
+# because reqwest and hyper-rustls enable them, and a change there would have
+# dropped TLS 1.2 or rustls's logging silently.
+#
+# NOT DONE YET, same shape as reqwest's: aws-lc-sys IS in Cargo.lock, and no
+# line in this file can remove it. Measured 2026-09-19 with `cargo tree
+# --workspace --all-features --target all -i aws-lc-rs -e features` and again
+# with default features: sui-eval 0.1.153 -> gix
+# `blocking-http-transport-reqwest-rust-tls` -> gix-transport 0.57.1
+# `http-client-reqwest-rust-tls` -> reqwest 0.13.4 `rustls` (which in 0.13 is
+# `__rustls-aws-lc-rs`, not the ring backend 0.12 calls `rustls-tls`) ->
+# rustls/aws-lc-rs. Cargo unifies rustls's features across the workspace, so
+# that one dependent decides the provider for every crate. The daemon still
+# installs ring as the process-wide provider at boot; what is linked and what
+# is used are different questions. ci/no-c-tls.tlisp records each edge as a
+# tls:CARRIERS row and fails on any other.
 rcgen                  = { version = "0.13", features = ["pem", "x509-parser"] }
 axum-server            = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
-rustls                 = { version = "0.23", default-features = false, features = ["ring"] }
+rustls                 = { version = "0.23", default-features = false, features = [
+  "ring",
+  "std",
+  "tls12",
+  "logging",
+] }
 rustls-pemfile         = "2"
 time                   = "0.3"
 # Deterministic cluster PKI: a BLAKE3-derived seed → an ed25519 key, so a

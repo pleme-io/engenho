@@ -3,14 +3,17 @@
 ;; stdlib + unit + this file with TLISP_TEST=1, from the repository root.
 ;;
 ;; The first tests read the real Cargo.toml, every member manifest and
-;; Cargo.lock, so they fail when the repository breaks a rule; two of them
-;; mutate the real workspace line, so the gate is shown to guard the line
-;; that ships and not only a fixture. The rest run the check against a small
-;; fixture workspace that keeps every rule, then against one mutation per
-;; rule, so each rule is shown to fire on the defect it names and to stay
-;; quiet on its near miss.
+;; Cargo.lock, so they fail when the repository breaks a rule; three of them
+;; mutate the real workspace reqwest and rustls lines, so the gate is shown
+;; to guard the lines that ship and not only a fixture, and one drops the
+;; aws-lc carrier rows to show that each is load-bearing against the lock as
+;; it is. The rest run the check against a small fixture workspace that keeps
+;; every rule, then against one mutation per rule, so each rule is shown to
+;; fire on the defect it names and to stay quiet on its near miss.
 
 (define (t:has? vs needle) (any? (fn (v) (string-contains? v needle)) vs))
+
+(define (t:locked? pkgs name) (any? (fn (p) (equal? (tls:p-name p) name)) pkgs))
 
 ;; A fixture with one substring replaced; the replacement must happen, or the
 ;; mutation test would silently check the unmutated fixture.
@@ -26,6 +29,7 @@ members = [\"a\", \"b\"]
 
 [workspace.dependencies]
 reqwest = { version = \"0.12\", default-features = false, features = [\"json\", \"rustls-tls\", \"rustls-tls-native-roots\", \"charset\", \"http2\", \"system-proxy\"] }
+rustls = { version = \"0.23\", default-features = false, features = [\"ring\", \"std\", \"tls12\", \"logging\"] }
 ")
 
 ;; a inherits the workspace line and adds a feature; b declares its own
@@ -168,8 +172,14 @@ dependencies = [\"reqwest\"]
 
 (define (t:members a b) (list (list "a/Cargo.toml" (t:toml a)) (list "b/Cargo.toml" (t:toml b))))
 
-;; Every violation for the four inputs as text, and the attribution rows.
-(define (t:vs root a b lock rows) (tls:violations (t:toml root) (t:members a b) (t:toml lock) rows))
+;; Every violation for the four inputs as text, the attribution rows, and the
+;; real carrier table: the fixture's reqwest is the locked 0.12.28, so its
+;; native-tls edges are read by the same rows the repository uses.
+(define (t:vs root a b lock rows) (tls:violations (t:toml root) (t:members a b) (t:toml lock) rows tls:CARRIERS))
+
+;; The same over a chosen carrier table, for the rows themselves.
+(define (t:carrier-vs lock carriers)
+  (tls:violations (t:toml t:ROOT) (t:members t:A t:B) (t:toml lock) (list) carriers))
 
 (define (t:good) (t:vs t:ROOT t:A t:B t:LOCK-TAINTED t:ROWS))
 
@@ -181,10 +191,16 @@ dependencies = [\"reqwest\"]
 
 ;; ── The real repository ──────────────────────────────────────────────────
 
-(define (t:real-vs manifest-text)
+(define (t:real-vs-with manifest-text carriers)
   (let ((manifest (toml-parse manifest-text)))
     (append (tls:unread-members manifest)
-      (tls:violations manifest (tls:load-members manifest) (tls:load-lock) tls:ATTRIBUTION))))
+      (tls:violations manifest (tls:load-members manifest) (tls:load-lock) tls:ATTRIBUTION carriers))))
+
+(define (t:real-vs manifest-text) (t:real-vs-with manifest-text tls:CARRIERS))
+
+;; The real tls:CARRIERS without the rows for `banned-name`.
+(define (t:carriers-without banned-name)
+  (filter (fn (row) (not (equal? (car (cdr (cdr row))) banned-name))) tls:CARRIERS))
 
 (deftest "the real Cargo.toml, member manifests and Cargo.lock keep every rule"
   (let* ((manifest (tls:load-manifest))
@@ -205,6 +221,41 @@ dependencies = [\"reqwest\"]
     (assert (t:has? vs "does not name `rustls-tls-native-roots`") "native roots dropped is refused")
     (assert (t:has? vs "does not name `charset`") "charset dropped is refused")
     (assert (t:has? vs "does not name `http2`") "http2 dropped is refused")))
+
+(deftest "the real workspace rustls line keeps ring, and refuses rustls's aws-lc defaults"
+  (let ((vs (t:real-vs (t:swap (read-file tls:MANIFEST)
+              "rustls                 = { version = \"0.23\", default-features = false, features = ["
+              "rustls                 = { version = \"0.23\", features = ["))))
+    (assert (t:has? vs "[workspace.dependencies] rustls: needs `default-features = false`")
+      "rustls's defaults are aws_lc_rs and prefer-post-quantum; the line must turn them off"))
+  (let ((vs (t:real-vs (t:swap (read-file tls:MANIFEST) "  \"ring\",\n  \"std\",\n" ""))))
+    (assert (t:has? vs "rustls: does not name `ring`") "the provider dropped is refused")
+    (assert (t:has? vs "rustls: does not name `std`") "std dropped is refused"))
+  (let ((vs (t:real-vs (t:swap (read-file tls:MANIFEST) "  \"logging\",\n] }" "  \"logging\",\n  \"prefer-post-quantum\",\n] }"))))
+    (assert (t:has? vs "names the feature `prefer-post-quantum`")
+      "prefer-post-quantum is defined as [aws_lc_rs], so naming it takes the C provider back")))
+
+;; The aws-lc ban against the repository as it is: aws-lc-sys IS locked (it
+;; arrives through gix-transport, see the check's header), so the ban is a
+;; ban on UNREAD edges, and each row has to be load-bearing for it to mean
+;; anything. Every version here is read from Cargo.lock, never spelled out:
+;; the rows are what pin versions, and the first test above fails on a bump.
+(deftest "aws-lc is locked, and every edge into it is refused without its carrier row"
+  (let* ((pkgs (tls:packages (tls:load-lock)))
+         (edges (filter
+                  (fn (p) (and (not (tls:in? (tls:p-name p) tls:BANNED))
+                               (any? (fn (d) (tls:in? (car d) tls:BANNED-AWS-LC)) (tls:p-deps p))))
+                  pkgs)))
+    (assert (t:locked? pkgs "aws-lc-sys") "aws-lc-sys is locked: this ban is measured against a crate that is there")
+    (assert (t:locked? pkgs "aws-lc-rs") "aws-lc-rs is locked")
+    (assert (> (length edges) 0) "and something outside the family depends on it")
+    (let ((vs (t:real-vs-with (read-file tls:MANIFEST) (t:carriers-without "aws-lc-rs"))))
+      (for-each
+        (fn (p)
+          (assert (t:has? vs (string-append (tls:p-label p) " depends on `aws-lc-rs` directly"))
+            (string-append "an unread edge is refused: " (tls:p-label p))))
+        edges)
+      (assert (= (length vs) (length edges)) "one violation per unread edge, and nothing else"))))
 
 ;; ── The fixture keeps every rule ─────────────────────────────────────────
 
@@ -235,6 +286,19 @@ dependencies = [\"reqwest\"]
 (deftest "a workspace line that names a native-tls feature is refused"
   (assert (t:has? (t:root-mutant "\"system-proxy\"]" "\"system-proxy\", \"native-tls\"]") "names the feature `native-tls`") "native-tls")
   (assert (t:has? (t:root-mutant "\"system-proxy\"]" "\"system-proxy\", \"default\"]") "names the feature `default`") "default"))
+
+(deftest "the workspace rustls line is read the same way, against rustls's own C features"
+  (assert (t:has? (t:root-mutant "rustls = { version = \"0.23\", default-features = false, features = [\"ring\", \"std\", \"tls12\", \"logging\"] }" "rustls = \"0.23\"")
+            "[workspace.dependencies] rustls: is a bare version")
+    "a bare version takes rustls's defaults, aws_lc_rs among them")
+  (assert (t:has? (t:root-mutant "features = [\"ring\", \"std\", \"tls12\", \"logging\"]" "features = [\"ring\", \"std\", \"tls12\", \"logging\", \"fips\"]") "names the feature `fips`")
+    "fips is aws-lc-rs in FIPS mode")
+  (assert (t:has? (t:root-mutant "features = [\"ring\", \"std\", \"tls12\", \"logging\"]" "features = [\"ring\", \"std\", \"tls12\", \"logging\", \"aws-lc-rs\"]") "names the feature `aws-lc-rs`")
+    "the hyphen spelling is rustls's alias for aws_lc_rs")
+  (let ((vs (t:root-mutant "\"ring\", \"std\", " "")))
+    (assert (t:has? vs "rustls: does not name `ring`") "the provider dropped")
+    (assert (t:has? vs "rustls: does not name `std`") "std dropped")
+    (assert (= (length vs) 2) "exactly the two dropped features")))
 
 ;; ── members ─────────────────────────────────────────────────────────────
 
@@ -267,6 +331,46 @@ dependencies = [\"reqwest\"]
   (assert (t:has? (t:a-mutant "\"reqwest/json\"" "\"reqwest/native-tls\"") "enables `reqwest/native-tls`") "reqwest/native-tls")
   (assert (t:has? (t:a-mutant "\"reqwest/json\"" "\"reqwest?/default-tls\"") "enables `reqwest?/default-tls`") "reqwest?/default-tls")
   (assert (= (length (t:a-mutant "\"reqwest/json\"" "\"reqwest?/json\"")) 0) "reqwest?/json"))
+
+(deftest "a member rustls entry is read like a reqwest one"
+  (assert (t:has? (t:a-mutant "[features]" "crypto = { package = \"rustls\", version = \"0.23\" }\n\n[features]")
+            "a/Cargo.toml [dependencies] `crypto`: does not set `default-features = false`")
+    "a renamed rustls is read by its `package`")
+  (assert (t:has? (t:a-mutant "\"reqwest/json\"" "\"rustls/aws_lc_rs\"") "enables `rustls/aws_lc_rs`")
+    "a [features] entry that enables rustls's aws_lc_rs is refused")
+  (assert (= (length (t:a-mutant "[features]" "rustls = { workspace = true }\n\n[features]")) 0)
+    "and inheriting the workspace rustls line is quiet"))
+
+;; ── the aws-lc family, over the lock ────────────────────────────────────
+
+;; The fixture once rustls takes its default crypto provider: aws-lc-rs, and
+;; the C it binds. No native-tls anywhere, so no attribution row applies.
+(define t:LOCK-AWS-LC
+  (string-append
+    (t:swap t:LOCK-CLEAN
+      "name = \"rustls\"\nversion = \"0.23.40\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\""
+      "name = \"rustls\"\nversion = \"0.23.40\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\ndependencies = [\"aws-lc-rs\"]")
+    "\n[[package]]\nname = \"aws-lc-rs\"\nversion = \"1.17.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\ndependencies = [\"aws-lc-sys\"]\n"
+    "\n[[package]]\nname = \"aws-lc-sys\"\nversion = \"0.41.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n"))
+
+(deftest "rustls on its default provider is quiet only while a carrier row reads that edge"
+  (assert (= (length (t:carrier-vs t:LOCK-AWS-LC tls:CARRIERS)) 0)
+    "rustls 0.23.40 -> aws-lc-rs is read, and aws-lc-rs -> aws-lc-sys is inside the banned family")
+  (let ((vs (t:carrier-vs t:LOCK-AWS-LC (t:carriers-without "aws-lc-rs"))))
+    (assert (t:has? vs "rustls 0.23.40 depends on `aws-lc-rs` directly, and no tls:CARRIERS row reads that edge")
+      "the row is load-bearing: without it the edge is a new C source")
+    (assert (= (length vs) 1) "and the banned-to-banned edge is not reported as a second source")))
+
+(deftest "a carrier row reads one version, so a lock bump past it is unattributed"
+  (let ((vs (t:carrier-vs (t:swap t:LOCK-AWS-LC "name = \"rustls\"\nversion = \"0.23.40\"" "name = \"rustls\"\nversion = \"0.23.41\"") tls:CARRIERS)))
+    (assert (t:has? vs "rustls 0.23.41 depends on `aws-lc-rs` directly") "the bumped version has to be read")))
+
+(deftest "a crate that pulls aws-lc-rs in by itself is refused, and so is one that reaches aws-lc-sys"
+  (let ((vs (t:carrier-vs (string-append t:LOCK-AWS-LC "\n[[package]]\nname = \"up-quic\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\ndependencies = [\"aws-lc-rs\"]\n") tls:CARRIERS)))
+    (assert (t:has? vs "up-quic 0.1.0 depends on `aws-lc-rs` directly") "a dependent nobody has read is a new C source"))
+  (let ((vs (t:carrier-vs (string-append t:LOCK-AWS-LC "\n[[package]]\nname = \"up-sys\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\ndependencies = [\"aws-lc-sys\"]\n") tls:CARRIERS)))
+    (assert (t:has? vs "up-sys 0.1.0 depends on `aws-lc-sys` directly")
+      "banning the binding does not leave the -sys crate reachable without a row")))
 
 ;; ── present ─────────────────────────────────────────────────────────────
 

@@ -6,19 +6,31 @@
 //! day one appears, under its own name or renamed with `package = ...`.
 //! Dev-dependencies are not checked: a test may drive the core from an
 //! executor without the library ever seeing one.
+//!
+//! This is the DIRECT ban — what this manifest itself names. The core could
+//! satisfy it and still carry a runtime by taking one edge to a workspace
+//! crate that has it, so `engenho/tests/shipped_closure.rs` bans the same
+//! crates transitively over the whole closure. Two questions, two tests.
 
 use toml::Value;
 
 const MANIFEST: &str = include_str!("../Cargo.toml");
 
-/// Crates that are, or exist to drive, an async runtime.
-const ASYNC_RUNTIME: [&str; 6] = [
-    "tokio",
-    "async-trait",
-    "futures",
-    "async-std",
-    "smol",
-    "tokio-util",
+/// What the core must not link, and why. The runtime crates are T5.6's
+/// carve: this half of the substrate is the one no executor reaches.
+/// `serde_yaml` is the same line drawn at config — parsing a config format
+/// is engenho-config's job, and the core sits below it.
+const FORBIDDEN: [(&str, &str); 7] = [
+    ("tokio", "an async runtime"),
+    ("async-trait", "exists to drive an async runtime"),
+    ("futures", "exists to drive an async runtime"),
+    ("async-std", "an async runtime"),
+    ("smol", "an async runtime"),
+    ("tokio-util", "exists to drive an async runtime"),
+    (
+        "serde_yaml",
+        "a config format; that is engenho-config's layer",
+    ),
 ];
 
 /// Every crate the library links: `[dependencies]`, `[build-dependencies]`
@@ -53,20 +65,21 @@ fn library_dependencies(manifest: &Value) -> Vec<String> {
 }
 
 #[test]
-fn the_core_links_no_async_runtime() {
+fn the_core_links_no_async_runtime_and_no_config_format() {
     let manifest: Value = toml::from_str(MANIFEST).expect("Cargo.toml parses");
     let deps = library_dependencies(&manifest);
     assert!(
         !deps.is_empty(),
         "read no dependencies at all; the manifest shape changed under this test"
     );
-    let runtime: Vec<&String> = deps
+    let carried: Vec<(&str, &str)> = FORBIDDEN
         .iter()
-        .filter(|d| ASYNC_RUNTIME.contains(&d.as_str()))
+        .copied()
+        .filter(|(name, _)| deps.iter().any(|d| d == name))
         .collect();
     assert!(
-        runtime.is_empty(),
-        "engenho-substrate-core must stay tokio-free; move the module that needs {runtime:?} to engenho-substrate"
+        carried.is_empty(),
+        "engenho-substrate-core links {carried:?}; move the module that needs it to engenho-substrate, the leaf"
     );
 }
 

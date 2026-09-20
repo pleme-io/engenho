@@ -1,10 +1,12 @@
 //! # engenho-teia
 //!
-//! The fabric layer — one NATS-backed transport that carries
-//! every cross-process byte in engenho. Per `docs/FABRIC.md`,
-//! teia is the third-site extraction of the messaging pattern
-//! that previously lived twice (engenho-revoada's InProcessRouter
-//! + engenho-store's InProcessRouter).
+//! A **fenced-off draft** of a NATS-backed transport. It is not
+//! engenho's fabric and carries no byte of it; see "Fenced off"
+//! below, and the banner on `docs/FABRIC.md`, which is the draft
+//! this crate types. The design there was a third-site extraction
+//! of the messaging pattern that lives twice (engenho-revoada's
+//! InProcessRouter + engenho-store's InProcessRouter); both still
+//! run, and the in-process router is what carries Raft traffic.
 //!
 //! ## Surface
 //!
