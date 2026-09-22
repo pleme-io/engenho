@@ -30,7 +30,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use engenho_config::{ConfigError, EngenhoConfig, ProvenanceMap};
+use engenho_config::{ConfigError, EngenhoConfig, OverrideLayer, ProvenanceMap};
 use engenho_kubelet::ContainerRuntime;
 use engenho_serve::{StopHandle, stop_channel};
 use engenho_store::data_dir_lock::{DataDirLock, LockError};
@@ -47,22 +47,87 @@ use super::journal::{
 };
 use super::machine::{
     DaemonLifecycle, ExitIntent, FailureReport, Lifecycle, LifecycleEffect, LifecycleEvent,
-    LifecycleState, Refused, RefusedBecause, RetryClass, StoreOutcome,
+    LifecycleState, PendingApply, Refused, RefusedBecause, RetryClass, StoreOutcome,
 };
 use crate::boot::{BootKind, BootPhase, BootProgress, BootRecorder, FailureClass, Timestamp};
 use crate::child::{Child, ChildState, DeadChild, DeathCause};
+use crate::control::apply::ApplyEffect;
+use crate::control::overrides::OverrideStore;
 use crate::control::ring::Ring;
 use crate::error::RuntimeError;
 use crate::publish::PublishRecord;
 use crate::release::{BootFailed, BootUnwind, StoreReleased};
 use crate::runtime::Runtime;
 
-/// Resolves the configuration a boot runs on. Called once per boot, inside
+/// The declared configuration folded with an override tier (or with none).
+pub type Fold =
+    Arc<dyn Fn(Option<&OverrideLayer>) -> Result<ResolvedConfig, ConfigError> + Send + Sync>;
+
+/// Resolves the configuration a boot runs on. Resolved once per boot, inside
 /// its [`BootPhase::ResolveConfig`], so a configuration that does not
 /// resolve is a failed boot the control plane can report, not a dead
-/// process. The control plane calls it too, to show the configuration of a
-/// runtime that is not running.
-pub type ConfigSource = Arc<dyn Fn() -> Result<ResolvedConfig, ConfigError> + Send + Sync>;
+/// process. The control plane resolves it too — to show the configuration,
+/// and to plan a change against a candidate override set before making it.
+#[derive(Clone)]
+pub struct ConfigSource {
+    fold: Fold,
+    overrides: Option<Arc<OverrideStore>>,
+}
+
+impl ConfigSource {
+    /// A source with no override tier.
+    pub fn new(
+        resolve: impl Fn() -> Result<ResolvedConfig, ConfigError> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            fold: Arc::new(move |_| resolve()),
+            overrides: None,
+        }
+    }
+
+    /// A source that folds `overrides` over the declared configuration.
+    pub fn layered(
+        fold: impl Fn(Option<&OverrideLayer>) -> Result<ResolvedConfig, ConfigError>
+        + Send
+        + Sync
+        + 'static,
+        overrides: Arc<OverrideStore>,
+    ) -> Self {
+        Self {
+            fold: Arc::new(fold),
+            overrides: Some(overrides),
+        }
+    }
+
+    /// The configuration with the overrides in force now.
+    ///
+    /// # Errors
+    ///
+    /// The configuration does not resolve, or the override tier cannot be
+    /// read.
+    pub fn resolve(&self) -> Result<ResolvedConfig, ConfigError> {
+        let layer = self.overrides.as_ref().map(|o| o.layer()).transpose()?;
+        (self.fold)(layer.as_ref())
+    }
+
+    /// The configuration with `overrides` in place of the ones in force.
+    ///
+    /// # Errors
+    ///
+    /// The configuration does not resolve.
+    pub fn resolve_with(
+        &self,
+        overrides: Option<&OverrideLayer>,
+    ) -> Result<ResolvedConfig, ConfigError> {
+        (self.fold)(overrides)
+    }
+
+    /// The override tier, when this source has one.
+    #[must_use]
+    pub fn overrides(&self) -> Option<&Arc<OverrideStore>> {
+        self.overrides.as_ref()
+    }
+}
 
 /// A resolved configuration, and which tier gave each leaf its value.
 #[derive(Debug, Clone)]
@@ -200,6 +265,49 @@ enum Request {
     Retry(Reply<Accepted>),
     Exit(ExitIntent, Reply<Accepted>),
     Inspect(oneshot::Sender<Inspection>),
+    Reconfigure {
+        restart_now: bool,
+        reply: oneshot::Sender<Result<Reconfigured, ReconfigureError>>,
+    },
+    Republish(oneshot::Sender<Result<Vec<PublishRecord>, ReconfigureError>>),
+}
+
+/// What the supervisor did with a configuration change
+/// ([`SupervisorHandle::reconfigure`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reconfigured {
+    /// The runtime is up: it took what it can in place.
+    Running {
+        /// Whether that republished the kubeconfigs.
+        republished: bool,
+        /// Every leaf it reflects only after a restart.
+        pending: Vec<engenho_config::LeafPath>,
+        /// Whether a restart was asked for, and started.
+        restarted: bool,
+    },
+    /// The last boot failed and was held: it is retried on the new
+    /// configuration.
+    Retrying,
+    /// No runtime is up (or one is booting or stopping): the next boot reads
+    /// the configuration afresh.
+    NotRunning,
+}
+
+/// Why the running runtime did not take a configuration change.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ReconfigureError {
+    /// The configuration does not resolve (it changed since it was planned).
+    #[error("the configuration does not resolve: {0}")]
+    Config(String),
+    /// The runtime refused or failed to apply it.
+    #[error("the running runtime could not apply it: {0}")]
+    Runtime(String),
+    /// No runtime is up.
+    #[error("no runtime is running")]
+    NotRunning,
+    /// The supervisor has ended.
+    #[error("the supervisor has ended")]
+    Gone,
 }
 
 /// Who holds the store's lock, as far as the supervisor can tell without
@@ -284,6 +392,20 @@ pub enum DaemonEvent {
         child: Child,
         /// How.
         cause: DeathCause,
+    },
+    /// A configuration change was applied.
+    ConfigApplied {
+        /// The override set's generation after it.
+        generation: u64,
+        /// The leaves it changed.
+        leaves: Vec<engenho_config::LeafPath>,
+        /// What it did.
+        effect: ApplyEffect,
+    },
+    /// A kubeconfig was published (again) while the runtime ran.
+    KubeconfigPublished {
+        /// Where, and how it went.
+        record: PublishRecord,
     },
 }
 
@@ -377,6 +499,37 @@ impl SupervisorHandle {
     /// [`CommandError::Gone`] when the supervisor has already ended.
     pub async fn exit(&self, intent: ExitIntent) -> Result<Accepted, CommandError> {
         self.ask(|reply| Request::Exit(intent, reply)).await
+    }
+
+    /// Bring the runtime to the configuration as it resolves now: a running
+    /// runtime takes what it can in place (and restarts for the rest when
+    /// `restart_now`); a held failed boot is retried; otherwise the next boot
+    /// reads it.
+    ///
+    /// # Errors
+    ///
+    /// [`ReconfigureError`].
+    pub async fn reconfigure(&self, restart_now: bool) -> Result<Reconfigured, ReconfigureError> {
+        let (reply, answer) = oneshot::channel();
+        self.requests
+            .send(Request::Reconfigure { restart_now, reply })
+            .await
+            .map_err(|_| ReconfigureError::Gone)?;
+        answer.await.map_err(|_| ReconfigureError::Gone)?
+    }
+
+    /// Publish the running runtime's kubeconfigs again.
+    ///
+    /// # Errors
+    ///
+    /// [`ReconfigureError::NotRunning`] when no runtime is up.
+    pub async fn republish(&self) -> Result<Vec<PublishRecord>, ReconfigureError> {
+        let (reply, answer) = oneshot::channel();
+        self.requests
+            .send(Request::Republish(reply))
+            .await
+            .map_err(|_| ReconfigureError::Gone)?;
+        answer.await.map_err(|_| ReconfigureError::Gone)?
     }
 
     async fn ask<T>(&self, request: impl FnOnce(Reply<T>) -> Request) -> Result<T, CommandError> {
@@ -615,7 +768,7 @@ impl Supervisor {
                 Some(()) = self.declared.recv() => {
                     // Refused (and logged at debug) unless a boot is failed:
                     // a change while running is drift, not a trigger.
-                    self.apply_logged(LifecycleEvent::DeclaredChanged { at: Timestamp::now() });
+                    self.apply_logged(LifecycleEvent::ConfigChanged { at: Timestamp::now() });
                 }
             }
         }
@@ -653,9 +806,89 @@ impl Supervisor {
                 let result = self.apply(LifecycleEvent::Exit { intent });
                 let _ = reply.send(result.map(|()| self.accepted(at)));
             }
+            Request::Reconfigure { restart_now, reply } => {
+                let _ = reply.send(self.reconfigure(restart_now, at));
+            }
+            Request::Republish(reply) => {
+                let _ = reply.send(self.republish());
+            }
             // Answered by the loop, which awaits the store.
             Request::Inspect(_) => {}
         }
+    }
+
+    fn reconfigure(
+        &mut self,
+        restart_now: bool,
+        at: Timestamp,
+    ) -> Result<Reconfigured, ReconfigureError> {
+        match &self.machine.state().state {
+            LifecycleState::Running { .. } => {}
+            LifecycleState::Failed {
+                retry: RetryClass::Hold,
+                ..
+            } => {
+                self.apply_logged(LifecycleEvent::ConfigChanged { at });
+                return Ok(Reconfigured::Retrying);
+            }
+            _ => return Ok(Reconfigured::NotRunning),
+        }
+        let resolved = self
+            .source
+            .resolve()
+            .map_err(|e| ReconfigureError::Config(e.to_string()))?;
+        let Slot::Up(running) = &mut self.slot else {
+            return Ok(Reconfigured::NotRunning);
+        };
+        let published = running
+            .runtime
+            .adopt(&resolved.config)
+            .map_err(|e| ReconfigureError::Runtime(e.to_string()))?;
+        let pending =
+            crate::control::apply::restart_pending(running.runtime.config(), &resolved.config);
+        running.provenance = resolved.provenance;
+
+        let republished = published.is_some();
+        for record in published.into_iter().flatten() {
+            self.events
+                .push(DaemonEvent::KubeconfigPublished { record });
+        }
+        self.apply_logged(LifecycleEvent::ConfigApplied {
+            pending: if pending.is_empty() {
+                PendingApply::InSync
+            } else {
+                PendingApply::RestartNeeded {
+                    leaves: pending.iter().map(ToString::to_string).collect(),
+                }
+            },
+        });
+        let restarted = restart_now
+            && !pending.is_empty()
+            && self.apply(LifecycleEvent::Restart { at }).is_ok();
+        if restarted {
+            info!(leaves = ?pending, "restarting the runtime for a configuration change");
+        }
+        Ok(Reconfigured::Running {
+            republished,
+            pending,
+            restarted,
+        })
+    }
+
+    fn republish(&mut self) -> Result<Vec<PublishRecord>, ReconfigureError> {
+        let Slot::Up(running) = &mut self.slot else {
+            return Err(ReconfigureError::NotRunning);
+        };
+        let records = running
+            .runtime
+            .republish()
+            .map_err(|e| ReconfigureError::Runtime(e.to_string()))?;
+        for record in &records {
+            self.events.push(DaemonEvent::KubeconfigPublished {
+                record: record.clone(),
+            });
+        }
+        Ok(records)
     }
 
     /// What only the loop can read: the running runtime, and the store's
@@ -948,7 +1181,7 @@ impl Supervisor {
         let (progress_tx, progress) = mpsc::unbounded_channel();
         let rec = BootRecorder::new(progress_tx, signal);
         let task = tokio::spawn(supervised_boot(
-            Arc::clone(&self.source),
+            self.source.clone(),
             self.backend.clone(),
             self.data_dir.clone(),
             self.declared_path.clone(),
@@ -1139,7 +1372,7 @@ async fn supervised_boot(
     // What the resolution is about to read, so drift is measured against
     // what this boot actually saw.
     let declared_digest = declared.as_deref().and_then(file_digest);
-    let resolved = match source() {
+    let resolved = match source.resolve() {
         Ok(resolved) => resolved,
         Err(e) => return failed(Err(rec.failed(e.into()))),
     };

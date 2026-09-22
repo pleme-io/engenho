@@ -25,7 +25,7 @@ pub use machine::{
     StoreOutcome,
 };
 pub use supervisor::{
-    Accepted, ChildFact, CommandError, ConfigSource, DaemonEvent, DaemonInfo, EVENTS, Hold,
-    Inspection, ResolvedConfig, RuntimeFacts, Snapshot, StopDone, StoreLock, Supervisor,
-    SupervisorConfig, SupervisorError, SupervisorHandle, file_digest,
+    Accepted, ChildFact, CommandError, ConfigSource, DaemonEvent, DaemonInfo, EVENTS, Fold, Hold,
+    Inspection, ReconfigureError, Reconfigured, ResolvedConfig, RuntimeFacts, Snapshot, StopDone,
+    StoreLock, Supervisor, SupervisorConfig, SupervisorError, SupervisorHandle, file_digest,
 };

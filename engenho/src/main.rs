@@ -55,12 +55,15 @@ use std::sync::Arc;
 
 use engenho_apiserver::load_or_generate_ca;
 use engenho_config::{
-    ConfigError, ConfigTier, EngenhoConfig, SocketDefaults, TieredConfig, render_provenance,
+    ConfigError, ConfigTier, EngenhoConfig, OverrideLayer, SocketDefaults, TieredConfig,
+    render_provenance,
 };
 use engenho_control_server::{AuditLog, GrantPolicy, Router, serve_uds};
 use engenho_kube_client::{emit_kubeconfig, emit_kubeconfig_with_admin};
 use engenho_runtime::census::{self, ApiSource, Catalog, DataDirSource, Predicate};
-use engenho_runtime::control::{DaemonControl, DaemonControlParts, LogLayer, SocketFacts};
+use engenho_runtime::control::{
+    DaemonControl, DaemonControlParts, LogLayer, OverrideStore, SocketFacts,
+};
 use engenho_runtime::lifecycle::{
     ConfigSource, ControlBootstrap, ControlDir, ExitIntent, ResolvedConfig, Supervisor,
     SupervisorConfig,
@@ -342,13 +345,15 @@ async fn run_daemon() -> anyhow::Result<ExitIntent> {
     );
 
     // 3. The supervisor. Each boot resolves the config afresh, inside its
-    //    own phase, so a config that does not resolve is a failed boot the
-    //    daemon reports and retries — not a dead process.
-    let source: ConfigSource = Arc::new(resolve_declared_config);
+    //    own phase — the declared file with the override tier folded over
+    //    it — so a config that does not resolve is a failed boot the daemon
+    //    reports and retries, not a dead process.
     let data_dir = bootstrap.data_dir.clone();
+    let overrides = Arc::new(OverrideStore::open(ControlDir::under(&data_dir).root()));
+    let source = ConfigSource::layered(resolve_declared_config, overrides);
     let (supervisor, handle) = Supervisor::new(SupervisorConfig {
         data_dir: data_dir.clone(),
-        source: Arc::clone(&source),
+        source: source.clone(),
         backend: None,
         declared: bootstrap.declared.clone(),
     })?;
@@ -415,10 +420,12 @@ async fn run_daemon() -> anyhow::Result<ExitIntent> {
 }
 
 /// The config one boot runs on, via the sealed progressive-discovery fold
-/// (bare → discovered[`DiscoveryLayer`] → `prescribed_default` → operator
-/// file overlay), each effective leaf carrying typed provenance.
-fn resolve_declared_config() -> Result<ResolvedConfig, ConfigError> {
-    let (config, provenance) = EngenhoConfig::resolve_progressively()?.into_parts();
+/// (bare → discovered[`DiscoveryLayer`] → `prescribed_default` → declared
+/// file → override tier), each effective leaf carrying typed provenance.
+fn resolve_declared_config(
+    overrides: Option<&OverrideLayer>,
+) -> Result<ResolvedConfig, ConfigError> {
+    let (config, provenance) = EngenhoConfig::resolve_progressively_with(overrides)?.into_parts();
     tracing::info!(
         cluster = %config.cluster.name,
         node = %config.runtime.node_name,
@@ -546,8 +553,19 @@ fn run_config_show(tier_arg: Option<String>) -> anyhow::Result<()> {
     };
     match tier {
         ConfigTier::Default => {
-            // The rich default: the progressive fold with typed provenance.
-            let resolution = EngenhoConfig::resolve_progressively()?;
+            // The rich default: the progressive fold with typed provenance,
+            // the override tier included — found where the daemon keeps it,
+            // under the data directory the bootstrap decides.
+            let bootstrap = ControlBootstrap::discover();
+            let overrides = OverrideStore::open(ControlDir::under(&bootstrap.data_dir).root());
+            let layer = match overrides.layer() {
+                Ok(layer) => Some(layer),
+                Err(err) => {
+                    eprintln!("engenho: without the override tier: {err}");
+                    None
+                }
+            };
+            let resolution = EngenhoConfig::resolve_progressively_with(layer.as_ref())?;
             print!("{}", resolution.value().to_yaml()?);
             print!("{}", render_provenance(resolution.provenance()));
         }

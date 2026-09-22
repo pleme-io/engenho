@@ -257,10 +257,18 @@ pub enum LifecycleEvent {
         /// When.
         at: Timestamp,
     },
-    /// The declared configuration file changed.
-    DeclaredChanged {
+    /// The configuration a boot would read changed: the declared file, or
+    /// the override tier.
+    ConfigChanged {
         /// When.
         at: Timestamp,
+    },
+    /// A configuration change reached the running runtime: what it took in
+    /// place it now reflects, and `pending` is what it reflects only after a
+    /// restart.
+    ConfigApplied {
+        /// What the running runtime does not reflect yet.
+        pending: PendingApply,
     },
     /// The boot entered a phase.
     Phase {
@@ -318,7 +326,8 @@ impl LifecycleEvent {
             Self::Start { .. } => "start",
             Self::Retry { .. } => "retry",
             Self::RetryDue { .. } => "retry_due",
-            Self::DeclaredChanged { .. } => "declared_changed",
+            Self::ConfigChanged { .. } => "config_changed",
+            Self::ConfigApplied { .. } => "config_applied",
             Self::Phase { .. } => "phase",
             Self::Booted { .. } => "booted",
             Self::BootFailed { .. } => "boot_failed",
@@ -584,7 +593,7 @@ impl DaemonLifecycle {
         let mut next = m.clone();
         let effect = match (&m.state, event) {
             (S::Resolving { .. } | S::Stopped { .. }, E::Start { at })
-            | (S::Failed { .. }, E::Retry { at } | E::DeclaredChanged { at })
+            | (S::Failed { .. }, E::Retry { at } | E::ConfigChanged { at })
             | (
                 S::Failed {
                     retry: RetryClass::Backoff { .. },
@@ -612,6 +621,23 @@ impl DaemonLifecycle {
                     attempt: *attempt,
                     phase: *phase,
                     since: *at,
+                };
+                LifecycleEffect::None
+            }
+            (
+                S::Running {
+                    attempt,
+                    since,
+                    apiserver_addr,
+                    ..
+                },
+                E::ConfigApplied { pending },
+            ) => {
+                next.state = S::Running {
+                    attempt: *attempt,
+                    since: *since,
+                    apiserver_addr: apiserver_addr.clone(),
+                    pending: pending.clone(),
                 };
                 LifecycleEffect::None
             }
@@ -729,7 +755,8 @@ impl DaemonLifecycle {
             (S::Failed { .. }, E::Start { .. }) => RefusedBecause::RuntimeNotStopped,
             (_, E::Retry { .. }) => RefusedBecause::RuntimeNotFailed,
             (S::Resolving { .. } | S::Stopped { .. }, E::Stop { .. } | E::Restart { .. })
-            | (S::Failed { .. }, E::Restart { .. }) => RefusedBecause::RuntimeNotRunning,
+            | (S::Failed { .. }, E::Restart { .. })
+            | (_, E::ConfigApplied { .. }) => RefusedBecause::RuntimeNotRunning,
             // An internal event where it cannot happen (a stale timer, a
             // report from a boot that already ended), or anything after the
             // exit. Accepted pairs never reach here.

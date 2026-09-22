@@ -28,3 +28,10 @@ engenho-controllers/src/watch_driver.rs
 engenho-kubelet/src/probe.rs
 engenho-kubelet/src/backoff.rs
 engenho-kubelet/src/native_backend.rs
+
+# The control plane's configuration tier (docs/CONTROL-PLANE.md, P4): what a
+# change to each leaf means, whether a change is accepted, and what applying
+# it did.
+engenho-config/src/mutability.rs
+engenho-runtime/src/control/apply.rs
+engenho-runtime/src/control/overrides.rs

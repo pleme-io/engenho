@@ -47,7 +47,7 @@ pub mod named;
 pub mod relogio;
 pub mod risca;
 
-pub use atomic_write::{AtomicWriteError, TempPath, write_atomic};
+pub use atomic_write::{AtomicWriteError, TempPath, write_atomic, write_atomic_mode};
 pub use error_kind::ErrorKind;
 pub use fingerprint::{Fingerprint, fingerprint_blake3};
 pub use hash_newtype::{

@@ -62,9 +62,17 @@
 //! Tier 1: $ENGENHO_CONFIG (single file)
 //! Tier 2: $XDG_CONFIG_HOME/engenho/engenho.yaml
 //! Tier 3: /etc/engenho/engenho.yaml
-//! Tier 4: ConfigMap (future, hot-reload)
-//! Tier 5: prescribed_default() — compiled-in safe values
+//! Tier 4: prescribed_default() — compiled-in safe values
 //! ```
+//!
+//! The first file found is the **declared** file (the one Nix writes). Over
+//! it sits the **override tier**: leaves set through the daemon's control
+//! plane, kept in `data_dir/control/overrides.yaml` and folded after the
+//! declared file, so an override wins leaf by leaf and `config-show` credits
+//! it to that file ([`OverrideLayer`], [`EngenhoConfig::resolve_progressively_with`]).
+//! Which leaves may be overridden, and what changing each one does to a
+//! running engenho, is [`mutability`]'s sealed table. There is no
+//! `ConfigMap` tier: the control plane is not the Kubernetes API.
 //!
 //! ## Validation
 //!
@@ -107,6 +115,8 @@ mod controllers;
 mod discovery;
 mod error;
 mod fabric;
+pub mod leaf;
+pub mod mutability;
 mod networking;
 mod node_local;
 mod revoada;
@@ -125,6 +135,8 @@ pub use controllers::{ControllerEnable, ControllersConfig};
 pub use discovery::{HostnameLayer, NODE_NAME_FALLBACK};
 pub use error::ConfigError;
 pub use fabric::{ConfigDeprecation, Fabric, LegacyTeiaSection};
+pub use leaf::{BadLeafPath, LeafPath};
+pub use mutability::{Anchor, InertWhy, LeafSpec, LiveEffect, Mutability, RespawnSet};
 pub use networking::{DatapathMode, NetworkingConfig, ResolvedDatapath, parse_ipv4_cidr};
 pub use node_local::{ListenerAddrRejection, LoopbackAddr, NodeLocalListener};
 pub use revoada::{RevoadaConfig, TopologyConfig, TopologyStrategyKind};
@@ -372,14 +384,19 @@ impl EngenhoConfig {
     /// [`ConfigError::Incoherent`] on cross-section invariant
     /// violation.
     pub fn from_yaml_with_defaults(yaml: &str) -> Result<Self, ConfigError> {
+        let overlay: serde_yaml::Value = serde_yaml::from_str(yaml)
+            .map_err(|e| ConfigError::Parse(format!("operator YAML: {e}")))?;
+        Self::from_yaml_value_with_defaults(overlay)
+    }
+
+    /// [`Self::from_yaml_with_defaults`] over an already-parsed overlay.
+    fn from_yaml_value_with_defaults(overlay: serde_yaml::Value) -> Result<Self, ConfigError> {
         // The operator YAML is parsed into a full struct (serde
         // requires all fields). We accept partial YAML via merging
         // serde_yaml::Value onto the default's Value, then
         // re-deserializing.
         let default_v: serde_yaml::Value = serde_yaml::to_value(Self::prescribed_default())
             .map_err(|e| ConfigError::Parse(format!("serialize default: {e}")))?;
-        let overlay: serde_yaml::Value = serde_yaml::from_str(yaml)
-            .map_err(|e| ConfigError::Parse(format!("operator YAML: {e}")))?;
         let merged = merge_yaml(default_v, overlay);
         let cfg: Self = serde_yaml::from_value(merged)
             .map_err(|e| ConfigError::Parse(format!("merge round-trip: {e}")))?;
@@ -414,7 +431,82 @@ impl EngenhoConfig {
     /// [`ConfigError::InvalidField`] on a validation failure — the same strict
     /// surface [`Self::discover`] enforces (no silent fallback).
     pub fn resolve_progressively() -> Result<ProgressiveResolution<Self>, ConfigError> {
-        let overlays = Self::file_overlay_layers()?;
+        Self::resolve_progressively_with(None)
+    }
+
+    /// [`Self::resolve_progressively`] with the override tier folded over the
+    /// declared file: an overridden leaf takes the override's value and is
+    /// credited to [`OverrideLayer::path`].
+    ///
+    /// The strict gate runs over the declared file and the overrides
+    /// together — the configuration a boot would get — so an override can
+    /// repair a declared file that does not validate on its own, and an
+    /// override that breaks one is refused.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::resolve_progressively`]; an error the override tier
+    /// caused names it.
+    pub fn resolve_progressively_with(
+        overrides: Option<&OverrideLayer>,
+    ) -> Result<ProgressiveResolution<Self>, ConfigError> {
+        let declared = match Self::discover_path() {
+            Some(path) => {
+                let yaml = std::fs::read_to_string(&path)
+                    .map_err(|e| ConfigError::Parse(format!("reading {}: {e}", path.display())))?;
+                Some((path, yaml))
+            }
+            None => None,
+        };
+        Self::resolve_over(
+            declared
+                .as_ref()
+                .map(|(path, yaml)| (path.as_path(), yaml.as_str())),
+            overrides,
+        )
+    }
+
+    /// The fold over an explicit declared file (`(path, yaml)`) and override
+    /// tier. [`Self::resolve_progressively_with`] reads the discovered file
+    /// and calls this.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::resolve_progressively_with`].
+    pub fn resolve_over(
+        declared: Option<(&std::path::Path, &str)>,
+        overrides: Option<&OverrideLayer>,
+    ) -> Result<ProgressiveResolution<Self>, ConfigError> {
+        let overrides = overrides.filter(|o| !o.values.is_empty());
+        let declared_value = match declared {
+            Some((_, yaml)) if !yaml.trim().is_empty() => serde_yaml::from_str(yaml)
+                .map_err(|e| ConfigError::Parse(format!("operator YAML: {e}")))?,
+            _ => serde_yaml::Value::Null,
+        };
+
+        // The strict gate: deny_unknown_fields and every validator, over
+        // exactly what the fold is about to see.
+        let mut overlays = Vec::new();
+        if let Some(overrides) = overrides {
+            let override_value = overrides.to_yaml_value()?;
+            Self::from_yaml_value_with_defaults(merge_yaml(declared_value, override_value.clone()))
+                .map_err(|e| overrides.blame(e))?;
+            if let Some((path, yaml)) = declared {
+                overlays.push(ProgressiveLayer::file(path, yaml_to_dict(yaml)?));
+            }
+            let text = serde_yaml::to_string(&override_value)
+                .map_err(|e| ConfigError::Parse(format!("serialize the override tier: {e}")))?;
+            overlays.push(ProgressiveLayer::file(
+                &overrides.path,
+                yaml_to_dict(&text)?,
+            ));
+        } else if let Some((path, yaml)) = declared {
+            Self::from_yaml_value_with_defaults(declared_value)?;
+            overlays.push(ProgressiveLayer::file(path, yaml_to_dict(yaml)?));
+        }
+
+        // Every overlay is a Custom-tier file layer; the fold's sort is
+        // stable, so the override tier (pushed last) wins leaf by leaf.
         let resolution = <Self as TieredConfig>::resolve_progressive_with(&overlays);
         resolution.value().validate()?;
         Ok(resolution)
@@ -441,28 +533,36 @@ impl EngenhoConfig {
         serde_yaml::to_string(self)
             .map_err(|e| ConfigError::Parse(format!("serialize config: {e}")))
     }
+}
 
-    /// Build the operator-file overlay layer(s) for the progressive fold from
-    /// the shikumi discovery cascade. Empty when no config file is found (the
-    /// fold then resolves to the three trait tiers alone).
-    ///
-    /// The discovered file is first run through the proven
-    /// [`Self::from_yaml_with_defaults`] path as a **strict gate**, so a
-    /// malformed / unknown-field / cross-section-invalid overlay errors here
-    /// exactly as [`Self::discover`] would — never a silent fallback. The
-    /// overlay itself is the *partial* operator dict (only the keys the
-    /// operator set), stamped with `File` provenance.
-    fn file_overlay_layers() -> Result<Vec<ProgressiveLayer>, ConfigError> {
-        let Some(path) = Self::discover_path() else {
-            return Ok(Vec::new());
-        };
-        let yaml = std::fs::read_to_string(&path)
-            .map_err(|e| ConfigError::Parse(format!("reading {}: {e}", path.display())))?;
-        // Strict gate — reuse the deny_unknown_fields + cross-section validate
-        // path so a bad overlay surfaces the same error the legacy loader does.
-        Self::from_yaml_with_defaults(&yaml)?;
-        let dict = yaml_to_dict(&yaml)?;
-        Ok(vec![ProgressiveLayer::file(path, dict)])
+/// The override tier: leaves set through the daemon's control plane, folded
+/// over the declared file ([`EngenhoConfig::resolve_progressively_with`]).
+///
+/// This crate only folds it. Keeping it — who set each leaf and when, the
+/// generation, the file under `data_dir/control/` — is the daemon's.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OverrideLayer {
+    /// Where the tier is kept; provenance credits overridden leaves to it.
+    pub path: std::path::PathBuf,
+    /// The overriding values, by leaf.
+    pub values: std::collections::BTreeMap<LeafPath, serde_json::Value>,
+}
+
+impl OverrideLayer {
+    fn to_yaml_value(&self) -> Result<serde_yaml::Value, ConfigError> {
+        serde_yaml::to_value(leaf::nest(&self.values))
+            .map_err(|e| ConfigError::Parse(format!("serialize the override tier: {e}")))
+    }
+
+    /// `err`, saying the override tier was folded in when it happened.
+    fn blame(&self, err: ConfigError) -> ConfigError {
+        let with =
+            |what: String| format!("{what} (with the override tier {})", self.path.display());
+        match err {
+            ConfigError::Parse(what) => ConfigError::Parse(with(what)),
+            ConfigError::Incoherent(what) => ConfigError::Incoherent(with(what)),
+            other => other,
+        }
     }
 }
 
@@ -1035,5 +1135,83 @@ runtime:
         assert!(rendered.contains("# provenance:"));
         assert!(rendered.contains("default"));
         assert!(rendered.contains("cluster.name  <-  default"));
+    }
+
+    // ── the override tier ─────────────────────────────────────────────────
+
+    fn overrides(pairs: &[(&str, serde_json::Value)]) -> OverrideLayer {
+        OverrideLayer {
+            path: std::path::PathBuf::from("/data/control/overrides.yaml"),
+            values: pairs
+                .iter()
+                .map(|(path, value)| (LeafPath::parse(path).unwrap(), value.clone()))
+                .collect(),
+        }
+    }
+
+    fn source_of<'a>(
+        r: &'a ProgressiveResolution<EngenhoConfig>,
+        path: &[&str],
+    ) -> Option<&'a std::path::Path> {
+        r.provenance()
+            .provenance_of(path)
+            .and_then(|p| p.source().as_path())
+    }
+
+    const DECLARED: &str =
+        "scheduler:\n  tick_interval_seconds: 7\ncontrollers:\n  namespace: declared\n";
+
+    #[test]
+    fn an_override_wins_its_leaf_and_is_credited_to_its_file() {
+        let declared = std::path::Path::new("/etc/engenho/engenho.yaml");
+        let tier = overrides(&[("scheduler.tick_interval_seconds", serde_json::json!(9))]);
+        let r = EngenhoConfig::resolve_over(Some((declared, DECLARED)), Some(&tier)).unwrap();
+
+        assert_eq!(
+            r.value().scheduler.tick_interval_seconds,
+            9,
+            "the override wins"
+        );
+        assert_eq!(
+            r.value().controllers.namespace,
+            "declared",
+            "the rest is the declared file's"
+        );
+        assert_eq!(
+            source_of(&r, &["scheduler", "tick_interval_seconds"]),
+            Some(tier.path.as_path())
+        );
+        assert_eq!(source_of(&r, &["controllers", "namespace"]), Some(declared));
+    }
+
+    #[test]
+    fn no_overrides_is_the_declared_fold() {
+        let declared = std::path::Path::new("/etc/engenho/engenho.yaml");
+        let with_empty =
+            EngenhoConfig::resolve_over(Some((declared, DECLARED)), Some(&overrides(&[]))).unwrap();
+        let without = EngenhoConfig::resolve_over(Some((declared, DECLARED)), None).unwrap();
+        assert_eq!(with_empty.value(), without.value());
+        assert_eq!(with_empty.provenance(), without.provenance());
+    }
+
+    #[test]
+    fn the_gate_sees_the_declared_file_and_the_overrides_together() {
+        let declared = std::path::Path::new("/etc/engenho/engenho.yaml");
+        let broken = "scheduler:\n  tick_interval_seconds: 0\n";
+        assert!(EngenhoConfig::resolve_over(Some((declared, broken)), None).is_err());
+
+        // An override can repair what the declared file broke...
+        let repair = overrides(&[("scheduler.tick_interval_seconds", serde_json::json!(5))]);
+        let repaired =
+            EngenhoConfig::resolve_over(Some((declared, broken)), Some(&repair)).unwrap();
+        assert_eq!(repaired.value().scheduler.tick_interval_seconds, 5);
+
+        // ...and breaking a good one is refused, naming the tier.
+        let breaks = overrides(&[("scheduler.tick_interval_seconds", serde_json::json!("soon"))]);
+        let err =
+            EngenhoConfig::resolve_over(Some((declared, DECLARED)), Some(&breaks)).unwrap_err();
+        assert!(err.to_string().contains("override tier"), "{err}");
+        let unknown = overrides(&[("scheduler.not_a_leaf", serde_json::json!(1))]);
+        assert!(EngenhoConfig::resolve_over(None, Some(&unknown)).is_err());
     }
 }

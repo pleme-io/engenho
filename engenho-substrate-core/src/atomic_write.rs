@@ -43,16 +43,51 @@ crate::impl_error_kind! {
 /// Returns [`AtomicWriteError::Io`] for any filesystem failure
 /// (permission denied, ENOSPC, etc).
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), AtomicWriteError> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| AtomicWriteError::Io(format!("mkdir {}: {e}", parent.display())))?;
-        }
+    write_atomic_with(path, bytes, None)
+}
+
+/// [`write_atomic`], the file carrying exactly `mode` (Unix permission bits)
+/// from the moment it exists: the temp file is created at `mode`, before any
+/// byte is in it, so a private file is never briefly readable at the umask's
+/// default. Ignored where there are no Unix permissions.
+///
+/// # Errors
+///
+/// As [`write_atomic`].
+pub fn write_atomic_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<(), AtomicWriteError> {
+    write_atomic_with(path, bytes, Some(mode))
+}
+
+fn write_atomic_with(path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<(), AtomicWriteError> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| AtomicWriteError::Io(format!("mkdir {}: {e}", parent.display())))?;
     }
     let tmp = TempPath::mint(path);
     {
-        let mut f = std::fs::File::create(tmp.path())
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(mode);
+        }
+        let mut f = options
+            .open(tmp.path())
             .map_err(|e| AtomicWriteError::Io(format!("create {}: {e}", tmp.path().display())))?;
+        // The umask may have narrowed it; `mode` is what was asked for.
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(mode))
+                .map_err(|e| {
+                    AtomicWriteError::Io(format!("chmod {}: {e}", tmp.path().display()))
+                })?;
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
         f.write_all(bytes)
             .map_err(|e| AtomicWriteError::Io(format!("write {}: {e}", tmp.path().display())))?;
         f.sync_all()
@@ -307,6 +342,23 @@ mod tests {
         let name = t.to_string_lossy().into_owned();
         assert!(name.starts_with("/tmp/x.bin."), "{name}");
         assert!(name.ends_with(".tmp"), "{name}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_mode_is_the_files_from_the_start() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_path("mode");
+        let _ = std::fs::remove_file(&path);
+        write_atomic_mode(&path, b"secret", 0o600).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        // Rewriting keeps it: the replacement is created at the mode too.
+        write_atomic_mode(&path, b"secret2", 0o600).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read(&path).unwrap(), b"secret2");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

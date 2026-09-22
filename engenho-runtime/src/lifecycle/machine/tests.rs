@@ -163,10 +163,47 @@ fn a_held_failure_waits_for_a_change_not_a_timer() {
         RefusedBecause::Unexpected,
         "a held failure has no timer to be due"
     );
-    let (_, effect) = step(&m, LifecycleEvent::DeclaredChanged { at: t(3) });
+    let (_, effect) = step(&m, LifecycleEvent::ConfigChanged { at: t(3) });
     assert!(matches!(effect, LifecycleEffect::StartBoot { .. }));
     let (_, effect) = step(&m, LifecycleEvent::Retry { at: t(3) });
     assert!(matches!(effect, LifecycleEffect::StartBoot { .. }));
+}
+
+#[test]
+fn a_running_runtime_carries_what_it_does_not_reflect_yet() {
+    let pending = PendingApply::RestartNeeded {
+        leaves: vec!["runtime.listen_addr".into()],
+    };
+    let (m, effect) = step(
+        &running(),
+        LifecycleEvent::ConfigApplied {
+            pending: pending.clone(),
+        },
+    );
+    assert_eq!(effect, LifecycleEffect::None);
+    assert!(matches!(&m.state, LifecycleState::Running { pending: p, .. } if *p == pending));
+    let (m, _) = step(
+        &m,
+        LifecycleEvent::ConfigApplied {
+            pending: PendingApply::InSync,
+        },
+    );
+    assert!(matches!(
+        m.state,
+        LifecycleState::Running {
+            pending: PendingApply::InSync,
+            ..
+        }
+    ));
+    assert_eq!(
+        refused(
+            &Lifecycle::at(t(0)),
+            &LifecycleEvent::ConfigApplied {
+                pending: PendingApply::InSync
+            }
+        ),
+        RefusedBecause::RuntimeNotRunning
+    );
 }
 
 #[test]
@@ -285,7 +322,7 @@ fn a_store_that_is_still_held_wedges_and_only_exit_leaves() {
         LifecycleEvent::Retry { at: t(4) },
         LifecycleEvent::Stop { at: t(4) },
         LifecycleEvent::Restart { at: t(4) },
-        LifecycleEvent::DeclaredChanged { at: t(4) },
+        LifecycleEvent::ConfigChanged { at: t(4) },
     ] {
         assert_eq!(
             refused(&m, &event),
@@ -562,7 +599,14 @@ fn any_event() -> impl Strategy<Value = LifecycleEvent> {
         at.clone().prop_map(|at| LifecycleEvent::Retry { at }),
         at.clone().prop_map(|at| LifecycleEvent::RetryDue { at }),
         at.clone()
-            .prop_map(|at| LifecycleEvent::DeclaredChanged { at }),
+            .prop_map(|at| LifecycleEvent::ConfigChanged { at }),
+        prop_oneof![
+            Just(PendingApply::InSync),
+            Just(PendingApply::RestartNeeded {
+                leaves: vec!["runtime.listen_addr".into()]
+            }),
+        ]
+        .prop_map(|pending| LifecycleEvent::ConfigApplied { pending }),
         (phase.clone(), at.clone()).prop_map(|(phase, at)| LifecycleEvent::Phase { phase, at }),
         at.clone().prop_map(|at| LifecycleEvent::Booted {
             at,

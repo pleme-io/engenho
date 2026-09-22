@@ -10,6 +10,8 @@ use engenho_apiserver::{
     handlers_from_catalog_with_admission, issue_admin_client_material, issue_server_material,
     load_or_generate_ca, metrics::log_would_reject,
 };
+use engenho_config::leaf::{flatten, nest};
+use engenho_config::mutability::{self, Mutability};
 use engenho_config::{
     EngenhoConfig, KubeconfigVisibility, KubeletBackendKind as CfgBackendKind, ResolvedDatapath,
 };
@@ -80,8 +82,10 @@ pub struct Runtime {
     would_reject: Arc<WouldRejectLedger>,
     /// Whether this boot created the store, resumed it, or runs in memory.
     boot_kind: BootKind,
-    /// Where this boot's kubeconfigs went.
+    /// Where this boot's kubeconfigs went (or the latest republish's).
     publish: Vec<PublishRecord>,
+    /// What publishing them again takes.
+    publisher: Publisher,
     /// The SANs the apiserver's certificate was issued with; `None` with
     /// TLS off. The certificate itself lives only in memory.
     server_sans: Option<Vec<String>>,
@@ -254,6 +258,7 @@ impl Runtime {
                 children,
                 health,
                 publish,
+                publisher,
                 server_sans,
             }) => Ok(Self {
                 config,
@@ -265,6 +270,7 @@ impl Runtime {
                 would_reject,
                 boot_kind,
                 publish,
+                publisher,
                 server_sans,
                 backend,
             }),
@@ -497,11 +503,8 @@ impl Runtime {
         //     CLIENT-CERT user (→ `kubectl auth whoami` = engenho-admin /
         //     system:masters). Without it (shouldn't happen when TLS is on) it
         //     falls back to the anonymous-token kubeconfig.
-        let written = ca_cert_pem.as_deref().map_or_else(
-            || Ok(PublishRecord::all_skipped(SkipReason::TlsDisabled)),
-            |ca_pem| write_boot_kubeconfig(boot, bound_addr, ca_pem, admin_material.as_ref()),
-        );
-        let publish = match written {
+        let publisher = Publisher::new(bound_addr, ca_cert_pem, admin_material);
+        let publish = match publisher.publish(boot) {
             Ok(records) => records,
             Err(err) => {
                 // The apiserver is serving; stop it and wait for its
@@ -545,6 +548,7 @@ impl Runtime {
             children,
             health,
             publish,
+            publisher,
             server_sans,
         })
     }
@@ -625,6 +629,71 @@ impl Runtime {
     #[must_use]
     pub fn server_sans(&self) -> Option<&[String]> {
         self.server_sans.as_deref()
+    }
+
+    /// Take `effective`'s in-place leaves — the live and inert ones of the
+    /// sealed mutability table — into the running configuration, and publish
+    /// the kubeconfigs again when a live one moved. Every other leaf stays as
+    /// booted: what takes a restart is the caller's to report as pending.
+    ///
+    /// Returns the new publish records when it published.
+    ///
+    /// # Errors
+    ///
+    /// The adopted configuration does not deserialize or a boot would refuse
+    /// it (the caller gated it, so neither is expected), or writing the data
+    /// directory's own kubeconfig failed. The runtime is unchanged then.
+    pub(crate) fn adopt(
+        &mut self,
+        effective: &EngenhoConfig,
+    ) -> Result<Option<Vec<PublishRecord>>, RuntimeError> {
+        let json = |c: &EngenhoConfig| serde_json::to_value(c).unwrap_or_default();
+        let mut current = flatten(&json(&self.config));
+        let target = flatten(&json(effective));
+        let (mut moved, mut republish) = (false, false);
+        for spec in mutability::leaves()
+            .iter()
+            .filter(|spec| spec.mutability.applies_in_place())
+        {
+            let want = target.get(&spec.path);
+            if current.get(&spec.path) == want {
+                continue;
+            }
+            match want {
+                Some(value) => current.insert(spec.path.clone(), value.clone()),
+                None => current.remove(&spec.path),
+            };
+            moved = true;
+            republish |= matches!(spec.mutability, Mutability::Live { .. });
+        }
+        if !moved {
+            return Ok(None);
+        }
+        let adopted: EngenhoConfig = serde_json::from_value(nest(&current)).map_err(|e| {
+            engenho_config::ConfigError::Parse(format!("adopting in-place leaves: {e}"))
+        })?;
+        let boot = BootConfig::read(&adopted)?;
+        let records = if republish {
+            Some(self.publisher.publish(&boot)?)
+        } else {
+            None
+        };
+        self.config = adopted;
+        if let Some(records) = &records {
+            self.publish.clone_from(records);
+        }
+        Ok(records)
+    }
+
+    /// Publish the kubeconfigs again, as configured.
+    ///
+    /// # Errors
+    ///
+    /// Writing the data directory's own kubeconfig failed.
+    pub(crate) fn republish(&mut self) -> Result<Vec<PublishRecord>, RuntimeError> {
+        let boot = BootConfig::read(&self.config)?;
+        self.publish = self.publisher.publish(&boot)?;
+        Ok(self.publish.clone())
     }
 
     /// The store's current revision and whether this node leads — read
@@ -753,7 +822,41 @@ struct Assembled {
     children: Children,
     health: Arc<Health>,
     publish: Vec<PublishRecord>,
+    publisher: Publisher,
     server_sans: Option<Vec<String>>,
+}
+
+/// What publishing the kubeconfigs takes that the configuration does not
+/// say, kept from the boot so a changed publish leaf can be applied to the
+/// running runtime: the address the apiserver bound, the CA its certificate
+/// chains to, and the admin credential (already on disk under `pki/`).
+struct Publisher {
+    bound_addr: SocketAddr,
+    ca_pem: Option<String>,
+    admin: Option<ClientMaterial>,
+}
+
+impl Publisher {
+    const fn new(
+        bound_addr: SocketAddr,
+        ca_pem: Option<String>,
+        admin: Option<ClientMaterial>,
+    ) -> Self {
+        Self {
+            bound_addr,
+            ca_pem,
+            admin,
+        }
+    }
+
+    /// Publish every kubeconfig `boot` asks for. With TLS off there is
+    /// nothing to hand kubectl, and every target says so.
+    fn publish(&self, boot: &BootConfig) -> Result<Vec<PublishRecord>, RuntimeError> {
+        self.ca_pem.as_deref().map_or_else(
+            || Ok(PublishRecord::all_skipped(SkipReason::TlsDisabled)),
+            |ca_pem| write_boot_kubeconfig(boot, self.bound_addr, ca_pem, self.admin.as_ref()),
+        )
+    }
 }
 
 /// Wait for raft leadership. The one wait the boot does not bound by its own

@@ -132,6 +132,49 @@ no switch to turn it off.
   `Restart=on-failure`. So `runtime exit` with a halt intent (exit 0) stays
   down, and a relaunch intent (exit 75) comes back.
 
+## Configuration after it is running (P4)
+
+The declared file is the one Nix writes. Over it sits the **override tier**:
+leaves set through the control plane, kept in
+`data_dir/control/overrides.yaml` (mode `0600`, written atomically) and folded
+after the declared file, so an override wins leaf by leaf and every view
+credits it — `engenho ctl config leaves` as `override` (with who set it, as
+the kernel attested, and when), `engenho config-show` as the overrides file.
+There is no ConfigMap tier.
+
+* **Every leaf is classified, and the table cannot fall behind.**
+  `engenho_config::mutability` gives each leaf one class — `inert`, `live`,
+  `respawn`, `next_boot`, `restart_runtime` or `not_overridable` — through a
+  `section!` per config struct that names every field and destructures the
+  struct with no `..`: a new field is a compile error until it is classified,
+  and a test pins the table to what the configuration serializes to.
+  `data_dir` (the tier lives under it), `durable`, the cluster and node names,
+  the service CIDR, the control socket and the retired `teia` keys are
+  `not_overridable`.
+* **One pipeline** (`engenho-runtime::control::apply`) serves `config set`,
+  `unset`, `clear` and `reload`: build the candidate override set, resolve it
+  with the fold a boot uses, gate it with a boot's own validators
+  (`validate()`, `deny_unknown_fields`, `BootConfig::read` — there is no
+  second validator to disagree with boot), diff it leaf by leaf, refuse the
+  whole change if a `not_overridable` leaf moves, stop there on `--dry-run
+  true`, then commit and apply. `--precondition-generation` makes it
+  optimistic-concurrency safe; the generation is persisted, so it keeps
+  rising across restarts.
+* **Applying** is the supervisor's: a running runtime adopts the in-place
+  leaves (`live` ones republish the kubeconfigs at once), and what takes a
+  restart is recorded as `pending: restart_needed` on the lifecycle — or
+  restarts it with `--restart-policy now`. A boot held on its configuration
+  is retried by an override change, exactly as by a change to the declared
+  file, so a broken declared file is repaired without touching it:
+  `engenho ctl config set scheduler.tick_interval_seconds --value 5`.
+  `respawn` leaves apply as a restart until children can be respawned one by
+  one (P6).
+* **Drift** (`engenho ctl config drift`): a unified diff against the declared
+  file alone, and per override whether removing it would change its leaf
+  (`shadowing`) or not (`redundant`).
+* **Persisted by default.** `--persist false` keeps an override in memory
+  only; it is gone when the process ends.
+
 ## Remote trust: SPKI pins, not the cluster CA
 
 The control listener does **not** trust engenho's cluster CA. It has its own
@@ -201,7 +244,8 @@ Deviations the spec settled while being authored:
 |---|---|
 | `engenho-serve` | the owned-connection serve loop (`Listener`, `Handshake`, `serve`, `StopHandle`) |
 | `engenho-control-types` | everything derived from the spec, plus `Principal` (Serialize-only), `ControlError`, the HTTP rendering helpers |
-| `engenho-runtime` | the supervisor, the boot journal, the publish records, and `control::DaemonControl` — the one `EngenhoControl` |
+| `engenho-config` | the configuration, its leaves (`leaf`), their sealed classes (`mutability`), and the fold with the override tier |
+| `engenho-runtime` | the supervisor, the boot journal, the publish records, the override store and apply pipeline, and `control::DaemonControl` — the one `EngenhoControl` |
 | `engenho-control-server` | the socket, the grant, the router, the audit chain |
 | `engenho-control-client` | typed and generic calls, and the socket resolution `engenho ctl` shares with the daemon |
 
@@ -214,7 +258,7 @@ Deviations the spec settled while being authored:
 | P1 | Supervisor, boot-phase journal, stay-up on failure, retry classes | done |
 | P2 | Local UDS, observe tier, `engenho ctl` | done |
 | P3 | Operate verbs, authorization tiers, audit chain, restart on failure only | done |
-| P4 | Persisted config overrides, sealed mutability, drift | — |
+| P4 | Persisted config overrides, sealed mutability, drift | done |
 | P5 | Remote mTLS with SPKI pins | — |
 | P6 | Child control | — |
 | P7 | Gated destructive re-init | — |

@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use engenho_apiserver::pki_inventory::{self, CaFact, CertFact, FileFact};
 use engenho_config::{
-    ConfigTierKind, EngenhoConfig, GroupTier, Provenance, ProvenanceMap, SocketAccess, TieredConfig,
+    ConfigTierKind, EngenhoConfig, GroupTier, ProvenanceMap, SocketAccess, TieredConfig,
 };
 use engenho_control_server::AuditLog;
 use engenho_control_types::ops::{
@@ -38,17 +38,23 @@ use engenho_control_types::{
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use super::apply::ApplyEffect;
+use super::configure::{
+    ApplyOptions, leaf_path, reconfigure_refusal, restart_now, unreadable_overrides,
+};
 use super::logs::LogEntry;
 use super::names::{child_from_wire, child_kind, child_to_wire, death_to_wire, respawn_to_wire};
+use super::overrides::Change;
 use super::ring::{Page, Ring};
 use crate::child::{Child, ChildState};
 use crate::lifecycle::journal::IdentityRecord;
 use crate::lifecycle::supervisor::{CommandError, file_digest};
 use crate::lifecycle::{
     ConfigSource, DaemonEvent, DataDirSource, ExitIntent, Hold, Inspection, LifecycleState,
-    PendingApply, RefusedBecause, RuntimeFacts, Snapshot, StoreLock, SupervisorHandle,
+    PendingApply, RefusedBecause, ResolvedConfig, RuntimeFacts, Snapshot, StoreLock,
+    SupervisorHandle,
 };
-use crate::publish::{PublishRecord, SkipReason};
+use crate::publish::{KubeconfigTarget, PublishRecord, SkipReason};
 use crate::runtime::STORE_DIR;
 
 /// Carry a value whose serde shape is the spec's across to the spec's type.
@@ -103,7 +109,10 @@ pub struct DaemonControlParts {
 
 /// The daemon's [`EngenhoControl`].
 pub struct DaemonControl {
-    p: DaemonControlParts,
+    pub(super) p: DaemonControlParts,
+    /// One configuration change at a time, from planning to applied: two
+    /// changes planned against one generation cannot both commit.
+    pub(super) applying: tokio::sync::Mutex<()>,
 }
 
 /// The longest a long-poll may wait.
@@ -114,8 +123,11 @@ const DEFAULT_LIMIT: usize = 256;
 impl DaemonControl {
     /// The control surface over `parts`.
     #[must_use]
-    pub const fn new(parts: DaemonControlParts) -> Self {
-        Self { p: parts }
+    pub fn new(parts: DaemonControlParts) -> Self {
+        Self {
+            p: parts,
+            applying: tokio::sync::Mutex::new(()),
+        }
     }
 
     /// Whether this daemon serves `id` yet. Everything else is refused as
@@ -145,18 +157,18 @@ impl DaemonControl {
             | O::StopRuntime
             | O::RestartRuntime
             | O::RetryBoot
-            | O::ExitProcess => true,
-            O::ListConfigLeaves
+            | O::ExitProcess
+            | O::ListConfigLeaves
             | O::GetConfigLeaf
             | O::ListConfigOverrides
             | O::SetConfigLeaf
             | O::UnsetConfigLeaf
             | O::ClearConfigOverrides
             | O::ReloadConfig
-            | O::RestartChild
+            | O::PublishKubeconfig => true,
+            O::RestartChild
             | O::EnableDriver
             | O::DisableDriver
-            | O::PublishKubeconfig
             | O::CreateConfirmation
             | O::CancelConfirmation
             | O::RotateAdminToken
@@ -187,24 +199,32 @@ impl DaemonControl {
         self.p.supervisor.inspect().await.map_err(gone)
     }
 
-    /// The configuration in force: the running runtime's, or a fresh
-    /// resolution of the source when nothing runs.
+    /// The effective configuration: the declared file with the override
+    /// tier folded over it, resolved now.
+    pub(super) fn effective(&self) -> Result<ResolvedConfig, ControlError> {
+        self.p.source.resolve().map_err(|e| {
+            ControlError::refused_with(
+                RefusalReason::ConfigRejected,
+                format!("the configuration does not resolve: {e}"),
+                vec![
+                    "fix the declared file (the daemon retries a held boot by itself)".into(),
+                    "engenho ctl config set <leaf> --value <v>".into(),
+                ],
+            )
+        })
+    }
+
+    /// The configuration to describe the daemon by: the effective one, or
+    /// the running runtime's when the effective one does not resolve.
     fn configuration(
         &self,
         facts: Option<&RuntimeFacts>,
     ) -> Result<(EngenhoConfig, Option<ProvenanceMap>), ControlError> {
-        if let Some(facts) = facts {
-            return Ok((facts.config.clone(), facts.provenance.clone()));
+        match (self.effective(), facts) {
+            (Ok(resolved), _) => Ok((resolved.config, resolved.provenance)),
+            (Err(_), Some(facts)) => Ok((facts.config.clone(), facts.provenance.clone())),
+            (Err(err), None) => Err(err),
         }
-        (self.p.source)()
-            .map(|r| (r.config, r.provenance))
-            .map_err(|e| {
-                ControlError::refused_with(
-                    RefusalReason::ConfigRejected,
-                    format!("the configuration does not resolve: {e}"),
-                    vec!["fix the declared file, then `engenho ctl runtime retry`".into()],
-                )
-            })
     }
 
     fn pending(snapshot: &Snapshot) -> PendingApply {
@@ -309,13 +329,15 @@ impl DaemonControl {
     }
 
     fn identity(
+        &self,
         snapshot: &Snapshot,
         config: &EngenhoConfig,
         provenance: Option<&ProvenanceMap>,
     ) -> types::IdentityFacts {
+        let overrides = self.p.source.overrides().map(|store| store.path());
         let sourced = |path: &[&str], value: &str| types::SourcedValue {
             value: value.to_owned(),
-            tier: tier_of(provenance, path),
+            tier: tier_of(provenance, path, overrides),
         };
         let first_boot = match &snapshot.identity {
             None => types::FirstBootIdentity::NotRecorded,
@@ -437,7 +459,7 @@ fn refusal(err: CommandError) -> ControlError {
     }
 }
 
-fn internal(err: impl std::fmt::Display) -> ControlError {
+pub(super) fn internal(err: impl std::fmt::Display) -> ControlError {
     ControlError::blind(BlindReason::Internal, err.to_string())
 }
 
@@ -451,18 +473,29 @@ fn unsupported(id: OperationId, arrives: &str) -> ControlError {
     )
 }
 
-/// Which tier gave a leaf its value.
-fn tier_of(provenance: Option<&ProvenanceMap>, path: &[&str]) -> types::ConfigTierName {
-    match provenance
-        .and_then(|p| p.provenance_of(path))
-        .map(Provenance::tier)
-    {
-        Some(ConfigTierKind::Bare) => types::ConfigTierName::Bare,
-        Some(ConfigTierKind::Discovered) => types::ConfigTierName::Discovered,
-        Some(ConfigTierKind::Custom) => types::ConfigTierName::Declared,
+/// Which tier gave a leaf its value. Both the declared file and the override
+/// tier are shikumi `Custom` file layers; the file they came from tells them
+/// apart.
+pub(super) fn tier_of(
+    provenance: Option<&ProvenanceMap>,
+    path: &[&str],
+    overrides: Option<&std::path::Path>,
+) -> types::ConfigTierName {
+    let Some(p) = provenance.and_then(|p| p.provenance_of(path)) else {
+        return types::ConfigTierName::Default;
+    };
+    match p.tier() {
+        ConfigTierKind::Bare => types::ConfigTierName::Bare,
+        ConfigTierKind::Discovered => types::ConfigTierName::Discovered,
+        ConfigTierKind::Custom
+            if p.source().as_path().is_some() && p.source().as_path() == overrides =>
+        {
+            types::ConfigTierName::Override
+        }
+        ConfigTierKind::Custom => types::ConfigTierName::Declared,
         // shikumi's tier kind is non-exhaustive; the tiers engenho folds are
         // the four above, and a leaf no tier claims is the compiled default.
-        Some(ConfigTierKind::Default | _) | None => types::ConfigTierName::Default,
+        ConfigTierKind::Default | _ => types::ConfigTierName::Default,
     }
 }
 
@@ -544,6 +577,37 @@ fn event_kind(event: &DaemonEvent) -> Result<types::ControlEventKind, ControlErr
             child: child_to_wire(*child),
             cause: death_to_wire(*cause),
         },
+        DaemonEvent::ConfigApplied {
+            generation,
+            leaves,
+            effect,
+        } => types::ControlEventKind::ConfigApplied {
+            generation: *generation,
+            leaves: leaves.iter().map(wire).collect::<Result<_, _>>()?,
+            effect: effect_to_wire(effect)?,
+        },
+        DaemonEvent::KubeconfigPublished { record } => {
+            types::ControlEventKind::KubeconfigPublished {
+                record: wire(record)?,
+            }
+        }
+    })
+}
+
+/// The control API's spelling of what an applied change did.
+pub(super) fn effect_to_wire(effect: &ApplyEffect) -> Result<types::ApplyEffect, ControlError> {
+    Ok(match effect {
+        ApplyEffect::NoChange => types::ApplyEffect::NoChange,
+        ApplyEffect::PlannedOnly => types::ApplyEffect::PlannedOnly,
+        ApplyEffect::AppliedLive => types::ApplyEffect::AppliedLive,
+        ApplyEffect::Respawned { children } => types::ApplyEffect::Respawned {
+            children: children.iter().copied().map(child_to_wire).collect(),
+        },
+        ApplyEffect::RestartScheduled => types::ApplyEffect::RestartScheduled,
+        ApplyEffect::RestartDeferred { leaves } => types::ApplyEffect::RestartDeferred {
+            leaves: leaves.iter().map(wire).collect::<Result<_, _>>()?,
+        },
+        ApplyEffect::NextBoot => types::ApplyEffect::NextBoot,
     })
 }
 
@@ -660,7 +724,7 @@ impl EngenhoControl for DaemonControl {
             DataDirSource::CompiledDefault => types::DataDirSource::CompiledDefault,
         };
         Ok(types::InitState {
-            identity: Self::identity(&snapshot, &config, provenance.as_ref()),
+            identity: self.identity(&snapshot, &config, provenance.as_ref()),
             data_dir: types::DataDirFacts {
                 path: self.p.data_dir.display().to_string(),
                 source,
@@ -679,13 +743,13 @@ impl EngenhoControl for DaemonControl {
         _: GetConfigRequest,
     ) -> Result<types::ConfigView, ControlError> {
         let snapshot = self.snapshot();
-        let inspection = self.inspect().await?;
-        let (config, _) = self.configuration(inspection.runtime.as_ref())?;
+        let effective = self.effective()?;
+        let overrides = self.override_set()?;
         Ok(types::ConfigView {
-            effective_yaml: serde_yaml::to_string(&config).map_err(internal)?,
+            effective_yaml: serde_yaml::to_string(&effective.config).map_err(internal)?,
             declared: self.declared_source()?,
-            generation: 0,
-            override_count: 0,
+            generation: overrides.generation(),
+            override_count: u32::try_from(overrides.len()).unwrap_or(u32::MAX),
             pending: wire(&Self::pending(&snapshot))?,
         })
     }
@@ -702,9 +766,10 @@ impl EngenhoControl for DaemonControl {
             .runtime
             .as_ref()
             .is_some_and(|facts| facts.declared_digest != on_disk);
+        let (unified_diff, leaves) = self.drift()?;
         Ok(types::DriftReport {
-            unified_diff: String::new(),
-            leaves: Vec::new(),
+            unified_diff,
+            leaves,
             applied: wire(&Self::pending(&snapshot))?,
             declared_on_disk: if changed {
                 types::DriftReportDeclaredOnDisk::ChangedSinceLoad
@@ -717,20 +782,19 @@ impl EngenhoControl for DaemonControl {
     async fn list_config_leaves(
         &self,
         _: &Principal,
-        _: ListConfigLeavesRequest,
+        req: ListConfigLeavesRequest,
     ) -> Result<types::ConfigLeafList, ControlError> {
-        Err(unsupported(
-            OperationId::ListConfigLeaves,
-            "the override tier",
-        ))
+        Ok(types::ConfigLeafList {
+            leaves: self.leaves(req.prefix.as_deref())?,
+        })
     }
 
     async fn get_config_leaf(
         &self,
         _: &Principal,
-        _: GetConfigLeafRequest,
+        req: GetConfigLeafRequest,
     ) -> Result<types::ConfigLeaf, ControlError> {
-        Err(unsupported(OperationId::GetConfigLeaf, "the override tier"))
+        self.leaf(&leaf_path(&req.leaf)?)
     }
 
     async fn list_config_overrides(
@@ -738,48 +802,87 @@ impl EngenhoControl for DaemonControl {
         _: &Principal,
         _: ListConfigOverridesRequest,
     ) -> Result<types::OverrideList, ControlError> {
-        Err(unsupported(
-            OperationId::ListConfigOverrides,
-            "the override tier",
-        ))
+        let overrides = self.override_set()?;
+        if let Some(why) = overrides.unreadable() {
+            return Err(unreadable_overrides(why));
+        }
+        Ok(types::OverrideList {
+            generation: overrides.generation(),
+            entries: overrides
+                .entries()
+                .into_iter()
+                .map(|entry| {
+                    Ok(types::OverrideEntry {
+                        path: wire(&entry.path)?,
+                        value: entry.stored.value,
+                        set_by: entry.stored.set_by,
+                        set_at: entry.stored.set_at,
+                        durability: wire(&entry.durability)?,
+                    })
+                })
+                .collect::<Result<_, ControlError>>()?,
+        })
     }
 
     async fn set_config_leaf(
         &self,
-        _: &Principal,
-        _: SetConfigLeafRequest,
+        by: &Principal,
+        req: SetConfigLeafRequest,
     ) -> Result<types::ApplyReport, ControlError> {
-        Err(unsupported(OperationId::SetConfigLeaf, "the override tier"))
+        let path = leaf_path(&req.leaf)?;
+        self.set(by, path, req.body).await
     }
 
     async fn unset_config_leaf(
         &self,
         _: &Principal,
-        _: UnsetConfigLeafRequest,
+        req: UnsetConfigLeafRequest,
     ) -> Result<types::ApplyReport, ControlError> {
-        Err(unsupported(
-            OperationId::UnsetConfigLeaf,
-            "the override tier",
-        ))
+        let path = leaf_path(&req.leaf)?;
+        self.configure(
+            Some(Change::Unset { path }),
+            ApplyOptions {
+                dry_run: req.dry_run.unwrap_or(false),
+                restart_now: restart_now(req.restart_policy),
+                precondition: req.precondition_generation,
+            },
+        )
+        .await
     }
 
     async fn clear_config_overrides(
         &self,
         _: &Principal,
-        _: ClearConfigOverridesRequest,
+        req: ClearConfigOverridesRequest,
     ) -> Result<types::ApplyReport, ControlError> {
-        Err(unsupported(
-            OperationId::ClearConfigOverrides,
-            "the override tier",
-        ))
+        let body = req.body;
+        self.configure(
+            Some(Change::Clear {
+                prefix: body.prefix,
+            }),
+            ApplyOptions {
+                dry_run: body.dry_run,
+                restart_now: restart_now(body.restart_policy),
+                precondition: body.precondition_generation,
+            },
+        )
+        .await
     }
 
     async fn reload_config(
         &self,
         _: &Principal,
-        _: ReloadConfigRequest,
+        req: ReloadConfigRequest,
     ) -> Result<types::ApplyReport, ControlError> {
-        Err(unsupported(OperationId::ReloadConfig, "the override tier"))
+        self.configure(
+            None,
+            ApplyOptions {
+                dry_run: req.body.dry_run,
+                restart_now: restart_now(req.body.restart_policy),
+                precondition: None,
+            },
+        )
+        .await
     }
 
     async fn list_children(
@@ -878,12 +981,19 @@ impl EngenhoControl for DaemonControl {
     async fn publish_kubeconfig(
         &self,
         _: &Principal,
-        _: PublishKubeconfigRequest,
+        req: PublishKubeconfigRequest,
     ) -> Result<types::PublishRecord, ControlError> {
-        Err(unsupported(
-            OperationId::PublishKubeconfig,
-            "the override tier",
-        ))
+        let target: KubeconfigTarget = wire(&req.target)?;
+        let records = self
+            .p
+            .supervisor
+            .republish()
+            .await
+            .map_err(reconfigure_refusal)?;
+        records
+            .iter()
+            .find(|record| record.target == target)
+            .map_or_else(|| Err(internal("every target has a record")), wire)
     }
 
     async fn list_events(

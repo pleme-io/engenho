@@ -52,7 +52,7 @@ impl Switch {
 
     fn source(&self) -> engenho_runtime::lifecycle::ConfigSource {
         let cell = Arc::clone(&self.0);
-        Arc::new(move || {
+        engenho_runtime::lifecycle::ConfigSource::new(move || {
             cell.lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone()
@@ -242,7 +242,7 @@ async fn a_hold_keeps_a_relaunched_daemon_stopped_until_started() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let source = Switch::new(Some(config(tmp.path(), true))).source();
     {
-        let (run, handle) = supervise(tmp.path(), Arc::clone(&source), None);
+        let (run, handle) = supervise(tmp.path(), source.clone(), None);
         let up = until(&handle, "running", running).await;
         assert_eq!(up.previous_run, PreviousRun::FirstEver);
         assert!(up.identity.is_some(), "the first boot records its identity");
@@ -278,7 +278,7 @@ async fn one_daemon_per_data_directory() {
     let source = Switch::new(None).source();
     let (_first, _handle) = Supervisor::new(SupervisorConfig {
         data_dir: tmp.path().to_path_buf(),
-        source: Arc::clone(&source),
+        source: source.clone(),
         backend: None,
         declared: None,
     })
@@ -327,7 +327,7 @@ async fn a_change_to_the_declared_file_retries_a_held_boot() {
     std::fs::write(&declared, "broken\n").expect("write");
     let good = config(tmp.path(), false);
     let file = declared.clone();
-    let source: engenho_runtime::lifecycle::ConfigSource = Arc::new(move || {
+    let source = engenho_runtime::lifecycle::ConfigSource::new(move || {
         let text = std::fs::read_to_string(&file).map_err(|e| ConfigError::Parse(e.to_string()))?;
         if text.trim() == "fixed" {
             Ok(ResolvedConfig::untracked(good.clone()))

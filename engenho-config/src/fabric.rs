@@ -42,14 +42,15 @@ pub enum Fabric {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LegacyTeiaSection {
+    // `pub(crate)` so the mutability table can name every field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    servers: Option<Vec<String>>,
+    pub(crate) servers: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    cluster: Option<String>,
+    pub(crate) cluster: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    credentials_path: Option<String>,
+    pub(crate) credentials_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    connect_timeout_seconds: Option<u32>,
+    pub(crate) connect_timeout_seconds: Option<u32>,
 }
 
 /// A key engenho still accepts from operator config but no longer reads.
