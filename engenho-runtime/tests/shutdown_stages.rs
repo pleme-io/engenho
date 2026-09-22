@@ -165,7 +165,13 @@ async fn a_watch_held_open_over_tls_and_http2_does_not_keep_the_store() {
     let ca = std::fs::read(tmp.path().join("pki/ca.crt")).expect("cluster CA written");
     let token = std::fs::read_to_string(tmp.path().join("pki/admin.token"))
         .expect("runtime minted the admin bearer token");
+    // rustls explicitly: in a whole-workspace build cargo unifies reqwest's
+    // `default-tls` back on (the sui-store edge the root Cargo.toml names),
+    // and native-tls — Security.framework on macOS — cannot handshake with
+    // the cluster's Ed25519 certificates. Measured 2026-09-22: -9806
+    // "connection closed via error" under the full gate, green alone.
     let client = reqwest::Client::builder()
+        .use_rustls_tls()
         .add_root_certificate(reqwest::Certificate::from_pem(&ca).expect("CA PEM"))
         .build()
         .expect("client");
