@@ -504,4 +504,105 @@ mod tests {
         let p256 = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
         assert!(KeyMaterial::from_pem(&p256.serialize_pem()).is_err());
     }
+
+    /// A pin set for a test: exactly these keys.
+    #[derive(Debug)]
+    struct Admits(Vec<Spki>);
+
+    impl PinSet for Admits {
+        fn admits(&self, spki: &Spki) -> bool {
+            self.0.contains(spki)
+        }
+    }
+
+    /// One handshake between the two configurations, in memory — no
+    /// sockets, no runtime: the two connections hand each other their
+    /// flights until both are done, or one refuses.
+    fn handshake(
+        server: &rustls::ServerConfig,
+        client: &rustls::ClientConfig,
+    ) -> Result<(), String> {
+        let say = |e: &dyn std::error::Error| e.to_string();
+        let name = rustls::pki_types::ServerName::try_from(CERT_NAME)
+            .expect("a name")
+            .to_owned();
+        let mut c =
+            rustls::ClientConnection::new(Arc::new(client.clone()), name).map_err(|e| say(&e))?;
+        let mut s = rustls::ServerConnection::new(Arc::new(server.clone())).map_err(|e| say(&e))?;
+        for _ in 0..16 {
+            if !c.is_handshaking() && !s.is_handshaking() {
+                return Ok(());
+            }
+            let mut to_server = Vec::new();
+            while c.wants_write() {
+                c.write_tls(&mut to_server).map_err(|e| say(&e))?;
+            }
+            if !to_server.is_empty() {
+                s.read_tls(&mut to_server.as_slice()).map_err(|e| say(&e))?;
+                s.process_new_packets().map_err(|e| say(&e))?;
+            }
+            let mut to_client = Vec::new();
+            while s.wants_write() {
+                s.write_tls(&mut to_client).map_err(|e| say(&e))?;
+            }
+            if !to_client.is_empty() {
+                c.read_tls(&mut to_client.as_slice()).map_err(|e| say(&e))?;
+                c.process_new_packets().map_err(|e| say(&e))?;
+            }
+        }
+        Err("the handshake never finished".to_owned())
+    }
+
+    /// The server presents what [`Presented`] holds, and only a client
+    /// pinned to THAT key gets through: replacing it is what the next
+    /// handshake sees, and the key before it is then refused.
+    #[test]
+    fn what_the_server_presents_is_what_it_was_last_given() {
+        let client_key = KeyMaterial::generate().unwrap();
+        let (first, second) = (
+            KeyMaterial::generate().unwrap(),
+            KeyMaterial::generate().unwrap(),
+        );
+        let presented = Arc::new(Presented::new(&first).unwrap());
+        let admits: Arc<dyn PinSet> = Arc::new(Admits(vec![client_key.spki()]));
+        let server = server_config(Arc::clone(&presented), admits).unwrap();
+        let pinned_to = |key: &KeyMaterial| client_config(&client_key, vec![key.spki()]).unwrap();
+
+        assert!(handshake(&server, &pinned_to(&first)).is_ok());
+        assert!(
+            handshake(&server, &pinned_to(&second)).is_err(),
+            "a client pinned to a key the server never held got through"
+        );
+
+        presented.present(&second).unwrap();
+
+        assert!(
+            handshake(&server, &pinned_to(&second)).is_ok(),
+            "the replaced key is not presented"
+        );
+        assert!(
+            handshake(&server, &pinned_to(&first)).is_err(),
+            "the old key is still presented"
+        );
+    }
+
+    /// The other half of the same handshake: a client whose key the server
+    /// does not pin never gets through, whatever it presents.
+    #[test]
+    fn a_client_the_server_does_not_pin_is_refused() {
+        let identity = KeyMaterial::generate().unwrap();
+        let (known, stranger) = (
+            KeyMaterial::generate().unwrap(),
+            KeyMaterial::generate().unwrap(),
+        );
+        let admits: Arc<dyn PinSet> = Arc::new(Admits(vec![known.spki()]));
+        let server = server_config(
+            Arc::new(Presented::new(&identity).unwrap()),
+            Arc::clone(&admits),
+        )
+        .unwrap();
+        let pin = vec![identity.spki()];
+        assert!(handshake(&server, &client_config(&known, pin.clone()).unwrap()).is_ok());
+        assert!(handshake(&server, &client_config(&stranger, pin).unwrap()).is_err());
+    }
 }
