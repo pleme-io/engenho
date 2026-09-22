@@ -23,7 +23,6 @@ use crate::object_body::ObjectBody;
 use crate::params::{DryRun, ResumePoint, Selectors, body_precondition};
 use crate::pod_logs::{LogQuery, PodLogReader};
 use crate::scale::{Scale, project_scale};
-use crate::watch_end::Compacted;
 use crate::watch_start::{WatchRefusal, WatchStart};
 
 mod write_plan;

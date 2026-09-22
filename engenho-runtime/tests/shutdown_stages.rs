@@ -13,14 +13,14 @@
 //!   * the store has been quiesced by the time ownership is attempted, so a
 //!     failed stop still leaves the raft pump and the bookmark ticker
 //!     stopped rather than running on behind the leaked clone;
-//!   * (ignored, pending the apiserver) a client holding a WATCH open across
-//!     the stop does not keep the store alive.
+//!   * a client holding a WATCH open across the stop does not keep the store
+//!     alive, over plaintext HTTP/1 and over TLS with HTTP/2.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use engenho_config::{EngenhoConfig, KubeletBackendKind};
-use engenho_runtime::{Runtime, RuntimeError, ShutdownStage};
+use engenho_runtime::{Runtime, RuntimeError, ShutdownStage, StoreReleased};
 use engenho_store::{Quiesced, TaskStop};
 use shikumi::TieredConfig;
 
@@ -44,8 +44,10 @@ fn config(data_dir: &std::path::Path) -> EngenhoConfig {
 
 /// Boot, keep a store clone past the stop, and return the stop's result
 /// with the clone.
-async fn stop_while_holding_the_store() -> (Result<(), RuntimeError>, Arc<engenho_store::StoreMesh>)
-{
+async fn stop_while_holding_the_store() -> (
+    Result<StoreReleased, RuntimeError>,
+    Arc<engenho_store::StoreMesh>,
+) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let rt = Runtime::start(config(tmp.path()))
         .await
@@ -104,22 +106,21 @@ async fn a_failed_stop_has_already_quiesced_the_store() {
     release(held).await;
 }
 
-/// ★ KNOWN LEAK, MEASURED 2026-09-19, and the fix is not in this crate.
+/// A client holding a WATCH open across the stop does not keep the store.
 ///
-/// A client holding a WATCH open across the stop keeps the apiserver's
-/// router alive: axum 0.7's `serve` and axum-server 0.7 each run a
-/// connection in its own detached `tokio::spawn`, `ApiServer::shutdown`
-/// aborts only the serve task, and a watch body never ends by itself. The
-/// connection task therefore holds every `StoreBackedHandler`'s
-/// `Arc<StoreMesh>` for the life of the process. Measured on both the
-/// plaintext and the TLS path: `StoreStillShared { strong_count: 57, after:
-/// ApiserverStopped }` after the 2 s grace. In production that is every
-/// stop with kubectl, k9s or an in-cluster informer watching.
+/// Measured 2026-09-19, before the fix: axum 0.7's `serve` and axum-server
+/// 0.7 each ran a connection in its own detached `tokio::spawn`,
+/// `ApiServer::shutdown` aborted only the serve task, and a watch body never
+/// ends by itself — so the connection task held every
+/// `StoreBackedHandler`'s `Arc<StoreMesh>` for the life of the process:
+/// `StoreStillShared { strong_count: 57, after: ApiserverStopped }` on both
+/// the plaintext and the TLS path, i.e. every production stop with kubectl,
+/// k9s or an in-cluster informer watching.
 ///
-/// Ignored until `ApiServer::shutdown` ends open watches and awaits its
-/// connection tasks (engenho-apiserver/src/server.rs).
+/// Fixed by engenho-serve, which owns the connection tasks: a stop severs an
+/// open watch at the grace and AWAITS the severed task. The TLS variant
+/// below covers the HTTP/2 path kubectl actually uses.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "engenho-apiserver: ApiServer::shutdown leaves connection tasks (and open watches) running"]
 async fn a_watch_held_open_across_the_stop_does_not_keep_the_store() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let rt = Runtime::start(config(tmp.path()))
@@ -145,5 +146,49 @@ async fn a_watch_held_open_across_the_stop_does_not_keep_the_store() {
     assert!(
         stopped.is_ok(),
         "an open watch kept the store alive: {stopped:?}"
+    );
+}
+
+/// The same over TLS, where kubectl and client-go negotiate HTTP/2: each
+/// request is a stream of one connection, driven by tasks the HTTP/2 server
+/// spawns per stream. The stop must still leave nothing holding the store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_watch_held_open_over_tls_and_http2_does_not_keep_the_store() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut cfg = config(tmp.path());
+    cfg.runtime.tls.enabled = true;
+    // Stay out of $HOME: the data_dir copy is still written.
+    cfg.runtime.kubeconfig_publish_path = String::new();
+    let rt = Runtime::start(cfg).await.expect("runtime boots with TLS");
+    let port = rt.local_addr().port();
+
+    let ca = std::fs::read(tmp.path().join("pki/ca.crt")).expect("cluster CA written");
+    let token = std::fs::read_to_string(tmp.path().join("pki/admin.token"))
+        .expect("runtime minted the admin bearer token");
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(&ca).expect("CA PEM"))
+        .build()
+        .expect("client");
+    let mut watch = client
+        .get(format!(
+            "https://127.0.0.1:{port}/api/v1/namespaces/default/configmaps?watch=1"
+        ))
+        .bearer_auth(token.trim())
+        .send()
+        .await
+        .expect("watch opens over TLS");
+    assert_eq!(watch.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        watch.version(),
+        reqwest::Version::HTTP_2,
+        "the TLS path negotiates HTTP/2, like kubectl"
+    );
+    let _ = tokio::time::timeout(Duration::from_millis(300), watch.chunk()).await;
+
+    let stopped = rt.shutdown().await;
+    drop(watch);
+    assert!(
+        stopped.is_ok(),
+        "an open HTTP/2 watch kept the store alive: {stopped:?}"
     );
 }

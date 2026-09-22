@@ -304,8 +304,8 @@ impl ClusterCa {
 
 /// The TLS material the server boots with: the server-cert chain (leaf +
 /// CA) PEM and the server private key PEM, plus the CA cert PEM for
-/// kubeconfig emission. `from_pem` for axum-server's `RustlsConfig`
-/// consumes `cert_chain_pem` + `key_pem`.
+/// kubeconfig emission. The server's rustls `ServerConfig` is built from
+/// `cert_chain_pem` + `key_pem` (`server::build_server_config`).
 pub struct TlsMaterial {
     /// Server leaf cert followed by the CA cert, PEM-concatenated — the
     /// chain rustls presents at handshake.

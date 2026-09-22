@@ -1,27 +1,38 @@
-//! `ApiServer` — the public lifecycle wrapper. Boots an Axum server on a
+//! `ApiServer` — the public lifecycle wrapper. Boots an Axum router on a
 //! TCP listener, serves the K8s API surface, terminates gracefully.
 //!
 //! Two serve paths, selected by whether [`TlsMaterial`] is supplied:
 //!
-//!   * **TLS (the production default).** `axum_server::bind_rustls` over
-//!     a rustls `ServerConfig` built from the issued server-cert chain +
-//!     key. Real kubectl negotiates HTTPS against a `server: https://…`
-//!     cluster and validates the presented cert against its SANs, so this
-//!     is the load-bearing half of local-kubectl compatibility.
-//!   * **Plaintext (tests + explicit dev opt-out).** The original
-//!     `axum::serve` path, kept for `tls.enabled = false`.
+//!   * **TLS (the production default).** A rustls `ServerConfig` built from
+//!     the issued server-cert chain + key. Real kubectl negotiates HTTPS
+//!     against a `server: https://…` cluster and validates the presented
+//!     cert against its SANs, so this is the load-bearing half of
+//!     local-kubectl compatibility.
+//!   * **Plaintext (tests + explicit dev opt-out).** For `tls.enabled =
+//!     false`.
 //!
-//! Both paths preserve the same graceful-shutdown semantics: signal a
-//! shutdown, give in-flight requests a bounded 2s grace, then sever any
-//! still-open long-poll WATCH streams (a K8s apiserver severs watches on
-//! shutdown; clients reconnect).
+//! Both run on [`engenho_serve::serve`], which OWNS every connection task.
+//! A shutdown signals every connection, gives in-flight requests a bounded
+//! 2s grace, then severs any still-open long-poll WATCH streams (a K8s
+//! apiserver severs watches on shutdown; clients reconnect) — and awaits
+//! the severed tasks, so when [`ApiServer::shutdown`] returns no connection
+//! holds the router, and through it the store.
+//!
+//! That last clause is the reason for the owned loop. axum 0.7's `serve` and
+//! axum-server 0.7 run connections in detached tasks: aborting the serve
+//! task left a watching client's connection alive, holding every
+//! `StoreBackedHandler`'s `Arc<StoreMesh>` for the life of the process
+//! (measured 2026-09-19, `StoreStillShared { strong_count: 57 }`).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
-use axum_server::Handle;
+use engenho_serve::{Plain, ServeReport, StopHandle, Tls, stop_channel};
+use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
+use tracing::{error, info};
 
 use crate::handler::ResourceHandler;
 use crate::pki::{PkiError, TlsMaterial};
@@ -31,7 +42,11 @@ mod tls_acceptor;
 
 /// How long graceful shutdown waits for in-flight requests to drain
 /// before severing open long-poll watches.
-const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
+/// How long a TLS handshake may take before the connection is dropped.
+/// The same bound axum-server applied by default.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
@@ -54,20 +69,16 @@ engenho_substrate::impl_error_kind! {
     }
 }
 
-/// How the server severs its background task on shutdown — one variant
-/// per serve path so the two stay symmetric (signal-then-grace) without
-/// duplicating the lifecycle logic.
-enum ShutdownGate {
-    /// Plaintext path: the `axum::serve` graceful-shutdown oneshot.
-    Plain(tokio::sync::oneshot::Sender<()>),
-    /// TLS path: `axum_server::Handle::graceful_shutdown`.
-    Tls(Handle),
-}
-
+/// A bound, serving apiserver.
+///
+/// Dropping it without [`Self::shutdown`] also stops the server (the stop
+/// handle goes with it), so a boot that fails after binding does not leave
+/// an apiserver serving behind it — but only `shutdown` waits for the
+/// connections to be gone.
 pub struct ApiServer {
     addr: SocketAddr,
-    task: JoinHandle<Result<(), std::io::Error>>,
-    gate: ShutdownGate,
+    task: JoinHandle<ServeReport>,
+    stop: StopHandle,
 }
 
 impl ApiServer {
@@ -92,7 +103,7 @@ impl ApiServer {
     /// Spawn the server over a pre-built [`RouterState`]. Identical to
     /// [`Self::start`] except the caller owns the `RouterState` + can RETAIN
     /// a clone of it — the load-bearing seam for CRD serving: the runtime
-    /// builds ONE RouterState, hands a clone here AND a clone to the
+    /// builds ONE `RouterState`, hands a clone here AND a clone to the
     /// `CrdController`'s [`crate::handler::RouterHandlerSink`], so a
     /// controller-driven `register()` mutates the SAME live `ArcSwap` table
     /// this server dispatches on (the swap is visible to in-flight requests).
@@ -114,44 +125,43 @@ impl ApiServer {
         }
     }
 
-    /// Plaintext serve path (tls.enabled = false). The original
-    /// `axum::serve` lifecycle.
+    /// Plaintext serve path (tls.enabled = false).
     async fn start_plain(addr: SocketAddr, router: Router) -> Result<Self, ServerError> {
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(ServerError::Bind)?;
         let bound_addr = listener.local_addr().map_err(ServerError::Bind)?;
 
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(async move {
-            axum::serve(listener, router)
-                .with_graceful_shutdown(async move {
-                    let _ = rx.await;
-                })
-                .await
-        });
+        let (stop_handle, stop) = stop_channel();
+        let task = tokio::spawn(engenho_serve::serve(
+            listener,
+            Plain,
+            move |_: &TcpStream, _: &SocketAddr| router.clone(),
+            stop,
+            SHUTDOWN_GRACE,
+        ));
 
         Ok(Self {
             addr: bound_addr,
             task,
-            gate: ShutdownGate::Plain(tx),
+            stop: stop_handle,
         })
     }
 
     /// TLS serve path (the production default). Builds the rustls
-    /// `ServerConfig` OURSELVES (so the OPTIONAL client-cert verifier can be
-    /// injected — `RustlsConfig::from_pem` builds a no-client-auth config and
-    /// can't), then serves through a custom acceptor that threads the verified
-    /// peer cert into request extensions.
+    /// `ServerConfig` OURSELVES so the OPTIONAL client-cert verifier can be
+    /// injected, then threads each connection's verified peer cert into its
+    /// requests' extensions.
     ///
     /// When `material.client_verifier` is `Some`, the server REQUESTS a client
     /// cert (verified against the cluster CA) but `allow_unauthenticated` keeps
     /// the handshake completing for a no-cert client — so existing
-    /// token/anonymous kubectl keeps connecting. The custom acceptor reads
-    /// `peer_certificates()` post-handshake, parses the leaf into a
-    /// [`crate::pki::VerifiedClientCert`], and injects it as a request
-    /// extension; the authn middleware's X509 stage reads it. When `None`, the
-    /// server runs with no client auth (the pre-authn behavior).
+    /// token/anonymous kubectl keeps connecting. After the handshake the
+    /// leaf is read off the session ([`tls_acceptor::verified_client_cert`])
+    /// and every request of the connection carries it as a
+    /// [`crate::pki::VerifiedClientCert`] extension; the authn middleware's
+    /// X509 stage reads it. When `None`, the server runs with no client auth
+    /// (the pre-authn behavior).
     async fn start_tls(
         addr: SocketAddr,
         router: Router,
@@ -167,41 +177,32 @@ impl ApiServer {
         // race), which is fine.
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        // Bind a std listener first so we can resolve the `:0` ephemeral
-        // port BEFORE handing the socket to axum-server (which otherwise
-        // hides the bound port behind its own accept loop).
-        let std_listener = std::net::TcpListener::bind(addr).map_err(ServerError::Bind)?;
-        std_listener
-            .set_nonblocking(true)
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
             .map_err(ServerError::Bind)?;
-        let bound_addr = std_listener.local_addr().map_err(ServerError::Bind)?;
+        let bound_addr = listener.local_addr().map_err(ServerError::Bind)?;
 
-        // Build the ServerConfig ourselves so we can inject the OPTIONAL client
-        // verifier. The leaf chain + key are identical to the `from_pem` path
-        // (same DER, same single-cert call) — the only change is the client
-        // auth posture.
         let server_config = build_server_config(&material)?;
-        let rustls_config =
-            axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(server_config));
+        let handshake = Tls::new(Arc::new(server_config), TLS_HANDSHAKE_TIMEOUT);
 
-        // Wrap the standard RustlsAcceptor so the verified peer cert is read
-        // post-handshake + injected into each request's extensions.
-        let acceptor = tls_acceptor::PeerCertAcceptor::new(rustls_config.clone());
-
-        let handle = Handle::new();
-        let serve_handle = handle.clone();
-        let task = tokio::spawn(async move {
-            axum_server::from_tcp(std_listener)
-                .acceptor(acceptor)
-                .handle(serve_handle)
-                .serve(router.into_make_service())
-                .await
-        });
+        let (stop_handle, stop) = stop_channel();
+        let task = tokio::spawn(engenho_serve::serve(
+            listener,
+            handshake,
+            move |stream: &tokio_rustls::server::TlsStream<TcpStream>, _: &SocketAddr| {
+                tls_acceptor::CertInjectingService::new(
+                    router.clone(),
+                    tls_acceptor::verified_client_cert(stream),
+                )
+            },
+            stop,
+            SHUTDOWN_GRACE,
+        ));
 
         Ok(Self {
             addr: bound_addr,
             task,
-            gate: ShutdownGate::Tls(handle),
+            stop: stop_handle,
         })
     }
 
@@ -210,38 +211,32 @@ impl ApiServer {
         self.addr
     }
 
-    /// Initiate graceful shutdown + await the server task.
+    /// Stop serving and wait until no connection is left.
     ///
-    /// Signals graceful shutdown, then waits a bounded grace for in-flight
-    /// requests to drain. Long-poll WATCH streams never drain on their own
-    /// (they stay open until the client disconnects), so a K8s apiserver
-    /// SEVERS them on shutdown — after the grace elapses we abort the serve
-    /// task, dropping any open watch connections. This is the correct
-    /// production behavior (clients reconnect) AND keeps shutdown bounded
-    /// instead of hanging forever on an open watch.
+    /// Signals every connection to shut down gracefully, waits a bounded
+    /// grace for in-flight requests to drain, then severs what is still open.
+    /// Long-poll WATCH streams never drain on their own (they stay open until
+    /// the client disconnects), so a K8s apiserver SEVERS them on shutdown;
+    /// clients reconnect. The severed connection tasks are awaited, not just
+    /// aborted: when this returns, nothing a connection captured — the
+    /// router, its handlers, their `Arc<StoreMesh>` — is still alive.
     ///
     /// # Errors
     ///
     /// Never returns `Err` today — kept fallible so a future serve path can
-    /// surface a real shutdown failure without a signature change.
+    /// surface a real shutdown failure without a signature change. A serve
+    /// task that panicked is logged, not returned: the stop it was asked for
+    /// has happened either way.
     pub async fn shutdown(self) -> Result<(), ServerError> {
-        match self.gate {
-            ShutdownGate::Plain(tx) => {
-                let _ = tx.send(());
-            }
-            ShutdownGate::Tls(handle) => {
-                // axum-server drains for the grace, then drops the rest.
-                handle.graceful_shutdown(Some(SHUTDOWN_GRACE));
-            }
-        }
-        let abort = self.task.abort_handle();
-        if tokio::time::timeout(SHUTDOWN_GRACE, self.task)
-            .await
-            .is_err()
-        {
-            // Open long-poll watches didn't drain within the grace —
-            // sever them by aborting the serve task (no leaked task).
-            abort.abort();
+        self.stop.stop();
+        match self.task.await {
+            Ok(report) => info!(
+                open = report.open_at_stop,
+                drained = report.drained,
+                severed = report.severed,
+                "apiserver stopped"
+            ),
+            Err(err) => error!(error = %err, "apiserver serve task ended abnormally"),
         }
         Ok(())
     }

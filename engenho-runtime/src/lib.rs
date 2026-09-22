@@ -151,6 +151,7 @@ mod panics;
 #[cfg(test)]
 mod read_census;
 mod rebind;
+mod release;
 mod runtime;
 mod runtime_health;
 #[cfg(test)]
@@ -167,6 +168,7 @@ pub use etcd_facade::MeshEtcdStore;
 pub use health::{CONTINUOUS_AFTER, Health, ProposeRate, ProposeWindow, Pulse, SPAN, Windows};
 pub use node_registration::NodeRegistrationError;
 pub use panics::PanicCounter;
+pub use release::{BootFailed, BootUnwind, StoreReleased};
 pub use runtime::Runtime;
 pub use runtime_health::{
     RELIST_PERIOD, RELIST_THRESHOLD, Relist, RelistFault, RelistLedger, Relisted, Relister,

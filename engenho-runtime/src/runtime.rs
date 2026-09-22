@@ -53,6 +53,7 @@ use crate::node_lease::NodeLease;
 use crate::node_registration::{HostOwned, register_node};
 use crate::panics::PanicCounter;
 use crate::rebind::serve_rebinding;
+use crate::release::{BootFailed, BootUnwind, StoreReleased};
 use crate::runtime_health::RuntimeHealthSource;
 
 /// The assembled single-node runtime. Owns the store spine, the
@@ -95,14 +96,9 @@ impl Runtime {
     /// leadership failure, apiserver bind failure, or an unparseable listen
     /// addr.
     pub async fn start(config: EngenhoConfig) -> Result<Self, RuntimeError> {
-        // Every field read once, before anything is probed or written: a
-        // field this runtime cannot honour is refused here (I21).
-        let boot = BootConfig::read(&config)?;
-        // Fail LOUDLY here if the configured runtime cannot be reached, rather
-        // than discovering it one warn-per-tick at a time forever.
-        preflight_backend(&boot)?;
-        let backend = build_backend(&boot)?;
-        Self::start_inner(config, boot, backend).await
+        Self::boot(config)
+            .await
+            .map_err(BootFailed::into_logged_error)
     }
 
     /// Boot with an explicit pre-built [`ContainerRuntime`] (e.g.
@@ -117,15 +113,68 @@ impl Runtime {
         config: EngenhoConfig,
         backend: Arc<dyn ContainerRuntime>,
     ) -> Result<Self, RuntimeError> {
-        let boot = BootConfig::read(&config)?;
+        Self::boot_with_backend(config, backend)
+            .await
+            .map_err(BootFailed::into_logged_error)
+    }
+
+    /// [`Runtime::start`], saying what a failed boot did about the store.
+    ///
+    /// A boot that fails after opening the store does not leave it behind: it
+    /// stops what it had started (the apiserver, if it was bound) and
+    /// terminates the store, so another boot in the same process can open it.
+    /// [`BootFailed::unwind`] says whether that worked
+    /// ([`BootUnwind::Released`]) — the fact a supervisor that retries needs.
+    ///
+    /// # Errors
+    ///
+    /// [`BootFailed`], carrying the [`RuntimeError`] [`Runtime::start`]
+    /// would have returned.
+    pub async fn boot(config: EngenhoConfig) -> Result<Self, BootFailed> {
+        let never = |error: RuntimeError| BootFailed {
+            error,
+            unwind: BootUnwind::NeverOpened,
+        };
+        // Every field read once, before anything is probed or written: a
+        // field this runtime cannot honour is refused here (I21).
+        let boot = BootConfig::read(&config).map_err(|e| never(e.into()))?;
+        // Fail LOUDLY here if the configured runtime cannot be reached, rather
+        // than discovering it one warn-per-tick at a time forever.
+        preflight_backend(&boot).map_err(never)?;
+        let backend = build_backend(&boot).map_err(never)?;
         Self::start_inner(config, boot, backend).await
     }
 
+    /// [`Runtime::start_with_backend`], saying what a failed boot did about
+    /// the store (see [`Runtime::boot`]).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Runtime::boot`].
+    pub async fn boot_with_backend(
+        config: EngenhoConfig,
+        backend: Arc<dyn ContainerRuntime>,
+    ) -> Result<Self, BootFailed> {
+        let boot = BootConfig::read(&config).map_err(|e| BootFailed {
+            error: e.into(),
+            unwind: BootUnwind::NeverOpened,
+        })?;
+        Self::start_inner(config, boot, backend).await
+    }
+
+    /// Boot over a read config: open the store, then [`Self::assemble`]
+    /// everything over it. When the assembly fails, it has already dropped
+    /// (and, for the apiserver, stopped) everything it built, so this holds
+    /// the store alone and can take it back.
     async fn start_inner(
         config: EngenhoConfig,
         boot: BootConfig,
         backend: Arc<dyn ContainerRuntime>,
-    ) -> Result<Self, RuntimeError> {
+    ) -> Result<Self, BootFailed> {
+        let never = |error: RuntimeError| BootFailed {
+            error,
+            unwind: BootUnwind::NeverOpened,
+        };
         // 0. Count every panic in the process from here on (T2.7): the hook
         //    chains to whatever was installed before it, and installs once
         //    however many runtimes start.
@@ -143,7 +192,7 @@ impl Runtime {
         // 1. Validate the whole config (every section + cross-section).
         //    Every field was already read into `boot`; what it read and does
         //    not run is said once, here.
-        config.validate()?;
+        config.validate().map_err(|e| never(e.into()))?;
         for not_run in &boot.not_run {
             info!(field = not_run.field(), why = %not_run, "config read, not run");
         }
@@ -151,8 +200,49 @@ impl Runtime {
         // 2. Bring up the store spine. Durable = restart-safe
         //    start_or_resume; ephemeral = in-memory start +
         //    initialize_singleton (test path).
-        let store = boot_store(&boot).await?;
+        let store = boot_store(&boot).await.map_err(never)?;
 
+        // 3–6. Everything else is built over the store. On failure the
+        //    assembly has dropped what it built and stopped the apiserver if
+        //    it had bound, so `store` is this frame's alone to take back.
+        match Self::assemble(&boot, &backend, &store, panics, &would_reject).await {
+            Ok(Assembled {
+                apiserver,
+                children,
+                health,
+            }) => Ok(Self {
+                config,
+                store,
+                apiserver,
+                children,
+                panics,
+                health,
+                would_reject,
+                backend,
+            }),
+            Err(error) => {
+                let unwind = unwind_failed_boot(store).await;
+                Err(BootFailed { error, unwind })
+            }
+        }
+    }
+
+    /// Steps 3–6 of the boot: leadership, scheduler, health, node
+    /// registration, seeds, PKI, the apiserver and the children, over an
+    /// opened store.
+    ///
+    /// Everything it builds is a local of this function, so an early return
+    /// drops it all. The one thing that outlives a drop is the apiserver's
+    /// serve task, which holds the router — and through it the store — until
+    /// it has severed its connections, so a failure after the bind stops the
+    /// apiserver explicitly before returning.
+    async fn assemble(
+        boot: &BootConfig,
+        backend: &Arc<dyn ContainerRuntime>,
+        store: &Arc<StoreMesh>,
+        panics: PanicCounter,
+        would_reject: &Arc<WouldRejectLedger>,
+    ) -> Result<Assembled, RuntimeError> {
         // 3. Wait for raft leadership — MUST precede any propose.
         let timeout_s = boot.leadership_timeout_seconds;
         if !store
@@ -180,13 +270,13 @@ impl Runtime {
         //     built ONCE and given to the drivers as well, so a tick the
         //     driver logs BLOCKED is the tick liveness reports stalled.
         let windows = boot.windows(scheduler.fallback_interval());
-        let health = Arc::new(Health::new(&store, windows, panics));
+        let health = Arc::new(Health::new(store, windows, panics));
 
         // 4. Register THIS node so the scheduler has a target: create its
         //    Node if absent, else merge only the host-owned fields — a
         //    restart never undoes a cordon, a taint or an operator's label.
         let node_name = &boot.node_name;
-        register_node(&store, node_name, &HostOwned::measured(node_name)).await?;
+        register_node(store, node_name, &HostOwned::measured(node_name)).await?;
 
         // 4.5. Seed the bootstrap RBAC policy (Brick B) — cluster-admin +
         //    system:discovery + system:basic-user + system:public-info-viewer
@@ -198,21 +288,21 @@ impl Runtime {
         //    Seed the four system namespaces FIRST: a namespace must exist
         //    before anything namespaced can live in it, and `default` is what
         //    every client opens to.
-        seed_system_namespaces(&store).await?;
+        seed_system_namespaces(store).await?;
         //    Then the `kubernetes` Service in `default`. It must follow the
         //    namespaces (it lives in one) and precede the apiserver bind, so
         //    the ClusterIP allocator sees .1 as held before any user Service
         //    can be created.
-        seed_kubernetes_service(&store, &boot).await?;
-        seed_bootstrap_rbac(&store).await?;
+        seed_kubernetes_service(store, boot).await?;
+        seed_bootstrap_rbac(store).await?;
         //    Then the default StorageClass. It must precede the apiserver bind
         //    for the same reason the others do: a PVC created in the first
         //    moments of a cluster's life should provision like any other, not
         //    hang until something happens to seed a class later.
-        seed_default_storage_class(&store).await?;
+        seed_default_storage_class(store).await?;
         //    Then the snapshot CRDs, so the VolumeSnapshot controller spawned
         //    below is watching kinds this cluster actually serves.
-        seed_snapshot_crds(&store).await?;
+        seed_snapshot_crds(store).await?;
 
         // 5. Bind the apiserver, backed by the same store.
         let listen_addr: SocketAddr =
@@ -353,7 +443,7 @@ impl Runtime {
         ))
         .with_authenticator(authenticator)
         .with_authorizer(authorizer)
-        .with_would_reject_ledger(Arc::clone(&would_reject))
+        .with_would_reject_ledger(Arc::clone(would_reject))
         // Health and the runtime's metric families, derived from observation
         // (T2.8). Installed here with the ledger, before any clone, for the
         // same reason.
@@ -397,7 +487,14 @@ impl Runtime {
         //     system:masters). Without it (shouldn't happen when TLS is on) it
         //     falls back to the anonymous-token kubeconfig.
         if let Some(ca_pem) = ca_cert_pem.as_deref() {
-            write_boot_kubeconfig(&boot, bound_addr, ca_pem, admin_material.as_ref())?;
+            if let Err(err) =
+                write_boot_kubeconfig(boot, bound_addr, ca_pem, admin_material.as_ref())
+            {
+                // The apiserver is serving; stop it and wait for its
+                // connections, or they keep the store the unwind needs back.
+                let _ = apiserver.shutdown().await;
+                return Err(err);
+            }
         }
 
         // 6. Spawn every child in the catalog (T2.6): the controller /
@@ -407,7 +504,7 @@ impl Runtime {
         //    listeners, into ONE owned set that `main` watches. Returns the
         //    Arc<Kubelet> so the Pod `/log` reader can be wired in.
         let (children, kubelet) =
-            spawn_children(&boot, &store, &backend, scheduler, &handler_sink, windows);
+            spawn_children(boot, store, backend, scheduler, &handler_sink, windows);
         info!(count = children.len(), "children spawned");
         // From here the health endpoints report every spawned child, each
         // Unknown until its first beat.
@@ -423,20 +520,15 @@ impl Runtime {
         //     atomically (same swap mechanism the CRD sink uses).
         let log_reader: Arc<dyn engenho_apiserver::PodLogReader> =
             Arc::new(KubeletLogReader { kubelet });
-        if let Some(pod_handler) = build_pod_log_handler(&store, &admission, log_reader) {
+        if let Some(pod_handler) = build_pod_log_handler(store, &admission, log_reader) {
             router_state_for_logs.register(pod_handler);
             info!("registered Pod /log handler (in-process kubelet log reader)");
         }
 
-        Ok(Self {
-            config,
-            store,
+        Ok(Assembled {
             apiserver,
             children,
-            panics,
             health,
-            would_reject,
-            backend,
         })
     }
 
@@ -521,11 +613,12 @@ impl Runtime {
     /// charged to the first stage that owed sole ownership and did not have
     /// it ([`ShutdownStage::owes_sole_ownership`]).
     ///
-    /// Known residual: a client holding a WATCH open across the stop keeps
-    /// the apiserver's router alive in a connection task the apiserver does
-    /// not stop, and this returns `StoreStillShared` charged to
-    /// [`ShutdownStage::ApiserverStopped`]. Pinned by an ignored test in
-    /// `tests/shutdown_stages.rs`; the fix belongs to the apiserver.
+    /// A client holding a WATCH open across the stop does not hold the store
+    /// up: the apiserver severs it at the grace and awaits the severed
+    /// connection (engenho-serve), pinned by `tests/shutdown_stages.rs`.
+    ///
+    /// On success it returns [`StoreReleased`]: the store is terminated and
+    /// its lock is free, so another runtime can boot over it in this process.
     ///
     /// # Errors
     ///
@@ -535,7 +628,7 @@ impl Runtime {
     /// holds every applied entry for the next boot to replay),
     /// [`RuntimeError::StoreStillShared`] if a store clone leaked past
     /// shutdown, or [`RuntimeError::Store`] on `terminate` failure.
-    pub async fn shutdown(self) -> Result<(), RuntimeError> {
+    pub async fn shutdown(self) -> Result<StoreReleased, RuntimeError> {
         let Self {
             mut children,
             apiserver,
@@ -606,7 +699,73 @@ impl Runtime {
             }
         })?;
         store.terminate().await?;
-        Ok(())
+        Ok(StoreReleased::minted())
+    }
+}
+
+/// What [`Runtime::assemble`] built over the store.
+struct Assembled {
+    apiserver: ApiServer,
+    children: Children,
+    health: Arc<Health>,
+}
+
+/// Take back the store of a boot that failed after opening it.
+///
+/// By the time this runs the assembly has dropped everything it built and
+/// stopped the apiserver, so the caller's `Arc` should be the only one. The
+/// store's own tasks are stopped first, as in [`Runtime::shutdown`], so a
+/// failed unwrap still leaves nothing running behind the leaked clone.
+async fn unwind_failed_boot(store: Arc<StoreMesh>) -> BootUnwind {
+    let quiesced = store.quiesce().await;
+    if quiesced.any_panicked() {
+        error!(
+            rpc_pump = ?quiesced.rpc_pump,
+            bookmark_ticker = ?quiesced.bookmark_ticker,
+            "a store background task had panicked before the failed boot unwound"
+        );
+    }
+    match Arc::try_unwrap(store) {
+        Ok(mesh) => match mesh.terminate().await {
+            Ok(()) => {
+                info!("failed boot unwound: store terminated and released");
+                BootUnwind::Released(StoreReleased::minted())
+            }
+            Err(err) => {
+                error!(error = %err, "failed boot unwound, but terminating the store failed");
+                BootUnwind::TerminateFailed(Box::new(err.into()))
+            }
+        },
+        Err(shared) => {
+            let strong_count = Arc::strong_count(&shared);
+            error!(
+                strong_count,
+                "failed boot could not release its store: something still holds it"
+            );
+            BootUnwind::StillShared { strong_count }
+        }
+    }
+}
+
+impl BootFailed {
+    /// The boot's error, for the callers of [`Runtime::start`] that only
+    /// need that. An unwind that did not release the store is logged here,
+    /// since those callers cannot see it.
+    fn into_logged_error(self) -> RuntimeError {
+        match &self.unwind {
+            BootUnwind::NeverOpened | BootUnwind::Released(_) => {}
+            BootUnwind::StillShared { strong_count } => error!(
+                strong_count,
+                error = %self.error,
+                "boot failed and its store is still held"
+            ),
+            BootUnwind::TerminateFailed(err) => error!(
+                terminate_error = %err,
+                error = %self.error,
+                "boot failed and its store could not be terminated"
+            ),
+        }
+        self.error
     }
 }
 

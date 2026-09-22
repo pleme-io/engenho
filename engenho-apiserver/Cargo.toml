@@ -21,7 +21,6 @@ tokio              = { workspace = true }
 tracing            = { workspace = true }
 anyhow             = { workspace = true }
 axum               = { workspace = true }
-axum-server        = { workspace = true }
 tower              = { workspace = true }
 utoipa             = { workspace = true }
 futures            = { workspace = true }
@@ -43,9 +42,12 @@ ed25519-dalek      = { workspace = true }
 # public constant would let anyone holding the source mint a token for any
 # ServiceAccount — including one bound to cluster-admin.
 getrandom          = "0.2"
-# Same line axum-server 0.7 pulls; we wrap its RustlsAcceptor (which yields a
-# tokio_rustls::server::TlsStream) to read the verified peer cert post-handshake.
+# engenho-serve's TLS handshake yields a tokio_rustls::server::TlsStream; the
+# verified peer cert is read off it post-handshake (server/tls_acceptor.rs).
 tokio-rustls       = { version = "0.26", default-features = false, features = ["ring"] }
+# The serve loop that owns every connection task (so a stop severs and awaits
+# open watches instead of leaking them with the store they hold).
+engenho-serve      = { workspace = true }
 time               = { workspace = true }
 # Production WebhookCaller — POST the AdmissionReview to a mutating webhook over
 # HTTPS. The trait seam keeps engenho-controllers reqwest-free; the live impl

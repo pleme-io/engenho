@@ -61,6 +61,7 @@ const SHIPPED: &[&str] = &[
     "engenho-mcp",
     "engenho-runtime",
     "engenho-scheduler",
+    "engenho-serve",
     "engenho-store",
     "engenho-substrate",
     "engenho-substrate-core",

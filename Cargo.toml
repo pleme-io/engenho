@@ -29,6 +29,7 @@ members = [
   "engenho-cni",
   "engenho-csi",
   "engenho-etcd",
+  "engenho-serve",
   "engenho-oracle",
 ]
 
@@ -58,6 +59,7 @@ engenho-kube-client    = { path = "engenho-kube-client", version = "0.53.118" }
 engenho-kube-proto     = { path = "engenho-kube-proto", version = "0.53.118" }
 engenho-store          = { path = "engenho-store", version = "0.53.118" }
 engenho-apiserver      = { path = "engenho-apiserver", version = "0.53.118" }
+engenho-serve          = { path = "engenho-serve", version = "0.53.118" }
 engenho-runtime        = { path = "engenho-runtime", version = "0.53.118" }
 engenho-scheduler      = { path = "engenho-scheduler", version = "0.53.118" }
 engenho-controllers    = { path = "engenho-controllers", version = "0.53.118" }
@@ -149,13 +151,13 @@ openraft               = { version = "=0.9.22", features = ["serde", "storage-v2
 fjall                  = "2"
 
 # Apiserver TLS — self-generated, data_dir-persisted cluster CA + a
-# per-boot server cert (rcgen), served over HTTPS via axum-server's
-# rustls acceptor. rustls is pinned to the 0.23 line fleet-wide and the
-# `ring` provider is installed explicitly at boot, so the process has one
-# provider whatever is linked and rustls never has to guess between
-# aws-lc-rs and ring. `tls-rustls-no-provider` keeps the provider
-# choice in our hands (we install ring); rcgen needs x509-parser to
-# reload a persisted CA from its PEM.
+# per-boot server cert (rcgen), served over HTTPS by engenho-serve's
+# tokio-rustls handshake. rustls is pinned to the 0.23 line fleet-wide and
+# the `ring` provider is installed explicitly at boot, so the process has
+# one provider whatever is linked and rustls never has to guess between
+# aws-lc-rs and ring. rcgen needs x509-parser to reload a persisted CA from
+# its PEM. (axum-server was dropped 2026-09-22: it ran each connection in a
+# detached task, so a stop could not end an open WATCH — see engenho-serve.)
 #
 # The rustls line names back what `default-features = false` turns off, the
 # way the reqwest line above does. rustls 0.23's defaults are `aws_lc_rs`,
@@ -180,7 +182,6 @@ fjall                  = "2"
 # is used are different questions. ci/no-c-tls.tlisp records each edge as a
 # tls:CARRIERS row and fails on any other.
 rcgen                  = { version = "0.13", features = ["pem", "x509-parser"] }
-axum-server            = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
 rustls                 = { version = "0.23", default-features = false, features = [
   "ring",
   "std",
