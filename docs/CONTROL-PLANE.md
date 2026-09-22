@@ -413,4 +413,17 @@ Deviations the spec settled while being authored:
 | P5 | Remote mTLS with SPKI pins | done (the fleet's Nix wiring: the `pleme-io/nix` repo) |
 | P6 | Child control: respawn, driver switches and listener moves in place | done |
 | P7 | Gated destructive re-init: confirmation handshake, attic, control identity rotation | done |
-| P8 | MCP tools, completions, docs | — |
+| P8 | MCP tools, docs | done — completions pending (below) |
+
+`pending-completions: no consumer for nested verbs`. Shell completion of
+`engenho ctl <resource> <verb>` has nothing in the fleet's shell stack to
+read it yet, measured 2026-09-22: skim-tab (`skim-tab/src/specs.rs`,
+`SpecRegistry::lookup`) consults only a spec's first level, and only to
+decorate candidates with a glyph and a description; frostmourne's
+`defcompletion` forms are flat and wait on a `frost-complete` dispatcher that
+has not landed (`frostmourne/lisp/40-completions.lisp`). Emitting a nested spec
+now would be an artifact nobody reads. What is done: sekkei 0.2 keeps an
+operation's vendor extensions (`Operation::extensions`), so a generator can
+group this API by its `x-engenho-cli` spelling instead of guessing from tags
+and operation ids. When the dispatcher lands, the completions are generated
+from the same `CATALOG` the client and the MCP tools are.
