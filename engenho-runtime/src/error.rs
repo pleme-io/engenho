@@ -180,6 +180,33 @@ pub enum RuntimeError {
     /// This node's own Node object could not be registered at boot.
     #[error(transparent)]
     NodeRegistration(#[from] crate::node_registration::NodeRegistrationError),
+
+    /// The boot was asked to stop, and stopped at a phase boundary (or out of
+    /// its wait for leadership). It unwinds like any other failed boot.
+    #[error("boot cancelled during {phase}")]
+    BootCancelled {
+        /// The phase the boot had reached.
+        phase: crate::boot::BootPhase,
+    },
+
+    /// The configuration resolves `runtime.data_dir` somewhere other than
+    /// where this daemon keeps its control state.
+    ///
+    /// The data directory is fixed for the life of a daemon process: its
+    /// control state (the boot journal, the hold marker, the lock that makes
+    /// it the only daemon there) was placed before the first boot, and a boot
+    /// over a different directory would open a store that state knows nothing
+    /// about. Moving it is a relaunch.
+    #[error(
+        "runtime.data_dir resolves to {resolved:?}, but this daemon keeps its state in {control:?}; \
+         the data directory is fixed for the life of the process (exit with relaunch to move it)"
+    )]
+    DataDirMoved {
+        /// Where this daemon's control state lives.
+        control: std::path::PathBuf,
+        /// Where the configuration now puts the data directory.
+        resolved: std::path::PathBuf,
+    },
 }
 
 engenho_substrate::impl_error_kind! {
@@ -199,6 +226,8 @@ engenho_substrate::impl_error_kind! {
         (Kubeconfig(_)) => "kubeconfig",
         { KubeconfigIo { .. } } => "kubeconfig_io",
         (NodeRegistration(_)) => "node_registration",
+        { BootCancelled { .. } } => "boot_cancelled",
+        { DataDirMoved { .. } } => "data_dir_moved",
     }
 }
 

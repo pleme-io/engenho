@@ -21,6 +21,7 @@ use std::path::Path;
 
 use engenho_store::data_dir_lock::{DataDirLock, LockError};
 
+use crate::boot::BootPhase;
 use crate::error::RuntimeError;
 use crate::runtime::STORE_DIR;
 
@@ -89,6 +90,8 @@ impl BootUnwind {
 pub struct BootFailed {
     /// Why the boot failed.
     pub error: RuntimeError,
+    /// The phase it failed in.
+    pub phase: BootPhase,
     /// What was done about the store it had opened.
     pub unwind: BootUnwind,
 }

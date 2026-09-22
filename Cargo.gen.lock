@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "898b93f04cf086223f753d895ce3dbcf031962fee80e0cc0515b64a088a87b50",
+  "cargo_lock_sha256": "aa04610c2f925a8d80bc690449711b43c03bec81b89053d27e122cee35ffe21a",
   "manifest_sha256": {
     "Cargo.toml": "ac76d743abb5dcd5d0448707cdb0997ce19cff75e08c129de1ed6c1e733112b0",
     "engenho-apiserver/Cargo.toml": "911801a9f6ef9c250e67f36bfe7116e83420e1413276f088533b53c75be53050",
@@ -22,7 +22,7 @@
     "engenho-mcp/Cargo.toml": "dc06fc92995d436359c7da1e38aff4fa8fbd4ed1bdb9f70d815f1e0d27163086",
     "engenho-oracle/Cargo.toml": "9b0da2a6c1d469c28eb0617b8d71df0b0bf6db7751596956e0bb74a6ac979984",
     "engenho-revoada/Cargo.toml": "08cfd6e45e8acfb75f3073e3a70a9a11a9c33575c43509d0199b1e73bb8012f9",
-    "engenho-runtime/Cargo.toml": "b4d974d57676d22934e4bc8fac33a3633658ef56b9c971637ba133be87f8df20",
+    "engenho-runtime/Cargo.toml": "e1d601f02abca584ac9371358d74ba2b2b42b36acd3e5f480e3ede634efb00ad",
     "engenho-scheduler/Cargo.toml": "b8e178bbb3012942524cd91c4f5e3c1160e11d2ec81eb81ce5f18bd1504426d1",
     "engenho-serve/Cargo.toml": "e91e4b03ebb3c2537969e30bce65f374c368c8e5a668006970524d2687023cd6",
     "engenho-store/Cargo.toml": "c1630fdd51788287b06e85c72280af36a0953aa3b94f751dd64137ae2c59d404",
@@ -6532,6 +6532,18 @@
             "tree": "target"
           },
           {
+            "name": "chrono",
+            "package_key": "chrono-0.4.44",
+            "kind": "normal",
+            "features": [
+              "serde"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
             "name": "ed25519_dalek",
             "package_key": "ed25519-dalek-2.2.0",
             "kind": "normal",
@@ -6625,6 +6637,16 @@
             "tree": "target"
           },
           {
+            "name": "engenho_serve",
+            "package_key": "engenho-serve-0.53.118",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
             "name": "engenho_store",
             "package_key": "engenho-store-0.53.118",
             "kind": "normal",
@@ -6665,8 +6687,40 @@
             "tree": "target"
           },
           {
+            "name": "serde",
+            "package_key": "serde-1.0.228",
+            "kind": "normal",
+            "features": [
+              "derive"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
             "name": "serde_json",
             "package_key": "serde_json-1.0.150",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "serde_yaml",
+            "package_key": "serde_yaml-0.9.34+deprecated",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "shikumi",
+            "package_key": "shikumi-0.1.821",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,

@@ -7,10 +7,13 @@
 //!
 //! ## Subcommands
 //!
-//! * `engenho` (no args) — boot the daemon: init tracing → discover
-//!   config → boot the Runtime → wait for SIGTERM or SIGINT (see
-//!   [`StopCause`]) → graceful shutdown.
-//!   On boot (TLS-enabled) the daemon writes `data_dir/kubeconfig`.
+//! * `engenho` (no args) — run the daemon: init tracing → place the control
+//!   state (`data_dir/control/`) → a [`Supervisor`] boots the Runtime and
+//!   stays up above it, retrying a failed boot on backoff (or holding it
+//!   until the declared config changes) → SIGTERM or SIGINT (see
+//!   [`StopCause`]) drains the runtime → exit 0. An exit requested with
+//!   relaunch exits 75 for the service manager to start a fresh process.
+//!   On boot (TLS-enabled) the runtime writes `data_dir/kubeconfig`.
 //! * `engenho daemon` — explicit alias for the bare no-arg form. Runs
 //!   the EXACT same `run_daemon` path. This is the verb the substrate
 //!   `mkModuleTrio` factory invokes (`daemonSubcommand = "daemon"`) when
@@ -48,12 +51,13 @@ compile_error!("the engenho daemon is unix-only: its stop path is SIGTERM/SIGINT
 
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use engenho_apiserver::load_or_generate_ca;
-use engenho_config::{ConfigTier, EngenhoConfig, TieredConfig, render_provenance};
+use engenho_config::{ConfigError, ConfigTier, EngenhoConfig, TieredConfig, render_provenance};
 use engenho_kube_client::{emit_kubeconfig, emit_kubeconfig_with_admin};
-use engenho_runtime::Runtime;
 use engenho_runtime::census::{self, ApiSource, Catalog, DataDirSource, Predicate};
+use engenho_runtime::lifecycle::{ControlBootstrap, ExitIntent, Supervisor, SupervisorConfig};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tracing_subscriber::EnvFilter;
 
@@ -260,7 +264,11 @@ async fn main() -> anyhow::Result<()> {
     // We avoid pulling clap for two verbs (the daemon path stays the
     // default).
     match Command::parse(std::env::args().skip(1))? {
-        Command::Daemon => run_daemon().await,
+        Command::Daemon => {
+            let intent = run_daemon().await?;
+            tracing::info!(?intent, code = intent.code(), "engenho exiting");
+            std::process::exit(intent.code())
+        }
         Command::Kubeconfig(flags) => run_kubeconfig(flags.into_iter()),
         Command::ConfigShow(tier) => run_config_show(tier),
         Command::ConfigDiff(from, to) => run_config_diff(&from, &to),
@@ -276,8 +284,10 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Boot the engenho daemon and run until SIGTERM or SIGINT.
-async fn run_daemon() -> anyhow::Result<()> {
+/// Run the engenho daemon: a [`Supervisor`] that stays up above the runtime,
+/// booting it, retrying it and stopping it, until SIGTERM, SIGINT or an
+/// exit request ends the process. Returns how it should end.
+async fn run_daemon() -> anyhow::Result<ExitIntent> {
     // 1. Tracing — env-filtered, info default for our crates.
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -294,9 +304,46 @@ async fn run_daemon() -> anyhow::Result<()> {
     // from here on neither SIGTERM nor SIGINT can kill the process mid-boot.
     let mut stop = StopSignals::subscribe()?;
 
-    // 2. Config via the sealed progressive-discovery fold
-    //    (bare → discovered[DiscoveryLayer] → prescribed_default → operator
-    //    file overlay), each effective leaf carrying typed Provenance.
+    // 2. Where the daemon keeps its own state, decided even when the config
+    //    is broken — that is the case the supervisor stays up for.
+    let bootstrap = ControlBootstrap::discover();
+    tracing::info!(
+        data_dir = %bootstrap.data_dir.display(),
+        source = ?bootstrap.data_dir_source,
+        "control state"
+    );
+
+    // 3. The supervisor. Each boot resolves the config afresh, inside its
+    //    own phase, so a config that does not resolve is a failed boot the
+    //    daemon reports and retries — not a dead process.
+    let (supervisor, handle) = Supervisor::new(SupervisorConfig {
+        data_dir: bootstrap.data_dir,
+        source: Arc::new(resolve_declared_config),
+        backend: None,
+        declared: bootstrap.declared,
+    })?;
+
+    // 4. A stop signal is an exit request: the supervisor drains the runtime
+    //    (if it is up) and the process exits 0. The signal streams live
+    //    OUTSIDE the loop, so a signal that lands while a request is in
+    //    flight stays recorded and is not lost.
+    tokio::spawn(async move {
+        loop {
+            let cause = stop.next().await;
+            tracing::info!(signal = %cause, "shutdown signal received");
+            if let Err(err) = handle.exit(ExitIntent::Halt).await {
+                tracing::warn!(signal = %cause, error = %err, "exit request not taken");
+            }
+        }
+    });
+
+    Ok(supervisor.run().await)
+}
+
+/// The config one boot runs on, via the sealed progressive-discovery fold
+/// (bare → discovered[`DiscoveryLayer`] → `prescribed_default` → operator
+/// file overlay), each effective leaf carrying typed provenance.
+fn resolve_declared_config() -> Result<EngenhoConfig, ConfigError> {
     let (config, provenance) = EngenhoConfig::resolve_progressively()?.into_parts();
     tracing::info!(
         cluster = %config.cluster.name,
@@ -323,28 +370,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         node_name_from = node_name_tier,
         "config provenance",
     );
-
-    // 3. Boot every subsystem over one StoreMesh. On boot the Runtime
-    //    writes data_dir/kubeconfig when TLS is enabled.
-    let mut runtime = Runtime::start(config).await?;
-    tracing::info!(addr = %runtime.local_addr(), "engenho up — apiserver bound");
-
-    // 4. Run until a stop signal, watching the runtime's children meanwhile.
-    //    A child's task cannot finish normally, so one that ends panicked or
-    //    was aborted: the runtime marks it Dead and logs it at ERROR as it
-    //    returns here. There is no respawn — the loop goes back to watching.
-    //    The signal streams live OUTSIDE the loop, so a signal that lands
-    //    while a death is being recorded stays recorded and is not lost.
-    let cause = loop {
-        tokio::select! {
-            cause = stop.next() => break cause,
-            _dead = runtime.next_dead_child() => {}
-        }
-    };
-    tracing::info!(signal = %cause, "shutdown signal received");
-    runtime.shutdown().await?;
-    tracing::info!(signal = %cause, "engenho stopped cleanly");
-    Ok(())
+    Ok(config)
 }
 
 /// `engenho kubeconfig [--data-dir <d>] [--server <url>]` — load the

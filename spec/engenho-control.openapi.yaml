@@ -995,7 +995,8 @@ components:
       enum: [operator_request, held_at_startup, reinit_complete]
     AfterDrain:
       type: string
-      enum: [stop, restart, exit, reinit]
+      description: What a draining runtime becomes once its store is released. A re-initialization runs from rest (Stopped or Failed), never out of a drain.
+      enum: [stop, restart, exit]
     RestartPolicy:
       type: string
       description: "What to do with a RestartRuntime-class change: `defer` records RestartNeeded; `now` restarts."

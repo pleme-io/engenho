@@ -45,10 +45,23 @@ engenho-kube-client = { workspace = true }
 # ErrorKind trait + impl_error_kind! macro — stable .kind() tags.
 engenho-substrate   = { workspace = true }
 
+serde               = { workspace = true }
 serde_json          = { workspace = true }
+# The lenient `runtime.data_dir` read the supervisor falls back on when the
+# declared config does not resolve (lifecycle/bootstrap.rs).
+serde_yaml          = { workspace = true }
+# Timestamp arithmetic for the lifecycle (a failed boot's next retry). Already
+# in the graph through engenho-types, same features.
+chrono              = { version = "0.4", features = ["serde"] }
 thiserror           = { workspace = true }
 tokio               = { workspace = true }
 tracing             = { workspace = true }
+# The supervisor watches the declared config file (symlink-aware, so a Nix
+# rebuild that swaps the store path is seen) to retry a boot held on it.
+shikumi             = "0.1.0"
+# The stop pair a supervised boot is cancelled through (and the serve loop the
+# control listeners run on).
+engenho-serve       = { workspace = true }
 # The KubeletLogReader adapter implements the apiserver's async PodLogReader trait.
 async-trait         = { workspace = true }
 # OS entropy for the bootstrap admin bearer token (no plaintext secret in the
@@ -71,8 +84,9 @@ engenho-etcd = { path = "../engenho-etcd" }
 openraft = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
-shikumi = "0.1.0"
 tempfile = "3"
+# The lifecycle machine's store invariant, over arbitrary event sequences.
+proptest = { workspace = true }
 # `tokio::time::pause`: the listener rebind tests walk minutes of backoff in
 # virtual time. A feature of the tokio already in the graph, not a new crate.
 tokio = { workspace = true, features = ["test-util"] }

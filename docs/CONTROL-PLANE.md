@@ -44,6 +44,45 @@ engenho-mcp                     — control tools (observe; mutate behind --allo
   in-flight requests for a grace, then severs and awaits what is left —
   which is what made a clean in-process restart possible (P0a).
 
+## The lifecycle (P1)
+
+`engenho daemon` is a supervisor (`engenho-runtime/src/lifecycle/`) above a
+restartable runtime. Its state is one pure machine, `DaemonLifecycle`, on
+`maquina::StateMachine`:
+
+| State | The store | Leaves on |
+|---|---|---|
+| `resolving` | not opened | start → `booting`; hold marker → `stopped` |
+| `booting{attempt, phase}` | may be open | booted → `running`; failed → `failed` (or `wedged`); stop/restart/exit → `draining` |
+| `running{attempt, pending}` | open | stop/restart/exit → `draining` |
+| `draining{then}` | open | released → `stopped` / next boot / `exiting`; still held → `wedged` |
+| `stopped{reason, epoch}` | released | start → `booting` |
+| `failed{report, retry}` | released | retry, a declared-file change, or a due backoff → `booting` |
+| `wedged{cause}` | held, unreleasable | exit only |
+| `exiting{intent}` | — | terminal: `halt` exits 0, `relaunch` exits 75 |
+
+* **A boot starts only over a released store.** The supervisor's runtime slot
+  is typed: a boot starts from `Idle`, entered only when this process holds no
+  store. The machine's side is checked over arbitrary event sequences
+  (`lifecycle::machine::tests::the_store_is_never_held_at_rest`).
+* **A failed boot is classified, not retried blindly.** `FailureClass::of` is
+  one exhaustive match over `RuntimeError` (and the store's and apiserver's
+  errors): a held port, a busy store or an absent container runtime back off
+  (1 s doubling to 60 s); a config the runtime refuses is held until the
+  declared file changes or an operator retries.
+* **A boot is 16 named phases** (`BootPhase`, `resolve_config` →
+  `adopt_health`), each entered through a `BootRecorder` that reports it to the
+  supervisor. A stop is honoured at phase boundaries and inside the leadership
+  wait, up to the apiserver bind; after the bind the boot finishes and the stop
+  is a shutdown (the children it spawned are not aborted by a drop).
+* **What survives the process**, in `data_dir/control/` (0700): the boot
+  journal (last 16 attempts, per-phase timing), `run.json` (whether dying now
+  would leave the store released — read back as `previous_run`), the
+  first-boot identity, the `hold` marker, and `daemon.lock` (one daemon per
+  data directory). The data directory itself is placed before any boot, even
+  when the config does not resolve (`ControlBootstrap`), and is fixed for the
+  life of the process.
+
 ## Remote trust: SPKI pins, not the cluster CA
 
 The control listener does **not** trust engenho's cluster CA. It has its own
@@ -122,7 +161,7 @@ Deviations the spec settled while being authored:
 |---|---|---|
 | P0a | Clean store handoff: owned connection tasks (`engenho-serve`), `shutdown → StoreReleased`, boot unwind | done |
 | P0b | Spec, `engenho-control-types`, forge-gen spike | done |
-| P1 | Supervisor, boot-phase journal, stay-up on failure, retry classes | — |
+| P1 | Supervisor, boot-phase journal, stay-up on failure, retry classes | done |
 | P2 | Local UDS, observe tier, `engenho ctl` | — |
 | P3 | Operate verbs, authorization tiers, audit chain | — |
 | P4 | Persisted config overrides, sealed mutability, drift | — |

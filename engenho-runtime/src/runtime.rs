@@ -45,6 +45,7 @@ use engenho_types::generated_v1_34::types::{NamespaceSpec, NamespaceStatus};
 use engenho_types::kind::GroupVersionKind;
 use tracing::{error, info, warn};
 
+use crate::boot::{BootKind, BootPhase, BootRecorder};
 use crate::boot_config::{ApiserverTls, BootConfig};
 use crate::child::{Child, ChildTask, Children, DeadChild, Driver, Listener, TickLoop, Wiring};
 use crate::error::{RuntimeError, ShutdownStage, StrongCounts};
@@ -76,6 +77,8 @@ pub struct Runtime {
     /// `engenho_would_reject_total{gate,reason}`, so a gate that counts
     /// anywhere else is a gate no scrape shows. See [`Runtime::would_reject`].
     would_reject: Arc<WouldRejectLedger>,
+    /// Whether this boot created the store, resumed it, or runs in memory.
+    boot_kind: BootKind,
     /// The backend the runtime was started with. Nothing reads it: the
     /// kubelet holds its own clone, and that clone is what keeps the backend
     /// alive for its ticks. A test passes its own clone to
@@ -131,18 +134,26 @@ impl Runtime {
     /// [`BootFailed`], carrying the [`RuntimeError`] [`Runtime::start`]
     /// would have returned.
     pub async fn boot(config: EngenhoConfig) -> Result<Self, BootFailed> {
-        let never = |error: RuntimeError| BootFailed {
-            error,
-            unwind: BootUnwind::NeverOpened,
-        };
-        // Every field read once, before anything is probed or written: a
-        // field this runtime cannot honour is refused here (I21).
-        let boot = BootConfig::read(&config).map_err(|e| never(e.into()))?;
-        // Fail LOUDLY here if the configured runtime cannot be reached, rather
-        // than discovering it one warn-per-tick at a time forever.
-        preflight_backend(&boot).map_err(never)?;
-        let backend = build_backend(&boot).map_err(never)?;
-        Self::start_inner(config, boot, backend).await
+        Self::boot_recorded(config, &mut BootRecorder::silent()).await
+    }
+
+    /// [`Runtime::boot`], entering each [`BootPhase`] through `rec`: the
+    /// phases are reported to whoever supervises the boot, and a stop
+    /// requested through `rec` ends the boot at the next phase boundary
+    /// before the apiserver binds (see [`BootRecorder`]).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Runtime::boot`]; [`BootFailed::phase`] names the phase the
+    /// boot failed in.
+    pub async fn boot_recorded(
+        config: EngenhoConfig,
+        rec: &mut BootRecorder,
+    ) -> Result<Self, BootFailed> {
+        // The caller resolved the config; entering the phase records it.
+        rec.enter(BootPhase::ResolveConfig)
+            .map_err(|e| rec.failed(e))?;
+        Self::boot_resolved(config, None, rec).await
     }
 
     /// [`Runtime::start_with_backend`], saying what a failed boot did about
@@ -155,11 +166,36 @@ impl Runtime {
         config: EngenhoConfig,
         backend: Arc<dyn ContainerRuntime>,
     ) -> Result<Self, BootFailed> {
-        let boot = BootConfig::read(&config).map_err(|e| BootFailed {
-            error: e.into(),
-            unwind: BootUnwind::NeverOpened,
-        })?;
-        Self::start_inner(config, boot, backend).await
+        let mut rec = BootRecorder::silent();
+        rec.enter(BootPhase::ResolveConfig)
+            .map_err(|e| rec.failed(e))?;
+        Self::boot_resolved(config, Some(backend), &mut rec).await
+    }
+
+    /// Boot over a resolved config, with `rec` already in
+    /// [`BootPhase::ResolveConfig`]. `backend` is built from the config when
+    /// absent.
+    pub(crate) async fn boot_resolved(
+        config: EngenhoConfig,
+        backend: Option<Arc<dyn ContainerRuntime>>,
+        rec: &mut BootRecorder,
+    ) -> Result<Self, BootFailed> {
+        // Every field read once, before anything is probed or written: a
+        // field this runtime cannot honour is refused here (I21).
+        rec.enter(BootPhase::ReadBootConfig)
+            .map_err(|e| rec.failed(e))?;
+        let boot = BootConfig::read(&config).map_err(|e| rec.failed(e.into()))?;
+        rec.enter(BootPhase::PreflightBackend)
+            .map_err(|e| rec.failed(e))?;
+        let backend = if let Some(backend) = backend {
+            backend
+        } else {
+            // Fail LOUDLY here if the configured runtime cannot be reached,
+            // rather than discovering it one warn-per-tick at a time forever.
+            preflight_backend(&boot).map_err(|e| rec.failed(e))?;
+            build_backend(&boot).map_err(|e| rec.failed(e))?
+        };
+        Self::start_inner(config, boot, backend, rec).await
     }
 
     /// Boot over a read config: open the store, then [`Self::assemble`]
@@ -170,11 +206,8 @@ impl Runtime {
         config: EngenhoConfig,
         boot: BootConfig,
         backend: Arc<dyn ContainerRuntime>,
+        rec: &mut BootRecorder,
     ) -> Result<Self, BootFailed> {
-        let never = |error: RuntimeError| BootFailed {
-            error,
-            unwind: BootUnwind::NeverOpened,
-        };
         // 0. Count every panic in the process from here on (T2.7): the hook
         //    chains to whatever was installed before it, and installs once
         //    however many runtimes start.
@@ -192,7 +225,9 @@ impl Runtime {
         // 1. Validate the whole config (every section + cross-section).
         //    Every field was already read into `boot`; what it read and does
         //    not run is said once, here.
-        config.validate().map_err(|e| never(e.into()))?;
+        rec.enter(BootPhase::ValidateConfig)
+            .map_err(|e| rec.failed(e))?;
+        config.validate().map_err(|e| rec.failed(e.into()))?;
         for not_run in &boot.not_run {
             info!(field = not_run.field(), why = %not_run, "config read, not run");
         }
@@ -200,12 +235,14 @@ impl Runtime {
         // 2. Bring up the store spine. Durable = restart-safe
         //    start_or_resume; ephemeral = in-memory start +
         //    initialize_singleton (test path).
-        let store = boot_store(&boot).await.map_err(never)?;
+        rec.enter(BootPhase::OpenStore).map_err(|e| rec.failed(e))?;
+        let (store, boot_kind) = boot_store(&boot).await.map_err(|e| rec.failed(e))?;
+        rec.observe(boot_kind);
 
         // 3–6. Everything else is built over the store. On failure the
         //    assembly has dropped what it built and stopped the apiserver if
         //    it had bound, so `store` is this frame's alone to take back.
-        match Self::assemble(&boot, &backend, &store, panics, &would_reject).await {
+        match Self::assemble(&boot, &backend, &store, panics, &would_reject, rec).await {
             Ok(Assembled {
                 apiserver,
                 children,
@@ -218,11 +255,17 @@ impl Runtime {
                 panics,
                 health,
                 would_reject,
+                boot_kind,
                 backend,
             }),
             Err(error) => {
+                let phase = rec.current();
                 let unwind = unwind_failed_boot(store).await;
-                Err(BootFailed { error, unwind })
+                Err(BootFailed {
+                    error,
+                    phase,
+                    unwind,
+                })
             }
         }
     }
@@ -236,22 +279,23 @@ impl Runtime {
     /// serve task, which holds the router — and through it the store — until
     /// it has severed its connections, so a failure after the bind stops the
     /// apiserver explicitly before returning.
+    ///
+    /// A stop requested through `rec` is honoured up to the bind. From there
+    /// on the boot finishes: the children it spawns are not aborted by a
+    /// drop, and unwinding a bound apiserver with its children IS a
+    /// shutdown, so whoever cancelled shuts the runtime down instead.
     async fn assemble(
         boot: &BootConfig,
         backend: &Arc<dyn ContainerRuntime>,
         store: &Arc<StoreMesh>,
         panics: PanicCounter,
         would_reject: &Arc<WouldRejectLedger>,
+        rec: &mut BootRecorder,
     ) -> Result<Assembled, RuntimeError> {
         // 3. Wait for raft leadership — MUST precede any propose.
-        let timeout_s = boot.leadership_timeout_seconds;
-        if !store
-            .wait_for_leadership(Duration::from_secs(u64::from(timeout_s)))
-            .await
-        {
-            return Err(RuntimeError::LeadershipTimeout { seconds: timeout_s });
-        }
-        info!(node = %boot.node_name, "store reached leadership");
+        rec.enter(BootPhase::AwaitLeadership)?;
+        await_leadership(store, boot, rec).await?;
+        rec.enter(BootPhase::BuildScheduler)?;
 
         // 3a. The scheduler, from every `scheduler.*` field (T5.8):
         //     `Scheduler::from_config` is that section's one reader. It scopes
@@ -275,8 +319,10 @@ impl Runtime {
         // 4. Register THIS node so the scheduler has a target: create its
         //    Node if absent, else merge only the host-owned fields — a
         //    restart never undoes a cordon, a taint or an operator's label.
+        rec.enter(BootPhase::RegisterNode)?;
         let node_name = &boot.node_name;
         register_node(store, node_name, &HostOwned::measured(node_name)).await?;
+        rec.enter(BootPhase::SeedCluster)?;
 
         // 4.5. Seed the bootstrap RBAC policy (Brick B) — cluster-admin +
         //    system:discovery + system:basic-user + system:public-info-viewer
@@ -304,7 +350,9 @@ impl Runtime {
         //    below is watching kinds this cluster actually serves.
         seed_snapshot_crds(store).await?;
 
-        // 5. Bind the apiserver, backed by the same store.
+        // 5. Bind the apiserver, backed by the same store. The listen address
+        //    is read with the PKI: the server certificate is issued for it.
+        rec.enter(BootPhase::IssuePki)?;
         let listen_addr: SocketAddr =
             boot.listen_addr
                 .parse()
@@ -314,64 +362,11 @@ impl Runtime {
                 })?;
 
         // 5a. Build the TLS material BEFORE binding (when tls.enabled).
-        //     load-or-generate the data_dir-persisted cluster CA, then
-        //     issue a server cert whose SANs cover loopback + node name +
-        //     the concrete listen IP (skipping 0.0.0.0/:: which aren't
-        //     valid SAN IPs — loopback access rides on 127.0.0.1/localhost).
-        //     `ca_cert_pem` is captured for the boot-time kubeconfig write.
-        //
-        //     For authn: also issue + persist the admin CLIENT cert, build the
-        //     OPTIONAL client-cert verifier (rooted at the SAME CA), attach the
-        //     verifier to the server material, and capture the admin material
-        //     for the admin-cert kubeconfig.
-        let mut ca_cert_pem: Option<String> = None;
-        let mut admin_material: Option<ClientMaterial> = None;
-        let tls: Option<TlsMaterial> = if let ApiserverTls::SelfIssued { extra_sans } = &boot.tls {
-            let ca =
-                load_or_generate_ca(&boot.data_dir).map_err(|e| RuntimeError::Server(e.into()))?;
-            // ── ★ A PUBLIC CA MAY NOT SERVE A REACHABLE ADDRESS ──────────
-            // See `RuntimeError::PublicCaOnReachableAddress`. The danger is not
-            // the CA by itself and not the address by itself; it is the pair,
-            // so the pair is what is refused. A pre-seed cluster stays usable on
-            // loopback and cannot be exposed by accident.
-            if ca.is_publicly_derivable() && !is_loopback_only(listen_addr) {
-                return Err(RuntimeError::PublicCaOnReachableAddress {
-                    listen_addr: boot.listen_addr.clone(),
-                    pki_dir: boot.data_dir.join("pki").display().to_string(),
-                });
-            }
-            ca_cert_pem = Some(ca.cert_pem().to_string());
-            let listen_ip = san_listen_ip(listen_addr);
-            // Classify the operator's declared SANs before anything binds, so a
-            // typo is a failed unit with the offending value in the message
-            // rather than a certificate that serves happily and verifies for
-            // nobody. See `RuntimeError::ExtraSan` for why this is checked here
-            // and not lazily at handshake time.
-            let extra_sans = server_sans(extra_sans, &boot.advertise_address)?;
-            let material = issue_server_material(
-                &ca,
-                &ServerSanInputs {
-                    node_name: &boot.node_name,
-                    listen_ip,
-                    extra_sans: &extra_sans,
-                },
-            )
-            .map_err(|e| RuntimeError::Server(e.into()))?;
-            // OPTIONAL client-cert verifier (allow_unauthenticated): existing
-            // token/anonymous kubectl keeps connecting; a presented cert is
-            // verified against the CA before the handshake completes.
-            let verifier = client_verifier(&ca).map_err(|e| RuntimeError::Server(e.into()))?;
-            let material = material.with_client_verifier(verifier);
-            // Issue + persist the admin client cert (for the operator's
-            // kubeconfig + `kubectl auth whoami → engenho-admin`).
-            let admin =
-                issue_admin_client_material(&ca).map_err(|e| RuntimeError::Server(e.into()))?;
-            persist_admin_material(&boot.data_dir, &admin)?;
-            admin_material = Some(admin);
-            Some(material)
-        } else {
-            None
-        };
+        let IssuedPki {
+            tls,
+            ca_cert_pem,
+            admin: admin_material,
+        } = issue_pki(boot, listen_addr)?;
 
         // Load-or-generate the bootstrap admin BEARER token (a second admin
         // credential alongside the client cert). Persisted under
@@ -382,6 +377,7 @@ impl Runtime {
         // plaintext-mode operator/test gets an admin (system:masters) identity
         // to write through the authorizer. (Pre-Brick-B the plaintext floor had
         // no admin token because authorize-ALL made one unnecessary.)
+        rec.enter(BootPhase::LoadAdminToken)?;
         let admin_token: Option<String> = Some(load_or_generate_admin_token(&boot.data_dir)?);
         if admin_token.is_some() {
             info!("bootstrap admin bearer token available at data_dir/pki/admin.token");
@@ -398,6 +394,7 @@ impl Runtime {
         // (restart-persistent + collision-free — the Services are the ledger).
         // FailClosed so a misconfigured CIDR / exhausted pool denies the
         // create rather than admitting a half-built Service.
+        rec.enter(BootPhase::BuildAuth)?;
         let cluster_ip_hook: Arc<dyn AdmissionWebhook> = Arc::new(ClusterIpDefaultingWebhook::new(
             boot.service_cidr.clone(),
             Arc::new(StoreServiceIpSource::new(store.clone())),
@@ -472,9 +469,12 @@ impl Runtime {
         // visible to in-flight requests (identical mechanism to the CRD sink).
         let router_state_for_logs = router_state.clone();
 
+        rec.enter(BootPhase::BindApiserver)?;
         let apiserver = ApiServer::start_with_state(listen_addr, router_state, tls).await?;
         let bound_addr = apiserver.local_addr();
         info!(addr = %bound_addr, tls = boot.tls.is_enabled(), "apiserver bound");
+        // Committed: from here on the boot finishes (see above).
+        rec.enter_committed(BootPhase::PublishKubeconfigs);
 
         // 5b. Boot-time kubeconfig write (TLS only — handing kubectl an
         //     anonymous-over-plaintext kubeconfig makes no sense). Uses the
@@ -486,15 +486,14 @@ impl Runtime {
         //     CLIENT-CERT user (→ `kubectl auth whoami` = engenho-admin /
         //     system:masters). Without it (shouldn't happen when TLS is on) it
         //     falls back to the anonymous-token kubeconfig.
-        if let Some(ca_pem) = ca_cert_pem.as_deref() {
-            if let Err(err) =
+        if let Some(ca_pem) = ca_cert_pem.as_deref()
+            && let Err(err) =
                 write_boot_kubeconfig(boot, bound_addr, ca_pem, admin_material.as_ref())
-            {
-                // The apiserver is serving; stop it and wait for its
-                // connections, or they keep the store the unwind needs back.
-                let _ = apiserver.shutdown().await;
-                return Err(err);
-            }
+        {
+            // The apiserver is serving; stop it and wait for its
+            // connections, or they keep the store the unwind needs back.
+            let _ = apiserver.shutdown().await;
+            return Err(err);
         }
 
         // 6. Spawn every child in the catalog (T2.6): the controller /
@@ -503,11 +502,13 @@ impl Runtime {
         //    handler_sink) and the :10250 kubelet + :2379 etcd-façade
         //    listeners, into ONE owned set that `main` watches. Returns the
         //    Arc<Kubelet> so the Pod `/log` reader can be wired in.
+        rec.enter_committed(BootPhase::SpawnChildren);
         let (children, kubelet) =
             spawn_children(boot, store, backend, scheduler, &handler_sink, windows);
         info!(count = children.len(), "children spawned");
         // From here the health endpoints report every spawned child, each
         // Unknown until its first beat.
+        rec.enter_committed(BootPhase::AdoptHealth);
         health.adopt(children.rows());
 
         // 6b. Register the Pod `/log` handler — a StoreBackedHandler for the
@@ -589,6 +590,12 @@ impl Runtime {
     #[must_use]
     pub fn config(&self) -> &EngenhoConfig {
         &self.config
+    }
+
+    /// Whether this boot created the store, resumed it, or runs in memory.
+    #[must_use]
+    pub const fn boot_kind(&self) -> BootKind {
+        self.boot_kind
     }
 
     /// Graceful shutdown, one [`ShutdownStage`] at a time: abort + await
@@ -708,6 +715,95 @@ struct Assembled {
     apiserver: ApiServer,
     children: Children,
     health: Arc<Health>,
+}
+
+/// Wait for raft leadership. The one wait the boot does not bound by its own
+/// work, so a stop requested through `rec` ends it.
+async fn await_leadership(
+    store: &StoreMesh,
+    boot: &BootConfig,
+    rec: &BootRecorder,
+) -> Result<(), RuntimeError> {
+    let timeout_s = boot.leadership_timeout_seconds;
+    let led = tokio::select! {
+        led = store.wait_for_leadership(Duration::from_secs(u64::from(timeout_s))) => led,
+        () = rec.cancelled() => {
+            return Err(RuntimeError::BootCancelled {
+                phase: BootPhase::AwaitLeadership,
+            });
+        }
+    };
+    if !led {
+        return Err(RuntimeError::LeadershipTimeout { seconds: timeout_s });
+    }
+    info!(node = %boot.node_name, "store reached leadership");
+    Ok(())
+}
+
+/// What [`BootPhase::IssuePki`] produced: the server's TLS material and what
+/// the boot kubeconfig is written from. All absent with TLS off.
+#[derive(Default)]
+struct IssuedPki {
+    tls: Option<TlsMaterial>,
+    /// The cluster CA, for the kubeconfig's `certificate-authority-data`.
+    ca_cert_pem: Option<String>,
+    /// The admin client cert, for the admin-cert kubeconfig.
+    admin: Option<ClientMaterial>,
+}
+
+/// Step 5a of the boot: load-or-generate the cluster CA persisted in
+/// `data_dir`, then issue a server cert whose SANs cover loopback + node
+/// name + the concrete listen IP (skipping `0.0.0.0` and `::`, which aren't
+/// valid SAN IPs — loopback access rides on `127.0.0.1` and `localhost`).
+///
+/// For authn: also issue + persist the admin CLIENT cert and build the
+/// OPTIONAL client-cert verifier (rooted at the SAME CA) the server material
+/// carries.
+fn issue_pki(boot: &BootConfig, listen_addr: SocketAddr) -> Result<IssuedPki, RuntimeError> {
+    let ApiserverTls::SelfIssued { extra_sans } = &boot.tls else {
+        return Ok(IssuedPki::default());
+    };
+    let ca = load_or_generate_ca(&boot.data_dir).map_err(|e| RuntimeError::Server(e.into()))?;
+    // ── ★ A PUBLIC CA MAY NOT SERVE A REACHABLE ADDRESS ──────────
+    // See `RuntimeError::PublicCaOnReachableAddress`. The danger is not
+    // the CA by itself and not the address by itself; it is the pair,
+    // so the pair is what is refused. A pre-seed cluster stays usable on
+    // loopback and cannot be exposed by accident.
+    if ca.is_publicly_derivable() && !is_loopback_only(listen_addr) {
+        return Err(RuntimeError::PublicCaOnReachableAddress {
+            listen_addr: boot.listen_addr.clone(),
+            pki_dir: boot.data_dir.join("pki").display().to_string(),
+        });
+    }
+    let listen_ip = san_listen_ip(listen_addr);
+    // Classify the operator's declared SANs before anything binds, so a
+    // typo is a failed unit with the offending value in the message
+    // rather than a certificate that serves happily and verifies for
+    // nobody. See `RuntimeError::ExtraSan` for why this is checked here
+    // and not lazily at handshake time.
+    let extra_sans = server_sans(extra_sans, &boot.advertise_address)?;
+    let material = issue_server_material(
+        &ca,
+        &ServerSanInputs {
+            node_name: &boot.node_name,
+            listen_ip,
+            extra_sans: &extra_sans,
+        },
+    )
+    .map_err(|e| RuntimeError::Server(e.into()))?;
+    // OPTIONAL client-cert verifier (allow_unauthenticated): existing
+    // token/anonymous kubectl keeps connecting; a presented cert is
+    // verified against the CA before the handshake completes.
+    let verifier = client_verifier(&ca).map_err(|e| RuntimeError::Server(e.into()))?;
+    // Issue + persist the admin client cert (for the operator's
+    // kubeconfig + `kubectl auth whoami → engenho-admin`).
+    let admin = issue_admin_client_material(&ca).map_err(|e| RuntimeError::Server(e.into()))?;
+    persist_admin_material(&boot.data_dir, &admin)?;
+    Ok(IssuedPki {
+        tls: Some(material.with_client_verifier(verifier)),
+        ca_cert_pem: Some(ca.cert_pem().to_string()),
+        admin: Some(admin),
+    })
 }
 
 /// Take back the store of a boot that failed after opening it.
@@ -1395,7 +1491,7 @@ fn build_backend(boot: &BootConfig) -> Result<Arc<dyn ContainerRuntime>, Runtime
 pub(crate) const STORE_DIR: &str = "store";
 
 /// Bring up the store spine — durable or ephemeral per config.
-async fn boot_store(boot: &BootConfig) -> Result<Arc<StoreMesh>, RuntimeError> {
+async fn boot_store(boot: &BootConfig) -> Result<(Arc<StoreMesh>, BootKind), RuntimeError> {
     let cfg = default_config(&boot.cluster_name)?;
     let router = InProcessRouter::new();
     // Single-node self-loop address; registration happens inside start.
@@ -1404,13 +1500,18 @@ async fn boot_store(boot: &BootConfig) -> Result<Arc<StoreMesh>, RuntimeError> {
     if boot.durable {
         let store_path = boot.data_dir.join(STORE_DIR);
         let (mesh, fresh) = StoreMesh::start_or_resume(1, listen, router, cfg, store_path).await?;
-        info!(fresh, "durable store opened");
-        Ok(Arc::new(mesh))
+        let kind = if fresh {
+            BootKind::FirstBoot
+        } else {
+            BootKind::Resume
+        };
+        info!(?kind, "durable store opened");
+        Ok((Arc::new(mesh), kind))
     } else {
         let mesh = StoreMesh::start(1, listen, router, cfg).await?;
         mesh.initialize_singleton().await?;
         info!("ephemeral store initialized");
-        Ok(Arc::new(mesh))
+        Ok((Arc::new(mesh), BootKind::Ephemeral))
     }
 }
 
@@ -3939,7 +4040,8 @@ mod tests {
     /// set. The store is returned so it outlives the set.
     async fn a_panicking(driver: Driver) -> (Children, Arc<StoreMesh>) {
         let boot = read(&ephemeral_test_config());
-        let store = boot_store(&boot).await.unwrap();
+        let (store, kind) = boot_store(&boot).await.unwrap();
+        assert_eq!(kind, BootKind::Ephemeral);
         assert!(store.wait_for_leadership(Duration::from_secs(5)).await);
         let children = Children::spawn_catalog(&boot, |child, _| {
             (child == Child::Driver(driver)).then(|| {

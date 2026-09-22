@@ -94,9 +94,18 @@ pub struct TransitionRecord<S, E> {
 
 /// Runner that owns one machine + drives steps + accumulates
 /// the transition history.
+///
+/// The history is unbounded unless capped with
+/// [`Self::with_history_cap`]. A runner that lives as long as a daemon —
+/// a lifecycle stepping on every retry of a failing boot, for months —
+/// must cap it, or the history is a leak with a clean conscience.
 pub struct MachineRunner<M: StateMachine> {
     state: M::State,
     history: Vec<TransitionRecord<M::State, M::Event>>,
+    /// Keep at most this many of the most recent transitions.
+    history_cap: Option<std::num::NonZeroUsize>,
+    /// Every transition ever taken, including those the cap dropped.
+    steps: usize,
     clock: std::sync::Arc<dyn crate::relogio::Clock>,
     name: &'static str,
 }
@@ -109,8 +118,29 @@ impl<M: StateMachine> MachineRunner<M> {
         Self {
             state: M::initial(),
             history: Vec::new(),
+            history_cap: None,
+            steps: 0,
             clock,
             name: <M as MachineNamed>::name_static(),
+        }
+    }
+
+    /// Keep only the `cap` most recent transitions. [`Self::step_count`]
+    /// still counts every transition ever taken.
+    #[must_use]
+    pub fn with_history_cap(mut self, cap: std::num::NonZeroUsize) -> Self {
+        self.history_cap = Some(cap);
+        self.trim_history();
+        self
+    }
+
+    /// Drop the oldest transitions beyond the cap, if any.
+    fn trim_history(&mut self) {
+        if let Some(cap) = self.history_cap {
+            let excess = self.history.len().saturating_sub(cap.get());
+            if excess > 0 {
+                self.history.drain(..excess);
+            }
         }
     }
 
@@ -120,6 +150,8 @@ impl<M: StateMachine> MachineRunner<M> {
     pub fn from_state(state: M::State, clock: std::sync::Arc<dyn crate::relogio::Clock>) -> Self {
         Self {
             state,
+            history_cap: None,
+            steps: 0,
             history: Vec::new(),
             clock,
             name: <M as MachineNamed>::name_static(),
@@ -144,6 +176,8 @@ impl<M: StateMachine> MachineRunner<M> {
             to: next_state.clone(),
             at: self.clock.now(),
         });
+        self.steps += 1;
+        self.trim_history();
         self.state = next_state;
         Ok(effect)
     }
@@ -160,7 +194,8 @@ impl<M: StateMachine> MachineRunner<M> {
         M::is_terminal(&self.state)
     }
 
-    /// Full transition history (cloneable for replay).
+    /// The recorded transitions, oldest first (cloneable for replay):
+    /// every one, or the most recent [`Self::with_history_cap`] of them.
     #[must_use]
     pub fn history(&self) -> &[TransitionRecord<M::State, M::Event>] {
         &self.history
@@ -172,16 +207,18 @@ impl<M: StateMachine> MachineRunner<M> {
         self.name
     }
 
-    /// Step count (number of transitions recorded).
+    /// Step count: every transition ever taken, including any the history
+    /// cap has since dropped.
     #[must_use]
     pub fn step_count(&self) -> usize {
-        self.history.len()
+        self.steps
     }
 
     /// Reset to initial state + clear history. Useful for tests.
     pub fn reset(&mut self) {
         self.state = M::initial();
         self.history.clear();
+        self.steps = 0;
     }
 }
 
@@ -216,7 +253,7 @@ where
         MachineSnapshot {
             name: self.name,
             state: self.state.clone(),
-            step_count: self.history.len(),
+            step_count: self.steps,
             is_terminal: M::is_terminal(&self.state),
         }
     }
@@ -416,6 +453,21 @@ mod tests {
         r.reset();
         assert_eq!(r.state(), &DoorState::Closed);
         assert_eq!(r.step_count(), 0);
+    }
+
+    #[test]
+    fn a_capped_history_keeps_the_most_recent_and_still_counts_every_step() {
+        let mut r = make_runner().with_history_cap(std::num::NonZeroUsize::new(2).unwrap());
+        for _ in 0..5 {
+            r.step(DoorEvent::OpenIt).unwrap();
+            r.step(DoorEvent::CloseIt).unwrap();
+        }
+        assert_eq!(r.step_count(), 10, "the count includes dropped transitions");
+        let h = r.history();
+        assert_eq!(h.len(), 2, "only the cap's worth is kept");
+        assert_eq!(h[0].event, DoorEvent::OpenIt, "oldest kept first");
+        assert_eq!(h[1].event, DoorEvent::CloseIt);
+        assert_eq!(h[1].to, DoorState::Closed, "the newest is the last taken");
     }
 
     #[test]

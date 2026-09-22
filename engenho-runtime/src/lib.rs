@@ -133,8 +133,10 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+pub mod boot;
 pub mod census;
 pub mod etcd_facade;
+pub mod lifecycle;
 
 mod boot_config;
 mod child;
