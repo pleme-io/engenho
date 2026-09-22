@@ -72,8 +72,8 @@ fn a_daemon_that_cannot_boot_is_reachable_repaired_and_operated_over_its_socket(
 
     socket_is_private(&sock);
     broken_and_saying_why(&sock);
-    repaired_through_the_declared_file(root, &sock);
-    stopped_started_and_audited(&sock);
+    let attempts = repaired_through_the_declared_file(root, &sock);
+    stopped_started_and_audited(&sock, attempts);
     mistakes_are_usage_errors(&sock);
     exits_on_request(&mut daemon, &sock);
 }
@@ -135,12 +135,26 @@ fn broken_and_saying_why(sock: &Path) {
 }
 
 /// Repaired through the declared file: the daemon notices by itself.
-fn repaired_through_the_declared_file(root: &Path, sock: &Path) {
+/// Returns the attempt the runtime came up on, which the store epoch below is
+/// a function of.
+fn repaired_through_the_declared_file(root: &Path, sock: &Path) -> u64 {
     write_config(root, false);
     let running = ctl_until(sock, &["runtime", "show"], PATIENCE, |v| {
         state(v) == "running"
     });
-    assert_eq!(running["lifecycle"]["attempt"], 2);
+    // NOT `== 2`. `write_config` truncates before it writes, and on Linux
+    // inotify reports the truncation as its own event, so the daemon can be
+    // woken by a file the writer has not finished: that attempt resolves an
+    // empty document, fails, and the supervisor re-reads and retries. The
+    // invariant is that the repair came from the FILE — a later attempt than
+    // the one that was already failing — not how many reads the writer's
+    // window cost. Measured 2026-09-22: the same commit produced 2 on one
+    // ubuntu run and 3 on the next.
+    let attempt = running["lifecycle"]["attempt"].as_u64().expect("attempt");
+    assert!(
+        attempt >= 2,
+        "the repair must be a later attempt: {running}"
+    );
 
     let children = ctl_json(sock, &["children", "list"]);
     assert_eq!(children["runtime"], "up");
@@ -165,15 +179,23 @@ fn repaired_through_the_declared_file(root: &Path, sock: &Path) {
             .iter()
             .all(|r| r["outcome"]["reason"] == "tls_disabled")
     );
+    attempt
 }
 
 /// Operated: stopped, started, and the audit chain records it.
-fn stopped_started_and_audited(sock: &Path) {
+fn stopped_started_and_audited(sock: &Path, attempts: u64) {
     let stopped = ctl_json(sock, &["runtime", "stop"]);
     assert_eq!(stopped["lifecycle"]["state"], "stopped");
+    // The epoch counts store releases, so it is a FUNCTION of how many boots
+    // there were, not a constant: each of the `attempts - 1` failed boots
+    // released it, and this stop releases it again — `attempts` in total.
+    // Written as the relation rather than the number it happened to be, so a
+    // run that costs one extra attempt (see `repaired_through_the_declared_
+    // file`) does not read as a defect in the epoch.
     assert_eq!(
-        stopped["epoch"], 2,
-        "the failed boot released it once, the stop again"
+        stopped["epoch"].as_u64(),
+        Some(attempts),
+        "every failed boot released the store once, and the stop again"
     );
     let store = ctl_json(sock, &["store", "show"]);
     assert_eq!(store["facts"]["state"]["store"], "present_offline");
