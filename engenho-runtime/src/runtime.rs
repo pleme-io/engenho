@@ -53,6 +53,7 @@ use crate::health::{Health, Row, Tallied, Tally, Windows};
 use crate::node_lease::NodeLease;
 use crate::node_registration::{HostOwned, register_node};
 use crate::panics::PanicCounter;
+use crate::publish::{KubeconfigTarget, PublishRecord, SkipReason};
 use crate::rebind::serve_rebinding;
 use crate::release::{BootFailed, BootUnwind, StoreReleased};
 use crate::runtime_health::RuntimeHealthSource;
@@ -79,6 +80,11 @@ pub struct Runtime {
     would_reject: Arc<WouldRejectLedger>,
     /// Whether this boot created the store, resumed it, or runs in memory.
     boot_kind: BootKind,
+    /// Where this boot's kubeconfigs went.
+    publish: Vec<PublishRecord>,
+    /// The SANs the apiserver's certificate was issued with; `None` with
+    /// TLS off. The certificate itself lives only in memory.
+    server_sans: Option<Vec<String>>,
     /// The backend the runtime was started with. Nothing reads it: the
     /// kubelet holds its own clone, and that clone is what keeps the backend
     /// alive for its ticks. A test passes its own clone to
@@ -247,6 +253,8 @@ impl Runtime {
                 apiserver,
                 children,
                 health,
+                publish,
+                server_sans,
             }) => Ok(Self {
                 config,
                 store,
@@ -256,6 +264,8 @@ impl Runtime {
                 health,
                 would_reject,
                 boot_kind,
+                publish,
+                server_sans,
                 backend,
             }),
             Err(error) => {
@@ -367,6 +377,7 @@ impl Runtime {
             ca_cert_pem,
             admin: admin_material,
         } = issue_pki(boot, listen_addr)?;
+        let server_sans = tls.as_ref().map(|t| t.sans.clone());
 
         // Load-or-generate the bootstrap admin BEARER token (a second admin
         // credential alongside the client cert). Persisted under
@@ -486,15 +497,19 @@ impl Runtime {
         //     CLIENT-CERT user (→ `kubectl auth whoami` = engenho-admin /
         //     system:masters). Without it (shouldn't happen when TLS is on) it
         //     falls back to the anonymous-token kubeconfig.
-        if let Some(ca_pem) = ca_cert_pem.as_deref()
-            && let Err(err) =
-                write_boot_kubeconfig(boot, bound_addr, ca_pem, admin_material.as_ref())
-        {
-            // The apiserver is serving; stop it and wait for its
-            // connections, or they keep the store the unwind needs back.
-            let _ = apiserver.shutdown().await;
-            return Err(err);
-        }
+        let written = ca_cert_pem.as_deref().map_or_else(
+            || Ok(PublishRecord::all_skipped(SkipReason::TlsDisabled)),
+            |ca_pem| write_boot_kubeconfig(boot, bound_addr, ca_pem, admin_material.as_ref()),
+        );
+        let publish = match written {
+            Ok(records) => records,
+            Err(err) => {
+                // The apiserver is serving; stop it and wait for its
+                // connections, or they keep the store the unwind needs back.
+                let _ = apiserver.shutdown().await;
+                return Err(err);
+            }
+        };
 
         // 6. Spawn every child in the catalog (T2.6): the controller /
         //    scheduler / kubelet drivers (incl. the CrdController, which
@@ -519,8 +534,7 @@ impl Runtime {
         //     IS this process's kubelet, so the read is in-process. `register`
         //     keys on (group, version, plural) so it overwrites the Pod entry
         //     atomically (same swap mechanism the CRD sink uses).
-        let log_reader: Arc<dyn engenho_apiserver::PodLogReader> =
-            Arc::new(KubeletLogReader { kubelet });
+        let log_reader = Arc::new(KubeletLogReader { kubelet });
         if let Some(pod_handler) = build_pod_log_handler(store, &admission, log_reader) {
             router_state_for_logs.register(pod_handler);
             info!("registered Pod /log handler (in-process kubelet log reader)");
@@ -530,6 +544,8 @@ impl Runtime {
             apiserver,
             children,
             health,
+            publish,
+            server_sans,
         })
     }
 
@@ -596,6 +612,27 @@ impl Runtime {
     #[must_use]
     pub const fn boot_kind(&self) -> BootKind {
         self.boot_kind
+    }
+
+    /// Where this boot's kubeconfigs went.
+    #[must_use]
+    pub fn publish_records(&self) -> &[PublishRecord] {
+        &self.publish
+    }
+
+    /// The SANs the apiserver's certificate was issued with; `None` with
+    /// TLS off.
+    #[must_use]
+    pub fn server_sans(&self) -> Option<&[String]> {
+        self.server_sans.as_deref()
+    }
+
+    /// The store's current revision and whether this node leads — read
+    /// through the runtime's own reference, so asking takes no new hold on
+    /// the store.
+    pub async fn store_position(&self) -> (u64, bool) {
+        let revision = self.store.current_revision().await;
+        (revision.get(), self.store.is_leader().await)
     }
 
     /// Graceful shutdown, one [`ShutdownStage`] at a time: abort + await
@@ -715,6 +752,8 @@ struct Assembled {
     apiserver: ApiServer,
     children: Children,
     health: Arc<Health>,
+    publish: Vec<PublishRecord>,
+    server_sans: Option<Vec<String>>,
 }
 
 /// Wait for raft leadership. The one wait the boot does not bound by its own
@@ -2434,26 +2473,53 @@ fn write_boot_kubeconfig(
     bound_addr: SocketAddr,
     ca_pem: &str,
     admin: Option<&ClientMaterial>,
-) -> Result<(), RuntimeError> {
+) -> Result<Vec<PublishRecord>, RuntimeError> {
+    // One kubeconfig for `server`: the same CA and credentials, whatever the
+    // address.
+    let emit = |server: &str| {
+        match admin {
+            Some(admin) => emit_kubeconfig_with_admin(
+                &boot.cluster_name,
+                server,
+                ca_pem.as_bytes(),
+                admin.cert_pem.as_bytes(),
+                admin.key_pem.as_bytes(),
+            ),
+            None => emit_kubeconfig(&boot.cluster_name, server, ca_pem.as_bytes()),
+        }
+        .map_err(|e| RuntimeError::Kubeconfig(e.to_string()))
+    };
+    // A publish that fails is recorded and logged, never fatal (see below).
+    let publish = |target: KubeconfigTarget, path: &std::path::Path, yaml: &str, what: &str| {
+        let visibility = boot.kubeconfig_publish_visibility;
+        match write_kubeconfig_file(path, yaml, visibility) {
+            Ok(()) => {
+                info!(path = %path.display(), "{what} published");
+                PublishRecord::written(target, path, visibility.mode())
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(), error = %e,
+                    "{what} publish failed — the daemon is serving"
+                );
+                PublishRecord::failed(target, path, &e)
+            }
+        }
+    };
     // Loopback server URL with the actually-bound port (handles `:0`).
     let server_url = loopback_server_url(bound_addr);
-    let yaml = match admin {
-        Some(admin) => emit_kubeconfig_with_admin(
-            &boot.cluster_name,
-            &server_url,
-            ca_pem.as_bytes(),
-            admin.cert_pem.as_bytes(),
-            admin.key_pem.as_bytes(),
-        ),
-        None => emit_kubeconfig(&boot.cluster_name, &server_url, ca_pem.as_bytes()),
-    }
-    .map_err(|e| RuntimeError::Kubeconfig(e.to_string()))?;
+    let yaml = emit(&server_url)?;
     let path = boot.data_dir.join("kubeconfig");
     // The `data_dir` copy is engenho's own bookkeeping and nothing else reads
     // it, so it stays owner-only regardless of the publish intent — widening
     // it would grant access nobody asked for.
     write_kubeconfig_file(&path, &yaml, KubeconfigVisibility::Private)?;
     info!(path = %path.display(), server = %server_url, admin = admin.is_some(), "kubeconfig written");
+    let mut records = vec![PublishRecord::written(
+        KubeconfigTarget::DataDir,
+        &path,
+        KubeconfigVisibility::Private.mode(),
+    )];
 
     // ── ★ ALSO PUBLISH WHERE ORDINARY TOOLING ACTUALLY LOOKS ──────────
     // The `data_dir` copy above is self-contained and nothing reads it:
@@ -2484,46 +2550,32 @@ fn write_boot_kubeconfig(
     // apiserver binds the host while containers live in a VM. A pod needs a
     // reachable address; it no longer needs borrowed admin credentials to be
     // ALLOWED, so prefer a ServiceAccount for new workloads.
-    if let Some(pod_publish) = resolve_publish_path(&boot.pod_kubeconfig_publish_path) {
-        match apiserver_reachability(boot).injectable() {
-            Some((host, port)) => {
-                let pod_server = format!("https://{host}:{port}");
-                let pod_yaml = match admin {
-                    Some(admin) => emit_kubeconfig_with_admin(
-                        &boot.cluster_name,
-                        &pod_server,
-                        ca_pem.as_bytes(),
-                        admin.cert_pem.as_bytes(),
-                        admin.key_pem.as_bytes(),
-                    ),
-                    None => emit_kubeconfig(&boot.cluster_name, &pod_server, ca_pem.as_bytes()),
-                }
-                .map_err(|e| RuntimeError::Kubeconfig(e.to_string()))?;
-                match write_kubeconfig_file(
-                    &pod_publish,
-                    &pod_yaml,
-                    boot.kubeconfig_publish_visibility,
-                ) {
-                    Ok(()) => info!(
-                        path = %pod_publish.display(), server = %pod_server,
-                        "pod-facing kubeconfig published"
-                    ),
-                    Err(e) => tracing::warn!(
-                        path = %pod_publish.display(), error = %e,
-                        "pod-facing kubeconfig publish failed — the daemon is serving"
-                    ),
+    records.push(
+        match resolve_publish_path(&boot.pod_kubeconfig_publish_path) {
+            Err(reason) => PublishRecord::skipped(KubeconfigTarget::Pod, reason),
+            Ok(pod_publish) => {
+                if let Some((host, port)) = apiserver_reachability(boot).injectable() {
+                    let pod_yaml = emit(&format!("https://{host}:{port}"))?;
+                    publish(
+                        KubeconfigTarget::Pod,
+                        &pod_publish,
+                        &pod_yaml,
+                        "pod-facing kubeconfig",
+                    )
+                } else {
+                    // No reachable address is known, so there is no honest
+                    // server URL to write. Writing one anyway would hand a
+                    // workload a kubeconfig that cannot connect, which is the
+                    // failure this whole path exists to remove.
+                    tracing::warn!(
+                        "pod-facing kubeconfig requested but no pod-reachable apiserver \
+                         address is known; writing nothing rather than an unusable file"
+                    );
+                    PublishRecord::skipped(KubeconfigTarget::Pod, SkipReason::NoPodAddress)
                 }
             }
-            // No reachable address is known, so there is no honest server URL
-            // to write. Writing one anyway would hand a workload a kubeconfig
-            // that cannot connect, which is the failure this whole path exists
-            // to remove.
-            None => tracing::warn!(
-                "pod-facing kubeconfig requested but no pod-reachable apiserver \
-                 address is known; writing nothing rather than an unusable file"
-            ),
-        }
-    }
+        },
+    );
 
     // ── ★ AND A REMOTE ONE, FOR OPERATORS ON ANOTHER MACHINE ──────────
     // The third audience. The `data_dir` copy and `kubeconfig_publish_path`
@@ -2538,61 +2590,46 @@ fn write_boot_kubeconfig(
     // field `server_sans` turns into a certificate SAN. One field, both
     // consumers — so a kubeconfig naming an address the cert does not is
     // unconstructible rather than merely tested for.
-    if let Some(remote_publish) = resolve_publish_path(&boot.remote_kubeconfig_publish_path) {
-        if let Some(remote_server) = advertised_server_url(&boot.advertise_address, bound_addr) {
-            let remote_yaml = match admin {
-                Some(admin) => emit_kubeconfig_with_admin(
-                    &boot.cluster_name,
-                    &remote_server,
-                    ca_pem.as_bytes(),
-                    admin.cert_pem.as_bytes(),
-                    admin.key_pem.as_bytes(),
-                ),
-                None => emit_kubeconfig(&boot.cluster_name, &remote_server, ca_pem.as_bytes()),
+    records.push(
+        match resolve_publish_path(&boot.remote_kubeconfig_publish_path) {
+            Err(reason) => PublishRecord::skipped(KubeconfigTarget::Remote, reason),
+            Ok(remote_publish) => {
+                if let Some(remote_server) =
+                    advertised_server_url(&boot.advertise_address, bound_addr)
+                {
+                    let remote_yaml = emit(&remote_server)?;
+                    publish(
+                        KubeconfigTarget::Remote,
+                        &remote_publish,
+                        &remote_yaml,
+                        "remote kubeconfig",
+                    )
+                } else {
+                    // Asked for a remote kubeconfig without saying what address is
+                    // remote. Writing a loopback url under that name would be worse
+                    // than writing nothing: it produces a file that looks like remote
+                    // access and silently is not.
+                    tracing::warn!(
+                        "remote_kubeconfig_publish_path is set but advertise_address is empty; \
+                     writing nothing rather than a file with a loopback server url"
+                    );
+                    PublishRecord::skipped(KubeconfigTarget::Remote, SkipReason::NoAdvertiseAddress)
+                }
             }
-            .map_err(|e| RuntimeError::Kubeconfig(e.to_string()))?;
-            match write_kubeconfig_file(
-                &remote_publish,
-                &remote_yaml,
-                boot.kubeconfig_publish_visibility,
-            ) {
-                Ok(()) => info!(
-                    path = %remote_publish.display(), server = %remote_server,
-                    "remote kubeconfig published"
-                ),
-                Err(e) => tracing::warn!(
-                    path = %remote_publish.display(), error = %e,
-                    "remote kubeconfig publish failed — the daemon is serving"
-                ),
-            }
-        } else {
-            // Asked for a remote kubeconfig without saying what address is
-            // remote. Writing a loopback url under that name would be worse
-            // than writing nothing: it produces a file that looks like remote
-            // access and silently is not.
-            tracing::warn!(
-                "remote_kubeconfig_publish_path is set but advertise_address is empty; \
-                 writing nothing rather than a file with a loopback server url"
-            );
-        }
-    }
+        },
+    );
 
-    if let Some(publish) = resolve_publish_path(&boot.kubeconfig_publish_path) {
-        match write_kubeconfig_file(&publish, &yaml, boot.kubeconfig_publish_visibility) {
-            Ok(()) => {
-                info!(path = %publish.display(), "kubeconfig published for kubectl/k9s/flux");
-            }
-            Err(e) => {
-                tracing::warn!(
-                    path = %publish.display(),
-                    error = %e,
-                    "kubeconfig publish failed — the daemon is serving; \
-                     `$KUBECONFIG` will not see this cluster until the path is writable"
-                );
-            }
-        }
-    }
-    Ok(())
+    // `$KUBECONFIG` will not see this cluster until a failed path is writable.
+    records.push(match resolve_publish_path(&boot.kubeconfig_publish_path) {
+        Err(reason) => PublishRecord::skipped(KubeconfigTarget::Operator, reason),
+        Ok(path) => publish(
+            KubeconfigTarget::Operator,
+            &path,
+            &yaml,
+            "kubeconfig for kubectl/k9s/flux",
+        ),
+    });
+    Ok(records)
 }
 
 /// Expand the configured publish path, or `None` when publishing is off.
@@ -2602,19 +2639,22 @@ fn write_boot_kubeconfig(
 /// path — the config layer must stay a pure value with no `$HOME` baked
 /// into it, or a rendered config would only be valid for the user who
 /// generated it.
-fn resolve_publish_path(raw: &str) -> Option<std::path::PathBuf> {
+fn resolve_publish_path(raw: &str) -> Result<std::path::PathBuf, SkipReason> {
     let raw = raw.trim();
     if raw.is_empty() {
-        return None;
+        return Err(SkipReason::NotConfigured);
     }
     if let Some(rest) = raw.strip_prefix("~/") {
         // `HOME` unset (some launchd contexts) means there is no home to
         // publish into — skip rather than write to a relative path that
         // would land wherever the daemon happens to be running.
-        let home = std::env::var("HOME").ok().filter(|h| !h.is_empty())?;
-        return Some(std::path::PathBuf::from(home).join(rest));
+        let home = std::env::var("HOME")
+            .ok()
+            .filter(|h| !h.is_empty())
+            .ok_or(SkipReason::NoHome)?;
+        return Ok(std::path::PathBuf::from(home).join(rest));
     }
-    Some(std::path::PathBuf::from(raw))
+    Ok(std::path::PathBuf::from(raw))
 }
 
 /// Persist the admin client cert + key under `data_dir/pki/` (cert 0644, key
@@ -3756,8 +3796,14 @@ mod tests {
     /// contexts use to stay out of `$HOME`.
     #[test]
     fn empty_publish_path_disables_publishing() {
-        assert!(super::resolve_publish_path("").is_none());
-        assert!(super::resolve_publish_path("   ").is_none());
+        assert_eq!(
+            super::resolve_publish_path(""),
+            Err(crate::publish::SkipReason::NotConfigured)
+        );
+        assert_eq!(
+            super::resolve_publish_path("   "),
+            Err(crate::publish::SkipReason::NotConfigured)
+        );
     }
 
     /// An absolute path is taken verbatim — nix renders one when it wants
@@ -3766,7 +3812,7 @@ mod tests {
     fn absolute_publish_path_is_verbatim() {
         assert_eq!(
             super::resolve_publish_path("/etc/engenho/kubeconfig"),
-            Some(std::path::PathBuf::from("/etc/engenho/kubeconfig"))
+            Ok(std::path::PathBuf::from("/etc/engenho/kubeconfig"))
         );
     }
 
@@ -3784,7 +3830,7 @@ mod tests {
         };
         assert_eq!(
             super::resolve_publish_path("~/.kube/configs/engenho"),
-            Some(std::path::PathBuf::from(home).join(".kube/configs/engenho"))
+            Ok(std::path::PathBuf::from(home).join(".kube/configs/engenho"))
         );
     }
 

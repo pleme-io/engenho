@@ -38,18 +38,20 @@ pub mod types {
 
 #[allow(clippy::all, clippy::pedantic)]
 mod catalog {
-    use crate::{CliSpelling, ConfirmGate, HttpMethod, OperationSpec};
+    use crate::{
+        CliSpelling, ConfirmGate, HttpMethod, MediaType, OperationSpec, ParamLocation, ParamSpec,
+    };
     include!(concat!(env!("OUT_DIR"), "/catalog.rs"));
 }
 pub use catalog::{CATALOG, OperationId};
 
 /// One marker type and one typed request per operation, plus
-/// [`EngenhoControl`].
+/// [`EngenhoControl`] and the [`ops::visit`] dispatch.
 #[allow(clippy::all, clippy::pedantic)]
 pub mod ops {
     include!(concat!(env!("OUT_DIR"), "/ops.rs"));
 }
-pub use ops::EngenhoControl;
+pub use ops::{EngenhoControl, OperationVisitor, visit};
 
 pub use types::{AuthorityTier, ReinitOp};
 
@@ -138,6 +140,83 @@ pub struct OperationSpec {
     pub cli: CliSpelling,
     /// The status of its success response.
     pub success_status: u16,
+    /// Its parameters: the path item's, then its own, in spec order.
+    pub params: &'static [ParamSpec],
+    /// Whether it takes a JSON request body.
+    pub body: bool,
+    /// The media type of its success body.
+    pub response_media: MediaType,
+}
+
+/// Where a parameter travels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ParamLocation {
+    /// A `{name}` segment of the path.
+    Path,
+    /// A query pair.
+    Query,
+    /// A header.
+    Header,
+}
+
+/// One parameter of an operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ParamSpec {
+    /// Its name, as the spec (and the wire) spells it.
+    pub name: &'static str,
+    /// Where it travels.
+    pub location: ParamLocation,
+    /// Whether the operation refuses a request without it.
+    pub required: bool,
+    /// How its text becomes a typed value.
+    pub kind: wire::Kind,
+}
+
+/// The media type of a success body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MediaType {
+    /// `application/json`.
+    Json,
+    /// `application/yaml` text (the spec itself).
+    Yaml,
+}
+
+impl MediaType {
+    /// The `Content-Type` value.
+    #[must_use]
+    pub const fn content_type(self) -> &'static str {
+        match self {
+            Self::Json => "application/json",
+            Self::Yaml => "application/yaml",
+        }
+    }
+}
+
+impl OperationId {
+    /// The operation a request names, and its decoded path parameters —
+    /// `None` when no operation has that method and path.
+    #[must_use]
+    pub fn route(method: &str, path: &str) -> Option<(Self, Vec<(String, String)>)> {
+        let segments: Vec<&str> = path.trim_end_matches('/').split('/').collect();
+        CATALOG.iter().find_map(|row| {
+            if !row.method.as_str().eq_ignore_ascii_case(method) {
+                return None;
+            }
+            let template: Vec<&str> = row.path.split('/').collect();
+            if template.len() != segments.len() {
+                return None;
+            }
+            let mut params = Vec::new();
+            for (want, got) in template.iter().zip(&segments) {
+                match want.strip_prefix('{').and_then(|w| w.strip_suffix('}')) {
+                    Some(name) => params.push((name.to_string(), wire::decode_segment(got)?)),
+                    None if want == got => {}
+                    None => return None,
+                }
+            }
+            Some((row.id, params))
+        })
+    }
 }
 
 // ── operations ──────────────────────────────────────────────────────────────
@@ -428,7 +507,7 @@ pub mod wire {
     impl std::error::Error for BadRequest {}
 
     /// How a parameter's raw text becomes JSON before serde types it.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub enum Kind {
         /// A string (or a string enum, or a pattern-constrained string).
         Text,
@@ -470,6 +549,26 @@ pub mod wire {
             Kind::Boolean => Value::Bool(raw.parse::<bool>().map_err(|e| bad(e.to_string()))?),
         };
         serde_json::from_value(value).map_err(|e| bad(e.to_string()))
+    }
+
+    /// Percent-decode one path segment; `None` when it is not valid
+    /// percent-encoding of UTF-8.
+    #[must_use]
+    pub fn decode_segment(s: &str) -> Option<String> {
+        let bytes = s.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' {
+                let hex = s.get(i + 1..i + 3)?;
+                out.push(u8::from_str_radix(hex, 16).ok()?);
+                i += 3;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8(out).ok()
     }
 
     /// Percent-encode one path segment (everything outside RFC 3986's

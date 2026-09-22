@@ -135,6 +135,7 @@
 
 pub mod boot;
 pub mod census;
+pub mod control;
 pub mod etcd_facade;
 pub mod lifecycle;
 
@@ -150,6 +151,7 @@ mod impl_census;
 mod node_lease;
 mod node_registration;
 mod panics;
+pub mod publish;
 #[cfg(test)]
 mod read_census;
 mod rebind;

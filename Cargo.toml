@@ -32,6 +32,8 @@ members = [
   "engenho-serve",
   "engenho-oracle",
   "engenho-control-types",
+  "engenho-control-server",
+  "engenho-control-client",
 ]
 
 [workspace.package]
@@ -61,6 +63,9 @@ engenho-kube-proto     = { path = "engenho-kube-proto", version = "0.53.118" }
 engenho-store          = { path = "engenho-store", version = "0.53.118" }
 engenho-apiserver      = { path = "engenho-apiserver", version = "0.53.118" }
 engenho-serve          = { path = "engenho-serve", version = "0.53.118" }
+engenho-control-types  = { path = "engenho-control-types", version = "0.53.118" }
+engenho-control-server = { path = "engenho-control-server", version = "0.53.118" }
+engenho-control-client = { path = "engenho-control-client", version = "0.53.118" }
 engenho-runtime        = { path = "engenho-runtime", version = "0.53.118" }
 engenho-scheduler      = { path = "engenho-scheduler", version = "0.53.118" }
 engenho-controllers    = { path = "engenho-controllers", version = "0.53.118" }

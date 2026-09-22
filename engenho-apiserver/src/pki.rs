@@ -216,6 +216,19 @@ fn legacy_public_keypair(ctx: &str) -> Result<KeyPair, PkiError> {
     Ok(KeyPair::try_from(&pkcs8)?)
 }
 
+/// Whether a CA private key (PEM) is the one every pre-seed engenho derived
+/// from [`LEGACY_PKI_BASE`] — see [`ClusterCa::is_publicly_derivable`].
+pub(crate) fn ca_key_is_publicly_derivable(key_pem: &str) -> bool {
+    let Ok(legacy) = legacy_public_keypair(CTX_CA) else {
+        // If the legacy key cannot be derived we cannot prove this CA is
+        // public — and must not claim it is private either. Report false
+        // and let the caller's other guards stand; the alternative is
+        // failing every cluster on an unrelated crypto error.
+        return false;
+    };
+    key_pem == legacy.serialize_pem()
+}
+
 /// An ed25519 [`KeyPair`] for a PKI role, derived from THIS cluster's seed.
 ///
 /// Deterministic given the seed, which is what makes every certificate stable
@@ -281,14 +294,7 @@ impl ClusterCa {
     /// remedy is to delete `<data_dir>/pki/` and let it regenerate.
     #[must_use]
     pub fn is_publicly_derivable(&self) -> bool {
-        let Ok(legacy) = legacy_public_keypair(CTX_CA) else {
-            // If the legacy key cannot be derived we cannot prove this CA is
-            // public — and must not claim it is private either. Report false
-            // and let the caller's other guards stand; the alternative is
-            // failing every cluster on an unrelated crypto error.
-            return false;
-        };
-        self.key.serialize_pem() == legacy.serialize_pem()
+        ca_key_is_publicly_derivable(&self.key.serialize_pem())
     }
 
     /// Reconstruct an issuer [`rcgen::Certificate`] from the CA params +
@@ -315,6 +321,10 @@ pub struct TlsMaterial {
     /// The cluster CA cert PEM (== the kubeconfig's
     /// `certificate-authority-data`, base64'd at emit time).
     pub ca_cert_pem: String,
+    /// Every SAN the server cert was issued with, rendered (DNS names as
+    /// they are, IPs in their text form) — what the control plane reports,
+    /// since the cert itself lives only in memory.
+    pub sans: Vec<String>,
     /// The OPTIONAL client-cert verifier. When `Some`, the server requests a
     /// client cert (verified against the cluster CA) but still completes the
     /// handshake for a no-cert client (`allow_unauthenticated`) — so existing
@@ -576,6 +586,7 @@ pub fn issue_server_material(
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     set_validity(&mut params, SERVER_VALIDITY_DAYS);
     params.subject_alt_names = build_sans(san)?;
+    let sans = params.subject_alt_names.iter().map(render_san).collect();
     params.serial_number = Some(SerialNumber::from(2u64));
 
     let leaf_key = cluster_keypair(CTX_SERVER, &ca.cluster_seed)?;
@@ -592,6 +603,7 @@ pub fn issue_server_material(
         cert_chain_pem,
         key_pem: leaf_key.serialize_pem(),
         ca_cert_pem: ca.ca_cert_pem.clone(),
+        sans,
         // No client verifier by default — the runtime attaches the OPTIONAL
         // verifier via [`TlsMaterial::with_client_verifier`] when it wants mTLS.
         client_verifier: None,
@@ -709,7 +721,7 @@ pub fn client_verifier(ca: &ClusterCa) -> Result<Arc<dyn ClientCertVerifier>, Pk
 /// every string variant to its text so the X509 authenticator never misses an
 /// identity over an encoding mismatch. Returns `None` for the BMP/Universal
 /// variants we never emit (kept total, no panic).
-fn dn_value_str(v: &DnValue) -> Option<String> {
+pub(crate) fn dn_value_str(v: &DnValue) -> Option<String> {
     match v {
         DnValue::Utf8String(s) => Some(s.clone()),
         DnValue::PrintableString(s) => Some(s.as_str().to_string()),
@@ -759,6 +771,15 @@ pub fn parse_client_cert(leaf_der: &[u8]) -> Result<Option<VerifiedClientCert>, 
 /// duplicated rather than shared because engenho-apiserver deliberately does
 /// not depend on engenho-runtime; a test pins the equality.
 pub const CONTAINER_HOST_GATEWAY_SAN: &str = "host.containers.internal";
+
+/// A SAN as text: a DNS name as it is, an IP in its text form.
+fn render_san(san: &SanType) -> String {
+    match san {
+        SanType::DnsName(name) => name.as_str().to_owned(),
+        SanType::IpAddress(ip) => ip.to_string(),
+        other => format!("{other:?}"),
+    }
+}
 
 /// Build the server cert SAN list. DNS SANs are deduped-by-construction
 /// (we never push the node name twice even if it's `localhost`).

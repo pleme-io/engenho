@@ -30,7 +30,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use engenho_config::{ConfigError, EngenhoConfig};
+use engenho_config::{ConfigError, EngenhoConfig, ProvenanceMap};
 use engenho_kubelet::ContainerRuntime;
 use engenho_serve::{StopHandle, stop_channel};
 use engenho_store::data_dir_lock::{DataDirLock, LockError};
@@ -42,21 +42,47 @@ use tokio::task::{JoinError, JoinHandle};
 use tracing::{debug, error, info, warn};
 
 use super::control_dir::ControlDir;
-use super::journal::{BootAttempt, BootJournal, IdentityRecord, LastSeen, PreviousRun, RunMarker};
+use super::journal::{
+    BootAttempt, BootJournal, IdentityRecord, LastSeen, PhaseRecord, PreviousRun, RunMarker,
+};
 use super::machine::{
     DaemonLifecycle, ExitIntent, FailureReport, Lifecycle, LifecycleEffect, LifecycleEvent,
     LifecycleState, Refused, RefusedBecause, RetryClass, StoreOutcome,
 };
 use crate::boot::{BootKind, BootPhase, BootProgress, BootRecorder, FailureClass, Timestamp};
+use crate::child::{Child, ChildState, DeadChild, DeathCause};
+use crate::control::ring::Ring;
 use crate::error::RuntimeError;
+use crate::publish::PublishRecord;
 use crate::release::{BootFailed, BootUnwind, StoreReleased};
 use crate::runtime::Runtime;
 
 /// Resolves the configuration a boot runs on. Called once per boot, inside
 /// its [`BootPhase::ResolveConfig`], so a configuration that does not
 /// resolve is a failed boot the control plane can report, not a dead
-/// process.
-pub type ConfigSource = Arc<dyn Fn() -> Result<EngenhoConfig, ConfigError> + Send + Sync>;
+/// process. The control plane calls it too, to show the configuration of a
+/// runtime that is not running.
+pub type ConfigSource = Arc<dyn Fn() -> Result<ResolvedConfig, ConfigError> + Send + Sync>;
+
+/// A resolved configuration, and which tier gave each leaf its value.
+#[derive(Debug, Clone)]
+pub struct ResolvedConfig {
+    /// The configuration.
+    pub config: EngenhoConfig,
+    /// Per-leaf provenance; `None` from a source that does not track it.
+    pub provenance: Option<ProvenanceMap>,
+}
+
+impl ResolvedConfig {
+    /// A configuration with no provenance (a source that built it by hand).
+    #[must_use]
+    pub const fn untracked(config: EngenhoConfig) -> Self {
+        Self {
+            config,
+            provenance: None,
+        }
+    }
+}
 
 /// How many lifecycle transitions the supervisor keeps in memory.
 const HISTORY_CAP: NonZeroUsize = match NonZeroUsize::new(64) {
@@ -173,16 +199,128 @@ enum Request {
     Restart(Reply<Accepted>),
     Retry(Reply<Accepted>),
     Exit(ExitIntent, Reply<Accepted>),
+    Inspect(oneshot::Sender<Inspection>),
 }
+
+/// Who holds the store's lock, as far as the supervisor can tell without
+/// disturbing a boot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoreLock {
+    /// This daemon: a runtime, a boot or a drain has it open.
+    HeldByThisDaemon,
+    /// Another process.
+    HeldByOtherProcess,
+    /// Nobody: a boot can open it.
+    Free,
+    /// The lock file could not be examined.
+    Unknown,
+}
+
+/// What the running runtime is doing, read in the supervisor's loop.
+#[derive(Debug, Clone)]
+pub struct RuntimeFacts {
+    /// The configuration it booted on.
+    pub config: EngenhoConfig,
+    /// Which tier gave each leaf its value, if the source tracked it.
+    pub provenance: Option<ProvenanceMap>,
+    /// BLAKE3 of the declared file when the boot read it.
+    pub declared_digest: Option<String>,
+    /// The apiserver's bound address.
+    pub apiserver_addr: std::net::SocketAddr,
+    /// Created, resumed, or in memory.
+    pub boot_kind: BootKind,
+    /// The store's current revision.
+    pub revision: u64,
+    /// Whether this node leads.
+    pub leader: bool,
+    /// Every spawned child.
+    pub children: Vec<ChildFact>,
+    /// Where the boot's kubeconfigs went.
+    pub publish: Vec<PublishRecord>,
+    /// The SANs the apiserver's certificate carries; `None` with TLS off.
+    pub server_sans: Option<Vec<String>>,
+}
+
+/// One spawned child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChildFact {
+    /// Which.
+    pub child: Child,
+    /// Running, or how it ended.
+    pub state: ChildState,
+    /// When it was spawned.
+    pub spawned_at: Timestamp,
+    /// When it ended.
+    pub ended_at: Option<Timestamp>,
+}
+
+/// Everything [`SupervisorHandle::inspect`] reads in the loop.
+#[derive(Debug, Clone)]
+pub struct Inspection {
+    /// The runtime, when it is up.
+    pub runtime: Option<RuntimeFacts>,
+    /// Who holds the store.
+    pub store_lock: StoreLock,
+    /// Whether the durable store's directory exists.
+    pub store_present: bool,
+}
+
+/// Something the control plane's event stream reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonEvent {
+    /// The lifecycle moved.
+    Lifecycle(LifecycleState),
+    /// A boot phase started, or ended.
+    BootPhase {
+        /// Which boot.
+        attempt: NonZeroU32,
+        /// The phase and how it is going.
+        record: PhaseRecord,
+    },
+    /// A child of the running runtime died.
+    ChildDied {
+        /// Which.
+        child: Child,
+        /// How.
+        cause: DeathCause,
+    },
+}
+
+/// How many events the ring keeps.
+pub const EVENTS: usize = 4096;
 
 /// Talks to a running [`Supervisor`]. Cheap to clone.
 #[derive(Clone)]
 pub struct SupervisorHandle {
     requests: mpsc::Sender<Request>,
     snapshot: watch::Receiver<Snapshot>,
+    events: Arc<Ring<DaemonEvent>>,
 }
 
 impl SupervisorHandle {
+    /// The event stream.
+    #[must_use]
+    pub fn events(&self) -> &Arc<Ring<DaemonEvent>> {
+        &self.events
+    }
+
+    /// Read what only the loop can: the running runtime's children and
+    /// store, and who holds the store's lock. Waits for the loop (which is
+    /// never busy for long: boots and drains run beside it).
+    ///
+    /// # Errors
+    ///
+    /// [`CommandError::Gone`] when the supervisor has ended.
+    pub async fn inspect(&self) -> Result<Inspection, CommandError> {
+        let (reply, answer) = oneshot::channel();
+        self.requests
+            .send(Request::Inspect(reply))
+            .await
+            .map_err(|_| CommandError::Gone)?;
+        answer.await.map_err(|_| CommandError::Gone)
+    }
+
     /// The latest snapshot. Never waits on the supervisor's loop.
     #[must_use]
     pub fn snapshot(&self) -> Snapshot {
@@ -262,24 +400,38 @@ enum Slot {
     Idle(Option<StoreReleased>),
     /// A boot is running.
     Booting {
-        task: JoinHandle<Result<Runtime, BootFailed>>,
+        task: JoinHandle<BootOutcome>,
         cancel: StopHandle,
         progress: mpsc::UnboundedReceiver<BootProgress>,
     },
     /// The runtime is up.
-    Up(Box<Runtime>),
+    Up(Box<Running>),
     /// The runtime is shutting down.
     Draining(JoinHandle<Result<StoreReleased, RuntimeError>>),
     /// Something holds the store that this process cannot release.
     Wedged,
 }
 
+/// A running runtime, and what its boot read.
+struct Running {
+    runtime: Runtime,
+    provenance: Option<ProvenanceMap>,
+    declared_digest: Option<String>,
+}
+
+/// What a supervised boot produced.
+struct BootOutcome {
+    result: Result<Runtime, BootFailed>,
+    provenance: Option<ProvenanceMap>,
+    declared_digest: Option<String>,
+}
+
 enum SlotEvent {
     Progress(BootProgress),
     /// Boxed: a `Runtime` is large, and this is one event among small ones.
-    BootDone(Box<Result<Result<Runtime, BootFailed>, JoinError>>),
+    BootDone(Box<Result<BootOutcome, JoinError>>),
     Drained(Result<Result<StoreReleased, RuntimeError>, JoinError>),
-    ChildDied,
+    ChildDied(DeadChild),
 }
 
 /// The next thing the slot has to say. Pends forever when it has nothing
@@ -292,11 +444,8 @@ async fn slot_event(slot: &mut Slot) -> SlotEvent {
             Some(report) = progress.recv() => SlotEvent::Progress(report),
             done = task => SlotEvent::BootDone(Box::new(done)),
         },
-        Slot::Up(runtime) => {
-            // Logged at ERROR by the runtime as it returns; not respawned.
-            let _dead = runtime.next_dead_child().await;
-            SlotEvent::ChildDied
-        }
+        // Logged at ERROR by the runtime as it returns; not respawned.
+        Slot::Up(running) => SlotEvent::ChildDied(running.runtime.next_dead_child().await),
         Slot::Draining(task) => SlotEvent::Drained(task.await),
         Slot::Idle(_) | Slot::Wedged => std::future::pending().await,
     }
@@ -328,7 +477,9 @@ pub struct Supervisor {
     pending_stops: Vec<Reply<StopDone>>,
     requests: mpsc::Receiver<Request>,
     snapshot: watch::Sender<Snapshot>,
+    events: Arc<Ring<DaemonEvent>>,
     declared: mpsc::UnboundedReceiver<()>,
+    declared_path: Option<PathBuf>,
     /// Kept alive for as long as the supervisor watches the declared file.
     _watcher: Option<shikumi::ConfigWatcher>,
 }
@@ -392,6 +543,7 @@ impl Supervisor {
             data_dir: data_dir.clone(),
         };
         let (snapshot, snapshot_rx) = watch::channel(first);
+        let events = Arc::new(Ring::new(EVENTS));
         info!(
             data_dir = %data_dir.display(),
             previous_run = ?previous_run,
@@ -414,12 +566,15 @@ impl Supervisor {
             pending_stops: Vec::new(),
             requests,
             snapshot,
+            events: Arc::clone(&events),
             declared: declared_rx,
+            declared_path: declared,
             _watcher: watcher,
         };
         let handle = SupervisorHandle {
             requests: requests_tx,
             snapshot: snapshot_rx,
+            events,
         };
         Ok((supervisor, handle))
     }
@@ -446,6 +601,9 @@ impl Supervisor {
             }
             tokio::select! {
                 request = self.requests.recv(), if requests_open => match request {
+                    Some(Request::Inspect(reply)) => {
+                        let _ = reply.send(self.inspect().await);
+                    }
                     Some(request) => self.on_request(request),
                     None => requests_open = false,
                 },
@@ -495,6 +653,67 @@ impl Supervisor {
                 let result = self.apply(LifecycleEvent::Exit { intent });
                 let _ = reply.send(result.map(|()| self.accepted(at)));
             }
+            // Answered by the loop, which awaits the store.
+            Request::Inspect(_) => {}
+        }
+    }
+
+    /// What only the loop can read: the running runtime, and the store's
+    /// lock — probed only while no boot or drain could be opening it.
+    async fn inspect(&self) -> Inspection {
+        let store_dir = self.data_dir.join(crate::runtime::STORE_DIR);
+        let store_present = store_dir.exists();
+        let (runtime, store_lock) = match &self.slot {
+            Slot::Up(running) => {
+                let rt = &running.runtime;
+                let (revision, leader) = rt.store_position().await;
+                let durable = rt.config().runtime.durable;
+                let facts = RuntimeFacts {
+                    config: rt.config().clone(),
+                    provenance: running.provenance.clone(),
+                    declared_digest: running.declared_digest.clone(),
+                    apiserver_addr: rt.local_addr(),
+                    boot_kind: rt.boot_kind(),
+                    revision,
+                    leader,
+                    children: rt
+                        .children()
+                        .iter()
+                        .map(|(child, handle)| ChildFact {
+                            child,
+                            state: handle.state(),
+                            spawned_at: handle.spawned_at(),
+                            ended_at: handle.ended_at(),
+                        })
+                        .collect(),
+                    publish: rt.publish_records().to_vec(),
+                    server_sans: rt.server_sans().map(<[String]>::to_vec),
+                };
+                let lock = if durable {
+                    StoreLock::HeldByThisDaemon
+                } else {
+                    StoreLock::Free
+                };
+                (Some(facts), lock)
+            }
+            Slot::Booting { .. } | Slot::Draining(_) | Slot::Wedged => {
+                (None, StoreLock::HeldByThisDaemon)
+            }
+            // Nothing of ours can be opening it, and a boot starts only
+            // from this loop: the probe cannot race one.
+            Slot::Idle(_) => (
+                None,
+                match DataDirLock::acquire(&store_dir) {
+                    Ok(_) => StoreLock::Free,
+                    Err(LockError::Held { .. }) => StoreLock::HeldByOtherProcess,
+                    Err(LockError::Unusable { .. }) => StoreLock::Unknown,
+                },
+            ),
+        };
+        Inspection {
+            runtime,
+            store_lock,
+            store_present,
         }
     }
 
@@ -503,6 +722,7 @@ impl Supervisor {
             SlotEvent::Progress(BootProgress::Entered { phase, at }) => {
                 self.journal.entered(phase, at);
                 self.persist_journal();
+                self.publish_phases(2);
                 self.apply_logged(LifecycleEvent::Phase { phase, at });
             }
             SlotEvent::Progress(BootProgress::Kind(kind)) => {
@@ -511,28 +731,61 @@ impl Supervisor {
             }
             SlotEvent::BootDone(done) => self.on_boot_done(*done),
             SlotEvent::Drained(done) => self.on_drained(done),
-            SlotEvent::ChildDied => {}
+            SlotEvent::ChildDied(dead) => {
+                self.events.push(DaemonEvent::ChildDied {
+                    child: dead.child,
+                    cause: dead.cause,
+                });
+            }
         }
     }
 
-    fn on_boot_done(&mut self, done: Result<Result<Runtime, BootFailed>, JoinError>) {
+    /// Put the latest attempt's last `n` phase records on the event stream:
+    /// the phase just entered, and the one it ended.
+    fn publish_phases(&self, n: usize) {
+        let Some(latest) = self.journal.latest() else {
+            return;
+        };
+        let start = latest.phases.len().saturating_sub(n);
+        for record in &latest.phases[start..] {
+            self.events.push(DaemonEvent::BootPhase {
+                attempt: latest.attempt,
+                record: record.clone(),
+            });
+        }
+    }
+
+    fn on_boot_done(&mut self, done: Result<BootOutcome, JoinError>) {
         let at = Timestamp::now();
         let event = match done {
-            Ok(Ok(runtime)) => {
+            Ok(BootOutcome {
+                result: Ok(runtime),
+                provenance,
+                declared_digest,
+            }) => {
                 let apiserver_addr = runtime.local_addr().to_string();
                 if runtime.boot_kind() == BootKind::FirstBoot {
                     self.record_identity(runtime.config(), at);
                 }
                 self.journal.succeeded();
+                self.publish_phases(1);
                 info!(addr = %apiserver_addr, "engenho up — apiserver bound");
-                self.slot = Slot::Up(Box::new(runtime));
+                self.slot = Slot::Up(Box::new(Running {
+                    runtime,
+                    provenance,
+                    declared_digest,
+                }));
                 LifecycleEvent::Booted { at, apiserver_addr }
             }
-            Ok(Err(BootFailed {
-                error,
-                phase,
-                unwind,
-            })) => {
+            Ok(BootOutcome {
+                result:
+                    Err(BootFailed {
+                        error,
+                        phase,
+                        unwind,
+                    }),
+                ..
+            }) => {
                 let class = FailureClass::of(&error);
                 let rendered = error.to_string();
                 let store = match unwind {
@@ -566,6 +819,7 @@ impl Supervisor {
                     self.journal.failed(&rendered);
                     warn!(%phase, ?class, error = %rendered, "boot failed");
                 }
+                self.publish_phases(1);
                 LifecycleEvent::BootFailed {
                     report: FailureReport {
                         phase,
@@ -667,9 +921,9 @@ impl Supervisor {
             }
             LifecycleEffect::ShutdownRuntime => {
                 match std::mem::replace(&mut self.slot, Slot::Idle(None)) {
-                    Slot::Up(runtime) => {
+                    Slot::Up(running) => {
                         info!("stopping the runtime");
-                        self.slot = Slot::Draining(tokio::spawn(runtime.shutdown()));
+                        self.slot = Slot::Draining(tokio::spawn(running.runtime.shutdown()));
                     }
                     other => {
                         self.slot = other;
@@ -697,6 +951,7 @@ impl Supervisor {
             Arc::clone(&self.source),
             self.backend.clone(),
             self.data_dir.clone(),
+            self.declared_path.clone(),
             rec,
         ));
         self.slot = Slot::Booting {
@@ -787,6 +1042,10 @@ impl Supervisor {
 
     fn publish(&self) {
         let lifecycle = self.machine.state();
+        if self.snapshot.borrow().lifecycle != lifecycle.state {
+            self.events
+                .push(DaemonEvent::Lifecycle(lifecycle.state.clone()));
+        }
         self.snapshot.send_replace(Snapshot {
             lifecycle: lifecycle.state.clone(),
             epoch: lifecycle.epoch(),
@@ -866,17 +1125,43 @@ async fn supervised_boot(
     source: ConfigSource,
     backend: Option<Arc<dyn ContainerRuntime>>,
     data_dir: PathBuf,
+    declared: Option<PathBuf>,
     mut rec: BootRecorder,
-) -> Result<Runtime, BootFailed> {
-    rec.enter(BootPhase::ResolveConfig)
-        .map_err(|e| rec.failed(e))?;
-    let config = source().map_err(|e| rec.failed(e.into()))?;
-    if config.runtime.data_dir != data_dir {
-        let resolved = config.runtime.data_dir.clone();
-        return Err(rec.failed(RuntimeError::DataDirMoved {
-            control: data_dir,
-            resolved,
-        }));
+) -> BootOutcome {
+    let failed = |result| BootOutcome {
+        result,
+        provenance: None,
+        declared_digest: None,
+    };
+    if let Err(e) = rec.enter(BootPhase::ResolveConfig) {
+        return failed(Err(rec.failed(e)));
     }
-    Runtime::boot_resolved(config, backend, &mut rec).await
+    // What the resolution is about to read, so drift is measured against
+    // what this boot actually saw.
+    let declared_digest = declared.as_deref().and_then(file_digest);
+    let resolved = match source() {
+        Ok(resolved) => resolved,
+        Err(e) => return failed(Err(rec.failed(e.into()))),
+    };
+    if resolved.config.runtime.data_dir != data_dir {
+        let err = RuntimeError::DataDirMoved {
+            control: data_dir,
+            resolved: resolved.config.runtime.data_dir.clone(),
+        };
+        return failed(Err(rec.failed(err)));
+    }
+    let ResolvedConfig { config, provenance } = resolved;
+    BootOutcome {
+        result: Runtime::boot_resolved(config, backend, &mut rec).await,
+        provenance,
+        declared_digest,
+    }
+}
+
+/// BLAKE3 of a file's bytes, lowercase hex; `None` when it cannot be read.
+#[must_use]
+pub fn file_digest(path: &std::path::Path) -> Option<String> {
+    std::fs::read(path)
+        .ok()
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
 }

@@ -141,6 +141,12 @@ impl Timestamp {
             .map_or(Self(DateTime::<Utc>::MAX_UTC), Self)
     }
 
+    /// The moment as chrono's UTC time (the control API's timestamp type).
+    #[must_use]
+    pub const fn utc(self) -> DateTime<Utc> {
+        self.0
+    }
+
     /// The RFC 3339 text, as serialized.
     #[must_use]
     pub fn to_rfc3339(self) -> String {

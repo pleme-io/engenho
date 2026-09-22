@@ -25,8 +25,16 @@ engenho-config      = { workspace = true }
 engenho-runtime     = { workspace = true }
 engenho-apiserver   = { workspace = true }
 engenho-kube-client = { workspace = true }
+# The control plane: the socket the daemon serves, the client `engenho ctl`
+# is, and the spec both speak.
+engenho-control-types  = { workspace = true }
+engenho-control-server = { workspace = true }
+engenho-control-client = { workspace = true }
+engenho-serve          = { workspace = true }
 
 anyhow             = { workspace = true }
+serde_json         = { workspace = true }
+serde_yaml         = { workspace = true }
 tokio              = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -35,6 +43,6 @@ tracing-subscriber = { workspace = true }
 # The stop-signal suite (tests/t2_9_stop_signal.rs) boots the BUILT binary and
 # signals it. `nix` is already in the graph (0.29); `signal` is the one safe
 # `kill(2)` wrapper, so the test needs no `unsafe` of its own.
-nix        = { version = "0.29", default-features = false, features = ["signal"] }
+nix        = { version = "0.29", default-features = false, features = ["signal", "user"] }
 serde_json = { workspace = true }
 tempfile   = "3"

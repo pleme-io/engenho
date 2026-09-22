@@ -12,15 +12,13 @@
 //! the fake kubelet backend, then deliver the real signal and read the exit
 //! status and the log the operator would read.
 
-use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use nix::sys::signal::{Signal, kill};
-use nix::unistd::Pid;
+
+mod common;
+use common::Daemon;
 
 /// The line `run_daemon` logs once the apiserver is bound — by then the
 /// daemon is fully up and its stop signals are subscribed.
@@ -61,121 +59,6 @@ fn write_config(root: &Path) -> PathBuf {
     path
 }
 
-/// A running `engenho daemon` child whose stdout and stderr are drained, line
-/// by line, into one channel. Dropping it kills the child, so a failed
-/// assertion never leaks a daemon.
-struct Daemon {
-    child: Child,
-    lines: mpsc::Receiver<String>,
-    seen: Vec<String>,
-    readers: Vec<thread::JoinHandle<()>>,
-}
-
-impl Daemon {
-    fn spawn(root: &Path) -> Self {
-        let config = write_config(root);
-        let home = root.join("home");
-        std::fs::create_dir_all(&home).expect("create throwaway HOME");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_engenho"))
-            .arg("daemon")
-            .env("ENGENHO_CONFIG", &config)
-            .env("HOME", &home)
-            .env("XDG_CONFIG_HOME", home.join(".config"))
-            // The production filter, not whatever the test runner exported,
-            // and no ANSI escapes splitting the fields we read back.
-            .env_remove("RUST_LOG")
-            .env("NO_COLOR", "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn the engenho binary");
-
-        let (tx, lines) = mpsc::channel();
-        let stdout = child.stdout.take().expect("piped stdout");
-        let stderr = child.stderr.take().expect("piped stderr");
-        let readers = vec![pump(stdout, tx.clone()), pump(stderr, tx)];
-        Self {
-            child,
-            lines,
-            seen: Vec::new(),
-            readers,
-        }
-    }
-
-    fn pid(&self) -> Pid {
-        Pid::from_raw(i32::try_from(self.child.id()).expect("pid fits in pid_t"))
-    }
-
-    /// Wait until a line containing `needle` has been printed. `false` on
-    /// timeout, or when the child's output closed without it.
-    fn wait_for_line(&mut self, needle: &str, timeout: Duration) -> bool {
-        if self.seen.iter().any(|l| l.contains(needle)) {
-            return true;
-        }
-        let deadline = Instant::now() + timeout;
-        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-            match self.lines.recv_timeout(left) {
-                Ok(line) => {
-                    let hit = line.contains(needle);
-                    self.seen.push(line);
-                    if hit {
-                        return true;
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
-                    return false;
-                }
-            }
-        }
-        false
-    }
-
-    /// Wait for the child to exit, then collect every line it printed.
-    /// `None` when it is still running at the deadline.
-    fn wait_for_exit(&mut self, timeout: Duration) -> Option<ExitStatus> {
-        let deadline = Instant::now() + timeout;
-        let status = loop {
-            if let Some(status) = self.child.try_wait().expect("poll the child") {
-                break status;
-            }
-            if Instant::now() >= deadline {
-                return None;
-            }
-            thread::sleep(Duration::from_millis(50));
-        };
-        // The pipes close with the process, so the readers finish and every
-        // line they read is already in the channel.
-        for reader in self.readers.drain(..) {
-            let _ = reader.join();
-        }
-        self.seen.extend(self.lines.try_iter());
-        Some(status)
-    }
-
-    fn output(&self) -> String {
-        self.seen.join("\n")
-    }
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn pump(stream: impl Read + Send + 'static, tx: mpsc::Sender<String>) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        for line in BufReader::new(stream).lines() {
-            let Ok(line) = line else { break };
-            if tx.send(line).is_err() {
-                break;
-            }
-        }
-    })
-}
-
 /// Boot a daemon, deliver `signal`, and assert the stop was CLEAN: exit
 /// status 0, the stop cause named in the log, and the clean-stop line —
 /// which is printed only after `Runtime::shutdown` returned `Ok`, i.e. every
@@ -184,7 +67,7 @@ fn pump(stream: impl Read + Send + 'static, tx: mpsc::Sender<String>) -> thread:
 /// `engenho-runtime/tests/clean_stop_restart.rs`.
 fn assert_stops_cleanly_on(signal: Signal, cause: &str) {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let mut daemon = Daemon::spawn(tmp.path());
+    let mut daemon = Daemon::spawn(tmp.path(), &write_config(tmp.path()));
 
     assert!(
         daemon.wait_for_line(BOOTED, BOOT_TIMEOUT),

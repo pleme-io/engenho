@@ -1347,11 +1347,16 @@ dependencies = [
  "anyhow",
  "engenho-apiserver",
  "engenho-config",
+ "engenho-control-client",
+ "engenho-control-server",
+ "engenho-control-types",
  "engenho-kube-client",
  "engenho-runtime",
+ "engenho-serve",
  "engenho-types",
  "nix",
  "serde_json",
+ "serde_yaml",
  "tempfile",
  "tokio",
  "tracing",
@@ -1392,6 +1397,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "time",
@@ -1452,6 +1458,45 @@ dependencies = [
  "shikumi",
  "tempfile",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "engenho-control-client"
+version = "0.53.118"
+dependencies = [
+ "bytes",
+ "engenho-config",
+ "engenho-control-types",
+ "nix",
+ "reqwest 0.12.28",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "engenho-control-server"
+version = "0.53.118"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "bytes",
+ "chrono",
+ "engenho-config",
+ "engenho-control-types",
+ "engenho-serve",
+ "engenho-store",
+ "http-body-util",
+ "hyper",
+ "nix",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -1763,12 +1808,15 @@ version = "0.53.118"
 dependencies = [
  "async-trait",
  "axum 0.7.9",
+ "blake3",
  "chrono",
  "cofre-fs",
  "ed25519-dalek",
  "engenho-apiserver",
  "engenho-cni",
  "engenho-config",
+ "engenho-control-server",
+ "engenho-control-types",
  "engenho-controllers",
  "engenho-etcd",
  "engenho-kube-client",
@@ -1792,6 +1840,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

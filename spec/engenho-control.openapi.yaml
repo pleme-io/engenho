@@ -1072,10 +1072,12 @@ components:
       enum: [data_dir, operator, pod, remote]
     SkipReason:
       type: string
-      enum: [not_configured, tls_disabled, no_advertise_address, runtime_down]
+      description: "Why a kubeconfig was not written: no publish path; no TLS (no CA to hand out); a remote one with no advertise_address; a pod-facing one with no pod-reachable address; a `~/` path with $HOME unset; the runtime is down."
+      enum: [not_configured, tls_disabled, no_advertise_address, no_pod_address, no_home, runtime_down]
     LockState:
       type: string
-      enum: [held_by_this_daemon, held_by_other_process, free]
+      description: "Who holds the store's lock. `unknown`: the lock file could not be examined — never read as free."
+      enum: [held_by_this_daemon, held_by_other_process, free, unknown]
     LayoutName:
       type: string
       enum: [store, pki, local_path, volumes, plugins, pods, snapshots, control]
@@ -1259,9 +1261,10 @@ components:
         lifecycle: {$ref: "#/components/schemas/LifecycleState"}
     StopRuntimeRequest:
       type: object
-      required: [hold]
       properties:
-        hold: {$ref: "#/components/schemas/Hold"}
+        hold:
+          allOf: [{$ref: "#/components/schemas/Hold"}]
+          default: none
     StopDone:
       type: object
       required: [epoch, lifecycle]
@@ -1270,9 +1273,10 @@ components:
         lifecycle: {$ref: "#/components/schemas/LifecycleState"}
     ExitRequest:
       type: object
-      required: [intent]
       properties:
-        intent: {$ref: "#/components/schemas/ExitIntent"}
+        intent:
+          allOf: [{$ref: "#/components/schemas/ExitIntent"}]
+          default: halt
 
     # ── boot journal ────────────────────────────────────────────────────────
     PhaseResult:

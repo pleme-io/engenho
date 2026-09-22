@@ -88,6 +88,7 @@ use engenho_controllers::{ControllerType, Heartbeat, KindFilter, PanicMessage, R
 use tokio::task::{AbortHandle, Id, JoinSet};
 use tracing::error;
 
+use crate::boot::Timestamp;
 use crate::boot_config::BootConfig;
 use crate::health::{Row, Tally};
 
@@ -383,6 +384,61 @@ impl Child {
             Self::NodeLease => Driver::Kubelet.enabled(&boot.enable),
         }
     }
+
+    /// How this child is brought back on its own, without restarting the
+    /// runtime.
+    ///
+    /// A stateless loop, a listener and the lease rebuild from what they
+    /// were spawned with. The kubelet's pod map is its own, but the lease
+    /// and its HTTP listener read the kubelet they were built against, so
+    /// they are rebuilt with it. A child whose state other parts of the
+    /// runtime also hold (the CRD handler table in the router, the routes
+    /// the service router installed, the CSI driver table) is not rebuilt
+    /// alone until it is shown to resync from scratch: a stated limit.
+    #[must_use]
+    pub const fn respawn(self) -> Respawn {
+        match self {
+            Self::Driver(d) => match d {
+                Driver::Deployment
+                | Driver::ReplicaSet
+                | Driver::StatefulSet
+                | Driver::DaemonSet
+                | Driver::Job
+                | Driver::CronJob
+                | Driver::PodDisruptionBudget
+                | Driver::Endpoints
+                | Driver::Gc
+                | Driver::Namespace
+                | Driver::PvBinder
+                | Driver::VolumeSnapshot
+                | Driver::PvcProtection
+                | Driver::ServedCapability
+                | Driver::CniStatus
+                | Driver::Scheduler
+                | Driver::NetworkPolicy => Respawn::Rebuild,
+                Driver::Kubelet => {
+                    Respawn::RebuildWith(&[Self::NodeLease, Self::Listener(Listener::KubeletHttp)])
+                }
+                Driver::Crd | Driver::ServiceRouting | Driver::CsiRegistrar => {
+                    Respawn::RuntimeRestartOnly
+                }
+            },
+            Self::Listener(Listener::KubeletHttp | Listener::EtcdFacade) | Self::NodeLease => {
+                Respawn::Rebuild
+            }
+        }
+    }
+}
+
+/// How a child is brought back on its own ([`Child::respawn`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Respawn {
+    /// Built again from what it was spawned with.
+    Rebuild,
+    /// Built again, and these dependents with it, after it.
+    RebuildWith(&'static [Child]),
+    /// Only a runtime restart brings it back.
+    RuntimeRestartOnly,
 }
 
 impl fmt::Display for Child {
@@ -643,9 +699,25 @@ pub struct ChildHandle {
     task: AbortHandle,
     tally: Option<Arc<Tally>>,
     state: ChildState,
+    /// When the task was spawned.
+    spawned_at: Timestamp,
+    /// When the supervisor saw it end.
+    ended_at: Option<Timestamp>,
 }
 
 impl ChildHandle {
+    /// When the task was spawned.
+    #[must_use]
+    pub const fn spawned_at(&self) -> Timestamp {
+        self.spawned_at
+    }
+
+    /// When the supervisor saw the task end; `None` while it runs.
+    #[must_use]
+    pub const fn ended_at(&self) -> Option<Timestamp> {
+        self.ended_at
+    }
+
     /// The heartbeat the child writes.
     #[must_use]
     pub fn beat(&self) -> &Arc<Heartbeat> {
@@ -721,6 +793,8 @@ impl Children {
                 task: abort,
                 tally: task.tally,
                 state: ChildState::Running,
+                spawned_at: Timestamp::now(),
+                ended_at: None,
             },
         );
     }
@@ -774,6 +848,7 @@ impl Children {
             };
             if let Some(entry) = self.entries.get_mut(&child) {
                 entry.state = ChildState::Dead(cause);
+                entry.ended_at = Some(Timestamp::now());
                 if cause == DeathCause::Panicked {
                     entry.beat.record_panic();
                 }
@@ -793,9 +868,11 @@ impl Children {
     pub(crate) async fn stop(&mut self) {
         self.set.shutdown().await;
         self.by_task.clear();
+        let at = Timestamp::now();
         for entry in self.entries.values_mut() {
             if entry.state == ChildState::Running {
                 entry.state = ChildState::Dead(DeathCause::Cancelled);
+                entry.ended_at = Some(at);
             }
         }
     }

@@ -233,6 +233,43 @@ let
         == "/Users/probe/.local/share/engenho";
       got = builtins.toJSON ((evalAsHomeManager { }).runtime or { }); }
 
+    { name = "control-socket-renders-at-its-wire-keys";
+      ok = (evalWith {
+             services.engenho.config.control.socket = {
+               path = "/run/engenho/control.sock";
+               access = "group";
+               groupTier = "mutate";
+             };
+           }).control or null == {
+             socket = {
+               path = "/run/engenho/control.sock";
+               access = "group";
+               group_tier = "mutate";
+             };
+           };
+      got = builtins.toJSON ((evalWith {
+             services.engenho.config.control.socket.access = "group";
+           }).control or null); }
+
+    { name = "an-unset-control-section-is-absent";
+      ok = !((evalWith { }) ? control);
+      got = builtins.toJSON (evalWith { }); }
+
+    { name = "a-relative-or-overlong-socket-path-fails-eval";
+      ok = !(builtins.tryEval (builtins.toJSON (evalWith {
+             services.engenho.config.control.socket.path = "control.sock";
+           }))).success
+        && !(builtins.tryEval (builtins.toJSON (evalWith {
+             services.engenho.config.control.socket.path = "/${lib.fixedWidthString 110 "d" ""}";
+           }))).success;
+      got = "a relative path or a 111-byte path evaluated"; }
+
+    { name = "a-group-tier-above-mutate-fails-eval";
+      ok = !(builtins.tryEval (builtins.toJSON (evalWith {
+             services.engenho.config.control.socket.groupTier = "destructive";
+           }))).success;
+      got = "groupTier = destructive evaluated"; }
+
     { name = "explicit-data_dir-still-wins-on-the-hm-arm";
       ok = ((evalAsHomeManager {
              services.engenho.config.runtime.dataDir = "/tmp/elsewhere";

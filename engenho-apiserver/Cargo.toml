@@ -31,6 +31,9 @@ base64             = "0.22"
 # same function so authz and dispatch cannot disagree on a path.
 percent-encoding   = "2"
 rcgen              = { workspace = true }
+# The CA fingerprint the control plane reports (pki_inventory). Already in
+# the graph; same major.
+sha2               = "0.10"
 rustls             = { workspace = true }
 rustls-pemfile     = { workspace = true }
 # Deterministic cluster PKI — BLAKE3-derived per-role seeds → ed25519 keys.

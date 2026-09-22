@@ -119,6 +119,9 @@ impl BootConfig {
             consistency,
             networking,
             runtime,
+            // The supervisor's, not the runtime's: the control listener is
+            // up before any boot and outlives every one (lifecycle/).
+            control: _,
         } = config;
         let ClusterConfig { name, region } = cluster;
         // Section order: the not-run records read in the order the config does.

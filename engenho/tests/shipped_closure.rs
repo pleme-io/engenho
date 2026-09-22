@@ -52,6 +52,9 @@ const SHIPPED: &[&str] = &[
     "engenho-cluster-config-render",
     "engenho-cni",
     "engenho-config",
+    "engenho-control-client",
+    "engenho-control-server",
+    "engenho-control-types",
     "engenho-controllers",
     "engenho-csi",
     "engenho-etcd",
@@ -71,12 +74,6 @@ const SHIPPED: &[&str] = &[
 /// Every workspace crate in no shipped binary, and why it is in the
 /// workspace at all.
 const UNSHIPPED: &[(&str, &str)] = &[
-    (
-        "engenho-control-types",
-        "the control plane's spec-derived types; linked into the daemon when its \
-         control listeners land (docs/CONTROL-PLANE.md, P2), and moved to SHIPPED \
-         then",
-    ),
     (
         "engenho-substrate-incubator",
         "substrate modules no shipped crate depends on (the T5.6 carve)",

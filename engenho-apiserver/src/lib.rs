@@ -47,6 +47,7 @@ pub mod object_body;
 pub mod openapi;
 pub mod params;
 pub mod pki;
+pub mod pki_inventory;
 pub mod pod_logs;
 pub mod proto_transcode;
 pub mod router;

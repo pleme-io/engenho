@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
-use engenho_config::{ConfigError, EngenhoConfig, TieredConfig};
+use engenho_config::{ConfigError, ControlConfig, EngenhoConfig, TieredConfig};
 use serde::{Deserialize, Serialize};
 
 /// How the data directory was decided.
@@ -44,6 +44,10 @@ pub struct ControlBootstrap {
     /// The declared configuration file, when there is one: watched, so a
     /// boot held on the configuration is retried when it changes.
     pub declared: Option<PathBuf>,
+    /// The control plane's own section, read the same way: from the
+    /// resolved configuration, else alone from the declared file, else the
+    /// defaults. The control socket must bind when the rest does not parse.
+    pub control: ControlConfig,
 }
 
 impl ControlBootstrap {
@@ -63,33 +67,50 @@ impl ControlBootstrap {
         resolved: Result<EngenhoConfig, ConfigError>,
         declared: Option<PathBuf>,
     ) -> Self {
-        let (data_dir, data_dir_source) = match resolved {
-            Ok(config) => (config.runtime.data_dir, DataDirSource::Resolved),
-            Err(err) => match declared.as_deref().and_then(lenient_data_dir) {
-                Some(data_dir) => (
-                    data_dir,
-                    DataDirSource::LenientFallback {
-                        error: err.to_string(),
-                    },
-                ),
-                None => (
-                    EngenhoConfig::prescribed_default().runtime.data_dir,
-                    DataDirSource::CompiledDefault,
-                ),
-            },
+        let (data_dir, data_dir_source, control) = match resolved {
+            Ok(config) => (
+                config.runtime.data_dir,
+                DataDirSource::Resolved,
+                config.control,
+            ),
+            Err(err) => {
+                let doc = declared.as_deref().and_then(read_yaml);
+                let control = doc
+                    .as_ref()
+                    .and_then(|d| d.get("control"))
+                    .and_then(|c| serde_yaml::from_value(c.clone()).ok())
+                    .unwrap_or_default();
+                match doc.as_ref().and_then(lenient_data_dir) {
+                    Some(data_dir) => (
+                        data_dir,
+                        DataDirSource::LenientFallback {
+                            error: err.to_string(),
+                        },
+                        control,
+                    ),
+                    None => (
+                        EngenhoConfig::prescribed_default().runtime.data_dir,
+                        DataDirSource::CompiledDefault,
+                        control,
+                    ),
+                }
+            }
         };
         Self {
             data_dir,
             data_dir_source,
             declared,
+            control,
         }
     }
 }
 
-/// `runtime.data_dir` from a YAML file, and nothing else from it.
-fn lenient_data_dir(path: &Path) -> Option<PathBuf> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let doc: serde_yaml::Value = serde_yaml::from_str(&text).ok()?;
+fn read_yaml(path: &Path) -> Option<serde_yaml::Value> {
+    serde_yaml::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+/// `runtime.data_dir` from a YAML document, and nothing else from it.
+fn lenient_data_dir(doc: &serde_yaml::Value) -> Option<PathBuf> {
     doc.get("runtime")?
         .get("data_dir")?
         .as_str()
@@ -106,7 +127,7 @@ mod tests {
         let file = tmp.path().join("engenho.yaml");
         std::fs::write(
             &file,
-            "runtime:\n  data_dir: /srv/engenho\n  not_a_field: true\n",
+            "runtime:\n  data_dir: /srv/engenho\n  not_a_field: true\ncontrol:\n  socket:\n    access: group\n",
         )
         .expect("write");
         let boot = ControlBootstrap::from_resolution(
@@ -119,6 +140,11 @@ mod tests {
             DataDirSource::LenientFallback { .. }
         ));
         assert_eq!(boot.declared, Some(file));
+        assert_eq!(
+            boot.control.socket.access,
+            engenho_config::SocketAccess::Group,
+            "the control section binds even when the rest does not parse"
+        );
     }
 
     #[test]

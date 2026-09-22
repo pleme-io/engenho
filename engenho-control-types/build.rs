@@ -116,6 +116,8 @@ struct Op {
     params: Vec<Param>,
     body: Option<TokenStream>,
     response: TokenStream,
+    /// The success body is `application/yaml` text rather than JSON.
+    yaml_response: bool,
     success_status: u16,
 }
 
@@ -179,7 +181,7 @@ fn operation(spec: &Value, path: &str, method: &str, op: &Value, shared: &[Value
             .unwrap_or_else(|| panic!("{id}: requestBody must be application/json"));
         schema_type(&id, schema)
     });
-    let (success_status, response) = operation_response(&id, op);
+    let (success_status, response, yaml_response) = operation_response(&id, op);
 
     Op {
         variant: ident(&id.to_pascal_case()),
@@ -197,6 +199,7 @@ fn operation(spec: &Value, path: &str, method: &str, op: &Value, shared: &[Value
         params,
         body,
         response,
+        yaml_response,
         success_status,
     }
 }
@@ -236,8 +239,9 @@ fn operation_params(spec: &Value, id: &str, op: &Value, shared: &[Value]) -> Vec
     params
 }
 
-/// An operation's success status and the Rust type of its success body.
-fn operation_response(id: &str, op: &Value) -> (u16, TokenStream) {
+/// An operation's success status, the Rust type of its success body, and
+/// whether that body is YAML text rather than JSON.
+fn operation_response(id: &str, op: &Value) -> (u16, TokenStream, bool) {
     let responses = op
         .get("responses")
         .and_then(Value::as_object)
@@ -249,18 +253,17 @@ fn operation_response(id: &str, op: &Value) -> (u16, TokenStream) {
     let success_status: u16 = status
         .parse()
         .unwrap_or_else(|_| panic!("{id}: bad status {status}"));
-    let response = if let Some(schema) = success.pointer("/content/application~1json/schema") {
-        schema_type(id, schema)
+    if let Some(schema) = success.pointer("/content/application~1json/schema") {
+        (success_status, schema_type(id, schema), false)
     } else if success
         .pointer("/content/application~1yaml/schema/type")
         .and_then(Value::as_str)
         == Some("string")
     {
-        quote!(::std::string::String)
+        (success_status, quote!(::std::string::String), true)
     } else {
         panic!("{id}: 2xx response must be application/json or an application/yaml string")
-    };
-    (success_status, response)
+    }
 }
 
 fn resolve<'a>(spec: &'a Value, v: &'a Value) -> &'a Value {
@@ -341,6 +344,23 @@ fn catalog(ops: &[Op]) -> TokenStream {
         let resource = &o.resource;
         let verb = &o.verb;
         let status = o.success_status;
+        let params = o.params.iter().map(|p| {
+            let name = &p.name;
+            let location = match p.location {
+                Location::Path => quote!(ParamLocation::Path),
+                Location::Query => quote!(ParamLocation::Query),
+                Location::Header => quote!(ParamLocation::Header),
+            };
+            let required = p.required;
+            let kind = kind_tokens(p.kind);
+            quote!(ParamSpec { name: #name, location: #location, required: #required, kind: #kind })
+        });
+        let body = o.body.is_some();
+        let media = if o.yaml_response {
+            quote!(MediaType::Yaml)
+        } else {
+            quote!(MediaType::Json)
+        };
         quote! {
             OperationSpec {
                 id: OperationId::#variant,
@@ -352,6 +372,9 @@ fn catalog(ops: &[Op]) -> TokenStream {
                 gate: #gate,
                 cli: CliSpelling { resource: #resource, verb: #verb },
                 success_status: #status,
+                params: &[#(#params),*],
+                body: #body,
+                response_media: #media,
             }
         }
     });
@@ -398,6 +421,24 @@ fn catalog(ops: &[Op]) -> TokenStream {
 
 fn ops_module(ops: &[Op]) -> TokenStream {
     let items = ops.iter().map(op_items);
+    let visits = ops.iter().map(|o| {
+        let marker = &o.variant;
+        quote!(crate::OperationId::#marker => visitor.visit::<#marker>())
+    });
+    let unserved = ops.iter().map(|o| {
+        let snake = &o.snake;
+        let req = request_ident(o);
+        let resp = &o.response;
+        let id = &o.id;
+        quote! {
+            async fn #snake(&self, _: &crate::Principal, _: #req) -> ::std::result::Result<#resp, crate::ControlError> {
+                Err(crate::ControlError::refused(
+                    crate::types::RefusalReason::Unsupported,
+                    concat!(#id, " is not served here"),
+                ))
+            }
+        }
+    });
     let trait_methods = ops.iter().map(|o| {
         let snake = &o.snake;
         let req = request_ident(o);
@@ -418,7 +459,43 @@ fn ops_module(ops: &[Op]) -> TokenStream {
             #(#trait_methods)*
         }
 
+        /// Something done once per operation type: the one way to go from a
+        /// runtime [`crate::OperationId`] to its marker type. Implement it
+        /// once (route, parse, render) and [`visit`] dispatches every
+        /// operation through it.
+        pub trait OperationVisitor {
+            /// What a visit produces.
+            type Output;
+            /// Visit operation `O`.
+            fn visit<O: crate::Operation>(self) -> Self::Output;
+        }
+
+        /// Dispatch `visitor` on the marker type of `id`. Exhaustive: a new
+        /// operation in the spec is a new arm here, generated with it.
+        pub fn visit<V: OperationVisitor>(id: crate::OperationId, visitor: V) -> V::Output {
+            match id { #(#visits),* }
+        }
+
+        /// A control that serves nothing: every operation is refused as
+        /// unsupported. For exercising a transport across the whole
+        /// catalog, and as the base of a partial implementation's tests.
+        #[derive(Debug, Clone, Copy, Default)]
+        pub struct Unserved;
+
+        #[::async_trait::async_trait]
+        impl EngenhoControl for Unserved {
+            #(#unserved)*
+        }
+
         #(#items)*
+    }
+}
+
+fn kind_tokens(kind: Kind) -> TokenStream {
+    match kind {
+        Kind::Text => quote!(crate::wire::Kind::Text),
+        Kind::Integer => quote!(crate::wire::Kind::Integer),
+        Kind::Boolean => quote!(crate::wire::Kind::Boolean),
     }
 }
 
@@ -587,11 +664,7 @@ fn from_http_body(o: &Op) -> TokenStream {
     let fields = o.params.iter().map(|p| {
         let field = &p.field;
         let name = &p.name;
-        let kind = match p.kind {
-            Kind::Text => quote!(crate::wire::Kind::Text),
-            Kind::Integer => quote!(crate::wire::Kind::Integer),
-            Kind::Boolean => quote!(crate::wire::Kind::Boolean),
-        };
+        let kind = kind_tokens(p.kind);
         let source = match p.location {
             Location::Path => quote!(parts.path_param(#name)),
             Location::Query => quote!(parts.query_param(#name)),

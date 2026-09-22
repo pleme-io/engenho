@@ -54,12 +54,25 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use engenho_apiserver::load_or_generate_ca;
-use engenho_config::{ConfigError, ConfigTier, EngenhoConfig, TieredConfig, render_provenance};
+use engenho_config::{
+    ConfigError, ConfigTier, EngenhoConfig, SocketDefaults, TieredConfig, render_provenance,
+};
+use engenho_control_server::{AuditLog, GrantPolicy, Router, serve_uds};
 use engenho_kube_client::{emit_kubeconfig, emit_kubeconfig_with_admin};
 use engenho_runtime::census::{self, ApiSource, Catalog, DataDirSource, Predicate};
-use engenho_runtime::lifecycle::{ControlBootstrap, ExitIntent, Supervisor, SupervisorConfig};
+use engenho_runtime::control::{DaemonControl, DaemonControlParts, LogLayer, SocketFacts};
+use engenho_runtime::lifecycle::{
+    ConfigSource, ControlBootstrap, ControlDir, ExitIntent, ResolvedConfig, Supervisor,
+    SupervisorConfig,
+};
+use engenho_serve::stop_channel;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Layer;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+
+mod ctl;
 
 /// The verb list, written ONCE.
 ///
@@ -69,8 +82,9 @@ use tracing_subscriber::EnvFilter;
 /// actually dispatched by [`Command::parse`], which closes the other
 /// direction: a verb added to the match arms without a row here fails
 /// the suite rather than becoming silently undiscoverable.
-const SUBCOMMAND_NAMES: [&str; 5] = [
+const SUBCOMMAND_NAMES: [&str; 6] = [
     "daemon",
+    "ctl",
     "kubeconfig",
     "config-show",
     "config-diff",
@@ -97,6 +111,9 @@ enum Command {
     ConfigDiff(String, String),
     /// `census …` — one named census check, or the catalog.
     Census(CensusCommand),
+    /// `ctl …` — talk to the running daemon over its control socket; the
+    /// arguments are parsed by [`ctl::CtlCommand::parse`].
+    Ctl(Vec<String>),
     /// `--help` / `-h` / `help` — print usage to stdout and exit 0.
     Help,
     /// `--version` / `-V` / `version` — print the version to stdout and exit 0.
@@ -123,6 +140,7 @@ impl Command {
             Some("kubeconfig") => Ok(Command::Kubeconfig(args.collect())),
             Some("config-show") => Ok(Command::ConfigShow(args.next())),
             Some("census") => Ok(Command::Census(CensusCommand::parse(args)?)),
+            Some("ctl") => Ok(Command::Ctl(args.collect())),
             Some("config-diff") => match (args.next(), args.next()) {
                 (Some(from), Some(to)) => Ok(Command::ConfigDiff(from, to)),
                 _ => Err(anyhow::anyhow!(
@@ -273,6 +291,7 @@ async fn main() -> anyhow::Result<()> {
         Command::ConfigShow(tier) => run_config_show(tier),
         Command::ConfigDiff(from, to) => run_config_diff(&from, &to),
         Command::Census(census) => run_census(census).await,
+        Command::Ctl(args) => std::process::exit(i32::from(ctl::run(args).await)),
         Command::Help => {
             print!("{}", help_text());
             Ok(())
@@ -288,11 +307,15 @@ async fn main() -> anyhow::Result<()> {
 /// booting it, retrying it and stopping it, until SIGTERM, SIGINT or an
 /// exit request ends the process. Returns how it should end.
 async fn run_daemon() -> anyhow::Result<ExitIntent> {
-    // 1. Tracing — env-filtered, info default for our crates.
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new("engenho=info,engenho_runtime=info,engenho_store=info")
-        }))
+    // 1. Tracing — env-filtered, info default for our crates: to stdout, and
+    //    into the ring the control plane serves (`engenho ctl logs list`).
+    let directives = std::env::var("RUST_LOG")
+        .unwrap_or_else(|_| "engenho=info,engenho_runtime=info,engenho_store=info".into());
+    let filter = || EnvFilter::try_new(&directives).unwrap_or_else(|_| EnvFilter::new("info"));
+    let (log_layer, logs) = LogLayer::new();
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_filter(filter()))
+        .with(log_layer.with_filter(filter()))
         .init();
 
     tracing::info!(
@@ -304,26 +327,70 @@ async fn run_daemon() -> anyhow::Result<ExitIntent> {
     // from here on neither SIGTERM nor SIGINT can kill the process mid-boot.
     let mut stop = StopSignals::subscribe()?;
 
-    // 2. Where the daemon keeps its own state, decided even when the config
-    //    is broken — that is the case the supervisor stays up for.
+    // 2. Where the daemon keeps its own state and where its control socket
+    //    is, decided even when the config is broken — that is the case the
+    //    supervisor stays up (and the socket stays reachable) for.
     let bootstrap = ControlBootstrap::discover();
+    let euid = engenho_control_server::daemon_euid();
+    let socket_config = bootstrap.control.socket.clone();
+    let socket_path = socket_config.resolved_path(&SocketDefaults::for_process(euid));
     tracing::info!(
         data_dir = %bootstrap.data_dir.display(),
         source = ?bootstrap.data_dir_source,
+        socket = %socket_path.display(),
         "control state"
     );
 
     // 3. The supervisor. Each boot resolves the config afresh, inside its
     //    own phase, so a config that does not resolve is a failed boot the
     //    daemon reports and retries — not a dead process.
+    let source: ConfigSource = Arc::new(resolve_declared_config);
+    let data_dir = bootstrap.data_dir.clone();
     let (supervisor, handle) = Supervisor::new(SupervisorConfig {
-        data_dir: bootstrap.data_dir,
-        source: Arc::new(resolve_declared_config),
+        data_dir: data_dir.clone(),
+        source: Arc::clone(&source),
         backend: None,
-        declared: bootstrap.declared,
+        declared: bootstrap.declared.clone(),
     })?;
 
-    // 4. A stop signal is an exit request: the supervisor drains the runtime
+    // 4. The local control socket, bound before the first boot: fatal if
+    //    it cannot be, since it is the recovery path.
+    let audit = Arc::new(AuditLog::open(
+        &data_dir.join(ControlDir::NAME).join("audit"),
+    )?);
+    let control = DaemonControl::new(DaemonControlParts {
+        supervisor: handle.clone(),
+        source,
+        data_dir,
+        data_dir_source: bootstrap.data_dir_source,
+        declared: bootstrap.declared,
+        socket: SocketFacts {
+            path: socket_path.clone(),
+            access: socket_config.access,
+            group_tier: socket_config.group_tier,
+        },
+        logs,
+        audit: Arc::clone(&audit),
+        git_rev: option_env!("ENGENHO_GIT_REV")
+            .unwrap_or("unknown")
+            .to_owned(),
+    });
+    let bound = engenho_control_server::bind(&socket_path, socket_config.access, euid)?;
+    let router = Arc::new(Router::new(
+        Arc::new(control),
+        GrantPolicy::new(euid, socket_config.access, socket_config.group_tier),
+        audit,
+    ));
+    let (control_stop, control_signal) = stop_channel();
+    let serving = tokio::spawn(serve_uds(
+        bound.listener,
+        router,
+        control_signal,
+        engenho_control_server::GRACE,
+    ));
+    tracing::info!(socket = %socket_path.display(), "control socket serving");
+
+    // 5. A stop signal is an exit request: the supervisor drains the runtime
     //    (if it is up) and the process exits 0. The signal streams live
     //    OUTSIDE the loop, so a signal that lands while a request is in
     //    flight stays recorded and is not lost.
@@ -337,13 +404,20 @@ async fn run_daemon() -> anyhow::Result<ExitIntent> {
         }
     });
 
-    Ok(supervisor.run().await)
+    let intent = supervisor.run().await;
+    // The exit request's own answer is on its way out: drain, then close.
+    control_stop.stop();
+    if let Err(err) = serving.await {
+        tracing::warn!(error = %err, "the control socket's server ended abnormally");
+    }
+    drop(bound.guard);
+    Ok(intent)
 }
 
 /// The config one boot runs on, via the sealed progressive-discovery fold
 /// (bare → discovered[`DiscoveryLayer`] → `prescribed_default` → operator
 /// file overlay), each effective leaf carrying typed provenance.
-fn resolve_declared_config() -> Result<EngenhoConfig, ConfigError> {
+fn resolve_declared_config() -> Result<ResolvedConfig, ConfigError> {
     let (config, provenance) = EngenhoConfig::resolve_progressively()?.into_parts();
     tracing::info!(
         cluster = %config.cluster.name,
@@ -370,7 +444,10 @@ fn resolve_declared_config() -> Result<EngenhoConfig, ConfigError> {
         node_name_from = node_name_tier,
         "config provenance",
     );
-    Ok(config)
+    Ok(ResolvedConfig {
+        config,
+        provenance: Some(provenance),
+    })
 }
 
 /// `engenho kubeconfig [--data-dir <d>] [--server <url>]` — load the
@@ -692,6 +769,10 @@ USAGE:
 SUBCOMMANDS:
     daemon                    Boot the runtime. This is the default when no
                               subcommand is given, so bare `engenho` runs it.
+    ctl <RESOURCE> <VERB>     Talk to the running daemon over its control
+                              socket: its lifecycle, boots, init state,
+                              config, children, PKI, store, logs and audit.
+                              `ctl --list` prints every resource and verb.
     kubeconfig [FLAGS]        Print a kubeconfig for the persisted cluster CA.
                               Flags: --data-dir <dir>, --server <url>
     config-show [TIER]        Print the resolved config and each leaf's

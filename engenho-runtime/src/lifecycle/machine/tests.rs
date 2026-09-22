@@ -629,6 +629,12 @@ proptest! {
             prop_assert_eq!(wire["state"].as_str(), Some(next.state.name()));
             let back: LifecycleState = serde_json::from_value(wire).expect("round trip");
             prop_assert_eq!(&back, &next.state);
+            // Parity with the control API: every reachable state is a valid
+            // `LifecycleState` of the spec, and says the same thing there.
+            let spec: engenho_control_types::types::LifecycleState =
+                crate::control::wire(&next.state).expect("the spec's shape");
+            let returned: LifecycleState = crate::control::wire(&spec).expect("and back");
+            prop_assert_eq!(&returned, &next.state);
             m = next;
         }
     }

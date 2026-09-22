@@ -12,8 +12,8 @@ use engenho_config::{ConfigError, EngenhoConfig, KubeletBackendKind};
 use engenho_runtime::boot::BootPhase;
 use engenho_runtime::lifecycle::{
     AttemptResult, CommandError, ControlDir, ExitIntent, Hold, LifecycleState, PreviousRun,
-    RefusedBecause, RetryClass, RunMarker, Snapshot, StopReason, Supervisor, SupervisorConfig,
-    SupervisorError, SupervisorHandle,
+    RefusedBecause, ResolvedConfig, RetryClass, RunMarker, Snapshot, StopReason, Supervisor,
+    SupervisorConfig, SupervisorError, SupervisorHandle,
 };
 use shikumi::TieredConfig;
 use tokio::task::JoinHandle;
@@ -56,6 +56,7 @@ impl Switch {
             cell.lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone()
+                .map(ResolvedConfig::untracked)
                 .ok_or_else(|| ConfigError::Parse("the test's config does not resolve".into()))
         })
     }
@@ -329,7 +330,7 @@ async fn a_change_to_the_declared_file_retries_a_held_boot() {
     let source: engenho_runtime::lifecycle::ConfigSource = Arc::new(move || {
         let text = std::fs::read_to_string(&file).map_err(|e| ConfigError::Parse(e.to_string()))?;
         if text.trim() == "fixed" {
-            Ok(good.clone())
+            Ok(ResolvedConfig::untracked(good.clone()))
         } else {
             Err(ConfigError::Parse(format!("not fixed: {text:?}")))
         }

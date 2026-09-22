@@ -102,6 +102,7 @@ pub use shikumi::{
 
 mod cluster;
 mod consistency;
+mod control;
 mod controllers;
 mod discovery;
 mod error;
@@ -116,6 +117,10 @@ mod tls;
 
 pub use cluster::ClusterConfig;
 pub use consistency::{ConsistencyConfig, ConsistencyTierKind};
+pub use control::{
+    ControlConfig, ControlSocketConfig, GroupTier, SOCKET_PATH_MAX, SYSTEM_SOCKET_PATH,
+    SocketAccess, SocketDefaults, check_socket_path_len,
+};
 pub use controllers::{ControllerEnable, ControllersConfig};
 pub use discovery::{HostnameLayer, NODE_NAME_FALLBACK};
 pub use error::ConfigError;
@@ -161,6 +166,11 @@ pub struct EngenhoConfig {
     /// Single-process assembly knobs (listen addr, data dir, node
     /// name, kubelet backend, leadership timeout).
     pub runtime: RuntimeConfig,
+    /// The daemon's own control plane (the local socket). Read by the
+    /// supervisor, never by the runtime. `#[serde(default)]` so operator YAML
+    /// written before this section existed still parses.
+    #[serde(default)]
+    pub control: ControlConfig,
 }
 
 impl TieredConfig for EngenhoConfig {
@@ -175,6 +185,7 @@ impl TieredConfig for EngenhoConfig {
             consistency: ConsistencyConfig::bare(),
             networking: NetworkingConfig::bare(),
             runtime: RuntimeConfig::bare(),
+            control: ControlConfig::bare(),
         }
     }
 
@@ -195,6 +206,7 @@ impl TieredConfig for EngenhoConfig {
             consistency: ConsistencyConfig::discovered(),
             networking: NetworkingConfig::discovered(),
             runtime: RuntimeConfig::discovered(),
+            control: ControlConfig::discovered(),
         }
     }
 
@@ -209,6 +221,7 @@ impl TieredConfig for EngenhoConfig {
             consistency: ConsistencyConfig::prescribed_default(),
             networking: NetworkingConfig::prescribed_default(),
             runtime: RuntimeConfig::prescribed_default(),
+            control: ControlConfig::prescribed_default(),
         }
     }
 
@@ -225,6 +238,7 @@ impl TieredConfig for EngenhoConfig {
             consistency: self.consistency.extend(&base.consistency),
             networking: self.networking.extend(&base.networking),
             runtime: self.runtime.extend(&base.runtime),
+            control: self.control.extend(&base.control),
         }
     }
 }
@@ -255,6 +269,7 @@ impl EngenhoConfig {
         self.consistency.validate()?;
         self.networking.validate()?;
         self.runtime.validate()?;
+        self.control.validate()?;
 
         // Cross-section: quorum-requiring consensus needs >=3 nodes.
         if matches!(
@@ -287,6 +302,7 @@ impl EngenhoConfig {
             consistency: _,
             networking: _,
             runtime: _,
+            control: _,
         } = self;
         legacy_teia
             .iter()

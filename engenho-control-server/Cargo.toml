@@ -1,0 +1,43 @@
+[package]
+name = "engenho-control-server"
+description = "engenho-control-server — serves engenho's control API (spec/engenho-control.openapi.yaml): the local Unix socket with kernel peer credentials, routing every request through the spec's operation catalog to one EngenhoControl implementation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+readme.workspace = true
+categories.workspace = true
+keywords.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+engenho-control-types = { workspace = true }
+engenho-config        = { workspace = true }
+engenho-serve         = { workspace = true }
+# The flock a socket is claimed with (`<sock>.lock`) is the store's
+# DataDirLock: one exclusive-claim primitive, not a copy.
+engenho-store         = { workspace = true }
+# The audit chain's links and parameter digests.
+blake3                = { workspace = true }
+bytes                 = "1"
+# The spec's timestamps are chrono's (engenho-control-types).
+chrono                = { version = "0.4", default-features = false, features = ["serde", "std", "clock"] }
+http-body-util        = "0.1"
+hyper                 = { workspace = true, features = ["server", "http1"] }
+# The daemon's effective uid, for the local grant (a safe libc wrapper; the
+# socket's peer credentials come from tokio).
+nix                   = { version = "0.29", default-features = false, features = ["user"] }
+serde_json            = { workspace = true }
+thiserror             = { workspace = true }
+tokio                 = { workspace = true }
+tower-service         = "0.3"
+tracing               = { workspace = true }
+
+[dev-dependencies]
+async-trait           = { workspace = true }
+tempfile              = "3"

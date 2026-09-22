@@ -83,6 +83,49 @@ restartable runtime. Its state is one pure machine, `DaemonLifecycle`, on
   when the config does not resolve (`ControlBootstrap`), and is fixed for the
   life of the process.
 
+## The local socket (P2, P3)
+
+`engenho daemon` binds its control socket before the first boot and keeps it
+across every boot, restart and failure — it is the recovery path, so there is
+no switch to turn it off.
+
+* **Where.** `control.socket.path`, else the daemon user's default: root →
+  `/run/engenho/control.sock` (Linux) or `/var/run/engenho/control.sock`
+  (macOS); anyone else → `$XDG_STATE_HOME/engenho/control.sock`, else
+  `~/.local/state/engenho/control.sock`. `engenho ctl` resolves it the same
+  way (`--socket` or `$ENGENHO_CONTROL_SOCKET` name it outright), reading the
+  `control` section leniently, so a broken config still names its socket.
+* **Binding it safely** (`engenho-control-server::socket`). One daemon per
+  socket: a `flock` on `<socket>.lock` (the store's `DataDirLock`, reused); a
+  socket whose lock is free was a dead daemon's and is replaced; a symlink, a
+  file or a directory at the path is refused, never removed; the directory
+  must be the daemon's and nobody else's to write (`0700` for owner access);
+  a path longer than `sun_path` is refused by name.
+* **Who may do what** (`grant`). The kernel's peer credentials, never the
+  request: the daemon's uid or root → destructive; a member of the socket
+  directory's group on a `group` socket → `control.socket.group_tier`
+  (observe or mutate, never destructive); anyone else → nothing. A caller
+  may lower its own tier (`Engenho-Ceiling`); `Engenho-Actor` is recorded,
+  never authority.
+* **Every mutation is audited** (`audit`): intent before it runs, result
+  after, and every refusal — the spec's `AuditRecord`, one JSON line each in
+  `data_dir/control/audit/audit.jsonl`, fsync'd, each carrying the BLAKE3 of
+  the line before it. Parameters are hashed, never written.
+* **Routing is the catalog's** (`router`): `OperationId::route` names the
+  operation from method and path, its catalog row says what tier it needs,
+  and the generated `visit` dispatches it — one exhaustive match, generated
+  from the spec.
+* **The daemon's answers** (`engenho-runtime::control`): lifecycle and journal
+  from the supervisor's snapshot (never waiting on its loop); children, store
+  and kubeconfigs from `SupervisorHandle::inspect`; the PKI from disk,
+  read-only (`engenho_apiserver::pki_inventory` never mints a CA to describe
+  one); events and logs from sequenced rings the caller long-polls.
+* **`engenho ctl <resource> <verb>`** is table-driven over the catalog:
+  positional arguments fill path parameters, `--param value` fills query and
+  header parameters, other `--field value` pairs build the body, and the
+  daemon's own generated parser checks the request before it is sent. Exit
+  codes: 0 answered, 2 usage, 3 refused, 4 blind or unreachable.
+
 ## Remote trust: SPKI pins, not the cluster CA
 
 The control listener does **not** trust engenho's cluster CA. It has its own
@@ -152,8 +195,9 @@ Deviations the spec settled while being authored:
 |---|---|
 | `engenho-serve` | the owned-connection serve loop (`Listener`, `Handshake`, `serve`, `StopHandle`) |
 | `engenho-control-types` | everything derived from the spec, plus `Principal` (Serialize-only), `ControlError`, the HTTP rendering helpers |
-| `engenho-runtime` | the supervisor, the boot journal, `InitState`, the override tier's apply pipeline, child control, re-init — and the `EngenhoControl` implementation (P1+) |
-| `engenho-control-server` / `engenho-control-client` | the transports and the client (P2+) |
+| `engenho-runtime` | the supervisor, the boot journal, the publish records, and `control::DaemonControl` — the one `EngenhoControl` |
+| `engenho-control-server` | the socket, the grant, the router, the audit chain |
+| `engenho-control-client` | typed and generic calls, and the socket resolution `engenho ctl` shares with the daemon |
 
 ## Phases
 
@@ -162,8 +206,8 @@ Deviations the spec settled while being authored:
 | P0a | Clean store handoff: owned connection tasks (`engenho-serve`), `shutdown → StoreReleased`, boot unwind | done |
 | P0b | Spec, `engenho-control-types`, forge-gen spike | done |
 | P1 | Supervisor, boot-phase journal, stay-up on failure, retry classes | done |
-| P2 | Local UDS, observe tier, `engenho ctl` | — |
-| P3 | Operate verbs, authorization tiers, audit chain | — |
+| P2 | Local UDS, observe tier, `engenho ctl` | done |
+| P3 | Operate verbs, authorization tiers, audit chain | done with P2, but for the service manager's restart policy |
 | P4 | Persisted config overrides, sealed mutability, drift | — |
 | P5 | Remote mTLS with SPKI pins | — |
 | P6 | Child control | — |

@@ -383,6 +383,35 @@ in
         "Grace period before topology reacts to a membership change.";
     };
 
+    # The daemon's own control plane (`engenho ctl`), read by its supervisor
+    # before any boot. There is deliberately no `control.enable`: the local
+    # socket is the recovery path — the one way in when the rest of this
+    # config is broken — so it is always on.
+    control.socket = {
+      path = optional
+        (types.addCheck types.str (s: lib.hasPrefix "/" s && lib.stringLength s <= 103))
+        ''
+          Where the daemon's control socket is. `engenho ctl` finds it the same
+          way (this key, read from the same file). Unset: the daemon's user's
+          default — `/run/engenho/control.sock` (Linux, root),
+          `/var/run/engenho/control.sock` (macOS, root), else
+          `$XDG_STATE_HOME/engenho/control.sock` or
+          `~/.local/state/engenho/control.sock`. Absolute, and at most 103
+          bytes: the longest socket address macOS holds.
+        '';
+      access = optional (types.enum [ "owner" "group" ]) ''
+        Who may connect: `owner` (the daemon's user and root; the socket is
+        0600 in a 0700 directory — engenho's default) or `group` (also the
+        members of the socket directory's group, at `groupTier`; the socket
+        is 0660 and the deployment owns the directory's group).
+      '';
+      groupTier = optional (types.enum [ "observe" "mutate" ]) ''
+        The most a group member may do with `access = "group"`: `observe`
+        (engenho's default) or `mutate`. Destructive operations always need
+        the daemon's user or root.
+      '';
+    };
+
     fabric = optional (types.enum [ "in_binary" ]) ''
       How engenho's parts reach one another. `in_binary` is the only value and
       engenho's own default, so leaving this unset is equivalent. There is no
@@ -509,6 +538,10 @@ in
         grace_period_seconds = cfg.revoada.topology.gracePeriodSeconds;
       };
       fabric = cfg.fabric;
+      control.socket = {
+        inherit (cfg.control.socket) path access;
+        group_tier = cfg.control.socket.groupTier;
+      };
       # No `teia`: engenho does not read it (§5.1). The deprecated options
       # above warn instead of rendering.
     });

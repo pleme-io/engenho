@@ -1,13 +1,15 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "aa04610c2f925a8d80bc690449711b43c03bec81b89053d27e122cee35ffe21a",
+  "cargo_lock_sha256": "b3765ff44d0e4b55c8d3d22484996147212a31c65332e3219fae7c599932f020",
   "manifest_sha256": {
-    "Cargo.toml": "ac76d743abb5dcd5d0448707cdb0997ce19cff75e08c129de1ed6c1e733112b0",
-    "engenho-apiserver/Cargo.toml": "911801a9f6ef9c250e67f36bfe7116e83420e1413276f088533b53c75be53050",
+    "Cargo.toml": "998e174c9668f10229291ded499f005bf0b38b8c8de62715b8d1eb54baa4eee3",
+    "engenho-apiserver/Cargo.toml": "f550042a842971824e9d8861f9f53ce2519a5fec8e9f31369a8d501304b8b3b6",
     "engenho-cluster-config-render/Cargo.toml": "5f5f6d40c2b9a572f18418d12e568412517972684259f34a9aa3d34de0a5dc8c",
     "engenho-cluster-config/Cargo.toml": "49d8ea7131956ec2d6323ae41968f624fab66bbbbca1afbb0537b2327a683391",
     "engenho-cni/Cargo.toml": "18a964f983410b945d3e150fe0f2a33635fe63aaadb02f9425a20eac53f39908",
     "engenho-config/Cargo.toml": "663a2eb970f314f8eea6242fce63190a45c143f25e356e8eaa566e83c3c73ac8",
+    "engenho-control-client/Cargo.toml": "f8518e599e0a640e7f93fad90d442e023c2c696f5f1a306443c1c4280ddd4611",
+    "engenho-control-server/Cargo.toml": "d803932e6c1f80d6665ee90a6d13861c4e2f464db61f420db0666ec3350c6ddf",
     "engenho-control-types/Cargo.toml": "5be026a2e76fab0a41b047c8ed2a9bb9bd5c63a0d53d1657513f22d3dab8a783",
     "engenho-controllers/Cargo.toml": "48e41f07d00e66d169fae64d426130413bcd968f7b9a523e3af1af38c9a9b621",
     "engenho-csi/Cargo.toml": "1e80780c1c952308203895db7e3cac22d1f7e6465cacb9d698060412e56d4c97",
@@ -22,7 +24,7 @@
     "engenho-mcp/Cargo.toml": "dc06fc92995d436359c7da1e38aff4fa8fbd4ed1bdb9f70d815f1e0d27163086",
     "engenho-oracle/Cargo.toml": "9b0da2a6c1d469c28eb0617b8d71df0b0bf6db7751596956e0bb74a6ac979984",
     "engenho-revoada/Cargo.toml": "08cfd6e45e8acfb75f3073e3a70a9a11a9c33575c43509d0199b1e73bb8012f9",
-    "engenho-runtime/Cargo.toml": "e1d601f02abca584ac9371358d74ba2b2b42b36acd3e5f480e3ede634efb00ad",
+    "engenho-runtime/Cargo.toml": "3b52e8dde031bc27d6d286e463b0d6dbc1aeb68e98bcb2cf87c050ff7d1c919a",
     "engenho-scheduler/Cargo.toml": "b8e178bbb3012942524cd91c4f5e3c1160e11d2ec81eb81ce5f18bd1504426d1",
     "engenho-serve/Cargo.toml": "e91e4b03ebb3c2537969e30bce65f374c368c8e5a668006970524d2687023cd6",
     "engenho-store/Cargo.toml": "c1630fdd51788287b06e85c72280af36a0953aa3b94f751dd64137ae2c59d404",
@@ -33,7 +35,7 @@
     "engenho-sui-typescape/Cargo.toml": "30fde1a3a1db010241fa2d2c10c14a4953dcbb9979d760cf0843622f3b694207",
     "engenho-teia/Cargo.toml": "c0b840a05f7e1a944503ea3701d4f1f2a4e3656b3c334d9029e8ceb6ee8cbbcc",
     "engenho-types/Cargo.toml": "ed835cbe693033a0b05c49550da9b34545d51a477a28a053bd0a86878bc917c3",
-    "engenho/Cargo.toml": "ba8430805198d138d2911a932e4ee76a903a601ab17de17073da36f9c0ec780c"
+    "engenho/Cargo.toml": "04637db9e4f3179d4e3d0d70b16d16adb3d894ba81c45c30aa2500170d1bf1d6"
   },
   "target_resolves": {
     "base": {
@@ -3670,6 +3672,36 @@
             "tree": "target"
           },
           {
+            "name": "engenho_control_client",
+            "package_key": "engenho-control-client-0.53.118",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "engenho_control_server",
+            "package_key": "engenho-control-server-0.53.118",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "engenho_control_types",
+            "package_key": "engenho-control-types-0.53.118",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
             "name": "engenho_kube_client",
             "package_key": "engenho-kube-client-0.53.118",
             "kind": "normal",
@@ -3690,8 +3722,38 @@
             "tree": "target"
           },
           {
+            "name": "engenho_serve",
+            "package_key": "engenho-serve-0.53.118",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
             "name": "engenho_types",
             "package_key": "engenho-types-0.53.118",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "serde_json",
+            "package_key": "serde_json-1.0.150",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "serde_yaml",
+            "package_key": "serde_yaml-0.9.34+deprecated",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4014,6 +4076,16 @@
           {
             "name": "serde_json",
             "package_key": "serde_json-1.0.150",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "sha2",
+            "package_key": "sha2-0.10.9",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -4390,6 +4462,270 @@
           {
             "name": "thiserror",
             "package_key": "thiserror-2.0.18",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
+      },
+      "engenho-control-client-0.53.118": {
+        "runtime_dependencies": [
+          {
+            "name": "bytes",
+            "package_key": "bytes-1.11.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "engenho_config",
+            "package_key": "engenho-config-0.53.118",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "engenho_control_types",
+            "package_key": "engenho-control-types-0.53.118",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "nix",
+            "package_key": "nix-0.29.0",
+            "kind": "normal",
+            "features": [
+              "user"
+            ],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "reqwest",
+            "package_key": "reqwest-0.12.28",
+            "kind": "normal",
+            "features": [
+              "charset",
+              "http2",
+              "json",
+              "rustls-tls",
+              "rustls-tls-native-roots",
+              "system-proxy"
+            ],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "serde_json",
+            "package_key": "serde_json-1.0.150",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "serde_yaml",
+            "package_key": "serde_yaml-0.9.34+deprecated",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "thiserror",
+            "package_key": "thiserror-2.0.18",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
+      },
+      "engenho-control-server-0.53.118": {
+        "runtime_dependencies": [
+          {
+            "name": "blake3",
+            "package_key": "blake3-1.8.5",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "bytes",
+            "package_key": "bytes-1.11.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "chrono",
+            "package_key": "chrono-0.4.44",
+            "kind": "normal",
+            "features": [
+              "clock",
+              "serde",
+              "std"
+            ],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "engenho_config",
+            "package_key": "engenho-config-0.53.118",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "engenho_control_types",
+            "package_key": "engenho-control-types-0.53.118",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "engenho_serve",
+            "package_key": "engenho-serve-0.53.118",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "engenho_store",
+            "package_key": "engenho-store-0.53.118",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "http_body_util",
+            "package_key": "http-body-util-0.1.3",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "hyper",
+            "package_key": "hyper-1.10.0",
+            "kind": "normal",
+            "features": [
+              "client",
+              "http1",
+              "http1",
+              "server"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "nix",
+            "package_key": "nix-0.29.0",
+            "kind": "normal",
+            "features": [
+              "user"
+            ],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "serde_json",
+            "package_key": "serde_json-1.0.150",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "thiserror",
+            "package_key": "thiserror-2.0.18",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tokio",
+            "package_key": "tokio-1.52.3",
+            "kind": "normal",
+            "features": [
+              "full"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tower_service",
+            "package_key": "tower-service-0.3.3",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tracing",
+            "package_key": "tracing-0.1.44",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -6532,6 +6868,16 @@
             "tree": "target"
           },
           {
+            "name": "blake3",
+            "package_key": "blake3-1.8.5",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
             "name": "chrono",
             "package_key": "chrono-0.4.44",
             "kind": "normal",
@@ -6579,6 +6925,26 @@
           {
             "name": "engenho_config",
             "package_key": "engenho-config-0.53.118",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "engenho_control_server",
+            "package_key": "engenho-control-server-0.53.118",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "engenho_control_types",
+            "package_key": "engenho-control-types-0.53.118",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -6782,6 +7148,18 @@
             "package_key": "tracing-0.1.44",
             "kind": "normal",
             "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tracing_subscriber",
+            "package_key": "tracing-subscriber-0.3.23",
+            "kind": "normal",
+            "features": [
+              "env-filter"
+            ],
             "uses_default_features": true,
             "optional": false,
             "target": null,
@@ -17289,11 +17667,13 @@
         ],
         "features": [
           "default",
+          "feature",
           "memoffset",
           "net",
           "process",
           "signal",
-          "socket"
+          "socket",
+          "user"
         ]
       },
       "nix-nar-0.3.1": {
@@ -38513,6 +38893,20 @@
       "edition": "2024",
       "lib_target": {
         "name": "engenho_config",
+        "path": "src/lib.rs"
+      }
+    },
+    "engenho-control-client-0.53.118": {
+      "edition": "2024",
+      "lib_target": {
+        "name": "engenho_control_client",
+        "path": "src/lib.rs"
+      }
+    },
+    "engenho-control-server-0.53.118": {
+      "edition": "2024",
+      "lib_target": {
+        "name": "engenho_control_server",
         "path": "src/lib.rs"
       }
     },
