@@ -47,6 +47,7 @@ pub mod object_body;
 pub mod openapi;
 pub mod params;
 pub mod pki;
+pub mod pki_files;
 pub mod pki_inventory;
 pub mod pod_logs;
 pub mod proto_transcode;
@@ -99,6 +100,7 @@ pub use pki::{
     VerifiedClientCert, client_verifier, issue_admin_client_material, issue_server_material,
     load_or_generate_ca, parse_client_cert,
 };
+pub use pki_files::PkiFile;
 pub use pod_logs::{LogQuery, PodLogReader};
 pub use router::{RouterState, build};
 pub use scale::{

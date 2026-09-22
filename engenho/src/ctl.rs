@@ -15,18 +15,30 @@
 //! The request is then parsed by the same generated parser the daemon uses,
 //! so a malformed argument is a usage error here, before anything is sent.
 //!
-//! Exit codes: 0 answered, 2 usage, 3 refused, 4 blind or unreachable.
+//! A destructive operation (its catalog row is [`ConfirmGate::Executes`])
+//! run without `--engenho-confirmation` goes through the handshake here:
+//! prepare a challenge, show what it binds and costs, take the cluster's
+//! name — `--confirm-phrase`, or typed at a terminal — and execute under it.
+//! Nothing about any one operation is written for this either.
+//!
+//! Exit codes: 0 answered, 2 usage, 3 refused, 4 blind or unreachable,
+//! 5 confirmation aborted (nothing executed).
 
 use std::fmt;
+use std::io::IsTerminal as _;
 use std::path::PathBuf;
 
 use engenho_control_client::{
     ClientError, ControlClient, RemotesConfig, Reply, remote, resolve_socket,
 };
+use engenho_control_types::ops::{
+    CancelConfirmation, CancelConfirmationRequest, CreateConfirmation, CreateConfirmationRequest,
+};
+use engenho_control_types::types;
 use engenho_control_types::wire::{HttpParts, HttpRequest, OperationRequest};
 use engenho_control_types::{
-    AuthorityTier, CATALOG, ControlError, MediaType, Operation, OperationId, OperationSpec,
-    OperationVisitor, ParamLocation, visit,
+    AuthorityTier, CATALOG, ConfirmGate, ControlError, MediaType, Operation, OperationId,
+    OperationSpec, OperationVisitor, ParamLocation, visit,
 };
 
 /// The call was answered.
@@ -37,6 +49,14 @@ pub const EXIT_USAGE: u8 = 2;
 pub const EXIT_REFUSED: u8 = 3;
 /// The daemon could not answer, or could not be reached.
 pub const EXIT_BLIND: u8 = 4;
+/// A destructive operation's confirmation was not given or did not match:
+/// nothing was executed, and the challenge was withdrawn.
+pub const EXIT_ABORTED: u8 = 5;
+
+/// The header a destructive operation carries its challenge in.
+const CONFIRMATION_HEADER: &str = "Engenho-Confirmation";
+/// The body field it carries the typed phrase in.
+const PHRASE_FIELD: &str = "confirm_phrase";
 
 /// Which daemon `engenho ctl` talks to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -397,15 +417,29 @@ pub async fn run(args: impl IntoIterator<Item = String>) -> u8 {
             return EXIT_USAGE;
         }
     };
-    let CtlAction::Call { id, parts } = command.action else {
+    let CtlAction::Call { id, mut parts } = command.action else {
         print!("{Usage}");
         return EXIT_OK;
     };
-    let request = match visit(id, Render(parts)) {
-        Ok(request) => request,
-        Err(usage) => {
-            eprintln!("engenho ctl: {usage}");
-            return EXIT_USAGE;
+    // A destructive operation without a challenge: the handshake below
+    // fills the challenge in, so what is checked now is the request the
+    // challenge will bind.
+    let handshake = match id.spec().gate {
+        ConfirmGate::Executes(op) if parts.header(CONFIRMATION_HEADER).is_none() => {
+            match reinit_request(op, &parts) {
+                Ok(request) => Some(request),
+                Err(usage) => {
+                    eprintln!("engenho ctl: {usage}");
+                    return EXIT_USAGE;
+                }
+            }
+        }
+        ConfirmGate::Executes(_) | ConfirmGate::Issue | ConfirmGate::Cancel | ConfirmGate::None => {
+            if let Err(usage) = visit(id, Render(parts.clone())) {
+                eprintln!("engenho ctl: {usage}");
+                return EXIT_USAGE;
+            }
+            None
         }
     };
     // Where it looked, for an unreachable local daemon; a remote one names
@@ -436,23 +470,42 @@ pub async fn run(args: impl IntoIterator<Item = String>) -> u8 {
         Some(tier) => client.with_ceiling(tier),
         None => client,
     };
+    if let Some(request) = handshake
+        && let Err(code) = confirm(&client, request, &mut parts, &looked).await
+    {
+        return code;
+    }
+    let request = match visit(id, Render(parts)) {
+        Ok(request) => request,
+        Err(usage) => {
+            eprintln!("engenho ctl: {usage}");
+            return EXIT_USAGE;
+        }
+    };
     match client.send(id, request).await {
         Ok(reply) => {
             print_reply(id, &reply, command.json);
             EXIT_OK
         }
-        Err(ClientError::Control(ControlError::Refused(r))) => {
+        Err(err) => report(&err, &looked),
+    }
+}
+
+/// Say why a call got no answer; the exit code that says so.
+fn report(err: &ClientError, looked: &[PathBuf]) -> u8 {
+    match err {
+        ClientError::Control(ControlError::Refused(r)) => {
             eprintln!("refused ({}): {}", r.reason, r.because);
             for legal in &r.legal {
                 eprintln!("  instead: {legal}");
             }
             EXIT_REFUSED
         }
-        Err(ClientError::Control(ControlError::Blind(b))) => {
+        ClientError::Control(ControlError::Blind(b)) => {
             eprintln!("blind ({}): {}", b.reason, b.because);
             EXIT_BLIND
         }
-        Err(err @ ClientError::Unreachable { .. }) => {
+        ClientError::Unreachable { .. } => {
             eprintln!("engenho ctl: {err}");
             if !looked.is_empty() {
                 let looked: Vec<String> = looked.iter().map(|p| p.display().to_string()).collect();
@@ -461,11 +514,122 @@ pub async fn run(args: impl IntoIterator<Item = String>) -> u8 {
             }
             EXIT_BLIND
         }
-        Err(err) => {
+        ClientError::Protocol(_) => {
             eprintln!("engenho ctl: {err}");
             EXIT_BLIND
         }
     }
+}
+
+/// The re-initialization `op` names with the parameters in `parts`' body —
+/// what the challenge binds.
+fn reinit_request(
+    op: types::ReinitOp,
+    parts: &HttpParts,
+) -> Result<types::ReinitRequest, CtlUsage> {
+    let mut fields = match &parts.body {
+        Some(serde_json::Value::Object(fields)) => fields.clone(),
+        Some(_) | None => serde_json::Map::new(),
+    };
+    fields.remove(PHRASE_FIELD);
+    fields.insert(
+        "operation".into(),
+        serde_json::Value::String(op.to_string()),
+    );
+    serde_json::from_value(serde_json::Value::Object(fields)).map_err(|e| CtlUsage::Invalid {
+        op: OperationId::CreateConfirmation,
+        detail: e.to_string(),
+    })
+}
+
+/// The handshake: prepare a challenge for `request`, show what it binds and
+/// costs, take the phrase, and fill the challenge and the phrase into
+/// `parts`. A phrase that is not the cluster's name, or none, withdraws the
+/// challenge.
+async fn confirm(
+    client: &ControlClient,
+    request: types::ReinitRequest,
+    parts: &mut HttpParts,
+    looked: &[PathBuf],
+) -> Result<(), u8> {
+    let challenge = client
+        .call::<CreateConfirmation>(&CreateConfirmationRequest {
+            body: types::ConfirmationRequest { request },
+        })
+        .await
+        .map_err(|err| report(&err, looked))?;
+    show(&challenge, client.endpoint());
+    let given = parts
+        .body
+        .as_ref()
+        .and_then(|body| body.get(PHRASE_FIELD))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let phrase = match given {
+        Some(phrase) => Some(phrase),
+        None if std::io::stdin().is_terminal() => prompt(&challenge.phrase_hint).await,
+        None => {
+            eprintln!(
+                "stdin is not a terminal: pass --confirm-phrase {} to confirm",
+                challenge.phrase_hint
+            );
+            None
+        }
+    };
+    if phrase.as_deref() != Some(challenge.phrase_hint.as_str()) {
+        let _ = client
+            .call::<CancelConfirmation>(&CancelConfirmationRequest {
+                confirmation: challenge.id.clone(),
+            })
+            .await;
+        eprintln!("aborted: nothing was done");
+        return Err(EXIT_ABORTED);
+    }
+    parts
+        .headers
+        .push((CONFIRMATION_HEADER.to_owned(), challenge.id.to_string()));
+    if let Some(serde_json::Value::Object(body)) = &mut parts.body {
+        body.insert(
+            PHRASE_FIELD.into(),
+            serde_json::Value::String(challenge.phrase_hint),
+        );
+    }
+    Ok(())
+}
+
+/// What a challenge binds and what executing it costs, on stderr.
+fn show(challenge: &types::Challenge, endpoint: &str) {
+    let bound = &challenge.bound;
+    eprintln!(
+        "{} on cluster {:?}, node {:?}, at {endpoint}",
+        bound.operation, bound.cluster_name, bound.node_name
+    );
+    let ca = match &bound.ca {
+        types::CaBinding::Present(sha256) => ["sha256:", sha256.as_str()].concat(),
+        types::CaBinding::Absent => "none".to_owned(),
+        types::CaBinding::Unreadable => "unreadable".to_owned(),
+    };
+    eprintln!("  CA: {ca}");
+    for line in &challenge.blast_radius {
+        eprintln!("  - {line}");
+    }
+    eprintln!("  (this challenge stands until {})", challenge.expires_at);
+}
+
+/// Ask for the phrase at the terminal; `None` at end of input.
+async fn prompt(hint: &str) -> Option<String> {
+    eprint!("type the cluster's name ({hint}) to confirm: ");
+    tokio::task::spawn_blocking(|| {
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .ok()
+            .filter(|n| *n > 0)
+            .map(|_| line.trim().to_owned())
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// A client for the remote daemon `name`: its address and pins from

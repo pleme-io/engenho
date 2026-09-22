@@ -46,3 +46,8 @@ engenho-control-server/src/grant.rs
 # one ends, whether a switch can flip in place, whether a change rebuilds a
 # child.
 engenho-runtime/src/child.rs
+
+# Destructive re-initialization (P7): whether a confirmation matches its
+# challenge, and what each operation moves aside.
+engenho-runtime/src/control/confirm.rs
+engenho-runtime/src/control/reinit.rs

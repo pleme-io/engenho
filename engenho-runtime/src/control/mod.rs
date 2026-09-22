@@ -10,9 +10,12 @@
 
 pub mod apply;
 mod configure;
+pub mod confirm;
+mod destructive;
 pub mod logs;
 pub mod names;
 pub mod overrides;
+pub mod reinit;
 pub mod ring;
 pub mod service;
 

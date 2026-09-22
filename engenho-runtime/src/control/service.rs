@@ -42,14 +42,16 @@ use super::apply::ApplyEffect;
 use super::configure::{
     ApplyOptions, leaf_path, reconfigure_refusal, restart_now, unreadable_overrides,
 };
+use super::confirm::{CaBound, ConfirmationBook};
 use super::logs::LogEntry;
 use super::names::{
-    child_from_wire, child_kind, child_to_wire, death_to_wire, driver_from_wire, driver_to_wire,
-    respawn_to_wire,
+    area_to_wire, child_from_wire, child_kind, child_to_wire, death_to_wire, driver_from_wire,
+    driver_to_wire, reinit_op_to_wire, respawn_to_wire,
 };
 use super::overrides::Change;
 use super::ring::{Page, Ring};
 use crate::child::{Child, ChildState, RespawnError};
+use crate::layout::Area;
 use crate::lifecycle::journal::IdentityRecord;
 use crate::lifecycle::supervisor::{CommandError, file_digest};
 use crate::lifecycle::{
@@ -92,15 +94,9 @@ pub struct SocketFacts {
 pub struct RemoteFacts {
     /// Where it is.
     pub state: tokio::sync::watch::Receiver<engenho_control_server::RemoteState>,
-    /// The listener's own key: its pin and when it was made, or why it is
-    /// unavailable.
-    pub identity: Result<
-        (
-            engenho_control_types::pin::Spki,
-            chrono::DateTime<chrono::Utc>,
-        ),
-        String,
-    >,
+    /// The listener's own key — read at each request, since it can be
+    /// rotated — or why there is none.
+    pub identity: Result<Arc<engenho_control_server::ControlIdentity>, String>,
     /// Who it admits.
     pub pins: engenho_control_server::Pins,
 }
@@ -135,6 +131,8 @@ pub struct DaemonControl {
     /// One configuration change at a time, from planning to applied: two
     /// changes planned against one generation cannot both commit.
     pub(super) applying: tokio::sync::Mutex<()>,
+    /// The destructive operations' pending challenges.
+    pub(super) confirmations: ConfirmationBook,
 }
 
 /// The longest a long-poll may wait.
@@ -149,6 +147,7 @@ impl DaemonControl {
         Self {
             p: parts,
             applying: tokio::sync::Mutex::new(()),
+            confirmations: ConfirmationBook::default(),
         }
     }
 
@@ -190,17 +189,17 @@ impl DaemonControl {
             | O::PublishKubeconfig
             | O::RestartChild
             | O::EnableDriver
-            | O::DisableDriver => true,
-            O::CreateConfirmation
+            | O::DisableDriver
+            | O::CreateConfirmation
             | O::CancelConfirmation
             | O::RotateAdminToken
             | O::ReseedPki
             | O::WipeStore
-            | O::RotateControlIdentity => false,
+            | O::RotateControlIdentity => true,
         }
     }
 
-    fn snapshot(&self) -> Snapshot {
+    pub(super) fn snapshot(&self) -> Snapshot {
         self.p.supervisor.snapshot()
     }
 
@@ -257,11 +256,7 @@ impl DaemonControl {
     }
 
     fn ca_binding(&self) -> types::CaBinding {
-        match pki_inventory::inventory(&self.p.data_dir).ca {
-            CaFact::Present { sha256, .. } => types::Sha256Hex::try_from(sha256)
-                .map_or(types::CaBinding::Absent, types::CaBinding::Present),
-            CaFact::Absent | CaFact::Unreadable(_) => types::CaBinding::Absent,
-        }
+        CaBound::of(&pki_inventory::inventory(&self.p.data_dir).ca).to_wire()
     }
 
     fn store_facts(inspection: &Inspection) -> types::StoreFacts {
@@ -423,27 +418,17 @@ impl DaemonControl {
     }
 
     fn layout(&self) -> Vec<types::LayoutEntry> {
-        use types::LayoutName as L;
-        [
-            (L::Store, STORE_DIR),
-            (L::Pki, "pki"),
-            (L::LocalPath, "local-path"),
-            (L::Volumes, "volumes"),
-            (L::Plugins, "plugins"),
-            (L::Pods, "pods"),
-            (L::Snapshots, "snapshots"),
-            (L::Control, crate::lifecycle::ControlDir::NAME),
-        ]
-        .into_iter()
-        .map(|(name, dir)| types::LayoutEntry {
-            name,
-            presence: if self.p.data_dir.join(dir).exists() {
-                types::Presence::Present
-            } else {
-                types::Presence::Absent
-            },
-        })
-        .collect()
+        Area::ALL
+            .iter()
+            .map(|&area| types::LayoutEntry {
+                name: area_to_wire(area),
+                presence: if area.path(&self.p.data_dir).exists() {
+                    types::Presence::Present
+                } else {
+                    types::Presence::Absent
+                },
+            })
+            .collect()
     }
 
     fn declared_source(&self) -> Result<types::DeclaredSource, ControlError> {
@@ -556,16 +541,6 @@ pub(super) fn internal(err: impl std::fmt::Display) -> ControlError {
     ControlError::blind(BlindReason::Internal, err.to_string())
 }
 
-fn unsupported(id: OperationId, arrives: &str) -> ControlError {
-    ControlError::refused(
-        RefusalReason::Unsupported,
-        format!(
-            "{} is not served by this daemon yet ({arrives})",
-            id.as_str()
-        ),
-    )
-}
-
 /// Which tier gave a leaf its value. Both the declared file and the override
 /// tier are shikumi `Custom` file layers; the file they came from tells them
 /// apart.
@@ -676,6 +651,9 @@ fn event_kind(event: &DaemonEvent) -> Result<types::ControlEventKind, ControlErr
                 generation: *generation,
             }
         }
+        DaemonEvent::ReinitExecuted { operation } => types::ControlEventKind::ReinitExecuted {
+            operation: reinit_op_to_wire(*operation),
+        },
         DaemonEvent::ConfigApplied {
             generation,
             leaves,
@@ -1209,9 +1187,10 @@ impl EngenhoControl for DaemonControl {
             },
             remote: remote.state.borrow().view(),
             identity: match &remote.identity {
-                Ok((spki, created_at)) => types::ControlIdentityView::Present {
-                    spki: types::SpkiSha256::try_from(spki.to_string()).map_err(internal)?,
-                    created_at: *created_at,
+                Ok(identity) => types::ControlIdentityView::Present {
+                    spki: types::SpkiSha256::try_from(identity.spki().to_string())
+                        .map_err(internal)?,
+                    created_at: identity.created_at(),
                 },
                 Err(detail) => types::ControlIdentityView::Unavailable {
                     detail: detail.clone(),
@@ -1271,62 +1250,82 @@ impl EngenhoControl for DaemonControl {
 
     async fn create_confirmation(
         &self,
-        _: &Principal,
-        _: CreateConfirmationRequest,
+        by: &Principal,
+        req: CreateConfirmationRequest,
     ) -> Result<types::Challenge, ControlError> {
-        Err(unsupported(
-            OperationId::CreateConfirmation,
-            "re-initialization",
-        ))
+        self.prepare(by, &req.body.request)
     }
 
     async fn cancel_confirmation(
         &self,
         _: &Principal,
-        _: CancelConfirmationRequest,
+        req: CancelConfirmationRequest,
     ) -> Result<types::Cancelled, ControlError> {
-        Err(unsupported(
-            OperationId::CancelConfirmation,
-            "re-initialization",
-        ))
+        self.cancel(&req.confirmation)
     }
 
     async fn rotate_admin_token(
         &self,
-        _: &Principal,
-        _: RotateAdminTokenRequest,
+        by: &Principal,
+        req: RotateAdminTokenRequest,
     ) -> Result<types::ReinitReport, ControlError> {
-        Err(unsupported(
-            OperationId::RotateAdminToken,
-            "re-initialization",
-        ))
+        let request = types::ReinitRequest::RotateAdminToken;
+        self.execute(
+            by,
+            &req.engenho_confirmation,
+            &request,
+            &req.body.confirm_phrase,
+        )
+        .await
     }
 
     async fn reseed_pki(
         &self,
-        _: &Principal,
-        _: ReseedPkiRequest,
+        by: &Principal,
+        req: ReseedPkiRequest,
     ) -> Result<types::ReinitReport, ControlError> {
-        Err(unsupported(OperationId::ReseedPki, "re-initialization"))
+        let request = types::ReinitRequest::ReseedPki {
+            sa_key: req.body.sa_key,
+        };
+        self.execute(
+            by,
+            &req.engenho_confirmation,
+            &request,
+            &req.body.confirm_phrase,
+        )
+        .await
     }
 
     async fn wipe_store(
         &self,
-        _: &Principal,
-        _: WipeStoreRequest,
+        by: &Principal,
+        req: WipeStoreRequest,
     ) -> Result<types::ReinitReport, ControlError> {
-        Err(unsupported(OperationId::WipeStore, "re-initialization"))
+        let request = types::ReinitRequest::WipeStore {
+            scope: req.body.scope,
+        };
+        self.execute(
+            by,
+            &req.engenho_confirmation,
+            &request,
+            &req.body.confirm_phrase,
+        )
+        .await
     }
 
     async fn rotate_control_identity(
         &self,
-        _: &Principal,
-        _: RotateControlIdentityRequest,
+        by: &Principal,
+        req: RotateControlIdentityRequest,
     ) -> Result<types::ReinitReport, ControlError> {
-        Err(unsupported(
-            OperationId::RotateControlIdentity,
-            "remote control",
-        ))
+        let request = types::ReinitRequest::RotateControlIdentity;
+        self.execute(
+            by,
+            &req.engenho_confirmation,
+            &request,
+            &req.body.confirm_phrase,
+        )
+        .await
     }
 }
 
@@ -1448,14 +1447,14 @@ mod tests {
         }
     }
 
-    /// `hello`'s capabilities are exactly the operations this daemon serves.
+    /// `hello`'s capabilities are exactly the operations this daemon serves
+    /// — since P7, every operation the spec has.
     #[test]
     fn capabilities_name_only_what_is_served() {
-        let served: Vec<_> = OperationId::ALL
+        let unserved: Vec<_> = OperationId::ALL
             .iter()
-            .filter(|id| DaemonControl::serves(**id))
+            .filter(|id| !DaemonControl::serves(**id))
             .collect();
-        assert!(served.contains(&&OperationId::Hello));
-        assert!(!served.contains(&&OperationId::WipeStore));
+        assert!(unserved.is_empty(), "not served: {unserved:?}");
     }
 }

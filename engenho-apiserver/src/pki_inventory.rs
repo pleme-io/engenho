@@ -16,6 +16,7 @@ use rcgen::{CertificateParams, DnType, KeyPair};
 use sha2::{Digest, Sha256};
 
 use crate::pki::ca_key_is_publicly_derivable;
+use crate::pki_files::PkiFile;
 
 /// A moment, in seconds since the Unix epoch (UTC).
 pub type UnixSeconds = i64;
@@ -95,13 +96,12 @@ pub struct PkiInventory {
 /// Read `data_dir/pki/`. Never writes.
 #[must_use]
 pub fn inventory(data_dir: &Path) -> PkiInventory {
-    let pki = data_dir.join("pki");
     PkiInventory {
-        ca: ca_fact(&pki),
-        cluster_seed: file_fact(&pki.join("cluster-seed")),
-        sa_key: file_fact(&pki.join("sa.key")),
-        admin_token: file_fact(&pki.join("admin.token")),
-        admin_cert: cert_fact(&pki.join("admin.crt")),
+        ca: ca_fact(data_dir),
+        cluster_seed: file_fact(&PkiFile::ClusterSeed.path(data_dir)),
+        sa_key: file_fact(&PkiFile::SaKey.path(data_dir)),
+        admin_token: file_fact(&PkiFile::AdminToken.path(data_dir)),
+        admin_cert: cert_fact(&PkiFile::AdminCert.path(data_dir)),
     }
 }
 
@@ -138,8 +138,8 @@ fn validity(params: &CertificateParams) -> (UnixSeconds, UnixSeconds) {
     )
 }
 
-fn ca_fact(pki: &Path) -> CaFact {
-    let der = match first_cert_der(&pki.join("ca.crt")) {
+fn ca_fact(data_dir: &Path) -> CaFact {
+    let der = match first_cert_der(&PkiFile::CaCert.path(data_dir)) {
         Ok(Some(der)) => der,
         Ok(None) => return CaFact::Absent,
         Err(err) => return CaFact::Unreadable(format!("ca.crt: {err}")),
@@ -148,7 +148,7 @@ fn ca_fact(pki: &Path) -> CaFact {
         Ok(params) => params,
         Err(err) => return CaFact::Unreadable(format!("ca.crt: {err}")),
     };
-    let key_pem = match std::fs::read_to_string(pki.join("ca.key")) {
+    let key_pem = match std::fs::read_to_string(PkiFile::CaKey.path(data_dir)) {
         Ok(pem) => pem,
         Err(err) => return CaFact::Unreadable(format!("ca.key: {err}")),
     };

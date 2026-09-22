@@ -58,7 +58,7 @@ pub enum ControlWriteError {
 
 impl ControlDir {
     /// The directory's name under the data directory.
-    pub const NAME: &'static str = "control";
+    pub const NAME: &'static str = crate::layout::Area::Control.dir();
     const JOURNAL: &'static str = "boot-journal.json";
     const RUN: &'static str = "run.json";
     const IDENTITY: &'static str = "identity.json";

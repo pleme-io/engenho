@@ -515,8 +515,8 @@ impl std::fmt::Debug for SaIssuer {
 /// which is a truncated or foreign file, and is refused rather than padded
 /// into a valid-but-wrong key.
 pub fn load_or_generate_sa_key(data_dir: &std::path::Path) -> std::io::Result<SaKeypair> {
-    let pki_dir = data_dir.join("pki");
-    let key_path = pki_dir.join("sa.key");
+    let pki_dir = crate::PkiFile::dir(data_dir);
+    let key_path = crate::PkiFile::SaKey.path(data_dir);
 
     let seed: [u8; 32] = if key_path.exists() {
         let bytes = std::fs::read(&key_path)?;

@@ -17,7 +17,7 @@
 //! certificate without its private key fails the handshake.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{
@@ -25,6 +25,8 @@ use rustls::crypto::{
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::sign::CertifiedKey;
 use rustls::{CertificateError, DigitallySignedStruct, DistinguishedName, Error, SignatureScheme};
 use sha2::{Digest, Sha256};
 
@@ -370,29 +372,73 @@ impl ServerCertVerifier for ServerPins {
 /// The name a control certificate carries; nothing checks it.
 pub const CERT_NAME: &str = "engenho-control";
 
-/// The remote listener's TLS: TLS 1.3, presenting `identity`, admitting only
-/// clients whose key `clients` pins.
+/// The certificate a server presents, replaceable while it serves: the next
+/// handshake after [`Self::present`] presents the new key, and connections
+/// already made keep the one they were made with.
+#[derive(Debug)]
+pub struct Presented {
+    current: RwLock<Arc<CertifiedKey>>,
+}
+
+impl Presented {
+    /// Present `identity`.
+    ///
+    /// # Errors
+    ///
+    /// Its certificate could not be made.
+    pub fn new(identity: &KeyMaterial) -> Result<Self, KeyError> {
+        Ok(Self {
+            current: RwLock::new(certified(identity)?),
+        })
+    }
+
+    /// Present `identity` from the next handshake on.
+    ///
+    /// # Errors
+    ///
+    /// Its certificate could not be made; the old one is still presented.
+    pub fn present(&self, identity: &KeyMaterial) -> Result<(), KeyError> {
+        let next = certified(identity)?;
+        *self.current.write().unwrap_or_else(PoisonError::into_inner) = next;
+        Ok(())
+    }
+}
+
+impl ResolvesServerCert for Presented {
+    fn resolve(&self, _: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        Some(Arc::clone(
+            &self.current.read().unwrap_or_else(PoisonError::into_inner),
+        ))
+    }
+}
+
+fn certified(identity: &KeyMaterial) -> Result<Arc<CertifiedKey>, KeyError> {
+    let (cert, key) = identity.certificate(CERT_NAME)?;
+    CertifiedKey::from_der(vec![cert], key, &provider())
+        .map(Arc::new)
+        .map_err(|e| KeyError(e.to_string()))
+}
+
+/// The remote listener's TLS: TLS 1.3, presenting what `identity` presents
+/// at each handshake, admitting only clients whose key `clients` pins.
 ///
 /// # Errors
 ///
-/// The identity's certificate could not be made, or rustls refused the
-/// configuration.
+/// rustls refused the configuration.
 pub fn server_config(
-    identity: &KeyMaterial,
+    identity: Arc<Presented>,
     clients: Arc<dyn PinSet>,
 ) -> Result<rustls::ServerConfig, KeyError> {
     let provider = provider();
     let signatures = Signatures(provider.signature_verification_algorithms);
-    let (cert, key) = identity.certificate(CERT_NAME)?;
-    rustls::ServerConfig::builder_with_provider(provider)
+    Ok(rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(VERSIONS)
         .map_err(|e| KeyError(e.to_string()))?
         .with_client_cert_verifier(Arc::new(ClientPins {
             pins: clients,
             signatures,
         }))
-        .with_single_cert(vec![cert], key)
-        .map_err(|e| KeyError(e.to_string()))
+        .with_cert_resolver(identity))
 }
 
 /// A client's TLS: TLS 1.3, presenting `key`, trusting only a server whose

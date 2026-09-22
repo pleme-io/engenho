@@ -214,6 +214,62 @@ Every respawn is on the event stream as `child_respawned`; a child that
 happens to die while others are being stopped is still reported as
 `child_died`.
 
+## Destructive re-initialization (P7)
+
+Four operations replace state a running cluster depends on:
+
+| Operation | Replaces | Needs the runtime stopped |
+|---|---|---|
+| `reinit rotate-admin-token` | `pki/admin.token` (a new one is written at once; the running apiserver keeps the old until it boots again) | no |
+| `reinit reseed-pki --sa-key keep\|rotate` | the cluster seed, and the CA and admin credential derived from it (`PkiFile::seed_derived`); `sa.key` with `rotate` | yes |
+| `reinit wipe-store --scope store_only\|store_and_node_local` | the store; with `store_and_node_local`, every node-local area (`Area::node_local`) | yes |
+| `control rotate-identity` | the control identity's key; the remote listener presents the new one from the next handshake, with no restart | no |
+
+**The handshake** (`engenho-runtime/src/control/confirm.rs`). `engenho ctl`
+runs it for any operation the catalog marks `ConfirmGate::Executes`, so
+nothing about any one operation is written in the client:
+
+1. `reinit prepare` binds a challenge to the cluster and node names, the CA's
+   fingerprint, the stop epoch (for the store operations), the operation and
+   a BLAKE3 digest of its parameters, and the caller — the uid on the local
+   socket, the pinned key remotely, never the process. It returns a
+   single-use 128-bit id, the phrase (the cluster's name), and the blast
+   radius, one consequence a line. It stands for 120 seconds.
+2. The operation carries the id (`Engenho-Confirmation`) and the phrase
+   (`--confirm-phrase`, or typed at a terminal). The daemon takes the
+   challenge out of its book first — it is used up whatever happens next —
+   then checks each bound fact again, afresh. A stale epoch (the runtime ran
+   since), another operation, other parameters, another caller or a wrong
+   phrase is `confirmation_mismatch`; an unknown or used id is
+   `confirmation_required`; an expired one `confirmation_expired`. Without a
+   phrase and without a terminal, or with a wrong one, `engenho ctl`
+   withdraws the challenge and exits 5, having done nothing.
+3. The data-directory operations run in the supervisor's loop, which checks
+   again that the runtime rests (stopped, or its boot failed, nothing booting
+   or draining) in the bound epoch and holds the store's lock throughout, so
+   nothing boots between the checks and the move.
+
+Tier-honest: this proves the operation is aimed at the cluster the operator
+named, as it was when they looked, by whoever looked, once. It does not prove
+a human typed it, which is why no destructive operation will be an MCP tool.
+The plan named `Selo` for the challenge; the client never carries the binding,
+only an id the daemon keeps beside it, so there is nothing for a MAC to
+protect, and single use needs the daemon's state regardless.
+
+**Nothing is deleted.** What an operation replaces is renamed into
+`data_dir/control/attic/<operation>-<time>/` at the same relative path — a
+rename, so it costs nothing however large the store — and a move that fails
+part-way puts back what it had moved. `data_dir/control/` itself is never
+replaced by a data-directory operation (a test holds every row out of it).
+The report names the attic, every published kubeconfig a re-seed made stale,
+and what to do next. After a wipe the next boot is a first boot; after a
+re-seed the next boot mints a new CA.
+
+The file names these operations move are named once: `PkiFile` (in
+`engenho-apiserver`, which owns the PKI) and `Area` (the data directory's
+layout, in `engenho-runtime`) — the same enums every reader and writer of
+those files and directories now goes through.
+
 ## Remote trust: SPKI pins, not the cluster CA
 
 The control listener does **not** trust engenho's cluster CA. It has its own
@@ -337,5 +393,5 @@ Deviations the spec settled while being authored:
 | P4 | Persisted config overrides, sealed mutability, drift | done |
 | P5 | Remote mTLS with SPKI pins | done (the fleet's Nix wiring: the `pleme-io/nix` repo) |
 | P6 | Child control: respawn, driver switches and listener moves in place | done |
-| P7 | Gated destructive re-init | — |
+| P7 | Gated destructive re-init: confirmation handshake, attic, control identity rotation | done |
 | P8 | MCP tools, completions, docs | — |

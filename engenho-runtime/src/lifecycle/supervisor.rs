@@ -53,8 +53,10 @@ use crate::boot::{BootKind, BootPhase, BootProgress, BootRecorder, FailureClass,
 use crate::child::{Child, ChildState, DeadChild, Death, DeathCause, RespawnError, Respawned};
 use crate::control::apply::ApplyEffect;
 use crate::control::overrides::OverrideStore;
+use crate::control::reinit::{self, MovedAside, Reinit, ReinitOp};
 use crate::control::ring::Ring;
 use crate::error::RuntimeError;
+use crate::layout::Area;
 use crate::publish::PublishRecord;
 use crate::release::{BootFailed, BootUnwind, StoreReleased};
 use crate::runtime::Runtime;
@@ -274,6 +276,36 @@ enum Request {
         child: Child,
         reply: oneshot::Sender<Result<Respawned, RestartChildError>>,
     },
+    Reinit {
+        reinit: Reinit,
+        epoch: Option<u64>,
+        reply: oneshot::Sender<Result<MovedAside, ReinitRefused>>,
+    },
+}
+
+/// Why the supervisor did not re-initialize ([`SupervisorHandle::reinit`]).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ReinitRefused {
+    /// It needs the runtime stopped (or its boot failed), and it is not.
+    #[error("the runtime must be stopped first")]
+    NotStopped,
+    /// The runtime ran since the challenge was prepared.
+    #[error("the runtime ran since the challenge was prepared (stop epoch {bound}, now {now})")]
+    EpochMoved {
+        /// The epoch it was prepared in.
+        bound: u64,
+        /// The epoch now.
+        now: u64,
+    },
+    /// Something still holds the store.
+    #[error("the store is held: {0}")]
+    StoreHeld(String),
+    /// It ran and failed; the data directory is as the reason says.
+    #[error("{0}")]
+    Failed(String),
+    /// The supervisor has ended.
+    #[error("the supervisor has ended")]
+    Gone,
 }
 
 /// What the supervisor did with a configuration change
@@ -423,6 +455,11 @@ pub enum DaemonEvent {
         child: Child,
         /// Its generation now.
         generation: u64,
+    },
+    /// A confirm-gated re-initialization ran.
+    ReinitExecuted {
+        /// Which.
+        operation: ReinitOp,
     },
     /// A configuration change was applied.
     ConfigApplied {
@@ -585,6 +622,30 @@ impl SupervisorHandle {
             .await
             .map_err(|_| RestartChildError::Gone)?;
         answer.await.map_err(|_| RestartChildError::Gone)?
+    }
+
+    /// Re-initialize the data directory ([`Reinit`]): only while the runtime
+    /// is stopped in `epoch` when the operation needs it stopped, with the
+    /// store's lock held throughout. The caller has checked the confirmation.
+    ///
+    /// # Errors
+    ///
+    /// [`ReinitRefused`].
+    pub async fn reinit(
+        &self,
+        reinit: Reinit,
+        epoch: Option<u64>,
+    ) -> Result<MovedAside, ReinitRefused> {
+        let (reply, answer) = oneshot::channel();
+        self.requests
+            .send(Request::Reinit {
+                reinit,
+                epoch,
+                reply,
+            })
+            .await
+            .map_err(|_| ReinitRefused::Gone)?;
+        answer.await.map_err(|_| ReinitRefused::Gone)?
     }
 
     async fn ask<T>(&self, request: impl FnOnce(Reply<T>) -> Request) -> Result<T, CommandError> {
@@ -875,6 +936,13 @@ impl Supervisor {
             Request::Republish(reply) => {
                 let _ = reply.send(self.republish());
             }
+            Request::Reinit {
+                reinit,
+                epoch,
+                reply,
+            } => {
+                let _ = reply.send(self.reinit(reinit, epoch, at));
+            }
             // Answered by the loop, which awaits the runtime.
             Request::Inspect(_) | Request::Reconfigure { .. } | Request::RestartChild { .. } => {}
         }
@@ -975,6 +1043,71 @@ impl Supervisor {
             pending,
             restarted,
         })
+    }
+
+    /// Run `reinit` here, in the loop, so no start, retry or boot can begin
+    /// between the checks and the move.
+    fn reinit(
+        &mut self,
+        reinit: Reinit,
+        epoch: Option<u64>,
+        at: Timestamp,
+    ) -> Result<MovedAside, ReinitRefused> {
+        // Held until the move is done: nothing opens the store meanwhile.
+        let _store_lock = if reinit.needs_stopped() {
+            self.resting_in(epoch)?
+        } else {
+            None
+        };
+        let moved = reinit::move_aside(&self.data_dir, reinit, at)
+            .map_err(|e| ReinitRefused::Failed(e.to_string()))?;
+        if reinit == Reinit::RotateAdminToken {
+            crate::runtime::load_or_generate_admin_token(&self.data_dir).map_err(|e| {
+                ReinitRefused::Failed(
+                    [
+                        "the old token is in ",
+                        moved.attic.display().to_string().as_str(),
+                        ", and a new one could not be written: ",
+                        e.to_string().as_str(),
+                    ]
+                    .concat(),
+                )
+            })?;
+        }
+        info!(
+            operation = reinit.op().name(),
+            attic = %moved.attic.display(),
+            moved = ?moved.moved,
+            "re-initialized"
+        );
+        self.events.push(DaemonEvent::ReinitExecuted {
+            operation: reinit.op(),
+        });
+        Ok(moved)
+    }
+
+    /// The runtime rests — stopped, or its boot failed, with nothing booting
+    /// or draining — in `epoch` (any, when `None`): then the store's lock,
+    /// taken, when there is a store to lock.
+    fn resting_in(&self, epoch: Option<u64>) -> Result<Option<DataDirLock>, ReinitRefused> {
+        let resting = matches!(
+            self.machine.state().state,
+            LifecycleState::Stopped { .. } | LifecycleState::Failed { .. }
+        ) && matches!(self.slot, Slot::Idle(_));
+        if !resting {
+            return Err(ReinitRefused::NotStopped);
+        }
+        let now = self.machine.state().epoch();
+        if let Some(bound) = epoch.filter(|bound| *bound != now) {
+            return Err(ReinitRefused::EpochMoved { bound, now });
+        }
+        let store = Area::Store.path(&self.data_dir);
+        if !store.exists() {
+            return Ok(None);
+        }
+        DataDirLock::acquire(&store)
+            .map(Some)
+            .map_err(|e| ReinitRefused::StoreHeld(e.to_string()))
     }
 
     fn republish(&mut self) -> Result<Vec<PublishRecord>, ReconfigureError> {

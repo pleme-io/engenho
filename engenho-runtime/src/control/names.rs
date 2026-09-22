@@ -10,6 +10,8 @@
 use engenho_control_types::types;
 
 use crate::child::{Child, DeathCause, Driver, Listener, Respawn};
+use crate::control::reinit::ReinitOp;
+use crate::layout::Area;
 
 macro_rules! driver_names {
     ($($variant:ident),* $(,)?) => {
@@ -99,6 +101,32 @@ pub const fn respawn_to_wire(respawn: Respawn) -> types::RespawnClass {
         Respawn::Rebuild => types::RespawnClass::Rebuild,
         Respawn::RebuildWith(_) => types::RespawnClass::RebuildWith,
         Respawn::RuntimeRestartOnly => types::RespawnClass::RuntimeRestartOnly,
+    }
+}
+
+/// A confirm-gated operation, by its API name.
+#[must_use]
+pub const fn reinit_op_to_wire(op: ReinitOp) -> types::ReinitOp {
+    match op {
+        ReinitOp::RotateAdminToken => types::ReinitOp::RotateAdminToken,
+        ReinitOp::ReseedPki => types::ReinitOp::ReseedPki,
+        ReinitOp::WipeStore => types::ReinitOp::WipeStore,
+        ReinitOp::RotateControlIdentity => types::ReinitOp::RotateControlIdentity,
+    }
+}
+
+/// An area of the data directory, by its API name.
+#[must_use]
+pub const fn area_to_wire(area: Area) -> types::LayoutName {
+    match area {
+        Area::Store => types::LayoutName::Store,
+        Area::Pki => types::LayoutName::Pki,
+        Area::LocalPath => types::LayoutName::LocalPath,
+        Area::Volumes => types::LayoutName::Volumes,
+        Area::Plugins => types::LayoutName::Plugins,
+        Area::Pods => types::LayoutName::Pods,
+        Area::Snapshots => types::LayoutName::Snapshots,
+        Area::Control => types::LayoutName::Control,
     }
 }
 

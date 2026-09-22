@@ -201,6 +201,74 @@ async fn only_pinned_clients_get_through_and_only_at_their_tier() {
     listener.stopped().await;
 }
 
+/// A rotated identity is presented from the next handshake, while the
+/// listener serves: a client pinned to the old key is refused by its own
+/// verifier, a client pinned to the new one gets through.
+#[tokio::test]
+async fn a_rotated_identity_is_presented_without_a_restart() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let identity =
+        Arc::new(ControlIdentity::load_or_create(&tmp.path().join("identity")).expect("identity"));
+    let operator = KeyMaterial::generate().expect("key");
+    let config = RemoteControlConfig {
+        enable: true,
+        listen_addr: "127.0.0.1:0".into(),
+        authorized_clients: vec![authorized("operator", &operator, RemoteTier::Observe)],
+    };
+    let (stop, signal) = stop_channel();
+    let listener = RemoteListener::spawn(
+        &config,
+        Ok(Arc::clone(&identity)),
+        Pins::new(AuthorizedSet::from_config(&config.authorized_clients).expect("pins")),
+        Arc::new(Router::new(
+            Arc::new(Unserved),
+            GrantPolicy::new(daemon_euid(), SocketAccess::Owner, GroupTier::Observe),
+            Arc::new(NoAudit),
+        )),
+        signal,
+        RemoteListener::channel().0,
+    );
+    let addr = serving(&listener).await.to_string();
+    let pinned_to = |spki| RemoteEndpoint {
+        address: addr.clone(),
+        server_spki: vec![spki],
+        key: None,
+    };
+    let reaches = |endpoint: RemoteEndpoint| {
+        let operator = &operator;
+        async move {
+            let err = ControlClient::remote(&endpoint, operator)
+                .expect("client")
+                .call::<Hello>(&HelloRequest {})
+                .await
+                .expect_err("Unserved refuses everything");
+            refusal(&err).is_some()
+        }
+    };
+    let old = identity.spki();
+    assert!(
+        reaches(pinned_to(old)).await,
+        "the first key was not served"
+    );
+
+    let new = identity
+        .rotate(&tmp.path().join("attic").join("key.pem"))
+        .expect("rotated");
+
+    assert_ne!(new, old);
+    assert!(
+        !reaches(pinned_to(old)).await,
+        "the old key is still presented"
+    );
+    assert!(
+        reaches(pinned_to(new)).await,
+        "the new key is not presented"
+    );
+
+    stop.stop();
+    listener.stopped().await;
+}
+
 #[tokio::test]
 async fn what_keeps_it_from_serving_is_its_state() {
     let (stop, signal) = stop_channel();

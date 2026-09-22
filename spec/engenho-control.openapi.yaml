@@ -2007,6 +2007,11 @@ components:
           required: [ca]
           properties:
             ca: {type: string, enum: [absent]}
+        - type: object
+          description: Something is there that does not read as a CA (the case a re-seed repairs).
+          required: [ca]
+          properties:
+            ca: {type: string, enum: [unreadable]}
     EpochBinding:
       description: Store-touching operations bind to the Stopped epoch they were prepared in.
       oneOf:

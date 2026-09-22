@@ -45,6 +45,8 @@ use rustls::pki_types::CertificateDer;
 use rustls::server::WebPkiClientVerifier;
 use rustls::server::danger::ClientCertVerifier;
 
+use crate::pki_files::PkiFile;
+
 /// Everything that can go wrong building or loading the cluster PKI.
 #[derive(Debug, thiserror::Error)]
 pub enum PkiError {
@@ -110,9 +112,6 @@ const CTX_CA: &str = "engenho cluster-ca v1";
 const CTX_SERVER: &str = "engenho apiserver-cert v1";
 const CTX_CLIENT: &str = "engenho admin-client-cert v1";
 
-/// Filename of the per-cluster PKI seed inside `data_dir/pki/`.
-const CLUSTER_SEED_FILE: &str = "cluster-seed";
-
 /// The seed every engenho cluster used to derive its keys from.
 ///
 /// ── ★ KEPT SOLELY TO DETECT ITS OWN VICTIMS ────────────────────────────────
@@ -172,8 +171,8 @@ const CLUSTER_SEED_LEN: usize = 32;
 /// randomness. Never falls back to a fixed value — a predictable seed is the
 /// defect this exists to remove, so failing to get entropy must fail loudly.
 fn load_or_generate_cluster_seed(data_dir: &Path) -> Result<[u8; CLUSTER_SEED_LEN], PkiError> {
-    let pki_dir = data_dir.join("pki");
-    let seed_path = pki_dir.join(CLUSTER_SEED_FILE);
+    let pki_dir = PkiFile::dir(data_dir);
+    let seed_path = PkiFile::ClusterSeed.path(data_dir);
 
     if seed_path.exists() {
         let bytes = std::fs::read(&seed_path).map_err(|source| PkiError::Io {
@@ -489,9 +488,9 @@ pub enum SanParseError {
 /// [`PkiError::Io`] on any filesystem failure; [`PkiError::Crypto`] if
 /// rcgen can't generate / parse / serialize the CA.
 pub fn load_or_generate_ca(data_dir: &Path) -> Result<ClusterCa, PkiError> {
-    let pki_dir = data_dir.join("pki");
-    let ca_cert_path = pki_dir.join("ca.crt");
-    let ca_key_path = pki_dir.join("ca.key");
+    let pki_dir = PkiFile::dir(data_dir);
+    let ca_cert_path = PkiFile::CaCert.path(data_dir);
+    let ca_key_path = PkiFile::CaKey.path(data_dir);
 
     // One seed per cluster, read (or minted) before either branch, because both
     // need it: a loaded CA still issues server and admin leaves from it.
@@ -1067,7 +1066,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().expect("tempdir");
         let _ = load_or_generate_ca(dir.path()).expect("boot");
-        let seed_path = dir.path().join("pki").join(super::CLUSTER_SEED_FILE);
+        let seed_path = dir.path().join("pki").join("cluster-seed");
 
         let bytes = std::fs::read(&seed_path).expect("seed persisted");
         assert_eq!(

@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use engenho_apiserver::{
-    ApiServer, ChainAuthenticator, ClientMaterial, RbacAuthorizer, RouterHandlerSink, RouterState,
-    SanEntry, ServerSanInputs, StoreRbacEnv, TlsMaterial, client_verifier,
+    ApiServer, ChainAuthenticator, ClientMaterial, PkiFile, RbacAuthorizer, RouterHandlerSink,
+    RouterState, SanEntry, ServerSanInputs, StoreRbacEnv, TlsMaterial, client_verifier,
     handlers_from_catalog_with_admission, issue_admin_client_material, issue_server_material,
     load_or_generate_ca, metrics::log_would_reject,
 };
@@ -56,6 +56,7 @@ use crate::child::{
 };
 use crate::error::{RuntimeError, ShutdownStage, StrongCounts};
 use crate::health::{Health, Row, Tallied, Tally, Windows};
+use crate::layout::Area;
 use crate::node_lease::NodeLease;
 use crate::node_registration::{HostOwned, register_node};
 use crate::panics::PanicCounter;
@@ -1062,7 +1063,7 @@ fn issue_pki(boot: &BootConfig, listen_addr: SocketAddr) -> Result<IssuedPki, Ru
     if ca.is_publicly_derivable() && !is_loopback_only(listen_addr) {
         return Err(RuntimeError::PublicCaOnReachableAddress {
             listen_addr: boot.listen_addr.clone(),
-            pki_dir: boot.data_dir.join("pki").display().to_string(),
+            pki_dir: PkiFile::dir(&boot.data_dir).display().to_string(),
         });
     }
     let listen_ip = san_listen_ip(listen_addr);
@@ -1781,7 +1782,7 @@ fn build_backend(boot: &BootConfig) -> Result<Arc<dyn ContainerRuntime>, Runtime
 /// The directory under `data_dir` a durable node keeps its store in. The
 /// census ([`crate::census::DataDirSource`]) reads a node's store from the
 /// same place.
-pub(crate) const STORE_DIR: &str = "store";
+pub(crate) const STORE_DIR: &str = crate::layout::Area::Store.dir();
 
 /// Bring up the store spine — durable or ephemeral per config.
 async fn boot_store(boot: &BootConfig) -> Result<(Arc<StoreMesh>, BootKind), RuntimeError> {
@@ -2763,7 +2764,7 @@ fn write_boot_kubeconfig(
     // Loopback server URL with the actually-bound port (handles `:0`).
     let server_url = loopback_server_url(bound_addr);
     let yaml = emit(&server_url)?;
-    let path = boot.data_dir.join("kubeconfig");
+    let path = data_dir_kubeconfig(boot);
     // The `data_dir` copy is engenho's own bookkeeping and nothing else reads
     // it, so it stays owner-only regardless of the publish intent — widening
     // it would grant access nobody asked for.
@@ -2804,32 +2805,30 @@ fn write_boot_kubeconfig(
     // apiserver binds the host while containers live in a VM. A pod needs a
     // reachable address; it no longer needs borrowed admin credentials to be
     // ALLOWED, so prefer a ServiceAccount for new workloads.
-    records.push(
-        match resolve_publish_path(&boot.pod_kubeconfig_publish_path) {
-            Err(reason) => PublishRecord::skipped(KubeconfigTarget::Pod, reason),
-            Ok(pod_publish) => {
-                if let Some((host, port)) = apiserver_reachability(boot).injectable() {
-                    let pod_yaml = emit(&format!("https://{host}:{port}"))?;
-                    publish(
-                        KubeconfigTarget::Pod,
-                        &pod_publish,
-                        &pod_yaml,
-                        "pod-facing kubeconfig",
-                    )
-                } else {
-                    // No reachable address is known, so there is no honest
-                    // server URL to write. Writing one anyway would hand a
-                    // workload a kubeconfig that cannot connect, which is the
-                    // failure this whole path exists to remove.
-                    tracing::warn!(
-                        "pod-facing kubeconfig requested but no pod-reachable apiserver \
+    records.push(match kubeconfig_path(boot, KubeconfigTarget::Pod) {
+        Err(reason) => PublishRecord::skipped(KubeconfigTarget::Pod, reason),
+        Ok(pod_publish) => {
+            if let Some((host, port)) = apiserver_reachability(boot).injectable() {
+                let pod_yaml = emit(&format!("https://{host}:{port}"))?;
+                publish(
+                    KubeconfigTarget::Pod,
+                    &pod_publish,
+                    &pod_yaml,
+                    "pod-facing kubeconfig",
+                )
+            } else {
+                // No reachable address is known, so there is no honest
+                // server URL to write. Writing one anyway would hand a
+                // workload a kubeconfig that cannot connect, which is the
+                // failure this whole path exists to remove.
+                tracing::warn!(
+                    "pod-facing kubeconfig requested but no pod-reachable apiserver \
                          address is known; writing nothing rather than an unusable file"
-                    );
-                    PublishRecord::skipped(KubeconfigTarget::Pod, SkipReason::NoPodAddress)
-                }
+                );
+                PublishRecord::skipped(KubeconfigTarget::Pod, SkipReason::NoPodAddress)
             }
-        },
-    );
+        }
+    });
 
     // ── ★ AND A REMOTE ONE, FOR OPERATORS ON ANOTHER MACHINE ──────────
     // The third audience. The `data_dir` copy and `kubeconfig_publish_path`
@@ -2844,37 +2843,34 @@ fn write_boot_kubeconfig(
     // field `server_sans` turns into a certificate SAN. One field, both
     // consumers — so a kubeconfig naming an address the cert does not is
     // unconstructible rather than merely tested for.
-    records.push(
-        match resolve_publish_path(&boot.remote_kubeconfig_publish_path) {
-            Err(reason) => PublishRecord::skipped(KubeconfigTarget::Remote, reason),
-            Ok(remote_publish) => {
-                if let Some(remote_server) =
-                    advertised_server_url(&boot.advertise_address, bound_addr)
-                {
-                    let remote_yaml = emit(&remote_server)?;
-                    publish(
-                        KubeconfigTarget::Remote,
-                        &remote_publish,
-                        &remote_yaml,
-                        "remote kubeconfig",
-                    )
-                } else {
-                    // Asked for a remote kubeconfig without saying what address is
-                    // remote. Writing a loopback url under that name would be worse
-                    // than writing nothing: it produces a file that looks like remote
-                    // access and silently is not.
-                    tracing::warn!(
-                        "remote_kubeconfig_publish_path is set but advertise_address is empty; \
+    records.push(match kubeconfig_path(boot, KubeconfigTarget::Remote) {
+        Err(reason) => PublishRecord::skipped(KubeconfigTarget::Remote, reason),
+        Ok(remote_publish) => {
+            if let Some(remote_server) = advertised_server_url(&boot.advertise_address, bound_addr)
+            {
+                let remote_yaml = emit(&remote_server)?;
+                publish(
+                    KubeconfigTarget::Remote,
+                    &remote_publish,
+                    &remote_yaml,
+                    "remote kubeconfig",
+                )
+            } else {
+                // Asked for a remote kubeconfig without saying what address is
+                // remote. Writing a loopback url under that name would be worse
+                // than writing nothing: it produces a file that looks like remote
+                // access and silently is not.
+                tracing::warn!(
+                    "remote_kubeconfig_publish_path is set but advertise_address is empty; \
                      writing nothing rather than a file with a loopback server url"
-                    );
-                    PublishRecord::skipped(KubeconfigTarget::Remote, SkipReason::NoAdvertiseAddress)
-                }
+                );
+                PublishRecord::skipped(KubeconfigTarget::Remote, SkipReason::NoAdvertiseAddress)
             }
-        },
-    );
+        }
+    });
 
     // `$KUBECONFIG` will not see this cluster until a failed path is writable.
-    records.push(match resolve_publish_path(&boot.kubeconfig_publish_path) {
+    records.push(match kubeconfig_path(boot, KubeconfigTarget::Operator) {
         Err(reason) => PublishRecord::skipped(KubeconfigTarget::Operator, reason),
         Ok(path) => publish(
             KubeconfigTarget::Operator,
@@ -2884,6 +2880,28 @@ fn write_boot_kubeconfig(
         ),
     });
     Ok(records)
+}
+
+/// Where `target`'s kubeconfig is written, as `boot` configures it.
+///
+/// # Errors
+///
+/// The [`SkipReason`] a target that is not configured is skipped for.
+pub(crate) fn kubeconfig_path(
+    boot: &BootConfig,
+    target: KubeconfigTarget,
+) -> Result<std::path::PathBuf, SkipReason> {
+    match target {
+        KubeconfigTarget::DataDir => Ok(data_dir_kubeconfig(boot)),
+        KubeconfigTarget::Operator => resolve_publish_path(&boot.kubeconfig_publish_path),
+        KubeconfigTarget::Pod => resolve_publish_path(&boot.pod_kubeconfig_publish_path),
+        KubeconfigTarget::Remote => resolve_publish_path(&boot.remote_kubeconfig_publish_path),
+    }
+}
+
+/// engenho's own copy of the kubeconfig.
+fn data_dir_kubeconfig(boot: &BootConfig) -> std::path::PathBuf {
+    boot.data_dir.join("kubeconfig")
 }
 
 /// Expand the configured publish path, or `None` when publishing is off.
@@ -2918,28 +2936,27 @@ fn persist_admin_material(
     data_dir: &std::path::Path,
     admin: &ClientMaterial,
 ) -> Result<(), RuntimeError> {
-    let pki = data_dir.join("pki");
-    create_pki_dir(&pki)?;
-    write_at_mode(&pki.join("admin.crt"), &admin.cert_pem, 0o644)?;
-    write_at_mode(&pki.join("admin.key"), &admin.key_pem, 0o600)?;
+    create_pki_dir(&PkiFile::dir(data_dir))?;
+    write_at_mode(&PkiFile::AdminCert.path(data_dir), &admin.cert_pem, 0o644)?;
+    write_at_mode(&PkiFile::AdminKey.path(data_dir), &admin.key_pem, 0o600)?;
     Ok(())
 }
 
 /// Load-or-generate the bootstrap admin BEARER token, persisted at
 /// `data_dir/pki/admin.token` (0600). Restart-stable: an already-distributed
 /// `Authorization: Bearer <token>` keeps working across reboots. The token is
-/// 32 random bytes hex-encoded (no external crate — uses `getrandom` via
-/// `rand`-free `std`-adjacent entropy from the OS).
-fn load_or_generate_admin_token(data_dir: &std::path::Path) -> Result<String, RuntimeError> {
-    let pki = data_dir.join("pki");
-    let token_path = pki.join("admin.token");
+/// 32 random bytes hex-encoded, from the OS's entropy ([`crate::entropy`]).
+pub(crate) fn load_or_generate_admin_token(
+    data_dir: &std::path::Path,
+) -> Result<String, RuntimeError> {
+    let token_path = PkiFile::AdminToken.path(data_dir);
     if let Ok(existing) = std::fs::read_to_string(&token_path) {
         let trimmed = existing.trim().to_string();
         if !trimmed.is_empty() {
             return Ok(trimmed);
         }
     }
-    create_pki_dir(&pki)?;
+    create_pki_dir(&PkiFile::dir(data_dir))?;
     let token = random_admin_token();
     write_at_mode(&token_path, &token, 0o600)?;
     Ok(token)
@@ -2952,25 +2969,20 @@ fn load_or_generate_admin_token(data_dir: &std::path::Path) -> Result<String, Ru
 /// isn't CSPRNG-grade in that degenerate case — logged is acceptable for a
 /// single-node bootstrap admin token).
 fn random_admin_token() -> String {
-    let mut bytes = [0u8; 32];
-    if getrandom::fill(&mut bytes).is_err() {
+    let bytes = crate::entropy::random::<32>().unwrap_or_else(|_| {
         // Degenerate fallback: mix process id + nanos. Never expected.
         let pid = std::process::id().to_le_bytes();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
+            .map_or(0, |d| d.as_nanos())
             .to_le_bytes();
-        for (i, b) in bytes.iter_mut().enumerate() {
-            *b = pid[i % pid.len()] ^ nanos[i % nanos.len()] ^ (i as u8);
+        let mut bytes = [0u8; 32];
+        for ((i, b), n) in bytes.iter_mut().enumerate().zip(0u8..) {
+            *b = pid[i % pid.len()] ^ nanos[i % nanos.len()] ^ n;
         }
-    }
-    let mut out = String::with_capacity(64);
-    for b in bytes {
-        out.push(char::from_digit(u32::from(b >> 4), 16).unwrap());
-        out.push(char::from_digit(u32::from(b & 0xf), 16).unwrap());
-    }
-    out
+        bytes
+    });
+    crate::entropy::lower_hex(&bytes)
 }
 
 /// Create `data_dir/pki` at 0700 — it holds the admin private key and the
@@ -3520,10 +3532,8 @@ impl Parts {
             // cannot be provisioned says why on the claim
             // (`ProvisioningFailed`), where `kubectl describe pvc` shows it.
             Driver::PvBinder => {
-                let local_path_root = self
-                    .boot
-                    .data_dir
-                    .join("local-path")
+                let local_path_root = Area::LocalPath
+                    .path(&self.boot.data_dir)
                     .to_string_lossy()
                     .into_owned();
                 self.watch(
@@ -3538,10 +3548,8 @@ impl Parts {
             // VolumeSnapshot: the snapshot half of the same local-path
             // provisioner — gated with the binder (see `Driver::enabled`).
             Driver::VolumeSnapshot => {
-                let snapshot_root = self
-                    .boot
-                    .data_dir
-                    .join("snapshots")
+                let snapshot_root = Area::Snapshots
+                    .path(&self.boot.data_dir)
                     .to_string_lossy()
                     .into_owned();
                 self.watch(
@@ -3789,7 +3797,7 @@ fn build_kubelet(
             // the same one the CSI layer is being handed.
             Arc::new(
                 engenho_kubelet::PodmanVolumeMaterializer::new()
-                    .with_data_root(boot.data_dir.join("volumes")),
+                    .with_data_root(Area::Volumes.path(&boot.data_dir)),
             ),
             csi_drivers.clone(),
             boot.data_dir.clone(),

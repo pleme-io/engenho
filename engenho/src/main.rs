@@ -53,7 +53,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use engenho_apiserver::load_or_generate_ca;
+use engenho_apiserver::{PkiFile, load_or_generate_ca};
 use engenho_config::{
     ConfigError, ConfigTier, EngenhoConfig, OverrideLayer, SocketDefaults, TieredConfig,
     render_provenance,
@@ -402,10 +402,7 @@ async fn run_daemon() -> anyhow::Result<ExitIntent> {
         },
         remote: RemoteFacts {
             state: remote_watch,
-            identity: identity
-                .as_ref()
-                .map(|id| (id.spki(), id.created_at()))
-                .map_err(Clone::clone),
+            identity: identity.clone(),
             pins: pins.clone(),
         },
         logs,
@@ -575,9 +572,8 @@ fn run_kubeconfig(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     // at first TLS boot), emit a kubeconfig that authenticates as the admin
     // identity (→ `kubectl auth whoami` = engenho-admin). Otherwise fall back
     // to the anonymous-token kubeconfig (pre-first-boot / plaintext).
-    let pki = data_dir.join("pki");
-    let admin_cert = std::fs::read(pki.join("admin.crt")).ok();
-    let admin_key = std::fs::read(pki.join("admin.key")).ok();
+    let admin_cert = std::fs::read(PkiFile::AdminCert.path(&data_dir)).ok();
+    let admin_key = std::fs::read(PkiFile::AdminKey.path(&data_dir)).ok();
     let yaml = match (admin_cert, admin_key) {
         (Some(cert), Some(key)) => emit_kubeconfig_with_admin(
             &config.cluster.name,

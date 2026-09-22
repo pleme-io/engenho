@@ -26,7 +26,7 @@ pub use machine::{
 };
 pub use supervisor::{
     Accepted, ChildFact, CommandError, ConfigSource, DaemonEvent, DaemonInfo, EVENTS, Fold, Hold,
-    Inspection, ReconfigureError, Reconfigured, ResolvedConfig, RestartChildError, RuntimeFacts,
-    Snapshot, StopDone, StoreLock, Supervisor, SupervisorConfig, SupervisorError, SupervisorHandle,
-    file_digest,
+    Inspection, ReconfigureError, Reconfigured, ReinitRefused, ResolvedConfig, RestartChildError,
+    RuntimeFacts, Snapshot, StopDone, StoreLock, Supervisor, SupervisorConfig, SupervisorError,
+    SupervisorHandle, file_digest,
 };

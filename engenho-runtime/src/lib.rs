@@ -137,11 +137,13 @@ pub mod boot;
 pub mod census;
 pub mod control;
 pub mod etcd_facade;
+pub mod layout;
 pub mod lifecycle;
 
 mod boot_config;
 mod child;
 mod dormant;
+mod entropy;
 mod error;
 #[cfg(test)]
 mod fault_matrix;

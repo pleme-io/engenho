@@ -168,7 +168,7 @@ impl RemoteListener {
             Ok(identity) => identity,
             Err(why) => return absent(Absence::IdentityUnavailable(why)),
         };
-        let tls = match server_config(identity.key(), Arc::new(pins.clone())) {
+        let tls = match server_config(identity.presented(), Arc::new(pins.clone())) {
             Ok(tls) => Arc::new(tls),
             Err(err) => return absent(Absence::IdentityUnavailable(err.to_string())),
         };
