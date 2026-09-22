@@ -69,6 +69,9 @@ const SHIPPED: &[&str] = &[
     "engenho-substrate",
     "engenho-substrate-core",
     "engenho-types",
+    // `engenho unit-run` runs a rendered systemd .service file as a pod's
+    // workload, so the runner ships in the daemon binary.
+    "engenho-unit",
 ];
 
 /// Every workspace crate in no shipped binary, and why it is in the

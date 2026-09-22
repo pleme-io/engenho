@@ -1,0 +1,12 @@
+# engenho-unit — TYPED EMISSION enforced, like the engenho binary crate.
+#
+# This crate is format!()-clean across all targets (lib + tests), so it opts
+# INTO the with-format-ban gate: every message is a typed value rendered once
+# by its Display impl through write!(). clippy resolves the nearest
+# `clippy.toml` walking up from this crate's manifest; this file REPLACES the
+# non-banning workspace-root ../clippy.toml for this crate only.
+#
+# Canonical: https://github.com/pleme-io/theory/blob/main/TYPED-EMISSION.md
+disallowed-macros = [
+  { path = "std::format", reason = "TYPED EMISSION: emit through typed serde / Display write!() / serde_yaml / the codec, not format!() of wire" },
+]

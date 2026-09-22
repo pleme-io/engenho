@@ -1354,6 +1354,7 @@ dependencies = [
  "engenho-runtime",
  "engenho-serve",
  "engenho-types",
+ "engenho-unit",
  "nix",
  "serde_json",
  "serde_yaml",
@@ -2024,6 +2025,15 @@ dependencies = [
  "serde_yaml",
  "shigoto-types",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "engenho-unit"
+version = "0.53.118"
+dependencies = [
+ "rustix",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]

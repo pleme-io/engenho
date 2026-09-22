@@ -1,0 +1,47 @@
+[Unit]
+After=network-online.target
+Before=home-assistant.service
+Description=Matter Server
+Wants=network-online.target
+
+[Service]
+Environment="HOME=/var/lib/matter-server"
+Environment="LOCALE_ARCHIVE=/nix/store/49vhlwl9gib4vavpd64klpz4l5nwz3g5-glibc-locales-2.40-224/lib/locale/locale-archive"
+Environment="PATH=/nix/store/hqkszxk2c0cxvd04xa4gsaqs182dw8l2-coreutils-9.8/bin:/nix/store/8xhaz2ysixijy8sgzmwmhlialqqind1p-findutils-4.10.0/bin:/nix/store/k3wiv3qqa4y0im5v1iq2jy4h9cm32dfc-gnugrep-3.12/bin:/nix/store/4zi0y6cmpjnbhmgrx7vfgqkyv5z1z4z0-gnused-4.9/bin:/nix/store/ckb44g2gn1ma5y47kh2bhk0zximhgqyi-systemd-258.7/bin:/nix/store/hqkszxk2c0cxvd04xa4gsaqs182dw8l2-coreutils-9.8/sbin:/nix/store/8xhaz2ysixijy8sgzmwmhlialqqind1p-findutils-4.10.0/sbin:/nix/store/k3wiv3qqa4y0im5v1iq2jy4h9cm32dfc-gnugrep-3.12/sbin:/nix/store/4zi0y6cmpjnbhmgrx7vfgqkyv5z1z4z0-gnused-4.9/sbin:/nix/store/ckb44g2gn1ma5y47kh2bhk0zximhgqyi-systemd-258.7/sbin"
+Environment="TZDIR=/nix/store/qa63hibyghja8i40f907q9g97cvkdw8c-tzdata-2026b/share/zoneinfo"
+AmbientCapabilities=
+BindReadOnlyPaths=/nix/store /run/dbus
+CapabilityBoundingSet=
+DevicePolicy=closed
+DynamicUser=true
+ExecStart=/nix/store/lfbzxs5wyqd2122mpbj5azkxhxspw9cd-bash-interactive-5.3p3/bin/sh -c ' /nix/store/hqkszxk2c0cxvd04xa4gsaqs182dw8l2-coreutils-9.8/bin/ln -s %S/matter-server/ %t/matter-server/root/data && /nix/store/xpmlrkmplw7vxrhn1kflmpyx9kjmdpfk-python3.13-python-matter-server-8.1.1/bin/matter-server --port 5580 --vendorid 4939 --storage-path /var/lib/matter-server --log-level info  '
+LockPersonality=true
+MemoryDenyWriteExecute=true
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+PrivateUsers=true
+ProcSubset=pid
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET
+RestrictAddressFamilies=AF_INET6
+RestrictAddressFamilies=AF_NETLINK
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RootDirectory=%t/matter-server/root
+RuntimeDirectory=matter-server/root
+StateDirectory=matter-server
+SystemCallFilter=~ @clock @cpu-emulation @debug @module @mount @obsolete @privileged @raw-io @reboot @resources @swap
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

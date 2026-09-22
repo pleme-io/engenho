@@ -1,8 +1,8 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "81e20d3fbe9e174ca9b6e2e039a3410bbc78191f2ffbff6b9b1966e6cc60c588",
+  "cargo_lock_sha256": "134cbade7bdf8b329e90b4147fcec27acb972f18e731fc802407ad4a2b5e3f8a",
   "manifest_sha256": {
-    "Cargo.toml": "998e174c9668f10229291ded499f005bf0b38b8c8de62715b8d1eb54baa4eee3",
+    "Cargo.toml": "468f98c06a9a3961cb4d2949d07a354d16ffc39fe44219ec79d54b41ba346a6c",
     "engenho-apiserver/Cargo.toml": "a42bf1f662ba3dbab338a871c0979aa15dfb734a22435d96e36e65cfa47d5abf",
     "engenho-cluster-config-render/Cargo.toml": "5f5f6d40c2b9a572f18418d12e568412517972684259f34a9aa3d34de0a5dc8c",
     "engenho-cluster-config/Cargo.toml": "49d8ea7131956ec2d6323ae41968f624fab66bbbbca1afbb0537b2327a683391",
@@ -35,7 +35,8 @@
     "engenho-sui-typescape/Cargo.toml": "30fde1a3a1db010241fa2d2c10c14a4953dcbb9979d760cf0843622f3b694207",
     "engenho-teia/Cargo.toml": "c0b840a05f7e1a944503ea3701d4f1f2a4e3656b3c334d9029e8ceb6ee8cbbcc",
     "engenho-types/Cargo.toml": "ed835cbe693033a0b05c49550da9b34545d51a477a28a053bd0a86878bc917c3",
-    "engenho/Cargo.toml": "04637db9e4f3179d4e3d0d70b16d16adb3d894ba81c45c30aa2500170d1bf1d6"
+    "engenho-unit/Cargo.toml": "217104ea4d3291e03dd9bf80316fba80abf0a05a103813d2e63306f925320c67",
+    "engenho/Cargo.toml": "5d13ee2e29e72d84c549f3ed82fcc8a399ef20795d9201a47bab1867b419f0ae"
   },
   "target_resolves": {
     "base": {
@@ -3734,6 +3735,16 @@
           {
             "name": "engenho_types",
             "package_key": "engenho-types-0.53.118",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "engenho_unit",
+            "package_key": "engenho-unit-0.53.118",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -8248,6 +8259,36 @@
         "features": [
           "default"
         ]
+      },
+      "engenho-unit-0.53.118": {
+        "runtime_dependencies": [
+          {
+            "name": "rustix",
+            "package_key": "rustix-1.1.4",
+            "kind": "normal",
+            "features": [
+              "fs",
+              "process",
+              "thread"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": "cfg(unix)",
+            "tree": "target"
+          },
+          {
+            "name": "tracing",
+            "package_key": "tracing-0.1.44",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
       },
       "enum_dispatch-0.3.13": {
         "runtime_dependencies": [
@@ -33110,9 +33151,11 @@
               "alloc",
               "default",
               "fs",
+              "process",
               "std",
               "system",
-              "termios"
+              "termios",
+              "thread"
             ]
           },
           "rustls-native-certs-0.8.3": {
@@ -33841,6 +33884,7 @@
               "general",
               "ioctl",
               "no_std",
+              "prctl",
               "system"
             ]
           },
@@ -34305,9 +34349,11 @@
               "alloc",
               "default",
               "fs",
+              "process",
               "std",
               "system",
-              "termios"
+              "termios",
+              "thread"
             ]
           },
           "rustls-native-certs-0.8.3": {
@@ -34884,6 +34930,7 @@
               "general",
               "ioctl",
               "no_std",
+              "prctl",
               "system"
             ]
           },
@@ -35348,9 +35395,11 @@
               "alloc",
               "default",
               "fs",
+              "process",
               "std",
               "system",
-              "termios"
+              "termios",
+              "thread"
             ]
           },
           "rustls-native-certs-0.8.3": {
@@ -36216,9 +36265,11 @@
               "alloc",
               "default",
               "fs",
+              "process",
               "std",
               "system",
-              "termios"
+              "termios",
+              "thread"
             ]
           },
           "rustls-native-certs-0.8.3": {
@@ -36978,6 +37029,7 @@
               "general",
               "ioctl",
               "no_std",
+              "prctl",
               "system"
             ]
           },
@@ -37422,9 +37474,11 @@
               "alloc",
               "default",
               "fs",
+              "process",
               "std",
               "system",
-              "termios"
+              "termios",
+              "thread"
             ]
           },
           "rustls-native-certs-0.8.3": {
@@ -38032,6 +38086,7 @@
               "general",
               "ioctl",
               "no_std",
+              "prctl",
               "system"
             ]
           },
@@ -38476,9 +38531,11 @@
               "alloc",
               "default",
               "fs",
+              "process",
               "std",
               "system",
-              "termios"
+              "termios",
+              "thread"
             ]
           },
           "rustls-native-certs-0.8.3": {
@@ -39240,6 +39297,13 @@
       "edition": "2024",
       "lib_target": {
         "name": "engenho_types",
+        "path": "src/lib.rs"
+      }
+    },
+    "engenho-unit-0.53.118": {
+      "edition": "2024",
+      "lib_target": {
+        "name": "engenho_unit",
         "path": "src/lib.rs"
       }
     },

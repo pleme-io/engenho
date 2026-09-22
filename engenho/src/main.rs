@@ -80,6 +80,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 mod ctl;
 mod remote;
+mod unit_run;
 
 /// The verb list, written ONCE.
 ///
@@ -89,7 +90,7 @@ mod remote;
 /// actually dispatched by [`Command::parse`], which closes the other
 /// direction: a verb added to the match arms without a row here fails
 /// the suite rather than becoming silently undiscoverable.
-const SUBCOMMAND_NAMES: [&str; 7] = [
+const SUBCOMMAND_NAMES: [&str; 8] = [
     "daemon",
     "ctl",
     "remote",
@@ -97,6 +98,7 @@ const SUBCOMMAND_NAMES: [&str; 7] = [
     "config-show",
     "config-diff",
     "census",
+    "unit-run",
 ];
 
 /// The parsed top-level command. Splitting the argv classification out of
@@ -124,6 +126,11 @@ enum Command {
     Ctl(Vec<String>),
     /// `remote …` — this machine's keys for remote daemons ([`remote::run`]).
     Remote(Vec<String>),
+    /// `unit-run …` — run a rendered systemd `.service` file as this pod's
+    /// workload ([`unit_run::run`]). Dispatched BEFORE the tokio runtime is
+    /// built: it ends in `execve`, and its privilege drop is a thread-scoped
+    /// syscall, both of which want a single-threaded process.
+    UnitRun(Vec<String>),
     /// `--help` / `-h` / `help` — print usage to stdout and exit 0.
     Help,
     /// `--version` / `-V` / `version` — print the version to stdout and exit 0.
@@ -151,6 +158,7 @@ impl Command {
             Some("config-show") => Ok(Command::ConfigShow(args.next())),
             Some("census") => Ok(Command::Census(CensusCommand::parse(args)?)),
             Some("ctl") => Ok(Command::Ctl(args.collect())),
+            Some("unit-run") => Ok(Command::UnitRun(args.collect())),
             Some("remote") => Ok(Command::Remote(args.collect())),
             Some("config-diff") => match (args.next(), args.next()) {
                 (Some(from), Some(to)) => Ok(Command::ConfigDiff(from, to)),
@@ -286,13 +294,25 @@ impl StopSignals {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     // Minimal arg parsing — the binary has exactly two optional verbs
     // (`daemon`, an explicit alias for the bare form, and `kubeconfig`).
     // We avoid pulling clap for two verbs (the daemon path stays the
     // default).
-    match Command::parse(std::env::args().skip(1))? {
+    let command = Command::parse(std::env::args().skip(1))?;
+    // ★ `unit-run` is dispatched HERE, before a tokio runtime exists. It
+    // drops privileges with thread-scoped syscalls and ends in `execve`;
+    // both are only obviously correct in a single-threaded process, and it
+    // never returns on success, so nothing else needs the runtime.
+    if let Command::UnitRun(args) = command {
+        std::process::exit(unit_run::run(args));
+    }
+    run_async(command)
+}
+
+#[tokio::main]
+async fn run_async(command: Command) -> anyhow::Result<()> {
+    match command {
         Command::Daemon => {
             let intent = run_daemon().await?;
             tracing::info!(?intent, code = intent.code(), "engenho exiting");
@@ -303,6 +323,10 @@ async fn main() -> anyhow::Result<()> {
         Command::ConfigDiff(from, to) => run_config_diff(&from, &to),
         Command::Census(census) => run_census(census).await,
         Command::Ctl(args) => std::process::exit(i32::from(ctl::run(args).await)),
+        // Dispatched in `main`, before the runtime: unreachable here, and an
+        // exhaustive match rather than a wildcard so a new verb still fails
+        // to compile until it is dispatched.
+        Command::UnitRun(args) => std::process::exit(unit_run::run(args)),
         Command::Remote(args) => std::process::exit(i32::from(remote::run(&args))),
         Command::Help => {
             print!("{}", help_text());
@@ -866,6 +890,13 @@ SUBCOMMANDS:
                               provenance. TIER overrides $ENGENHO_TIER.
     config-diff <FROM> <TO>   Unified diff between two resolved config tiers.
                               Tiers: bare | discovered | default | <yaml-path>
+    unit-run --unit <PATH> [--user <NAME>] [--group <NAME>] [--root <DIR>] [--check]
+                              Run a rendered systemd .service file as this
+                              pod's workload: its user, directories,
+                              environment, credentials and ExecStartPre=
+                              steps, then exec its ExecStart=. --user is
+                              REQUIRED for a DynamicUser=yes unit. --check
+                              prints the plan and does nothing.
     census --predicate <NAME> (--kubeconfig <PATH> | --data-dir <DIR>)
                               Count the live objects a planned rule would
                               refuse, read-only, over a running apiserver or a

@@ -1,0 +1,27 @@
+[Unit]
+Before=nss-lookup.target nss-user-lookup.target
+Description=Name Service Cache Daemon (nsncd)
+Wants=nss-lookup.target nss-user-lookup.target
+
+[Service]
+Environment="LD_LIBRARY_PATH=/nix/store/f99j50qvfy3lr4mxxad1qxsf7c6c9brj-systemd-258.7/lib"
+Environment="LOCALE_ARCHIVE=/nix/store/0mk6nx5x3y5y7z7mkj4m6w9lkxw69zni-glibc-locales-2.40-224/lib/locale/locale-archive"
+Environment="PATH=/nix/store/nja3jimv61blss0mfgjqa68rfiwfxv39-coreutils-9.8/bin:/nix/store/f72alkaiwzx07151akyzlz0w7lwpi6px-findutils-4.10.0/bin:/nix/store/fpidzzfdfq4kqpg7izrjwl5dprm1ybql-gnugrep-3.12/bin:/nix/store/m4mnwm47q796m3zq16bpbca19r7ab2hk-gnused-4.9/bin:/nix/store/f99j50qvfy3lr4mxxad1qxsf7c6c9brj-systemd-258.7/bin:/nix/store/nja3jimv61blss0mfgjqa68rfiwfxv39-coreutils-9.8/sbin:/nix/store/f72alkaiwzx07151akyzlz0w7lwpi6px-findutils-4.10.0/sbin:/nix/store/fpidzzfdfq4kqpg7izrjwl5dprm1ybql-gnugrep-3.12/sbin:/nix/store/m4mnwm47q796m3zq16bpbca19r7ab2hk-gnused-4.9/sbin:/nix/store/f99j50qvfy3lr4mxxad1qxsf7c6c9brj-systemd-258.7/sbin"
+Environment="TZDIR=/nix/store/61dk4kx1ra82nlzymqdxb8alpc0nn452-tzdata-2026b/share/zoneinfo"
+Environment=NSNCD_HANDOFF_TIMEOUT=10
+ExecStart=/nix/store/8jxrba53nmjncxgx5h1g0i8kri9sar5a-nsncd-1.5.2/bin/nsncd
+Group=nscd
+NoNewPrivileges=true
+PIDFile=/run/nscd/nscd.pid
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=strict
+RemoveIPC=true
+Restart=always
+RestrictSUIDSGID=true
+RuntimeDirectory=nscd
+Type=notify
+User=nscd
+
+[Install]
+WantedBy=multi-user.target

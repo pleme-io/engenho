@@ -25,6 +25,9 @@ engenho-config      = { workspace = true }
 engenho-runtime     = { workspace = true }
 engenho-apiserver   = { workspace = true }
 engenho-kube-client = { workspace = true }
+# `engenho unit-run`: the systemd-unit runner (parser, identity, directories,
+# credentials, privilege drop).
+engenho-unit        = { workspace = true }
 # The control plane: the socket the daemon serves, the client `engenho ctl`
 # is, and the spec both speak.
 engenho-control-types  = { workspace = true }

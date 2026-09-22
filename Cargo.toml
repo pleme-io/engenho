@@ -34,6 +34,7 @@ members = [
   "engenho-control-types",
   "engenho-control-server",
   "engenho-control-client",
+  "engenho-unit",
 ]
 
 [workspace.package]
@@ -66,6 +67,7 @@ engenho-serve          = { path = "engenho-serve", version = "0.53.118" }
 engenho-control-types  = { path = "engenho-control-types", version = "0.53.118" }
 engenho-control-server = { path = "engenho-control-server", version = "0.53.118" }
 engenho-control-client = { path = "engenho-control-client", version = "0.53.118" }
+engenho-unit           = { path = "engenho-unit", version = "0.53.118" }
 engenho-runtime        = { path = "engenho-runtime", version = "0.53.118" }
 engenho-scheduler      = { path = "engenho-scheduler", version = "0.53.118" }
 engenho-controllers    = { path = "engenho-controllers", version = "0.53.118" }

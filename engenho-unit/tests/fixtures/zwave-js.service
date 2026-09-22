@@ -1,0 +1,43 @@
+[Unit]
+After=network.target
+Description=Z-Wave JS Server
+
+[Service]
+Environment="LOCALE_ARCHIVE=/nix/store/49vhlwl9gib4vavpd64klpz4l5nwz3g5-glibc-locales-2.40-224/lib/locale/locale-archive"
+Environment="PATH=/nix/store/hqkszxk2c0cxvd04xa4gsaqs182dw8l2-coreutils-9.8/bin:/nix/store/8xhaz2ysixijy8sgzmwmhlialqqind1p-findutils-4.10.0/bin:/nix/store/k3wiv3qqa4y0im5v1iq2jy4h9cm32dfc-gnugrep-3.12/bin:/nix/store/4zi0y6cmpjnbhmgrx7vfgqkyv5z1z4z0-gnused-4.9/bin:/nix/store/ckb44g2gn1ma5y47kh2bhk0zximhgqyi-systemd-258.7/bin:/nix/store/hqkszxk2c0cxvd04xa4gsaqs182dw8l2-coreutils-9.8/sbin:/nix/store/8xhaz2ysixijy8sgzmwmhlialqqind1p-findutils-4.10.0/sbin:/nix/store/k3wiv3qqa4y0im5v1iq2jy4h9cm32dfc-gnugrep-3.12/sbin:/nix/store/4zi0y6cmpjnbhmgrx7vfgqkyv5z1z4z0-gnused-4.9/sbin:/nix/store/ckb44g2gn1ma5y47kh2bhk0zximhgqyi-systemd-258.7/sbin"
+Environment="TZDIR=/nix/store/qa63hibyghja8i40f907q9g97cvkdw8c-tzdata-2026b/share/zoneinfo"
+CacheDirectory=zwave-js
+CapabilityBoundingSet=
+DeviceAllow=/dev/ttyUSB0
+DevicePolicy=closed
+DynamicUser=true
+ExecStart=/nix/store/33d0494xzz5gi57p6d2qwrlhhxkpy9np-zwave-js-server-3.4.0/bin/zwave-server --config /run/zwave-js/config.json --port 3000 /dev/ttyUSB0 
+ExecStartPre=/bin/sh -c "/nix/store/9bl4bqnjk4bf5f4hjlb0jdhbvkl2m9pg-jq-1.8.1-bin/bin/jq -s '.[0] * .[1]' /nix/store/hkh6qhmzhljgy1wmnkfrzc5fyg58ivla-zwave-js-config.json %d/secrets.json > /run/zwave-js/config.json"
+
+LoadCredential=secrets.json:/run/secrets/zwave-js.json
+LockPersonality=true
+MemoryDenyWriteExecute=false
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateUsers=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+RemoveIPC=true
+Restart=on-failure
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RuntimeDirectory=zwave-js
+SupplementaryGroups=dialout
+SystemCallArchitectures=native
+SystemCallFilter=@system-service @pkey
+SystemCallFilter=~@privileged @resources
+UMask=0077
+User=zwave-js
+
+[Install]
+WantedBy=multi-user.target

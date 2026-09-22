@@ -1,0 +1,29 @@
+[package]
+name = "engenho-unit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+readme.workspace = true
+categories.workspace = true
+keywords.workspace = true
+description = "engenho-unit — run a rendered systemd .service file as an engenho workload: a typed subset of [Service]/[Unit] (identity, directories, environment, credentials, ExecStartPre prefixes, ambient capabilities), the sandboxing directives acknowledged rather than dropped, and the privilege drop done through rustix. Backs `engenho unit-run`."
+
+[dependencies]
+tracing = { workspace = true }
+
+# The privilege drop (setgroups/setresgid/setresuid, capset, PR_CAP_AMBIENT)
+# and umask. rustix speaks the syscalls directly — no libc getpwnam/NSS, no
+# `unsafe` in this crate. The thread-scoped credential calls exist only on
+# Linux; macOS uses `umask` alone and refuses a drop (see `privilege`).
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs", "process", "thread"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
