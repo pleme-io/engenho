@@ -114,6 +114,19 @@ pub fn is_root() -> bool {
     rustix::process::geteuid().is_root()
 }
 
+/// The caller's effective uid and gid.
+///
+/// Public because the answer decides what a caller can honestly do: a test
+/// can only chown to itself, and an operator running `unit-run` as the
+/// service's own user needs no drop.
+#[must_use]
+pub fn current_ids() -> (u32, u32) {
+    (
+        rustix::process::geteuid().as_raw(),
+        rustix::process::getegid().as_raw(),
+    )
+}
+
 /// Whether becoming `account` is a change at all.
 ///
 /// A drop is skipped when the caller already IS that uid and gid — the case
@@ -123,8 +136,7 @@ pub fn is_root() -> bool {
 /// either runs as hass or fails loudly.
 #[must_use]
 pub fn needs_drop(account: &Account) -> bool {
-    let uid = rustix::process::geteuid().as_raw();
-    let gid = rustix::process::getegid().as_raw();
+    let (uid, gid) = current_ids();
     uid != account.uid || gid != account.gid
 }
 

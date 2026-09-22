@@ -54,7 +54,7 @@ fn root() -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
     let etc = root.path().join("etc");
     std::fs::create_dir_all(&etc).unwrap();
-    let uid = rustix_uid();
+    let uid = engenho_unit::privilege::current_ids();
     std::fs::write(
         etc.join("passwd"),
         // The account the override names is THIS test's own user, so the
@@ -78,19 +78,6 @@ fn root() -> tempfile::TempDir {
     std::fs::create_dir_all(&secrets).unwrap();
     std::fs::write(secrets.join("svc.json"), "{\"token\":\"s3cret\"}").unwrap();
     root
-}
-
-fn rustix_uid() -> (u32, u32) {
-    // The test's own ids: a non-root run can only chown to itself.
-    let uid = std::process::Command::new("id").arg("-u").output().unwrap();
-    let gid = std::process::Command::new("id").arg("-g").output().unwrap();
-    let parse = |out: std::process::Output| {
-        String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .parse::<u32>()
-            .unwrap()
-    };
-    (parse(uid), parse(gid))
 }
 
 fn write_unit(root: &Path) -> std::path::PathBuf {
