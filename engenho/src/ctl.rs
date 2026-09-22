@@ -29,16 +29,16 @@ use std::io::IsTerminal as _;
 use std::path::PathBuf;
 
 use engenho_control_client::{
-    ClientError, ControlClient, RemotesConfig, Reply, remote, resolve_socket,
+    ClientError, ControlClient, RemotesConfig, Reply, remote, render, resolve_socket,
 };
 use engenho_control_types::ops::{
     CancelConfirmation, CancelConfirmationRequest, CreateConfirmation, CreateConfirmationRequest,
 };
 use engenho_control_types::types;
-use engenho_control_types::wire::{HttpParts, HttpRequest, OperationRequest};
+use engenho_control_types::wire::{HttpParts, HttpRequest};
 use engenho_control_types::{
-    AuthorityTier, CATALOG, ConfirmGate, ControlError, MediaType, Operation, OperationId,
-    OperationSpec, OperationVisitor, ParamLocation, visit,
+    AuthorityTier, CATALOG, ConfirmGate, ControlError, MediaType, OperationId, OperationSpec,
+    ParamLocation,
 };
 
 /// The call was answered.
@@ -393,19 +393,11 @@ impl fmt::Display for Usage {
 }
 
 /// Check the pieces with the daemon's own parser, then render them.
-struct Render(HttpParts);
-
-impl OperationVisitor for Render {
-    type Output = Result<HttpRequest, CtlUsage>;
-
-    fn visit<O: Operation>(self) -> Self::Output {
-        O::Request::from_http(&self.0)
-            .map(|req| req.to_http())
-            .map_err(|bad| CtlUsage::Invalid {
-                op: O::ID,
-                detail: bad.to_string(),
-            })
-    }
+fn rendered(id: OperationId, parts: &HttpParts) -> Result<HttpRequest, CtlUsage> {
+    render(id, parts).map_err(|bad| CtlUsage::Invalid {
+        op: bad.op,
+        detail: bad.detail,
+    })
 }
 
 /// Run `engenho ctl`.
@@ -435,7 +427,7 @@ pub async fn run(args: impl IntoIterator<Item = String>) -> u8 {
             }
         }
         ConfirmGate::Executes(_) | ConfirmGate::Issue | ConfirmGate::Cancel | ConfirmGate::None => {
-            if let Err(usage) = visit(id, Render(parts.clone())) {
+            if let Err(usage) = rendered(id, &parts) {
                 eprintln!("engenho ctl: {usage}");
                 return EXIT_USAGE;
             }
@@ -475,7 +467,7 @@ pub async fn run(args: impl IntoIterator<Item = String>) -> u8 {
     {
         return code;
     }
-    let request = match visit(id, Render(parts)) {
+    let request = match rendered(id, &parts) {
         Ok(request) => request,
         Err(usage) => {
             eprintln!("engenho ctl: {usage}");
@@ -784,9 +776,9 @@ mod tests {
     #[test]
     fn a_bad_parameter_is_caught_by_the_daemons_own_parser_before_sending() {
         let (id, parts) = call("logs list --after notanumber");
-        assert!(visit(id, Render(parts)).is_err());
+        assert!(rendered(id, &parts).is_err());
         let (id, parts) = call("logs list --after 7");
-        let rendered = visit(id, Render(parts)).expect("renders");
-        assert_eq!(rendered.query, vec![("after", "7".to_string())]);
+        let request = rendered(id, &parts).expect("renders");
+        assert_eq!(request.query, vec![("after", "7".to_string())]);
     }
 }

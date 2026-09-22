@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "24b74184963e1df2a0617d9c53110ffab11e2ebb9272f2653e8bec93e961e385",
+  "cargo_lock_sha256": "289d64e02409e78f1a6bf5434d0e1ba47eda73089b33431e9fb8ff9b5eb1a9a9",
   "manifest_sha256": {
     "Cargo.toml": "998e174c9668f10229291ded499f005bf0b38b8c8de62715b8d1eb54baa4eee3",
     "engenho-apiserver/Cargo.toml": "a42bf1f662ba3dbab338a871c0979aa15dfb734a22435d96e36e65cfa47d5abf",
@@ -21,7 +21,7 @@
     "engenho-kube-codegen/Cargo.toml": "2fd91bb5b562a4adbd5f8298595155bcdbb51c52070e49b2efc47cc805a070ea",
     "engenho-kube-proto/Cargo.toml": "7545b21650bdbf36fa4b0592ee3659069a39555f10174f42142bf337b1f1c00b",
     "engenho-kubelet/Cargo.toml": "e6e0a52fade25343da69129b7ce04d396a15d930903084d09e564e0716fb2ee1",
-    "engenho-mcp/Cargo.toml": "dc06fc92995d436359c7da1e38aff4fa8fbd4ed1bdb9f70d815f1e0d27163086",
+    "engenho-mcp/Cargo.toml": "a73d0471a92fe4eeb98d75f5ca945aeafcf56c6034e36f47d06bbf980ed9e369",
     "engenho-oracle/Cargo.toml": "9b0da2a6c1d469c28eb0617b8d71df0b0bf6db7751596956e0bb74a6ac979984",
     "engenho-revoada/Cargo.toml": "08cfd6e45e8acfb75f3073e3a70a9a11a9c33575c43509d0199b1e73bb8012f9",
     "engenho-runtime/Cargo.toml": "72a78cdbcea75a22fe5875c42fceabc59878d7323da8876cc6a94d876985a9a9",
@@ -6573,6 +6573,26 @@
           {
             "name": "engenho_cluster_config",
             "package_key": "engenho-cluster-config-0.53.118",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "engenho_control_client",
+            "package_key": "engenho-control-client-0.53.118",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "engenho_control_types",
+            "package_key": "engenho-control-types-0.53.118",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,

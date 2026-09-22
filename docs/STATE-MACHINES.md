@@ -42,7 +42,8 @@
 | ⑨ | Controller reconcile | control | `engenho-controllers/src/controller.rs` | ✅ generic trait + core set |
 | ⑩ | Fonte convergence (7-beat) | source-of-truth | `engenho-fonte/src/lib.rs` | 🔴 mock-universe; real M1.x |
 | ⑪ | Face lifecycle | revoada | `engenho-revoada/src/face.rs` | ✅ start/stop; verbs per impl |
-| ⑫ | MCP reader → writer | operator | `engenho-mcp/src/{reader,writer}/` | reader ✅ · writer P2 (saguão) |
+| ⑫ | MCP reader → writer | operator | `engenho-mcp/src/{reader,writer}/` · `engenho-mcp/src/control.rs` | reader ✅ · control tools ✅ · Kubernetes writer P2 (saguão) |
+| ⑬ | Daemon lifecycle (supervisor) | operator | `engenho-runtime/src/lifecycle/machine.rs::DaemonLifecycle` · `engenho-runtime/src/lifecycle/supervisor.rs` | ✅ pure step fn, store-released invariant proptested |
 
 ---
 
@@ -346,9 +347,41 @@ Snapshot/restore for hot-swap (`FaceSnapshot`).
 tools — `cluster_status · cluster_config · cluster_kubeconfig ·
 cluster_snapshot_meta · cluster_pods · cluster_resource_list ·
 cluster_resource_get` (13-kind catalog, Secrets redacted at the
-boundary). Writer trait is scaffolded but MCP-exposure is **gated on
-saguão passport authority** at P2 — no mutation/attestation in the
-current version.
+boundary). Kubernetes writes through the writer trait stay **gated on
+saguão passport authority** at P2.
+
+The daemon's control plane is exposed separately
+(`engenho-mcp/src/control.rs`): one `control_<resource>_<verb>` tool per
+operation of the control API's catalog, calling the local socket. The
+launch decides the set — `Authority::Observe` (default) offers the observe
+operations, `Authority::LocalMutate` (`--allow-mutate`) adds the mutate ones,
+and no authority offers a destructive or sensitive one; the daemon caps
+every call at the same tier (`Engenho-Ceiling`).
+
+---
+
+## ⑬ Daemon lifecycle — the supervisor (`engenho-runtime/src/lifecycle/`)
+
+**Owner:** `engenho-runtime/src/lifecycle/machine.rs::DaemonLifecycle`, a
+`maquina::StateMachine` whose `step` is pure; the supervisor loop
+(`engenho-runtime/src/lifecycle/supervisor.rs`) feeds it events and carries
+out its effects. The control plane serves throughout, before the first boot
+and across every failure.
+
+States: `Resolving` → `Booting{attempt, phase}` → `Running{attempt, pending}`
+→ `Draining{then}` → `Stopped{reason, epoch}`; a boot that fails goes to
+`Failed{attempt, report, retry}` (backed off, or held until its configuration
+changes); a store that cannot be released goes to `Wedged{cause}`, from which
+only `Exiting{intent}` leads. Events: `Start · Retry · RetryDue ·
+ConfigChanged · ConfigApplied · Phase · Booted · BootFailed · Stop · Restart
+· Exit · Drained · HeldAtStartup`.
+
+**Invariant** (proptested over arbitrary event sequences): outside `Wedged`,
+no state that holds no runtime is entered without the store released
+(`StoreReleased`, minted only by a shutdown, a boot's unwind, or a lock
+probe), so no boot opens a store another still holds. Destructive
+re-initialization runs only while the machine rests in `Stopped` or `Failed`
+in the epoch its confirmation bound.
 
 ---
 

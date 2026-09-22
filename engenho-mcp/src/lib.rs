@@ -11,6 +11,7 @@
 //! * [`reader`] — the `ClusterReader` trait + production / mock impls
 //! * [`server`] — the rmcp `ServerHandler` impl wiring the trait to tools
 
+pub mod control;
 pub mod reader;
 pub mod redaction;
 pub mod resource_kind;
@@ -23,4 +24,4 @@ pub use reader::{ClusterReader, ReaderError};
 pub use resource_kind::ResourceKind;
 pub use server::EngenhoMcp;
 pub use writer::kikai::KikaiClusterWriter;
-pub use writer::{Authority, ClusterWriter, WriterError};
+pub use writer::{Authority, ClusterWriter, Grant, WriterError};

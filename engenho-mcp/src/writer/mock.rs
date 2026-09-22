@@ -101,7 +101,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn mock_writer_rejects_placeholder_authority() {
+    async fn mock_writer_rejects_observe_authority() {
         let writer = MockClusterWriter::new();
         let err = writer
             .apply_resource(
@@ -112,7 +112,7 @@ mod tests {
                 serde_json::json!({}),
                 "mcp",
                 false,
-                &Authority::Placeholder,
+                &Authority::Observe,
             )
             .await
             .unwrap_err();

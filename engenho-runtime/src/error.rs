@@ -101,11 +101,12 @@ pub enum RuntimeError {
     /// consulted by a remote client during a TLS handshake, so a malformed one
     /// costs nothing locally and the node comes up looking entirely healthy —
     /// the failure lands on whoever tries to connect, as a verification error
-    /// that reads like their kubeconfig is wrong. Worse, the certificate is
-    /// persisted on first boot and reloaded thereafter, so the mistake outlives
-    /// the fix until the PKI directory is removed. Failing the unit at start,
+    /// that reads like their kubeconfig is wrong. Failing the unit at start,
     /// naming the value, is the loud version of a fault that is otherwise
-    /// silent and sticky.
+    /// silent. (The server certificate is issued in memory at every boot from
+    /// the CA and the configured SANs — nothing about it is persisted — so a
+    /// corrected value takes effect at the next boot: a config change and a
+    /// restart, never a PKI re-initialization.)
     #[error("invalid runtime.tls.extra_sans entry: {source}")]
     ExtraSan {
         /// The classification failure.

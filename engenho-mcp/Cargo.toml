@@ -26,6 +26,10 @@ kotae = "0.1"
 anyhow             = { workspace = true }
 async-trait        = { workspace = true }
 engenho-cluster-config = { workspace = true }
+# The daemon's control plane as tools: the catalog they are generated from,
+# and the client (socket resolution, request rendering) `engenho ctl` uses.
+engenho-control-types  = { workspace = true }
+engenho-control-client = { workspace = true }
 engenho-types          = { workspace = true }
 engenho-kube-client    = { workspace = true }
 rmcp               = { workspace = true }
@@ -39,3 +43,7 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# tests/control_tools.rs serves a real control socket for the tools to call.
+engenho-config         = { workspace = true }
+engenho-control-server = { workspace = true }
+engenho-serve          = { workspace = true }

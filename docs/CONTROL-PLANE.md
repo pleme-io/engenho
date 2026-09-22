@@ -270,6 +270,25 @@ The file names these operations move are named once: `PkiFile` (in
 layout, in `engenho-runtime`) — the same enums every reader and writer of
 those files and directories now goes through.
 
+## Agents: the control plane as MCP tools (P8)
+
+`engenho-mcp` offers one tool per operation of the catalog,
+`control_<resource>_<verb>` (the `engenho ctl` spelling), generated at start
+from `CATALOG` (`engenho-mcp/src/control.rs`): parameters by name, the body as
+`body`, the call over this machine's socket through the same resolution and
+request rendering (`engenho_control_client::render`, the daemon's own parser)
+`engenho ctl` uses. An answer is the daemon's own: found, refused (reason and
+what would be accepted) or blind — a daemon that cannot be reached is blind,
+never an empty success.
+
+The launch decides the set: without flags the server offers the observe
+operations; `engenho-mcp --allow-mutate` adds the mutate ones; no flag offers
+a destructive or sensitive one (a test holds both). Every call carries
+`Engenho-Actor: agent` and `Engenho-Ceiling: <tier>`, so the daemon caps it at
+the launch's tier on its own and the audit chain names the agent. The grant
+is control-plane mutation only: Kubernetes writes through the writer trait
+stay closed until the saguão passport.
+
 ## Remote trust: SPKI pins, not the cluster CA
 
 The control listener does **not** trust engenho's cluster CA. It has its own

@@ -280,16 +280,23 @@ mod tests {
         (tmp, writer)
     }
 
-    /// Placeholder authority is always rejected — every kind, every method.
-    /// This guards the trait contract: as long as `Authority::Placeholder`
-    /// is the only variant, no path through `apply_resource` or
-    /// `delete_resource` succeeds. P2 (saguão) lands the variant that
-    /// can flip these to actual mutations.
+    /// Every authority defined today is rejected — every kind, every
+    /// method, the control plane's launch-flag grant included. The saguão
+    /// passport (dormant) is the variant that can flip these to actual
+    /// mutations.
     #[tokio::test]
-    async fn placeholder_authority_rejects_every_kind() {
+    async fn no_authority_today_passes_the_writer() {
         let (_tmp, writer) = setup();
-        let auth = Authority::Placeholder;
-        for &kind in ResourceKind::all() {
+        let grants = [
+            Authority::Observe,
+            Authority::LocalMutate {
+                granted_by: crate::writer::Grant::LaunchFlag,
+            },
+        ];
+        for (&kind, auth) in ResourceKind::all()
+            .iter()
+            .flat_map(|kind| grants.iter().map(move |auth| (kind, auth)))
+        {
             let apply_err = writer
                 .apply_resource(
                     "demo",
@@ -299,7 +306,7 @@ mod tests {
                     serde_json::json!({}),
                     "engenho-mcp",
                     false,
-                    &auth,
+                    auth,
                 )
                 .await
                 .unwrap_err();
@@ -309,7 +316,7 @@ mod tests {
                 "{kind:?} apply should require authority"
             );
             let delete_err = writer
-                .delete_resource("demo", kind, "default", "name", &auth)
+                .delete_resource("demo", kind, "default", "name", auth)
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -338,7 +345,7 @@ mod tests {
                 serde_json::json!({}),
                 "engenho-mcp",
                 false,
-                &Authority::Placeholder,
+                &Authority::Observe,
             )
             .await
             .unwrap_err();

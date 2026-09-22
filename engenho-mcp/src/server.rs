@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::reader::{ClusterReader, ReaderError};
 use crate::resource_kind::ResourceKind;
 use crate::views::SnapshotMetaView;
+use crate::writer::Authority;
 
 /// Input for `cluster_pods` — cluster + namespace.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -124,16 +125,30 @@ pub struct SnapshotMetaResponse {
 #[derive(Clone)]
 pub struct EngenhoMcp {
     reader: Arc<dyn ClusterReader>,
+    authority: Authority,
     tool_router: ToolRouter<EngenhoMcp>,
 }
 
 impl EngenhoMcp {
+    /// The server over `reader`, offering the control-plane tools
+    /// `authority` allows ([`crate::control`]) beside the reader's.
     #[must_use]
-    pub fn new(reader: Arc<dyn ClusterReader>) -> Self {
+    pub fn new(reader: Arc<dyn ClusterReader>, authority: Authority) -> Self {
+        let mut tool_router = Self::tool_router();
+        for row in crate::control::exposed(&authority) {
+            tool_router.add_route(crate::control::route(row));
+        }
         Self {
             reader,
-            tool_router: Self::tool_router(),
+            authority,
+            tool_router,
         }
+    }
+
+    /// What the server was launched to allow.
+    #[must_use]
+    pub const fn authority(&self) -> &Authority {
+        &self.authority
     }
 }
 
@@ -283,10 +298,15 @@ impl ServerHandler for EngenhoMcp {
     }
 }
 
-const INSTRUCTIONS: &str = "engenho-mcp — typed reader for engenho-managed Kubernetes clusters. \
-Surfaces kikai's on-disk cluster state (status rows, config, kubeconfig \
-descriptor, snapshot meta) as MCP tools. Read-only by construction — no \
-mutation or attestation in this version (Writer layer ships at P2).";
+const INSTRUCTIONS: &str = "engenho-mcp — typed reader for engenho-managed Kubernetes clusters, \
+and this machine's engenho daemon's control plane. The cluster_* tools surface kikai's on-disk \
+cluster state and the live Kubernetes API, read-only. The control_* tools are generated from \
+the daemon's control API (`engenho ctl <resource> <verb>`, one tool each) and reach it over its \
+local socket: runtime lifecycle, boot journal, init state, configuration and its overrides, \
+children, PKI facts, store, kubeconfigs, events, logs, audit. Observe tools are always offered; \
+mutate tools only when the server was launched with --allow-mutate; destructive operations \
+(re-initialization) are never tools. Every control answer is found, refused (with the reason and \
+what would be accepted) or blind — never read blind as empty.";
 
 /// Pretty-printed JSON response. Pretty so operators reading raw
 /// MCP traces can scan structure; clients ignore whitespace.
@@ -374,7 +394,34 @@ mod tests {
 
     fn server() -> EngenhoMcp {
         let r = MockClusterReader::new().with_cluster("demo", sample_state());
-        EngenhoMcp::new(Arc::new(r))
+        EngenhoMcp::new(Arc::new(r), Authority::Observe)
+    }
+
+    /// The router carries the reader's tools and exactly the control tools
+    /// the authority offers.
+    #[test]
+    fn the_router_offers_the_control_tools_the_authority_allows() {
+        let names = |authority: Authority| -> Vec<String> {
+            let r = MockClusterReader::new().with_cluster("demo", sample_state());
+            EngenhoMcp::new(Arc::new(r), authority)
+                .tool_router
+                .list_all()
+                .into_iter()
+                .map(|t| t.name.into_owned())
+                .collect()
+        };
+        let observe = names(Authority::Observe);
+        let mutate = names(Authority::LocalMutate {
+            granted_by: crate::writer::Grant::LaunchFlag,
+        });
+        assert!(observe.iter().any(|n| n == "cluster_status"));
+        assert!(observe.iter().any(|n| n == "control_runtime_show"));
+        assert!(!observe.iter().any(|n| n == "control_runtime_stop"));
+        assert!(mutate.iter().any(|n| n == "control_runtime_stop"));
+        assert!(
+            !mutate.iter().any(|n| n.starts_with("control_reinit")),
+            "a destructive operation is a tool: {mutate:?}"
+        );
     }
 
     #[tokio::test]

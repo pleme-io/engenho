@@ -29,6 +29,11 @@ engenho-kubelet/src/probe.rs
 engenho-kubelet/src/backoff.rs
 engenho-kubelet/src/native_backend.rs
 
+# The daemon's lifecycle (docs/CONTROL-PLANE.md, P1): what a boot's failure
+# means (retry or hold), and which transitions the supervisor may take.
+engenho-runtime/src/lifecycle/machine.rs
+engenho-runtime/src/boot/failure.rs
+
 # The control plane's configuration tier (docs/CONTROL-PLANE.md, P4): what a
 # change to each leaf means, whether a change is accepted, and what applying
 # it did.

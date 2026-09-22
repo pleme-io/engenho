@@ -3,7 +3,8 @@
 //! * [`ControlClient::call`] — one typed operation: the spec's request in,
 //!   its response (or its typed refusal) out.
 //! * [`ControlClient::send`] — any operation by id, already rendered: what
-//!   the table-driven `engenho ctl` uses.
+//!   the table-driven `engenho ctl` and the MCP control tools use, with
+//!   [`render`] building the request through the daemon's own parser.
 //! * [`resolve_socket`] — where the local daemon's socket is, found the way
 //!   the daemon placed it.
 //! * [`ControlClient::remote`] + [`remote`] — a daemon on another machine,
@@ -19,8 +20,10 @@ use bytes::Bytes;
 use engenho_config::{EngenhoConfig, SYSTEM_SOCKET_PATH, SocketDefaults};
 use engenho_control_types::pin::{KeyMaterial, client_config};
 use engenho_control_types::types::{Blind, Refusal};
-use engenho_control_types::wire::{HttpRequest, OperationRequest};
-use engenho_control_types::{AuthorityTier, ControlError, MediaType, Operation, OperationId};
+use engenho_control_types::wire::{HttpParts, HttpRequest, OperationRequest};
+use engenho_control_types::{
+    AuthorityTier, ControlError, MediaType, Operation, OperationId, OperationVisitor, visit,
+};
 
 pub use remote::{RemoteEndpoint, RemoteError, RemotesConfig};
 
@@ -206,6 +209,43 @@ impl ControlClient {
             return Ok(Reply { status, body });
         }
         Err(error_body(status, &body))
+    }
+}
+
+/// An operation's HTTP pieces its request type refused.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{}: {detail}", op.as_str())]
+pub struct Unrenderable {
+    /// The operation.
+    pub op: OperationId,
+    /// Why.
+    pub detail: String,
+}
+
+/// Render `parts` as operation `id`'s request, through the generated request
+/// type the daemon parses it into — so a malformed argument is refused here,
+/// by the daemon's own parser, before anything is sent. What `engenho ctl`
+/// and the MCP control tools both build their requests with.
+///
+/// # Errors
+///
+/// [`Unrenderable`].
+pub fn render(id: OperationId, parts: &HttpParts) -> Result<HttpRequest, Unrenderable> {
+    visit(id, Render(parts))
+}
+
+struct Render<'a>(&'a HttpParts);
+
+impl OperationVisitor for Render<'_> {
+    type Output = Result<HttpRequest, Unrenderable>;
+
+    fn visit<O: Operation>(self) -> Self::Output {
+        O::Request::from_http(self.0)
+            .map(|req| req.to_http())
+            .map_err(|bad| Unrenderable {
+                op: O::ID,
+                detail: bad.to_string(),
+            })
     }
 }
 

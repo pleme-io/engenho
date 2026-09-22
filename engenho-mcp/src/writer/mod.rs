@@ -8,18 +8,20 @@
 //!
 //! # Authority gating
 //!
-//! Every write takes an [`Authority`] reference. At M0.0.2 only
-//! [`Authority::Placeholder`] exists — and it ALWAYS rejects.
-//! That's a deliberate substrate gate: the trait + impl + tests
-//! are ready, but no path from MCP wire reaches a successful write
-//! until the saguão passport variant lands at P2.
+//! The server holds one [`Authority`], decided at launch. It answers two
+//! different questions, and deliberately not the same way:
 //!
-//! When P2 ships:
-//!   1. New variant `Authority::SaguaoPassport { ref: SecretRef }`
-//!   2. `Authority::can_write()` returns true for it
-//!   3. The `engenho-mcp` server registers `cluster_resource_apply`
-//!      + `cluster_resource_delete` MCP tools that accept a
-//!      passport reference and route through this trait.
+//! * **The control plane** ([`crate::control`]): [`Authority::control_ceiling`]
+//!   caps the control operations offered as tools — observe always, mutate
+//!   with `--allow-mutate` — and the daemon enforces the same cap on its
+//!   own and audits every call.
+//! * **Kubernetes writes** (this trait): [`Authority::can_write`] is false for
+//!   every variant defined today. Nothing on this path has a tier or an
+//!   audit record, so the launch flag that grants control-plane mutation
+//!   does not reach it. The variant that will is the saguão passport
+//!   (dormant): `Authority::SaguaoPassport`, `can_write` true for it, and
+//!   `cluster_resource_apply` / `cluster_resource_delete` tools routed
+//!   through this trait.
 //!
 //! Until then, the trait + impl exist for internal callers
 //! (engenho-apiserver's M0.1 control plane, future engenho-controllers)
@@ -34,28 +36,50 @@ pub mod kikai;
 #[cfg(test)]
 pub mod mock;
 
-/// Typed authority capsule. Every [`ClusterWriter`] method takes
-/// one. The only variant that grants write permission is
-/// `Authority::SaguaoPassport` (which lands at P2); until then,
-/// the writer always rejects.
+/// What the server may do, decided at launch. See the module docs for the
+/// two questions it answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Authority {
-    /// **Deny-all placeholder.** Lives in the substrate until
-    /// saguão passport materialization lands at P2. Every
-    /// `ClusterWriter` method given this rejects with
-    /// [`WriterError::AuthorityRequired`].
-    Placeholder,
-    // Future:
-    // SaguaoPassport(saguao::Passport),
+    /// Read only: the default. Observe control tools only; every
+    /// `ClusterWriter` method rejects with [`WriterError::AuthorityRequired`].
+    Observe,
+    /// Control-plane mutation on this machine's engenho, granted by the
+    /// operator who launched the server.
+    LocalMutate {
+        /// How it was granted.
+        granted_by: Grant,
+    },
+    // Dormant (saguão): SaguaoPassport(saguao::Passport) — the variant that
+    // opens `can_write`.
+}
+
+/// How a [`Authority::LocalMutate`] was granted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Grant {
+    /// `engenho-mcp --allow-mutate`: whoever can launch the server can
+    /// already run `engenho ctl` as the same user.
+    LaunchFlag,
 }
 
 impl Authority {
-    /// Whether this authority is currently sufficient for write
-    /// operations. False for every variant defined today — flip
-    /// to true on the saguão variant when it lands.
+    /// Whether Kubernetes writes through a [`ClusterWriter`] are allowed.
+    /// False for every variant defined today, `LocalMutate` included.
     #[must_use]
-    pub fn can_write(&self) -> bool {
-        matches!(self, _placeholder if false)
+    pub const fn can_write(&self) -> bool {
+        match self {
+            Self::Observe | Self::LocalMutate { .. } => false,
+        }
+    }
+
+    /// The highest control-plane tier the server acts at: the tools it
+    /// offers, and the `Engenho-Ceiling` every call carries. Never
+    /// destructive.
+    #[must_use]
+    pub const fn control_ceiling(&self) -> engenho_control_types::AuthorityTier {
+        match self {
+            Self::Observe => engenho_control_types::AuthorityTier::Observe,
+            Self::LocalMutate { .. } => engenho_control_types::AuthorityTier::Mutate,
+        }
     }
 }
 
@@ -160,9 +184,23 @@ mod tests {
         }
     }
 
+    /// The launch flag grants control-plane mutation, never Kubernetes
+    /// writes, and never destructive control.
     #[test]
-    fn placeholder_authority_always_denies() {
-        assert!(!Authority::Placeholder.can_write());
+    fn no_authority_today_writes_kubernetes() {
+        let mutate = Authority::LocalMutate {
+            granted_by: Grant::LaunchFlag,
+        };
+        assert!(!Authority::Observe.can_write());
+        assert!(!mutate.can_write());
+        assert_eq!(
+            Authority::Observe.control_ceiling(),
+            engenho_control_types::AuthorityTier::Observe
+        );
+        assert_eq!(
+            mutate.control_ceiling(),
+            engenho_control_types::AuthorityTier::Mutate
+        );
     }
 
     #[test]
