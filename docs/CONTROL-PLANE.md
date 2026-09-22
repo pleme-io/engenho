@@ -125,6 +125,12 @@ no switch to turn it off.
   header parameters, other `--field value` pairs build the body, and the
   daemon's own generated parser checks the request before it is sent. Exit
   codes: 0 answered, 2 usage, 3 refused, 4 blind or unreachable.
+* **A halt stays halted.** Every service unit the module trio renders for
+  engenho restarts it on failure only (`daemonRestartPolicy = "on-failure"`
+  in `flake.nix`, projected by substrate's `lib/hm/restart-policy.nix`):
+  launchd `KeepAlive = { SuccessfulExit = false; Crashed = true; }`, systemd
+  `Restart=on-failure`. So `runtime exit` with a halt intent (exit 0) stays
+  down, and a relaunch intent (exit 75) comes back.
 
 ## Remote trust: SPKI pins, not the cluster CA
 
@@ -207,7 +213,7 @@ Deviations the spec settled while being authored:
 | P0b | Spec, `engenho-control-types`, forge-gen spike | done |
 | P1 | Supervisor, boot-phase journal, stay-up on failure, retry classes | done |
 | P2 | Local UDS, observe tier, `engenho ctl` | done |
-| P3 | Operate verbs, authorization tiers, audit chain | done with P2, but for the service manager's restart policy |
+| P3 | Operate verbs, authorization tiers, audit chain, restart on failure only | done |
 | P4 | Persisted config overrides, sealed mutability, drift | — |
 | P5 | Remote mTLS with SPKI pins | — |
 | P6 | Child control | — |

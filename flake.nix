@@ -217,6 +217,13 @@
         withUserDaemon = true;
         daemonSubcommand = "daemon";
 
+        # The daemon ends on purpose: `engenho ctl runtime exit` with a halt
+        # intent exits 0 and means "stay down", a relaunch intent exits 75
+        # and means "bring me back" (docs/CONTROL-PLANE.md). Under the
+        # service managers' `always` a halt is relaunched like a crash, so
+        # both arms restart on failure only.
+        daemonRestartPolicy = "on-failure";
+
         # engenho reads shikumi TieredConfig, so the YAML the trio deploys
         # IS its file tier. Defaults stay EMPTY on purpose: engenho's own
         # progressive fold already supplies prescribed defaults, and a key
