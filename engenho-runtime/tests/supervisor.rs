@@ -351,3 +351,56 @@ async fn a_change_to_the_declared_file_retries_a_held_boot() {
     until(&handle, "running", running).await;
     exit(run, &handle, ExitIntent::Halt).await;
 }
+
+/// The same fix, landing WHILE the boot that will fail is still reading —
+/// the case the watcher cannot report, because `ConfigChanged` is refused in
+/// `Booting`. The supervisor must settle against the file as it is when the
+/// failure lands, not against the events it happened to receive.
+///
+/// This is a real shape, not a contrived one: on Linux `std::fs::write`
+/// truncates and then writes, and inotify reports the truncation on its own,
+/// so a boot woken by it reads a file the writer has not finished. That is
+/// how `control_uds` failed on ubuntu while every darwin run passed.
+///
+/// TIER — this is a LINUX-side gate, and measured to be vacuous on darwin:
+/// with the fix reverted it still passes here, because FSEvents coalesces the
+/// write and delivers one event after the writer has closed, late enough that
+/// the edge-triggered path accepts it. On Linux the same revert holds the
+/// daemon and this times out. Do not read a green run on a Mac as evidence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_that_lands_during_a_failing_boot_is_not_lost() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let declared = tmp.path().join("engenho.yaml");
+    std::fs::write(&declared, "broken\n").expect("write");
+    let good = config(tmp.path(), false);
+    let file = declared.clone();
+    let (reading_tx, reading_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel();
+    // Taken by the FIRST resolve only; every later one runs straight through.
+    let gate = Mutex::new(Some((reading_tx, go_rx)));
+    let source = engenho_runtime::lifecycle::ConfigSource::new(move || {
+        let text = std::fs::read_to_string(&file).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        if let Some((reading, go)) = gate.lock().unwrap_or_else(PoisonError::into_inner).take() {
+            let _ = reading.send(());
+            let _ = go.recv();
+        }
+        if text.trim() == "fixed" {
+            Ok(ResolvedConfig::untracked(good.clone()))
+        } else {
+            Err(ConfigError::Parse(format!("not fixed: {text:?}")))
+        }
+    });
+    let (run, handle) = supervise(tmp.path(), source, Some(declared.clone()));
+
+    tokio::task::spawn_blocking(move || reading_rx.recv())
+        .await
+        .expect("join")
+        .expect("the first attempt read the declared file");
+    // Mid-boot: this write's event reaches a supervisor in `Booting`, which
+    // refuses it. Nothing else will arrive.
+    std::fs::write(&declared, "fixed\n").expect("fix the file mid-boot");
+    let _ = go_tx.send(());
+
+    until(&handle, "running", running).await;
+    exit(run, &handle, ExitIntent::Halt).await;
+}

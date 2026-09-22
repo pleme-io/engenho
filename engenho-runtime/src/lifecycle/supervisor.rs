@@ -1227,6 +1227,12 @@ impl Supervisor {
 
     fn on_boot_done(&mut self, done: Result<BootOutcome, JoinError>) {
         let at = Timestamp::now();
+        // Kept out of the match so a FAILED attempt can say what it read —
+        // see `resettle_declared`, which runs once this failure has landed.
+        let read_by_attempt = match &done {
+            Ok(outcome) => outcome.declared_digest.clone(),
+            Err(_) => None,
+        };
         let event = match done {
             Ok(BootOutcome {
                 result: Ok(runtime),
@@ -1326,6 +1332,44 @@ impl Supervisor {
         };
         self.persist_journal();
         self.apply_logged(event);
+        if matches!(self.machine.state().state, LifecycleState::Failed { .. }) {
+            self.resettle_declared(read_by_attempt.as_deref(), at);
+        }
+    }
+
+    /// A failed boot read the declared file at one instant; by the time the
+    /// failure lands the file may already say something else — a change whose
+    /// event arrived WHILE the boot was in flight (`ConfigChanged` is refused
+    /// in `Booting`: a change during a boot is not a second trigger), or one
+    /// whose event never arrived at all. Either way the daemon would hold on a
+    /// configuration that is already correct on disk, and nothing further is
+    /// coming to wake it.
+    ///
+    /// So the file is re-read and compared with what the attempt saw, rather
+    /// than trusting the edge. A difference is a retry the supervisor asks
+    /// for itself, which makes the promise level-triggered: *a held boot
+    /// settles against the file as it is now*, not against the events that
+    /// happened to be delivered.
+    ///
+    /// Measured 2026-09-22 (pleme-io/engenho `control_uds`, ubuntu). Linux's
+    /// `std::fs::write` truncates before it writes and inotify reports the
+    /// truncation as its own `Modify(Data(Any))`, so a boot woken by it read
+    /// an EMPTY document — every value its default, `data_dir` back to
+    /// `/var/lib/engenho` — failed `DataDirMoved`, and held forever although
+    /// the complete file landed microseconds later. macOS coalesces the same
+    /// write into one event after the writer is done, which is exactly why
+    /// 5,200 tests on this laptop never saw it.
+    ///
+    /// One retry at most per difference: the second attempt records the digest
+    /// it read, so an unchanged file compares equal and nothing re-fires.
+    fn resettle_declared(&mut self, read_by_attempt: Option<&str>, at: Timestamp) {
+        let Some(path) = self.declared_path.clone() else {
+            return;
+        };
+        if file_digest(&path).as_deref() != read_by_attempt {
+            debug!(path = %path.display(), "the declared file moved under a failed boot — retrying");
+            self.apply_logged(LifecycleEvent::ConfigChanged { at });
+        }
     }
 
     fn on_drained(&mut self, done: Result<Result<StoreReleased, RuntimeError>, JoinError>) {
@@ -1600,27 +1644,30 @@ async fn supervised_boot(
     declared: Option<PathBuf>,
     mut rec: BootRecorder,
 ) -> BootOutcome {
-    let failed = |result| BootOutcome {
+    let failed = |result, declared_digest| BootOutcome {
         result,
         provenance: None,
-        declared_digest: None,
+        declared_digest,
     };
     if let Err(e) = rec.enter(BootPhase::ResolveConfig) {
-        return failed(Err(rec.failed(e)));
+        return failed(Err(rec.failed(e)), None);
     }
     // What the resolution is about to read, so drift is measured against
-    // what this boot actually saw.
+    // what this boot actually saw. Taken BEFORE the read, deliberately: a
+    // failure must report the bytes it resolved from, not bytes that landed
+    // afterwards — that is what lets `resettle_declared` tell "the file still
+    // says what broke me" from "the file already says something else".
     let declared_digest = declared.as_deref().and_then(file_digest);
     let resolved = match source.resolve() {
         Ok(resolved) => resolved,
-        Err(e) => return failed(Err(rec.failed(e.into()))),
+        Err(e) => return failed(Err(rec.failed(e.into())), declared_digest),
     };
     if resolved.config.runtime.data_dir != data_dir {
         let err = RuntimeError::DataDirMoved {
             control: data_dir,
             resolved: resolved.config.runtime.data_dir.clone(),
         };
-        return failed(Err(rec.failed(err)));
+        return failed(Err(rec.failed(err)), declared_digest);
     }
     let ResolvedConfig { config, provenance } = resolved;
     BootOutcome {
