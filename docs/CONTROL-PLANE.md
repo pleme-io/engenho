@@ -70,6 +70,14 @@ restartable runtime. Its state is one pure machine, `DaemonLifecycle`, on
   errors): a held port, a busy store or an absent container runtime back off
   (1 s doubling to 60 s); a config the runtime refuses is held until the
   declared file changes or an operator retries.
+* **A held boot settles against the file, not against the events.** Each
+  attempt records the BLAKE3 of the declared file it read; when the attempt
+  lands failed, the file is re-read and a difference is a retry the supervisor
+  asks for itself. `ConfigChanged` is refused inside `booting` — a change
+  during a boot is not a second trigger — so without this, a change whose
+  event arrived in that window was lost and the daemon held on a configuration
+  that was already correct on disk. It covers an event that never arrives at
+  all, too: the watcher is an optimisation, and the file is the truth.
 * **A boot is 16 named phases** (`BootPhase`, `resolve_config` →
   `adopt_health`), each entered through a `BootRecorder` that reports it to the
   supervisor. A stop is honoured at phase boundaries and inside the leadership
