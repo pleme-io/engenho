@@ -24,14 +24,19 @@ use quote::quote;
 use serde_json::Value;
 
 const SPEC: &str = "../spec/engenho-control.openapi.yaml";
+/// The spec, embedded when this script is compiled. `include_str!` resolves
+/// against this file, not against the directory the script runs in: cargo
+/// runs a build script from its package, but Nix's `buildRustCrate` runs it
+/// from the workspace root, where a relative read of `SPEC` finds nothing.
+const SPEC_TEXT: &str = include_str!("../spec/engenho-control.openapi.yaml");
 const METHODS: [&str; 5] = ["get", "put", "post", "delete", "patch"];
 
 fn main() {
     println!("cargo:rerun-if-changed={SPEC}");
     println!("cargo:rerun-if-changed=build.rs");
 
-    let text = std::fs::read_to_string(SPEC).unwrap_or_else(|e| panic!("read {SPEC}: {e}"));
-    let spec: Value = serde_yaml::from_str(&text).unwrap_or_else(|e| panic!("parse {SPEC}: {e}"));
+    let spec: Value =
+        serde_yaml::from_str(SPEC_TEXT).unwrap_or_else(|e| panic!("parse {SPEC}: {e}"));
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
 
     write(&out.join("types.rs"), &types(&spec));
