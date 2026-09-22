@@ -28,6 +28,44 @@
 //! site can accidentally believe it got confinement. A backend that silently
 //! ran workloads unconfined while reporting success is the exact failure shape
 //! this crate keeps finding.
+//!
+//! ## ★ Why a restart cannot run a workload twice ([`Readoption::Cannot`])
+//!
+//! A workload is a child of THIS process, tracked in an in-memory table. A
+//! new backend — a new daemon process, or a new runtime booted inside the same
+//! one — starts with an empty table and no way to find what the old one
+//! spawned, so it would start every pod a second time beside the first. For a
+//! stateful workload (two Postgres on one data directory) that is corruption,
+//! not waste. Three things, one per way a backend can end, keep the old copy
+//! from surviving:
+//!
+//! * **The daemon process stops, on Linux.** The engenho daemon runs as the
+//!   systemd unit `engenho-daemon`, rendered by substrate's `mkNixOSService`
+//!   with `KillMode=control-group`: stopping (or restarting) the unit kills
+//!   every process in its cgroup, and every native workload is in it, because
+//!   it is spawned as the daemon's child. That is what makes a daemon restart
+//!   safe, and it is load-bearing — so the NixOS arm in `flake.nix` ASSERTS
+//!   it, and an evaluation that sets `KillMode` to anything else (`process`,
+//!   `mixed`, `none`) fails instead of silently doubling every pod. A daemon
+//!   that CRASHES is the same case: systemd stops the unit's remaining cgroup
+//!   before `Restart=on-failure` starts it again.
+//! * **The daemon process stops, on macOS.** The workload stays in the
+//!   daemon's process group (see [`Termination::spawn`]), and launchd kills
+//!   the job's group when it stops the job.
+//! * **The backend is dropped inside a running process.** The supervisor can
+//!   shut a runtime down and boot a new one without the process exiting, and
+//!   the new boot builds a new backend. Every workload is spawned with
+//!   `kill_on_drop`, so dropping the backend's table SIGKILLs every live
+//!   process it still owns. `SIGKILL` and not a graceful stop because a
+//!   `Drop` cannot wait out a grace period; a graceful drain belongs to the
+//!   kubelet stopping its pods before shutdown, and this is the floor under
+//!   it. A process already handed to its termination task is reaped by that
+//!   task, which owns it, and is unaffected.
+//!
+//! Tier-honest: the first is eval-rejected (a Nix assertion), the third is
+//! pinned by a test here, the second is launchd's documented behaviour and is
+//! not tested in this crate. A workload's OWN children are covered by the
+//! cgroup kill on Linux and by none of the others.
 
 use crate::backend::{
     ContainerRuntime, ContainerSpec, ContainerStatus, ExecOutcome, LogOptions, Readoption,
@@ -344,6 +382,30 @@ impl Termination {
     }
 }
 
+/// The command a workload is spawned from: `program` with `args`, the declared
+/// `env` and nothing else, stdin closed, and killed if its handle is dropped.
+///
+/// * `env_clear`, so a container inherits the DAEMON's environment only by
+///   declaration. Inheriting it implicitly is how a workload ends up
+///   depending on something no manifest records.
+/// * `kill_on_drop`, so a backend that is dropped while its workloads run —
+///   a runtime shut down and booted again inside one process — takes them
+///   with it rather than leaving them for the next backend to start twice.
+///   See the module header, "Why a restart cannot run a workload twice".
+fn workload_command<'a>(
+    program: &Path,
+    args: impl IntoIterator<Item = &'a String>,
+    env: &std::collections::BTreeMap<String, String>,
+) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args);
+    cmd.env_clear();
+    cmd.envs(env);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.kill_on_drop(true);
+    cmd
+}
+
 /// Stop `child`: `SIGTERM`, `SIGKILL` once `grace` has passed, then reap.
 async fn terminate(mut child: tokio::process::Child, grace: Duration) -> Reaped {
     // `id()` is `Some` exactly while the child is unreaped, so the pid cannot
@@ -650,18 +712,9 @@ impl ContainerRuntime for NativeBackend {
             detail: e.to_string(),
         })?;
 
-        let mut cmd = tokio::process::Command::new(&program);
-        cmd.args(spec.command.iter().skip(1));
-        // env_clear so a container inherits the DAEMON's environment only by
-        // declaration. Inheriting it implicitly is how a workload ends up
-        // depending on something no manifest records.
-        cmd.env_clear();
-        for (k, v) in &spec.env {
-            cmd.env(k, v);
-        }
+        let mut cmd = workload_command(&program, spec.command.iter().skip(1), &spec.env);
         cmd.stdout(std::process::Stdio::from(log));
         cmd.stderr(std::process::Stdio::from(log_err));
-        cmd.stdin(std::process::Stdio::null());
 
         let child = cmd.spawn().map_err(|e| NativeError::Spawn {
             program: program.clone(),
@@ -1147,6 +1200,44 @@ mod tests {
             .expect("read stdout");
         assert_eq!(first.as_deref(), Some("ready"));
         child
+    }
+
+    /// ★ A workload whose handle is dropped is killed, so a backend dropped
+    /// inside a running process (a runtime shut down and booted again) leaves
+    /// nothing running for the next backend to start a second copy of.
+    ///
+    /// Observed through the workload's stdout: the pipe reaches EOF only when
+    /// the process has exited, and the script would otherwise hold it open
+    /// for 30s. It ignores SIGTERM, so only a SIGKILL ends it this fast.
+    #[tokio::test]
+    async fn a_dropped_workload_handle_kills_the_workload() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+        let args = [
+            "-c".to_string(),
+            "trap '' TERM; echo ready; exec sleep 30".to_string(),
+        ];
+        let mut cmd = workload_command(
+            Path::new("/bin/sh"),
+            args.iter(),
+            &std::collections::BTreeMap::new(),
+        );
+        cmd.stdout(std::process::Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn /bin/sh");
+        let mut stdout = tokio::io::BufReader::new(child.stdout.take().expect("stdout is piped"));
+        let mut first = String::new();
+        tokio::time::timeout(Duration::from_secs(5), stdout.read_line(&mut first))
+            .await
+            .expect("the script reports ready within 5s")
+            .expect("read stdout");
+        assert_eq!(first.trim(), "ready");
+
+        drop(child);
+
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stdout.read_to_end(&mut rest))
+            .await
+            .expect("dropping the handle must end the workload, not leave it running")
+            .expect("read to EOF");
     }
 
     /// ★ T2.10: a workload that ignores SIGTERM is killed with SIGKILL once its grace

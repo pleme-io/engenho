@@ -232,6 +232,33 @@
         # name. See nix/typed-config.nix's `prune`.
         withShikumiConfig = true;
         shikumiDefaults = { };
+
+        # ── ★ KillMode=control-group is LOAD-BEARING on Linux ─────────────
+        # The native backend (engenho-kubelet/src/native_backend.rs) runs a
+        # pod as a child process of the daemon and cannot re-adopt one after
+        # a restart (`Readoption::Cannot`). What keeps a daemon restart from
+        # leaving a second copy of every native workload running is systemd
+        # killing the WHOLE cgroup when the daemon's unit stops — which is
+        # KillMode=control-group, substrate's mkNixOSService default. Under
+        # `process` or `none`, a restarted engenho would start every pod a
+        # second time beside the orphaned first copy (two Postgres on one
+        # data directory). The default is not enough: a later
+        # `mkForce "process"` anywhere in the fleet would change it silently,
+        # so evaluation refuses it.
+        extraNixosConfigFn = { cfg, lib, config, ... }:
+          lib.mkIf (cfg.daemon.enable or false) {
+            assertions = [{
+              assertion =
+                (config.systemd.services.engenho-daemon.serviceConfig.KillMode or null)
+                == "control-group";
+              message = ''
+                services.engenho: systemd.services.engenho-daemon must keep
+                KillMode=control-group. engenho's native backend cannot re-adopt
+                the workloads a previous daemon spawned, so only the cgroup kill
+                on stop keeps a restart from running every native pod twice.
+              '';
+            }];
+          };
       };
       # The typed surface rides with every arm, so a consumer gets one
       # import and gets eval-time type checking with it.
