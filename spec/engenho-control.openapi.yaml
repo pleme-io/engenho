@@ -1,0 +1,2335 @@
+# engenho control plane — the ONE authored source of truth.
+#
+# Every operation an operator (or an agent, or a remote engenho) can perform
+# against a RUNNING engenho daemon without going through the Kubernetes API.
+# Served over a local Unix socket (kernel peer-credential authz) and a remote
+# TLS 1.3 listener (SPKI-pinned client certs). See docs/CONTROL-PLANE.md.
+#
+# Spec-first law (org Pillar 3): this file is authored; every transport, the
+# central Rust types (engenho-control-types), the operation catalog, the CLI
+# verb table, the MCP tool set and the completions are DERIVED from it. A
+# hand-authored copy of anything here is drift.
+#
+# Vendor extensions, read by engenho-control-types/build.rs into CATALOG and
+# enforced by engenho-control-types/tests/spec_invariants.rs:
+#   x-engenho-authority     observe | mutate | destructive   (every operation)
+#   x-engenho-sensitive     bool — the response carries secret material; such
+#                           an operation is never registered as an MCP tool
+#   x-engenho-confirm       <ReinitOp wire name> — the operation executes a
+#                           confirm-gated re-initialization; the request must
+#                           carry `Engenho-Confirmation` + a `confirm_phrase`
+#   x-engenho-confirmation  issue | cancel — the operation manages a
+#                           confirmation challenge (destructive tier, but it
+#                           cannot itself require a confirmation)
+#   x-engenho-cli           {resource, verb} — the `engenho ctl <resource>
+#                           <verb>` spelling; (resource, verb) is injective
+#
+# Wire conventions: every enum value is snake_case. Every discriminated union
+# is a oneOf of INLINE object variants carrying one required single-valued tag
+# property (`state`, `kind`, `status`, …) — absence is a variant, never an
+# omitted field. Timestamps are RFC 3339 (`format: date-time`).
+openapi: 3.0.3
+info:
+  title: engenho control plane
+  version: v1
+  description: |
+    Non-Kubernetes management API for a running engenho daemon: lifecycle,
+    boot journal, initialization state, persisted runtime configuration,
+    child supervision, gated re-initialization, and event/log/audit streams.
+  license:
+    name: MIT
+servers:
+  - url: http://localhost
+    description: Local Unix socket (the host part is ignored).
+  - url: https://{remote}:7443
+    description: Remote mTLS listener (SPKI-pinned both ways).
+    variables:
+      remote:
+        default: node.tailnet
+tags:
+  - name: meta
+    description: Negotiation and the spec itself.
+  - name: runtime
+    description: Lifecycle of the in-process runtime and of the daemon process.
+  - name: boot
+    description: Boot journal and initialization state.
+  - name: config
+    description: Effective configuration, persisted overrides, drift.
+  - name: children
+    description: Supervised controller loops and listeners.
+  - name: pki
+    description: Public PKI inventory.
+  - name: store
+    description: The raft store.
+  - name: kubeconfigs
+    description: Published kubeconfig files.
+  - name: reinit
+    description: Confirm-gated destructive re-initialization.
+  - name: stream
+    description: Cursor-paged long-poll event, log and audit feeds.
+  - name: control
+    description: The control plane's own listeners, identity and grants.
+
+paths:
+  # ── meta ──────────────────────────────────────────────────────────────────
+  /v1/hello:
+    get:
+      operationId: hello
+      tags: [meta]
+      summary: Negotiate — version, capabilities, the caller's principal, cluster identity.
+      x-engenho-authority: observe
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: hello, verb: show}
+      responses:
+        "200":
+          description: The daemon's self-description as seen by this caller.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Hello"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+  /v1/spec:
+    get:
+      operationId: getSpec
+      tags: [meta]
+      summary: This spec, exactly as authored.
+      x-engenho-authority: observe
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: spec, verb: show}
+      responses:
+        "200":
+          description: The authored OpenAPI document.
+          content:
+            application/yaml:
+              schema: {type: string}
+        "403": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+
+  # ── runtime ───────────────────────────────────────────────────────────────
+  /v1/runtime:
+    get:
+      operationId: getRuntime
+      tags: [runtime]
+      summary: Lifecycle state of the runtime and facts about the daemon process.
+      x-engenho-authority: observe
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: runtime, verb: show}
+      responses:
+        "200":
+          description: Current lifecycle state.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/RuntimeStatus"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+  /v1/runtime/start:
+    post:
+      operationId: startRuntime
+      tags: [runtime]
+      summary: Boot the runtime from Stopped or Failed.
+      x-engenho-authority: mutate
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: runtime, verb: start}
+      responses:
+        "202":
+          description: Boot accepted; follow /v1/events or /v1/boot.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Accepted"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "409": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+  /v1/runtime/stop:
+    post:
+      operationId: stopRuntime
+      tags: [runtime]
+      summary: Drain and stop the runtime; the process and the control plane stay up.
+      x-engenho-authority: mutate
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: runtime, verb: stop}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/StopRuntimeRequest"}
+      responses:
+        "200":
+          description: The runtime is stopped and the store released.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/StopDone"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "409": {$ref: "#/components/responses/Refused"}
+        "422": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+  /v1/runtime/restart:
+    post:
+      operationId: restartRuntime
+      tags: [runtime]
+      summary: Drain, stop, and boot the runtime again in-process.
+      x-engenho-authority: mutate
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: runtime, verb: restart}
+      responses:
+        "202":
+          description: Restart accepted.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Accepted"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "409": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+  /v1/runtime/retry:
+    post:
+      operationId: retryBoot
+      tags: [runtime]
+      summary: Retry a failed boot now (skips any pending backoff).
+      x-engenho-authority: mutate
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: runtime, verb: retry}
+      responses:
+        "202":
+          description: Retry accepted.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Accepted"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "409": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+  /v1/runtime/exit:
+    post:
+      operationId: exitProcess
+      tags: [runtime]
+      summary: Drain the runtime and end the daemon process.
+      description: |
+        `halt` exits 0 (the service manager must be configured not to restart
+        a successful exit); `relaunch` exits 75 so the service manager starts
+        a fresh process.
+      x-engenho-authority: mutate
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: runtime, verb: exit}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ExitRequest"}
+      responses:
+        "202":
+          description: Exit accepted.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Accepted"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "409": {$ref: "#/components/responses/Refused"}
+        "422": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+
+  # ── boot / init ───────────────────────────────────────────────────────────
+  /v1/boot:
+    get:
+      operationId: getBoot
+      tags: [boot]
+      summary: The latest boot attempt and how the previous run ended.
+      x-engenho-authority: observe
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: boot, verb: show}
+      responses:
+        "200":
+          description: Boot view.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/BootView"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+  /v1/boot/attempts:
+    get:
+      operationId: listBootAttempts
+      tags: [boot]
+      summary: The persisted boot journal (last 16 attempts, newest first).
+      x-engenho-authority: observe
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: boot, verb: attempts}
+      responses:
+        "200":
+          description: Boot journal.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/BootAttemptList"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+  /v1/init:
+    get:
+      operationId: getInitState
+      tags: [boot]
+      summary: Initialization and bootstrap state — identity, PKI, store, publishes, layout.
+      x-engenho-authority: observe
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: init, verb: show}
+      responses:
+        "200":
+          description: Init state; every fact is an enum where absence is a variant.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/InitState"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+
+  # ── config ────────────────────────────────────────────────────────────────
+  /v1/config:
+    get:
+      operationId: getConfig
+      tags: [config]
+      summary: The effective configuration and its override bookkeeping.
+      x-engenho-authority: observe
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: config, verb: show}
+      responses:
+        "200":
+          description: Config view.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ConfigView"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+  /v1/config/leaves:
+    get:
+      operationId: listConfigLeaves
+      tags: [config]
+      summary: Every classified leaf with its value, provenance and mutability.
+      x-engenho-authority: observe
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: config, verb: leaves}
+      parameters:
+        - name: prefix
+          in: query
+          required: false
+          description: Dotted leaf-path prefix filter (e.g. `runtime.tls`).
+          schema: {type: string}
+      responses:
+        "200":
+          description: Leaves.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ConfigLeafList"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+  /v1/config/leaves/{leaf}:
+    parameters:
+      - $ref: "#/components/parameters/Leaf"
+    get:
+      operationId: getConfigLeaf
+      tags: [config]
+      summary: One leaf.
+      x-engenho-authority: observe
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: config, verb: get}
+      responses:
+        "200":
+          description: The leaf.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ConfigLeaf"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "422": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+    put:
+      operationId: setConfigLeaf
+      tags: [config]
+      summary: Set an override for one leaf (persisted by default).
+      description: |
+        Gated by the same validators boot uses. A NotOverridable leaf is
+        refused. A RestartRuntime-class change is deferred unless
+        `restart_policy: now`.
+      x-engenho-authority: mutate
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: config, verb: set}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/SetLeafRequest"}
+      responses:
+        "200":
+          description: What was (or, for a dry run, would be) applied.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ApplyReport"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "409": {$ref: "#/components/responses/Refused"}
+        "422": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+    delete:
+      operationId: unsetConfigLeaf
+      tags: [config]
+      summary: Remove the override for one leaf, falling back to the declared value.
+      x-engenho-authority: mutate
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: config, verb: unset}
+      parameters:
+        - $ref: "#/components/parameters/DryRun"
+        - $ref: "#/components/parameters/RestartPolicyParam"
+        - $ref: "#/components/parameters/PreconditionGeneration"
+      responses:
+        "200":
+          description: What was (or would be) applied.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ApplyReport"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "409": {$ref: "#/components/responses/Refused"}
+        "422": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+  /v1/config/overrides:
+    get:
+      operationId: listConfigOverrides
+      tags: [config]
+      summary: The persisted (and ephemeral) override set.
+      x-engenho-authority: observe
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: config, verb: overrides}
+      responses:
+        "200":
+          description: Overrides.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/OverrideList"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+  /v1/config/overrides/clear:
+    post:
+      operationId: clearConfigOverrides
+      tags: [config]
+      summary: Remove every override (or every override under a prefix).
+      x-engenho-authority: mutate
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: config, verb: clear}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ClearOverridesRequest"}
+      responses:
+        "200":
+          description: What was (or would be) applied.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ApplyReport"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "409": {$ref: "#/components/responses/Refused"}
+        "422": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+  /v1/config/drift:
+    get:
+      operationId: getConfigDrift
+      tags: [config]
+      summary: How the effective configuration differs from the declared (Nix) file.
+      x-engenho-authority: observe
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: config, verb: drift}
+      responses:
+        "200":
+          description: Drift report.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/DriftReport"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+  /v1/config/reload:
+    post:
+      operationId: reloadConfig
+      tags: [config]
+      summary: Re-read the declared file and apply what changed.
+      x-engenho-authority: mutate
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: config, verb: reload}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ReloadConfigRequest"}
+      responses:
+        "200":
+          description: What was (or would be) applied.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ApplyReport"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "409": {$ref: "#/components/responses/Refused"}
+        "422": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+
+  # ── children ──────────────────────────────────────────────────────────────
+  /v1/children:
+    get:
+      operationId: listChildren
+      tags: [children]
+      summary: Every supervised child and its state.
+      x-engenho-authority: observe
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: children, verb: list}
+      responses:
+        "200":
+          description: Children view.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ChildrenView"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+  /v1/children/{child}:
+    parameters:
+      - $ref: "#/components/parameters/Child"
+    get:
+      operationId: getChild
+      tags: [children]
+      summary: One child.
+      x-engenho-authority: observe
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: children, verb: get}
+      responses:
+        "200":
+          description: The child.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ChildLookup"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+  /v1/children/{child}/restart:
+    parameters:
+      - $ref: "#/components/parameters/Child"
+    post:
+      operationId: restartChild
+      tags: [children]
+      summary: Respawn a dead child (or restart a running one) and its dependents.
+      x-engenho-authority: mutate
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: children, verb: restart}
+      responses:
+        "200":
+          description: The respawn.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/RespawnReport"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "409": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+  /v1/drivers/{driver}/enable:
+    parameters:
+      - $ref: "#/components/parameters/Driver"
+    post:
+      operationId: enableDriver
+      tags: [children]
+      summary: Enable a controller driver (persisted as a `controllers.enable` override).
+      x-engenho-authority: mutate
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: children, verb: enable}
+      responses:
+        "200":
+          description: The toggle and what it applied.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/DriverToggleReport"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "409": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+  /v1/drivers/{driver}/disable:
+    parameters:
+      - $ref: "#/components/parameters/Driver"
+    post:
+      operationId: disableDriver
+      tags: [children]
+      summary: Disable a controller driver (persisted as a `controllers.enable` override).
+      x-engenho-authority: mutate
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: children, verb: disable}
+      responses:
+        "200":
+          description: The toggle and what it applied.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/DriverToggleReport"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "409": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+
+  # ── pki / store / kubeconfigs ─────────────────────────────────────────────
+  /v1/pki:
+    get:
+      operationId: getPki
+      tags: [pki]
+      summary: Public PKI inventory — fingerprints, validity, presence; never key material.
+      x-engenho-authority: observe
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: pki, verb: show}
+      responses:
+        "200":
+          description: PKI inventory.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/PkiInventory"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+  /v1/store:
+    get:
+      operationId: getStore
+      tags: [store]
+      summary: Store facts — initialization, revision, leadership, lock.
+      x-engenho-authority: observe
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: store, verb: show}
+      responses:
+        "200":
+          description: Store view.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/StoreView"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+  /v1/kubeconfigs:
+    get:
+      operationId: listKubeconfigs
+      tags: [kubeconfigs]
+      summary: The outcome of every kubeconfig publish target.
+      x-engenho-authority: observe
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: kubeconfigs, verb: list}
+      responses:
+        "200":
+          description: Publish records.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/KubeconfigList"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+  /v1/kubeconfigs/{target}/publish:
+    parameters:
+      - $ref: "#/components/parameters/KubeconfigTargetParam"
+    post:
+      operationId: publishKubeconfig
+      tags: [kubeconfigs]
+      summary: Re-publish one kubeconfig target from the running runtime's retained inputs.
+      x-engenho-authority: mutate
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: kubeconfigs, verb: publish}
+      responses:
+        "200":
+          description: The publish outcome.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/PublishRecord"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "409": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+
+  # ── reinit (confirm-gated) ────────────────────────────────────────────────
+  /v1/confirmations:
+    post:
+      operationId: createConfirmation
+      tags: [reinit]
+      summary: Issue a single-use challenge bound to cluster identity, operation, params and principal.
+      x-engenho-authority: destructive
+      x-engenho-sensitive: false
+      x-engenho-confirmation: issue
+      x-engenho-cli: {resource: reinit, verb: prepare}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ConfirmationRequest"}
+      responses:
+        "201":
+          description: The challenge.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Challenge"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "409": {$ref: "#/components/responses/Refused"}
+        "422": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+  /v1/confirmations/{confirmation}:
+    parameters:
+      - $ref: "#/components/parameters/ConfirmationIdParam"
+    delete:
+      operationId: cancelConfirmation
+      tags: [reinit]
+      summary: Consume a challenge without executing anything.
+      x-engenho-authority: destructive
+      x-engenho-sensitive: false
+      x-engenho-confirmation: cancel
+      x-engenho-cli: {resource: reinit, verb: cancel}
+      responses:
+        "200":
+          description: The challenge is consumed.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Cancelled"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "422": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+  /v1/reinit/admin-token:
+    post:
+      operationId: rotateAdminToken
+      tags: [reinit]
+      summary: Replace pki/admin.token. Bearer-token holders break after the next boot.
+      x-engenho-authority: destructive
+      x-engenho-sensitive: false
+      x-engenho-confirm: rotate_admin_token
+      x-engenho-cli: {resource: reinit, verb: rotate-admin-token}
+      parameters:
+        - $ref: "#/components/parameters/ConfirmationHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/RotateAdminTokenExecute"}
+      responses:
+        "200":
+          description: The re-initialization.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ReinitReport"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "409": {$ref: "#/components/responses/Refused"}
+        "422": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+  /v1/reinit/pki:
+    post:
+      operationId: reseedPki
+      tags: [reinit]
+      summary: Re-seed the cluster PKI (seed, CA, admin cert; optionally sa.key).
+      x-engenho-authority: destructive
+      x-engenho-sensitive: false
+      x-engenho-confirm: reseed_pki
+      x-engenho-cli: {resource: reinit, verb: reseed-pki}
+      parameters:
+        - $ref: "#/components/parameters/ConfirmationHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ReseedPkiExecute"}
+      responses:
+        "200":
+          description: The re-initialization.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ReinitReport"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "409": {$ref: "#/components/responses/Refused"}
+        "422": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+  /v1/reinit/store:
+    post:
+      operationId: wipeStore
+      tags: [reinit]
+      summary: Move the store (and optionally node-local state) aside; the next boot is FirstBoot.
+      x-engenho-authority: destructive
+      x-engenho-sensitive: false
+      x-engenho-confirm: wipe_store
+      x-engenho-cli: {resource: reinit, verb: wipe-store}
+      parameters:
+        - $ref: "#/components/parameters/ConfirmationHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/WipeStoreExecute"}
+      responses:
+        "200":
+          description: The re-initialization.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ReinitReport"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "409": {$ref: "#/components/responses/Refused"}
+        "422": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+
+  # ── stream ────────────────────────────────────────────────────────────────
+  /v1/events:
+    get:
+      operationId: listEvents
+      tags: [stream]
+      summary: Control events after a cursor; long-polls up to `wait_ms` when none are ready.
+      x-engenho-authority: observe
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: events, verb: list}
+      parameters:
+        - $ref: "#/components/parameters/After"
+        - $ref: "#/components/parameters/WaitMs"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: A page of events.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/EventPage"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+  /v1/logs:
+    get:
+      operationId: listLogs
+      tags: [stream]
+      summary: Daemon log lines after a cursor; long-polls up to `wait_ms`.
+      x-engenho-authority: observe
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: logs, verb: list}
+      parameters:
+        - $ref: "#/components/parameters/After"
+        - $ref: "#/components/parameters/WaitMs"
+        - $ref: "#/components/parameters/Limit"
+        - name: level
+          in: query
+          required: false
+          description: Minimum level (default `info`).
+          schema: {$ref: "#/components/schemas/LogLevel"}
+      responses:
+        "200":
+          description: A page of log lines.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/LogPage"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+  /v1/audit:
+    get:
+      operationId: listAudit
+      tags: [stream]
+      summary: The BLAKE3-chained audit log after a cursor.
+      x-engenho-authority: observe
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: audit, verb: list}
+      parameters:
+        - $ref: "#/components/parameters/After"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: A page of audit records.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/AuditPage"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+
+  # ── control ───────────────────────────────────────────────────────────────
+  /v1/control:
+    get:
+      operationId: getControl
+      tags: [control]
+      summary: Listener states, this daemon's control identity, and the authorized client pins.
+      x-engenho-authority: observe
+      x-engenho-sensitive: false
+      x-engenho-cli: {resource: control, verb: show}
+      responses:
+        "200":
+          description: Control view.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ControlView"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+  /v1/control/identity/rotate:
+    post:
+      operationId: rotateControlIdentity
+      tags: [control]
+      summary: Replace the control identity key; every client's server pin must be updated.
+      x-engenho-authority: destructive
+      x-engenho-sensitive: false
+      x-engenho-confirm: rotate_control_identity
+      x-engenho-cli: {resource: control, verb: rotate-identity}
+      parameters:
+        - $ref: "#/components/parameters/ConfirmationHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/RotateControlIdentityExecute"}
+      responses:
+        "200":
+          description: The re-initialization.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ReinitReport"}
+        "403": {$ref: "#/components/responses/Refused"}
+        "409": {$ref: "#/components/responses/Refused"}
+        "422": {$ref: "#/components/responses/Refused"}
+        "503": {$ref: "#/components/responses/Blind"}
+
+components:
+  parameters:
+    Leaf:
+      name: leaf
+      in: path
+      required: true
+      description: Dotted config leaf path, e.g. `runtime.kubeconfig_publish_visibility`.
+      schema: {$ref: "#/components/schemas/LeafPath"}
+    Child:
+      name: child
+      in: path
+      required: true
+      schema: {$ref: "#/components/schemas/ChildName"}
+    Driver:
+      name: driver
+      in: path
+      required: true
+      schema: {$ref: "#/components/schemas/DriverName"}
+    KubeconfigTargetParam:
+      name: target
+      in: path
+      required: true
+      schema: {$ref: "#/components/schemas/KubeconfigTarget"}
+    ConfirmationIdParam:
+      name: confirmation
+      in: path
+      required: true
+      schema: {$ref: "#/components/schemas/ConfirmationId"}
+    ConfirmationHeader:
+      name: Engenho-Confirmation
+      in: header
+      required: true
+      description: The id of a challenge issued by `createConfirmation` for this exact operation.
+      schema: {$ref: "#/components/schemas/ConfirmationId"}
+    DryRun:
+      name: dry_run
+      in: query
+      required: false
+      schema: {type: boolean, default: false}
+    RestartPolicyParam:
+      name: restart_policy
+      in: query
+      required: false
+      schema: {$ref: "#/components/schemas/RestartPolicy"}
+    PreconditionGeneration:
+      name: precondition_generation
+      in: query
+      required: false
+      description: Refuse unless the override set is at exactly this generation.
+      schema: {type: integer, format: uint64, minimum: 0}
+    After:
+      name: after
+      in: query
+      required: false
+      description: Return items with a sequence number strictly greater than this cursor.
+      schema: {type: integer, format: uint64, minimum: 0}
+    WaitMs:
+      name: wait_ms
+      in: query
+      required: false
+      description: Long-poll budget when no item is ready (0 returns immediately).
+      schema: {type: integer, format: uint32, minimum: 0, maximum: 30000}
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema: {type: integer, format: uint32, minimum: 1, maximum: 1024}
+
+  responses:
+    Refused:
+      description: The request was understood and refused; `legal` names what would be accepted.
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Refusal"}
+    Blind:
+      description: The daemon could not answer (the subject is unknown, not absent).
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Blind"}
+
+  schemas:
+    # ── scalars / closed axes ───────────────────────────────────────────────
+    AuthorityTier:
+      type: string
+      description: Ordered observe < mutate < destructive.
+      enum: [observe, mutate, destructive]
+    LeafPath:
+      type: string
+      description: Dotted config leaf path.
+      pattern: "^[a-z][a-z0-9_]*(\\.[a-z0-9_]+)*$"
+    ConfirmationId:
+      type: string
+      description: Opaque single-use challenge id.
+      pattern: "^[0-9a-f]{32}$"
+    SpkiSha256:
+      type: string
+      description: SHA-256 of a DER SubjectPublicKeyInfo, as `sha256:<64 hex>`.
+      pattern: "^sha256:[0-9a-f]{64}$"
+    Sha256Hex:
+      type: string
+      pattern: "^[0-9a-f]{64}$"
+    Blake3Hex:
+      type: string
+      pattern: "^[0-9a-f]{64}$"
+    BootPhase:
+      type: string
+      description: One step of the runtime's boot, in the order they run.
+      enum:
+        - resolve_config
+        - read_boot_config
+        - preflight_backend
+        - validate_config
+        - open_store
+        - await_leadership
+        - build_scheduler
+        - register_node
+        - seed_cluster
+        - issue_pki
+        - load_admin_token
+        - build_auth
+        - bind_apiserver
+        - publish_kubeconfigs
+        - spawn_children
+        - adopt_health
+    BootKind:
+      type: string
+      description: Whether the store was created by this boot, resumed, or is in-memory.
+      enum: [first_boot, resume, ephemeral]
+    ExitIntent:
+      type: string
+      description: "`halt` exits 0; `relaunch` exits 75 for the service manager to restart."
+      enum: [halt, relaunch]
+    Hold:
+      type: string
+      description: "`across_relaunch` writes control/hold so a relaunched daemon comes up Stopped."
+      enum: [none, across_relaunch]
+    StopReason:
+      type: string
+      enum: [operator_request, held_at_startup, reinit_complete]
+    AfterDrain:
+      type: string
+      enum: [stop, restart, exit, reinit]
+    RestartPolicy:
+      type: string
+      description: "What to do with a RestartRuntime-class change: `defer` records RestartNeeded; `now` restarts."
+      enum: [defer, now]
+    ConfigTierName:
+      type: string
+      enum: [bare, discovered, default, declared, override]
+    DriverName:
+      type: string
+      description: A controller driver. Parity with engenho-runtime's `Driver::ALL` is asserted in engenho-runtime.
+      enum:
+        - deployment
+        - replica_set
+        - stateful_set
+        - daemon_set
+        - job
+        - cron_job
+        - pod_disruption_budget
+        - endpoints
+        - service_routing
+        - gc
+        - namespace
+        - pv_binder
+        - volume_snapshot
+        - pvc_protection
+        - crd
+        - scheduler
+        - served_capability
+        - network_policy
+        - csi_registrar
+        - cni_status
+        - kubelet
+    ChildName:
+      type: string
+      description: Every supervised child = every driver + every listener + the node lease.
+      enum:
+        - deployment
+        - replica_set
+        - stateful_set
+        - daemon_set
+        - job
+        - cron_job
+        - pod_disruption_budget
+        - endpoints
+        - service_routing
+        - gc
+        - namespace
+        - pv_binder
+        - volume_snapshot
+        - pvc_protection
+        - crd
+        - scheduler
+        - served_capability
+        - network_policy
+        - csi_registrar
+        - cni_status
+        - kubelet
+        - kubelet_http
+        - etcd_facade
+        - node_lease
+    ChildKind:
+      type: string
+      enum: [driver, listener, node_lease]
+    DeathCause:
+      type: string
+      enum: [panicked, cancelled]
+    RespawnClass:
+      type: string
+      description: "`rebuild_with` also rebuilds dependents; `runtime_restart_only` cannot be respawned alone."
+      enum: [rebuild, rebuild_with, runtime_restart_only]
+    KubeconfigTarget:
+      type: string
+      enum: [data_dir, operator, pod, remote]
+    SkipReason:
+      type: string
+      enum: [not_configured, tls_disabled, no_advertise_address, runtime_down]
+    LockState:
+      type: string
+      enum: [held_by_this_daemon, held_by_other_process, free]
+    LayoutName:
+      type: string
+      enum: [store, pki, local_path, volumes, plugins, pods, snapshots, control]
+    Presence:
+      type: string
+      enum: [present, absent]
+    ReinitOp:
+      type: string
+      description: Every confirm-gated operation.
+      enum: [rotate_admin_token, reseed_pki, wipe_store, rotate_control_identity]
+    SaKeyAction:
+      type: string
+      enum: [keep, rotate]
+    WipeScope:
+      type: string
+      enum: [store_only, store_and_node_local]
+    LogLevel:
+      type: string
+      enum: [error, warn, info, debug, trace]
+    Transport:
+      type: string
+      enum: [uds, mtls]
+    SocketAccess:
+      type: string
+      enum: [owner, group]
+    RefusalReason:
+      type: string
+      enum:
+        - insufficient_authority
+        - unknown_operation
+        - confirmation_required
+        - confirmation_mismatch
+        - confirmation_expired
+        - unknown_leaf
+        - not_overridable_leaf
+        - invalid_value
+        - config_rejected
+        - precondition_failed
+        - runtime_running
+        - runtime_not_running
+        - runtime_not_failed
+        - runtime_not_stopped
+        - lifecycle_busy
+        - wedged
+        - respawn_refused
+        - unsupported
+    BlindReason:
+      type: string
+      enum: [runtime_unavailable, store_unavailable, io_error, internal]
+
+    # ── errors ──────────────────────────────────────────────────────────────
+    Refusal:
+      type: object
+      required: [outcome, reason, because]
+      properties:
+        outcome: {type: string, enum: [refused]}
+        reason: {$ref: "#/components/schemas/RefusalReason"}
+        because: {type: string}
+        legal:
+          type: array
+          description: What would be accepted instead.
+          items: {type: string}
+    Blind:
+      type: object
+      required: [outcome, reason, because]
+      properties:
+        outcome: {type: string, enum: [blind]}
+        reason: {$ref: "#/components/schemas/BlindReason"}
+        because: {type: string}
+
+    # ── lifecycle ───────────────────────────────────────────────────────────
+    PendingApply:
+      description: Whether the running runtime reflects the effective configuration.
+      oneOf:
+        - type: object
+          required: [kind]
+          properties:
+            kind: {type: string, enum: [in_sync]}
+        - type: object
+          required: [kind, leaves]
+          properties:
+            kind: {type: string, enum: [restart_needed]}
+            leaves:
+              type: array
+              items: {$ref: "#/components/schemas/LeafPath"}
+    RetryClass:
+      oneOf:
+        - type: object
+          required: [class, next_retry_at, delay_ms]
+          properties:
+            class: {type: string, enum: [backoff]}
+            next_retry_at: {type: string, format: date-time}
+            delay_ms: {type: integer, format: uint64, minimum: 0}
+        - type: object
+          required: [class]
+          properties:
+            class: {type: string, enum: [hold]}
+    FailureReport:
+      type: object
+      required: [phase, error, at]
+      properties:
+        phase: {$ref: "#/components/schemas/BootPhase"}
+        error: {type: string}
+        at: {type: string, format: date-time}
+    LifecycleState:
+      description: The daemon's lifecycle; the control plane is served in every state.
+      oneOf:
+        - type: object
+          required: [state, since]
+          properties:
+            state: {type: string, enum: [resolving]}
+            since: {type: string, format: date-time}
+        - type: object
+          required: [state, attempt, phase, since]
+          properties:
+            state: {type: string, enum: [booting]}
+            attempt: {type: integer, format: uint32, minimum: 1}
+            phase: {$ref: "#/components/schemas/BootPhase"}
+            since: {type: string, format: date-time}
+        - type: object
+          required: [state, attempt, since, apiserver_addr, pending]
+          properties:
+            state: {type: string, enum: [running]}
+            attempt: {type: integer, format: uint32, minimum: 1}
+            since: {type: string, format: date-time}
+            apiserver_addr: {type: string}
+            pending: {$ref: "#/components/schemas/PendingApply"}
+        - type: object
+          required: [state, attempt, then]
+          properties:
+            state: {type: string, enum: [draining]}
+            attempt: {type: integer, format: uint32, minimum: 1}
+            then: {$ref: "#/components/schemas/AfterDrain"}
+            intent:
+              $ref: "#/components/schemas/ExitIntent"
+              description: "Present exactly when `then` is `exit`: whether the process halts (0) or relaunches (75) once drained."
+        - type: object
+          required: [state, reason, epoch, since]
+          properties:
+            state: {type: string, enum: [stopped]}
+            reason: {$ref: "#/components/schemas/StopReason"}
+            epoch: {type: integer, format: uint64, minimum: 0}
+            since: {type: string, format: date-time}
+        - type: object
+          required: [state, attempt, report, retry]
+          properties:
+            state: {type: string, enum: [failed]}
+            attempt: {type: integer, format: uint32, minimum: 1}
+            report: {$ref: "#/components/schemas/FailureReport"}
+            retry: {$ref: "#/components/schemas/RetryClass"}
+        - type: object
+          required: [state, cause, since]
+          properties:
+            state: {type: string, enum: [wedged]}
+            cause: {type: string}
+            since: {type: string, format: date-time}
+        - type: object
+          required: [state, intent]
+          properties:
+            state: {type: string, enum: [exiting]}
+            intent: {$ref: "#/components/schemas/ExitIntent"}
+    DaemonInfo:
+      type: object
+      required: [version, git_rev, pid, started_at]
+      properties:
+        version: {type: string}
+        git_rev: {type: string}
+        pid: {type: integer, format: uint32, minimum: 0}
+        started_at: {type: string, format: date-time}
+    RuntimeStatus:
+      type: object
+      required: [lifecycle, daemon]
+      properties:
+        lifecycle: {$ref: "#/components/schemas/LifecycleState"}
+        daemon: {$ref: "#/components/schemas/DaemonInfo"}
+    Accepted:
+      type: object
+      required: [accepted_at, lifecycle]
+      properties:
+        accepted_at: {type: string, format: date-time}
+        lifecycle: {$ref: "#/components/schemas/LifecycleState"}
+    StopRuntimeRequest:
+      type: object
+      required: [hold]
+      properties:
+        hold: {$ref: "#/components/schemas/Hold"}
+    StopDone:
+      type: object
+      required: [epoch, lifecycle]
+      properties:
+        epoch: {type: integer, format: uint64, minimum: 0}
+        lifecycle: {$ref: "#/components/schemas/LifecycleState"}
+    ExitRequest:
+      type: object
+      required: [intent]
+      properties:
+        intent: {$ref: "#/components/schemas/ExitIntent"}
+
+    # ── boot journal ────────────────────────────────────────────────────────
+    PhaseResult:
+      oneOf:
+        - type: object
+          required: [result]
+          properties:
+            result: {type: string, enum: [in_progress]}
+        - type: object
+          required: [result, elapsed_ms]
+          properties:
+            result: {type: string, enum: [completed]}
+            elapsed_ms: {type: integer, format: uint64, minimum: 0}
+        - type: object
+          required: [result, elapsed_ms, error]
+          properties:
+            result: {type: string, enum: [failed]}
+            elapsed_ms: {type: integer, format: uint64, minimum: 0}
+            error: {type: string}
+        - type: object
+          required: [result, elapsed_ms]
+          properties:
+            result: {type: string, enum: [cancelled]}
+            elapsed_ms: {type: integer, format: uint64, minimum: 0}
+    PhaseRecord:
+      type: object
+      required: [phase, started_at, result]
+      properties:
+        phase: {$ref: "#/components/schemas/BootPhase"}
+        started_at: {type: string, format: date-time}
+        result: {$ref: "#/components/schemas/PhaseResult"}
+    BootKindObservation:
+      description: The boot kind, once OpenStore has run.
+      oneOf:
+        - type: object
+          required: [status]
+          properties:
+            status: {type: string, enum: [not_yet_known]}
+        - type: object
+          required: [status, kind]
+          properties:
+            status: {type: string, enum: [known]}
+            kind: {$ref: "#/components/schemas/BootKind"}
+    AttemptResult:
+      type: string
+      enum: [in_progress, succeeded, failed, cancelled]
+    BootAttempt:
+      type: object
+      required: [attempt, started_at, kind, result, phases]
+      properties:
+        attempt: {type: integer, format: uint32, minimum: 1}
+        started_at: {type: string, format: date-time}
+        kind: {$ref: "#/components/schemas/BootKindObservation"}
+        result: {$ref: "#/components/schemas/AttemptResult"}
+        phases:
+          type: array
+          items: {$ref: "#/components/schemas/PhaseRecord"}
+    LatestBootAttempt:
+      oneOf:
+        - type: object
+          required: [status]
+          properties:
+            status: {type: string, enum: [none]}
+        - type: object
+          required: [status, attempt]
+          properties:
+            status: {type: string, enum: [recorded]}
+            attempt: {$ref: "#/components/schemas/BootAttempt"}
+    LastSeen:
+      oneOf:
+        - type: object
+          required: [seen, phase]
+          properties:
+            seen: {type: string, enum: [booting]}
+            phase: {$ref: "#/components/schemas/BootPhase"}
+        - type: object
+          required: [seen]
+          properties:
+            seen: {type: string, enum: [running]}
+        - type: object
+          required: [seen]
+          properties:
+            seen: {type: string, enum: [draining]}
+    PreviousRun:
+      description: How the previous daemon process ended, from control/run.json.
+      oneOf:
+        - type: object
+          required: [previous]
+          properties:
+            previous: {type: string, enum: [first_ever]}
+        - type: object
+          required: [previous, at]
+          properties:
+            previous: {type: string, enum: [clean_stop]}
+            at: {type: string, format: date-time}
+        - type: object
+          required: [previous, last_seen]
+          properties:
+            previous: {type: string, enum: [unclean]}
+            last_seen: {$ref: "#/components/schemas/LastSeen"}
+    BootView:
+      type: object
+      required: [latest, previous_run]
+      properties:
+        latest: {$ref: "#/components/schemas/LatestBootAttempt"}
+        previous_run: {$ref: "#/components/schemas/PreviousRun"}
+    BootAttemptList:
+      type: object
+      required: [attempts]
+      properties:
+        attempts:
+          type: array
+          maxItems: 16
+          items: {$ref: "#/components/schemas/BootAttempt"}
+
+    # ── init state ──────────────────────────────────────────────────────────
+    SourcedValue:
+      type: object
+      required: [value, tier]
+      properties:
+        value: {type: string}
+        tier: {$ref: "#/components/schemas/ConfigTierName"}
+    FirstBootIdentity:
+      description: The identity recorded at FirstBoot (control/identity.json) against today's.
+      oneOf:
+        - type: object
+          required: [status]
+          properties:
+            status: {type: string, enum: [not_recorded]}
+        - type: object
+          required: [status, recorded_at]
+          properties:
+            status: {type: string, enum: [matches]}
+            recorded_at: {type: string, format: date-time}
+        - type: object
+          required: [status, recorded_at, recorded_cluster_name, recorded_node_name]
+          properties:
+            status: {type: string, enum: [drifted]}
+            recorded_at: {type: string, format: date-time}
+            recorded_cluster_name: {type: string}
+            recorded_node_name: {type: string}
+    IdentityFacts:
+      type: object
+      required: [cluster_name, node_name, first_boot]
+      properties:
+        cluster_name: {$ref: "#/components/schemas/SourcedValue"}
+        node_name: {$ref: "#/components/schemas/SourcedValue"}
+        first_boot: {$ref: "#/components/schemas/FirstBootIdentity"}
+    DataDirSource:
+      oneOf:
+        - type: object
+          required: [source]
+          properties:
+            source: {type: string, enum: [resolved]}
+        - type: object
+          required: [source, error]
+          properties:
+            source: {type: string, enum: [lenient_fallback]}
+            error: {type: string}
+        - type: object
+          required: [source]
+          properties:
+            source: {type: string, enum: [compiled_default]}
+    DataDirFacts:
+      type: object
+      required: [path, source]
+      properties:
+        path: {type: string}
+        source: {$ref: "#/components/schemas/DataDirSource"}
+    CaFact:
+      oneOf:
+        - type: object
+          required: [ca]
+          properties:
+            ca: {type: string, enum: [absent]}
+        - type: object
+          required: [ca, sha256, not_before, not_after, publicly_derivable]
+          properties:
+            ca: {type: string, enum: [present]}
+            sha256: {$ref: "#/components/schemas/Sha256Hex"}
+            not_before: {type: string, format: date-time}
+            not_after: {type: string, format: date-time}
+            publicly_derivable: {type: boolean}
+        - type: object
+          required: [ca, error]
+          properties:
+            ca: {type: string, enum: [unreadable]}
+            error: {type: string}
+    SecretFileFact:
+      description: Presence, size and mode of a secret file — never its value.
+      oneOf:
+        - type: object
+          required: [file]
+          properties:
+            file: {type: string, enum: [absent]}
+        - type: object
+          required: [file, bytes, mode]
+          properties:
+            file: {type: string, enum: [present]}
+            bytes: {type: integer, format: uint64, minimum: 0}
+            mode: {type: string, pattern: "^0[0-7]{3,4}$"}
+        - type: object
+          required: [file, error]
+          properties:
+            file: {type: string, enum: [unreadable]}
+            error: {type: string}
+    AdminCertFact:
+      oneOf:
+        - type: object
+          required: [cert]
+          properties:
+            cert: {type: string, enum: [absent]}
+        - type: object
+          required: [cert, common_name, organizations, not_before, not_after]
+          properties:
+            cert: {type: string, enum: [present]}
+            common_name: {type: string}
+            organizations:
+              type: array
+              items: {type: string}
+            not_before: {type: string, format: date-time}
+            not_after: {type: string, format: date-time}
+        - type: object
+          required: [cert, error]
+          properties:
+            cert: {type: string, enum: [unreadable]}
+            error: {type: string}
+    ServerCertFact:
+      description: The apiserver cert is issued in memory on every boot, so it exists only while Running.
+      oneOf:
+        - type: object
+          required: [cert, sans]
+          properties:
+            cert: {type: string, enum: [issued]}
+            sans:
+              type: array
+              items: {type: string}
+        - type: object
+          required: [cert, reason]
+          properties:
+            cert: {type: string, enum: [not_issued]}
+            reason: {type: string, enum: [runtime_down, tls_disabled]}
+    PkiInventory:
+      type: object
+      required: [ca, cluster_seed, sa_key, admin_token, admin_cert, server_cert]
+      properties:
+        ca: {$ref: "#/components/schemas/CaFact"}
+        cluster_seed: {$ref: "#/components/schemas/SecretFileFact"}
+        sa_key: {$ref: "#/components/schemas/SecretFileFact"}
+        admin_token: {$ref: "#/components/schemas/SecretFileFact"}
+        admin_cert: {$ref: "#/components/schemas/AdminCertFact"}
+        server_cert: {$ref: "#/components/schemas/ServerCertFact"}
+    StoreState:
+      oneOf:
+        - type: object
+          required: [store]
+          properties:
+            store: {type: string, enum: [absent]}
+        - type: object
+          required: [store]
+          properties:
+            store: {type: string, enum: [present_offline]}
+        - type: object
+          required: [store, kind, revision, leader]
+          properties:
+            store: {type: string, enum: [live]}
+            kind: {$ref: "#/components/schemas/BootKind"}
+            revision: {type: integer, format: uint64, minimum: 0}
+            leader: {type: boolean}
+        - type: object
+          required: [store]
+          properties:
+            store: {type: string, enum: [ephemeral]}
+    StoreFacts:
+      type: object
+      required: [state, lock]
+      properties:
+        state: {$ref: "#/components/schemas/StoreState"}
+        lock: {$ref: "#/components/schemas/LockState"}
+    StoreView:
+      type: object
+      required: [path, facts]
+      properties:
+        path: {type: string}
+        facts: {$ref: "#/components/schemas/StoreFacts"}
+    PublishOutcome:
+      oneOf:
+        - type: object
+          required: [status, path, mode]
+          properties:
+            status: {type: string, enum: [written]}
+            path: {type: string}
+            mode: {type: string, pattern: "^0[0-7]{3,4}$"}
+        - type: object
+          required: [status, path, error]
+          properties:
+            status: {type: string, enum: [failed]}
+            path: {type: string}
+            error: {type: string}
+        - type: object
+          required: [status, reason]
+          properties:
+            status: {type: string, enum: [skipped]}
+            reason: {$ref: "#/components/schemas/SkipReason"}
+    PublishRecord:
+      type: object
+      required: [target, outcome]
+      properties:
+        target: {$ref: "#/components/schemas/KubeconfigTarget"}
+        outcome: {$ref: "#/components/schemas/PublishOutcome"}
+    KubeconfigList:
+      type: object
+      required: [records]
+      properties:
+        records:
+          type: array
+          items: {$ref: "#/components/schemas/PublishRecord"}
+    LayoutEntry:
+      type: object
+      required: [name, presence]
+      properties:
+        name: {$ref: "#/components/schemas/LayoutName"}
+        presence: {$ref: "#/components/schemas/Presence"}
+    InitState:
+      type: object
+      required: [identity, data_dir, pki, store, kubeconfigs, layout, previous_run]
+      properties:
+        identity: {$ref: "#/components/schemas/IdentityFacts"}
+        data_dir: {$ref: "#/components/schemas/DataDirFacts"}
+        pki: {$ref: "#/components/schemas/PkiInventory"}
+        store: {$ref: "#/components/schemas/StoreFacts"}
+        kubeconfigs:
+          type: array
+          items: {$ref: "#/components/schemas/PublishRecord"}
+        layout:
+          type: array
+          items: {$ref: "#/components/schemas/LayoutEntry"}
+        previous_run: {$ref: "#/components/schemas/PreviousRun"}
+
+    # ── config ──────────────────────────────────────────────────────────────
+    Mutability:
+      description: What applying a change to this leaf does; sealed per leaf in engenho-config.
+      oneOf:
+        - type: object
+          required: [class, why]
+          properties:
+            class: {type: string, enum: [inert]}
+            why: {type: string, enum: [not_run, single_accepted_value]}
+        - type: object
+          required: [class, effect]
+          properties:
+            class: {type: string, enum: [live]}
+            effect: {type: string, enum: [republish]}
+        - type: object
+          required: [class, set]
+          properties:
+            class: {type: string, enum: [respawn]}
+            set: {type: string, enum: [enabled_drivers, node_local_listeners]}
+        - type: object
+          required: [class]
+          properties:
+            class: {type: string, enum: [next_boot]}
+        - type: object
+          required: [class]
+          properties:
+            class: {type: string, enum: [restart_runtime]}
+        - type: object
+          required: [class, anchor]
+          properties:
+            class: {type: string, enum: [not_overridable]}
+            anchor: {type: string, enum: [overlay_anchor, storage_mode, identity, allocated, retired]}
+    PrincipalView:
+      type: object
+      required: [attested, declared]
+      properties:
+        attested: {$ref: "#/components/schemas/AttestedView"}
+        declared: {$ref: "#/components/schemas/DeclaredView"}
+    AttestedView:
+      description: What the kernel or the TLS handshake proved about the caller.
+      oneOf:
+        - type: object
+          required: [via, uid, gid, pid]
+          properties:
+            via: {type: string, enum: [local_uid]}
+            uid: {type: integer, format: uint32, minimum: 0}
+            gid: {type: integer, format: uint32, minimum: 0}
+            pid: {type: integer, format: int32}
+        - type: object
+          required: [via, client, spki]
+          properties:
+            via: {type: string, enum: [remote_pin]}
+            client: {type: string}
+            spki: {$ref: "#/components/schemas/SpkiSha256"}
+    DeclaredView:
+      description: What the caller claimed about itself (Engenho-Actor header); never authority.
+      oneOf:
+        - type: object
+          required: [actor]
+          properties:
+            actor: {type: string, enum: [unknown]}
+        - type: object
+          required: [actor]
+          properties:
+            actor: {type: string, enum: [human]}
+        - type: object
+          required: [actor, label]
+          properties:
+            actor: {type: string, enum: [agent]}
+            label: {type: string}
+        - type: object
+          required: [actor, label]
+          properties:
+            actor: {type: string, enum: [automation]}
+            label: {type: string}
+    LeafProvenance:
+      oneOf:
+        - type: object
+          required: [tier]
+          properties:
+            tier: {type: string, enum: [bare]}
+        - type: object
+          required: [tier]
+          properties:
+            tier: {type: string, enum: [discovered]}
+        - type: object
+          required: [tier]
+          properties:
+            tier: {type: string, enum: [default]}
+        - type: object
+          required: [tier, path]
+          properties:
+            tier: {type: string, enum: [declared]}
+            path: {type: string}
+        - type: object
+          required: [tier, path, set_by, set_at]
+          properties:
+            tier: {type: string, enum: [override]}
+            path: {type: string}
+            set_by: {$ref: "#/components/schemas/PrincipalView"}
+            set_at: {type: string, format: date-time}
+    ConfigLeaf:
+      type: object
+      required: [path, value, provenance, mutability]
+      properties:
+        path: {$ref: "#/components/schemas/LeafPath"}
+        value: {description: The effective JSON value.}
+        provenance: {$ref: "#/components/schemas/LeafProvenance"}
+        mutability: {$ref: "#/components/schemas/Mutability"}
+    ConfigLeafList:
+      type: object
+      required: [leaves]
+      properties:
+        leaves:
+          type: array
+          items: {$ref: "#/components/schemas/ConfigLeaf"}
+    DeclaredSource:
+      oneOf:
+        - type: object
+          required: [declared, path, digest]
+          properties:
+            declared: {type: string, enum: [file]}
+            path: {type: string}
+            digest: {$ref: "#/components/schemas/Blake3Hex"}
+        - type: object
+          required: [declared]
+          properties:
+            declared: {type: string, enum: [none]}
+    ConfigView:
+      type: object
+      required: [effective_yaml, declared, generation, override_count, pending]
+      properties:
+        effective_yaml: {type: string}
+        declared: {$ref: "#/components/schemas/DeclaredSource"}
+        generation:
+          description: The override set's generation (optimistic-concurrency token).
+          type: integer
+          format: uint64
+          minimum: 0
+        override_count: {type: integer, format: uint32, minimum: 0}
+        pending: {$ref: "#/components/schemas/PendingApply"}
+    Durability:
+      type: string
+      enum: [persisted, ephemeral]
+    OverrideEntry:
+      type: object
+      required: [path, value, set_by, set_at, durability]
+      properties:
+        path: {$ref: "#/components/schemas/LeafPath"}
+        value: {description: The overriding JSON value.}
+        set_by: {$ref: "#/components/schemas/PrincipalView"}
+        set_at: {type: string, format: date-time}
+        durability: {$ref: "#/components/schemas/Durability"}
+    OverrideList:
+      type: object
+      required: [generation, entries]
+      properties:
+        generation: {type: integer, format: uint64, minimum: 0}
+        entries:
+          type: array
+          items: {$ref: "#/components/schemas/OverrideEntry"}
+    SetLeafRequest:
+      type: object
+      required: [value]
+      properties:
+        value: {description: The new JSON value.}
+        persist:
+          description: Write to control/overrides.yaml (default). `false` keeps the override in memory only.
+          type: boolean
+          default: true
+        dry_run: {type: boolean, default: false}
+        restart_policy: {$ref: "#/components/schemas/RestartPolicy"}
+        precondition_generation:
+          description: Refuse unless the override set is at exactly this generation.
+          type: integer
+          format: uint64
+          minimum: 0
+    ClearOverridesRequest:
+      type: object
+      properties:
+        prefix:
+          description: Only clear overrides under this dotted prefix.
+          type: string
+        dry_run: {type: boolean, default: false}
+        restart_policy: {$ref: "#/components/schemas/RestartPolicy"}
+        precondition_generation: {type: integer, format: uint64, minimum: 0}
+    ReloadConfigRequest:
+      type: object
+      properties:
+        dry_run: {type: boolean, default: false}
+        restart_policy: {$ref: "#/components/schemas/RestartPolicy"}
+    LeafChange:
+      type: object
+      required: [path, previous, next, mutability]
+      properties:
+        path: {$ref: "#/components/schemas/LeafPath"}
+        previous: {description: Effective value before.}
+        next: {description: Effective value after.}
+        mutability: {$ref: "#/components/schemas/Mutability"}
+    ApplyEffect:
+      oneOf:
+        - type: object
+          required: [effect]
+          properties:
+            effect: {type: string, enum: [no_change]}
+        - type: object
+          required: [effect]
+          properties:
+            effect: {type: string, enum: [planned_only]}
+        - type: object
+          required: [effect]
+          properties:
+            effect: {type: string, enum: [applied_live]}
+        - type: object
+          required: [effect, children]
+          properties:
+            effect: {type: string, enum: [respawned]}
+            children:
+              type: array
+              items: {$ref: "#/components/schemas/ChildName"}
+        - type: object
+          required: [effect]
+          properties:
+            effect: {type: string, enum: [restart_scheduled]}
+        - type: object
+          required: [effect, leaves]
+          properties:
+            effect: {type: string, enum: [restart_deferred]}
+            leaves:
+              type: array
+              items: {$ref: "#/components/schemas/LeafPath"}
+        - type: object
+          required: [effect]
+          properties:
+            effect: {type: string, enum: [next_boot]}
+    ApplyReport:
+      type: object
+      required: [dry_run, generation, changed, effect]
+      properties:
+        dry_run: {type: boolean}
+        generation: {type: integer, format: uint64, minimum: 0}
+        changed:
+          type: array
+          items: {$ref: "#/components/schemas/LeafChange"}
+        effect: {$ref: "#/components/schemas/ApplyEffect"}
+    LeafDrift:
+      type: object
+      required: [path, declared, effective, kind]
+      properties:
+        path: {$ref: "#/components/schemas/LeafPath"}
+        declared: {description: The declared (Nix) value.}
+        effective: {description: The effective value.}
+        kind:
+          description: "`shadowing`: an override changes the value; `redundant`: it equals the declared value."
+          type: string
+          enum: [shadowing, redundant]
+    DriftReport:
+      type: object
+      required: [unified_diff, leaves, applied, declared_on_disk]
+      properties:
+        unified_diff: {type: string}
+        leaves:
+          type: array
+          items: {$ref: "#/components/schemas/LeafDrift"}
+        applied: {$ref: "#/components/schemas/PendingApply"}
+        declared_on_disk:
+          type: string
+          enum: [current, changed_since_load]
+
+    # ── children ────────────────────────────────────────────────────────────
+    ChildState:
+      oneOf:
+        - type: object
+          required: [state, since]
+          properties:
+            state: {type: string, enum: [running]}
+            since: {type: string, format: date-time}
+        - type: object
+          required: [state, cause, at]
+          properties:
+            state: {type: string, enum: [dead]}
+            cause: {$ref: "#/components/schemas/DeathCause"}
+            at: {type: string, format: date-time}
+        - type: object
+          required: [state]
+          properties:
+            state: {type: string, enum: [disabled]}
+    LastDeath:
+      oneOf:
+        - type: object
+          required: [death]
+          properties:
+            death: {type: string, enum: [never]}
+        - type: object
+          required: [death, cause, at]
+          properties:
+            death: {type: string, enum: [recorded]}
+            cause: {$ref: "#/components/schemas/DeathCause"}
+            at: {type: string, format: date-time}
+    ChildView:
+      type: object
+      required: [child, kind, state, generation, last_death, respawn]
+      properties:
+        child: {$ref: "#/components/schemas/ChildName"}
+        kind: {$ref: "#/components/schemas/ChildKind"}
+        state: {$ref: "#/components/schemas/ChildState"}
+        generation: {type: integer, format: uint64, minimum: 0}
+        last_death: {$ref: "#/components/schemas/LastDeath"}
+        respawn: {$ref: "#/components/schemas/RespawnClass"}
+    ChildrenView:
+      oneOf:
+        - type: object
+          required: [runtime, children]
+          properties:
+            runtime: {type: string, enum: [up]}
+            children:
+              type: array
+              items: {$ref: "#/components/schemas/ChildView"}
+        - type: object
+          required: [runtime, lifecycle]
+          properties:
+            runtime: {type: string, enum: [down]}
+            lifecycle: {$ref: "#/components/schemas/LifecycleState"}
+    ChildLookup:
+      oneOf:
+        - type: object
+          required: [runtime, child]
+          properties:
+            runtime: {type: string, enum: [up]}
+            child: {$ref: "#/components/schemas/ChildView"}
+        - type: object
+          required: [runtime, lifecycle]
+          properties:
+            runtime: {type: string, enum: [down]}
+            lifecycle: {$ref: "#/components/schemas/LifecycleState"}
+    RespawnReport:
+      type: object
+      required: [child, generation, rebuilt]
+      properties:
+        child: {$ref: "#/components/schemas/ChildName"}
+        generation: {type: integer, format: uint64, minimum: 0}
+        rebuilt:
+          description: Every child rebuilt, the target first, then its dependents.
+          type: array
+          items: {$ref: "#/components/schemas/ChildName"}
+    DriverToggleReport:
+      type: object
+      required: [driver, enabled, apply]
+      properties:
+        driver: {$ref: "#/components/schemas/DriverName"}
+        enabled: {type: boolean}
+        apply: {$ref: "#/components/schemas/ApplyReport"}
+
+    # ── reinit ──────────────────────────────────────────────────────────────
+    ReinitRequest:
+      description: One confirm-gated operation and its parameters.
+      oneOf:
+        - type: object
+          required: [operation]
+          properties:
+            operation: {type: string, enum: [rotate_admin_token]}
+        - type: object
+          required: [operation, sa_key]
+          properties:
+            operation: {type: string, enum: [reseed_pki]}
+            sa_key: {$ref: "#/components/schemas/SaKeyAction"}
+        - type: object
+          required: [operation, scope]
+          properties:
+            operation: {type: string, enum: [wipe_store]}
+            scope: {$ref: "#/components/schemas/WipeScope"}
+        - type: object
+          required: [operation]
+          properties:
+            operation: {type: string, enum: [rotate_control_identity]}
+    ConfirmationRequest:
+      type: object
+      required: [request]
+      properties:
+        request: {$ref: "#/components/schemas/ReinitRequest"}
+    CaBinding:
+      oneOf:
+        - type: object
+          required: [ca, sha256]
+          properties:
+            ca: {type: string, enum: [present]}
+            sha256: {$ref: "#/components/schemas/Sha256Hex"}
+        - type: object
+          required: [ca]
+          properties:
+            ca: {type: string, enum: [absent]}
+    EpochBinding:
+      description: Store-touching operations bind to the Stopped epoch they were prepared in.
+      oneOf:
+        - type: object
+          required: [bound, epoch]
+          properties:
+            bound: {type: string, enum: [stop_epoch]}
+            epoch: {type: integer, format: uint64, minimum: 0}
+        - type: object
+          required: [bound]
+          properties:
+            bound: {type: string, enum: [not_required]}
+    ChallengeBinding:
+      type: object
+      required: [cluster_name, node_name, ca, epoch, operation, params_blake3, principal_fingerprint]
+      properties:
+        cluster_name: {type: string}
+        node_name: {type: string}
+        ca: {$ref: "#/components/schemas/CaBinding"}
+        epoch: {$ref: "#/components/schemas/EpochBinding"}
+        operation: {$ref: "#/components/schemas/ReinitOp"}
+        params_blake3: {$ref: "#/components/schemas/Blake3Hex"}
+        principal_fingerprint: {$ref: "#/components/schemas/Blake3Hex"}
+    Challenge:
+      type: object
+      required: [id, phrase_hint, expires_at, bound, blast_radius]
+      properties:
+        id: {$ref: "#/components/schemas/ConfirmationId"}
+        phrase_hint:
+          description: The phrase the operator must type (the cluster name).
+          type: string
+        expires_at: {type: string, format: date-time}
+        bound: {$ref: "#/components/schemas/ChallengeBinding"}
+        blast_radius:
+          description: Human-readable consequences, one per line.
+          type: array
+          items: {type: string}
+    Cancelled:
+      type: object
+      required: [id, cancelled_at]
+      properties:
+        id: {$ref: "#/components/schemas/ConfirmationId"}
+        cancelled_at: {type: string, format: date-time}
+    RotateAdminTokenExecute:
+      type: object
+      required: [confirm_phrase]
+      properties:
+        confirm_phrase: {type: string}
+    ReseedPkiExecute:
+      type: object
+      required: [confirm_phrase, sa_key]
+      properties:
+        confirm_phrase: {type: string}
+        sa_key: {$ref: "#/components/schemas/SaKeyAction"}
+    WipeStoreExecute:
+      type: object
+      required: [confirm_phrase, scope]
+      properties:
+        confirm_phrase: {type: string}
+        scope: {$ref: "#/components/schemas/WipeScope"}
+    RotateControlIdentityExecute:
+      type: object
+      required: [confirm_phrase]
+      properties:
+        confirm_phrase: {type: string}
+    ReinitReport:
+      type: object
+      required: [operation, executed_at, attic_path, stale_kubeconfigs, next]
+      properties:
+        operation: {$ref: "#/components/schemas/ReinitOp"}
+        executed_at: {type: string, format: date-time}
+        attic_path:
+          description: Where the replaced files were moved (never deleted).
+          type: string
+        stale_kubeconfigs:
+          description: Published kubeconfig paths this operation made stale.
+          type: array
+          items: {type: string}
+        next:
+          description: What the operator does next.
+          type: string
+
+    # ── stream ──────────────────────────────────────────────────────────────
+    Replay:
+      oneOf:
+        - type: object
+          required: [replay]
+          properties:
+            replay: {type: string, enum: [complete]}
+        - type: object
+          required: [replay, oldest_cursor]
+          properties:
+            replay: {type: string, enum: [truncated]}
+            oldest_cursor: {type: integer, format: uint64, minimum: 0}
+    ControlEventKind:
+      oneOf:
+        - type: object
+          required: [event, to]
+          properties:
+            event: {type: string, enum: [lifecycle]}
+            to: {$ref: "#/components/schemas/LifecycleState"}
+        - type: object
+          required: [event, attempt, phase, result]
+          properties:
+            event: {type: string, enum: [boot_phase]}
+            attempt: {type: integer, format: uint32, minimum: 1}
+            phase: {$ref: "#/components/schemas/BootPhase"}
+            result: {$ref: "#/components/schemas/PhaseResult"}
+        - type: object
+          required: [event, child, cause]
+          properties:
+            event: {type: string, enum: [child_died]}
+            child: {$ref: "#/components/schemas/ChildName"}
+            cause: {$ref: "#/components/schemas/DeathCause"}
+        - type: object
+          required: [event, child, generation]
+          properties:
+            event: {type: string, enum: [child_respawned]}
+            child: {$ref: "#/components/schemas/ChildName"}
+            generation: {type: integer, format: uint64, minimum: 0}
+        - type: object
+          required: [event, generation, leaves, effect]
+          properties:
+            event: {type: string, enum: [config_applied]}
+            generation: {type: integer, format: uint64, minimum: 0}
+            leaves:
+              type: array
+              items: {$ref: "#/components/schemas/LeafPath"}
+            effect: {$ref: "#/components/schemas/ApplyEffect"}
+        - type: object
+          required: [event, operation]
+          properties:
+            event: {type: string, enum: [reinit_executed]}
+            operation: {$ref: "#/components/schemas/ReinitOp"}
+        - type: object
+          required: [event, record]
+          properties:
+            event: {type: string, enum: [kubeconfig_published]}
+            record: {$ref: "#/components/schemas/PublishRecord"}
+        - type: object
+          required: [event, listener]
+          properties:
+            event: {type: string, enum: [remote_listener]}
+            listener: {$ref: "#/components/schemas/RemoteListenerState"}
+    ControlEvent:
+      type: object
+      required: [seq, at, kind]
+      properties:
+        seq: {type: integer, format: uint64, minimum: 1}
+        at: {type: string, format: date-time}
+        kind: {$ref: "#/components/schemas/ControlEventKind"}
+    EventPage:
+      type: object
+      required: [events, next_cursor, replay]
+      properties:
+        events:
+          type: array
+          items: {$ref: "#/components/schemas/ControlEvent"}
+        next_cursor: {type: integer, format: uint64, minimum: 0}
+        replay: {$ref: "#/components/schemas/Replay"}
+    LogLine:
+      type: object
+      required: [seq, at, level, target, message, fields]
+      properties:
+        seq: {type: integer, format: uint64, minimum: 1}
+        at: {type: string, format: date-time}
+        level: {$ref: "#/components/schemas/LogLevel"}
+        target: {type: string}
+        message: {type: string}
+        fields:
+          type: object
+          additionalProperties: {type: string}
+    LogPage:
+      type: object
+      required: [lines, next_cursor, replay]
+      properties:
+        lines:
+          type: array
+          items: {$ref: "#/components/schemas/LogLine"}
+        next_cursor: {type: integer, format: uint64, minimum: 0}
+        replay: {$ref: "#/components/schemas/Replay"}
+    AuditPhase:
+      type: string
+      description: "`intent` is written before execution, `result` after; `refused` never executed."
+      enum: [intent, result, refused]
+    AuditRecord:
+      type: object
+      required: [seq, at, prev, principal, operation, tier, phase, params_blake3]
+      properties:
+        seq: {type: integer, format: uint64, minimum: 1}
+        at: {type: string, format: date-time}
+        prev:
+          description: BLAKE3 of the previous record (the chain link).
+          allOf: [{$ref: "#/components/schemas/Blake3Hex"}]
+        principal: {$ref: "#/components/schemas/PrincipalView"}
+        operation:
+          description: The operationId.
+          type: string
+        tier: {$ref: "#/components/schemas/AuthorityTier"}
+        phase: {$ref: "#/components/schemas/AuditPhase"}
+        params_blake3: {$ref: "#/components/schemas/Blake3Hex"}
+        http_status:
+          description: Present on `result` and `refused` records.
+          type: integer
+          format: uint16
+          minimum: 100
+          maximum: 599
+        confirmation:
+          description: The consumed challenge, on confirm-gated records.
+          allOf: [{$ref: "#/components/schemas/ConfirmationId"}]
+    AuditPage:
+      type: object
+      required: [records, next_cursor, replay]
+      properties:
+        records:
+          type: array
+          items: {$ref: "#/components/schemas/AuditRecord"}
+        next_cursor: {type: integer, format: uint64, minimum: 0}
+        replay: {$ref: "#/components/schemas/Replay"}
+
+    # ── meta / control ──────────────────────────────────────────────────────
+    ClusterIdentity:
+      type: object
+      required: [cluster_name, node_name, ca]
+      properties:
+        cluster_name: {type: string}
+        node_name: {type: string}
+        ca: {$ref: "#/components/schemas/CaBinding"}
+    GrantView:
+      type: object
+      required: [granted, effective]
+      properties:
+        granted:
+          description: The tier this principal is entitled to.
+          allOf: [{$ref: "#/components/schemas/AuthorityTier"}]
+        effective:
+          description: min(granted, Engenho-Ceiling) — what this request may do.
+          allOf: [{$ref: "#/components/schemas/AuthorityTier"}]
+    Hello:
+      type: object
+      required: [api_version, daemon, capabilities, principal, grant, cluster, transport, lifecycle]
+      properties:
+        api_version: {type: string, enum: [engenho.control/v1]}
+        daemon: {$ref: "#/components/schemas/DaemonInfo"}
+        capabilities:
+          description: Every operationId this daemon serves.
+          type: array
+          items: {type: string}
+        principal: {$ref: "#/components/schemas/PrincipalView"}
+        grant: {$ref: "#/components/schemas/GrantView"}
+        cluster: {$ref: "#/components/schemas/ClusterIdentity"}
+        transport: {$ref: "#/components/schemas/Transport"}
+        lifecycle: {$ref: "#/components/schemas/LifecycleState"}
+    UdsListenerState:
+      type: object
+      required: [path, access, group_tier]
+      properties:
+        path: {type: string}
+        access: {$ref: "#/components/schemas/SocketAccess"}
+        group_tier: {$ref: "#/components/schemas/AuthorityTier"}
+    RemoteAbsence:
+      oneOf:
+        - type: object
+          required: [absence]
+          properties:
+            absence: {type: string, enum: [disabled]}
+        - type: object
+          required: [absence]
+          properties:
+            absence: {type: string, enum: [no_authorized_clients]}
+        - type: object
+          required: [absence, detail]
+          properties:
+            absence: {type: string, enum: [control_config_invalid]}
+            detail: {type: string}
+        - type: object
+          required: [absence, detail]
+          properties:
+            absence: {type: string, enum: [identity_unavailable]}
+            detail: {type: string}
+        - type: object
+          required: [absence, addr, detail, retry_in_ms]
+          properties:
+            absence: {type: string, enum: [bind_failed]}
+            addr: {type: string}
+            detail: {type: string}
+            retry_in_ms: {type: integer, format: uint64, minimum: 0}
+    RemoteListenerState:
+      oneOf:
+        - type: object
+          required: [listener, addr, since]
+          properties:
+            listener: {type: string, enum: [serving]}
+            addr: {type: string}
+            since: {type: string, format: date-time}
+        - type: object
+          required: [listener, since, absence]
+          properties:
+            listener: {type: string, enum: [absent]}
+            since: {type: string, format: date-time}
+            absence: {$ref: "#/components/schemas/RemoteAbsence"}
+    ControlIdentityView:
+      oneOf:
+        - type: object
+          required: [identity, spki, created_at]
+          properties:
+            identity: {type: string, enum: [present]}
+            spki: {$ref: "#/components/schemas/SpkiSha256"}
+            created_at: {type: string, format: date-time}
+        - type: object
+          required: [identity, detail]
+          properties:
+            identity: {type: string, enum: [unavailable]}
+            detail: {type: string}
+    AuthorizedClient:
+      type: object
+      required: [name, spki, tier]
+      properties:
+        name: {type: string}
+        spki: {$ref: "#/components/schemas/SpkiSha256"}
+        tier: {$ref: "#/components/schemas/AuthorityTier"}
+    ControlView:
+      type: object
+      required: [uds, remote, identity, authorized_clients]
+      properties:
+        uds: {$ref: "#/components/schemas/UdsListenerState"}
+        remote: {$ref: "#/components/schemas/RemoteListenerState"}
+        identity: {$ref: "#/components/schemas/ControlIdentityView"}
+        authorized_clients:
+          type: array
+          items: {$ref: "#/components/schemas/AuthorizedClient"}

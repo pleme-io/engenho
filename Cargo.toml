@@ -31,6 +31,7 @@ members = [
   "engenho-etcd",
   "engenho-serve",
   "engenho-oracle",
+  "engenho-control-types",
 ]
 
 [workspace.package]

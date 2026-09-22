@@ -72,6 +72,12 @@ const SHIPPED: &[&str] = &[
 /// workspace at all.
 const UNSHIPPED: &[(&str, &str)] = &[
     (
+        "engenho-control-types",
+        "the control plane's spec-derived types; linked into the daemon when its \
+         control listeners land (docs/CONTROL-PLANE.md, P2), and moved to SHIPPED \
+         then",
+    ),
+    (
         "engenho-substrate-incubator",
         "substrate modules no shipped crate depends on (the T5.6 carve)",
     ),

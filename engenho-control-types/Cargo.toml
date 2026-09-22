@@ -1,0 +1,41 @@
+[package]
+name = "engenho-control-types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+readme.workspace = true
+categories.workspace = true
+keywords.workspace = true
+description = "engenho-control-types — the central types of engenho's non-Kubernetes control plane, DERIVED at build time from spec/engenho-control.openapi.yaml: the schema types, the closed OperationId + CATALOG (authority tier, confirm gate, CLI spelling per operation), per-operation typed requests, and the transport-agnostic EngenhoControl trait every transport serves."
+
+[dependencies]
+async-trait = { workspace = true }
+chrono      = { version = "0.4", default-features = false, features = ["serde", "std"] }
+# typify emits `regress` for `pattern`-constrained strings (LeafPath,
+# SpkiSha256, ConfirmationId, …): the pattern is enforced at the border, on
+# deserialize and on construction, not re-checked by hand downstream.
+# Same major as typify-impl's own `regress` (0.12), so the closure carries one.
+regress     = "0.12"
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+
+[build-dependencies]
+heck         = "0.5"
+prettyplease = "0.2"
+proc-macro2  = "1"
+quote        = "1"
+schemars     = "0.8"
+serde_json   = { workspace = true }
+serde_yaml   = { workspace = true }
+syn          = { version = "2", features = ["full"] }
+typify       = "0.8"
+
+[dev-dependencies]
+serde_yaml = { workspace = true }
+
+[lints]
+workspace = true
