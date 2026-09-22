@@ -18,7 +18,7 @@ use engenho_control_types::{
 };
 
 use crate::audit::{Audit, AuditEntry};
-use crate::grant::{ACTOR_HEADER, CEILING_HEADER, GrantPolicy, PeerCred, mint};
+use crate::grant::{ACTOR_HEADER, CEILING_HEADER, GrantPolicy, Peer, mint};
 
 /// The largest request body accepted.
 pub const MAX_BODY: usize = 1024 * 1024;
@@ -87,9 +87,38 @@ impl Router {
         &self.policy
     }
 
-    /// Answer one request from a local peer (`None`: the kernel did not say
+    /// What `peer` is granted, and what its transport attested — or why it
+    /// gets nothing.
+    fn authenticate(
+        &self,
+        peer: Option<Peer>,
+    ) -> Result<(AuthorityTier, engenho_control_types::types::AttestedView), ControlError> {
+        let Some(peer) = peer else {
+            return Err(ControlError::refused(
+                RefusalReason::InsufficientAuthority,
+                "the transport did not say who is calling",
+            ));
+        };
+        let Some(granted) = self.policy.grant_peer(&peer) else {
+            let who = match &peer {
+                Peer::Local(local) => format!("uid {} may not use this socket", local.uid),
+                Peer::Remote(client) => format!("{} may not use this listener", client.name),
+            };
+            return Err(ControlError::refused_with(
+                RefusalReason::InsufficientAuthority,
+                who,
+                vec!["run as the daemon's user, or as root".into()],
+            ));
+        };
+        let attested = peer
+            .attested()
+            .map_err(|why| ControlError::blind(BlindReason::Internal, why))?;
+        Ok((granted, attested))
+    }
+
+    /// Answer one request from `peer` (`None`: the transport could not say
     /// who it is).
-    pub async fn handle(&self, peer: Option<PeerCred>, req: Incoming) -> Answer {
+    pub async fn handle(&self, peer: Option<Peer>, req: Incoming) -> Answer {
         let Some((id, path_params)) = OperationId::route(&req.method, &req.path) else {
             return Answer::error(&ControlError::refused_with(
                 RefusalReason::UnknownOperation,
@@ -97,18 +126,9 @@ impl Router {
                 vec!["GET /v1/hello".into(), "GET /v1/spec".into()],
             ));
         };
-        let Some(peer) = peer else {
-            return Answer::error(&ControlError::refused(
-                RefusalReason::InsufficientAuthority,
-                "the kernel did not say who is calling",
-            ));
-        };
-        let Some(granted) = self.policy.grant(&peer) else {
-            return Answer::error(&ControlError::refused_with(
-                RefusalReason::InsufficientAuthority,
-                format!("uid {} may not use this socket", peer.uid),
-                vec!["run as the daemon's user, or as root".into()],
-            ));
+        let (granted, attested) = match self.authenticate(peer) {
+            Ok(caller) => caller,
+            Err(refused) => return Answer::error(&refused),
         };
         let header = |name: &str| {
             req.headers
@@ -116,7 +136,12 @@ impl Router {
                 .find(|(k, _)| k.eq_ignore_ascii_case(name))
                 .map(|(_, v)| v.as_str())
         };
-        let by = mint(&peer, granted, header(ACTOR_HEADER), header(CEILING_HEADER));
+        let by = mint(
+            attested,
+            granted,
+            header(ACTOR_HEADER),
+            header(CEILING_HEADER),
+        );
         let row = id.spec();
         if by.effective() < row.tier {
             let refusal = ControlError::refused_with(

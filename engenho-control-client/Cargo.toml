@@ -16,11 +16,12 @@ keywords.workspace = true
 workspace = true
 
 [dependencies]
-engenho-control-types = { workspace = true }
+engenho-control-types = { workspace = true, features = ["tls"] }
 engenho-config        = { workspace = true }
 bytes                 = "1"
 nix                   = { version = "0.29", default-features = false, features = ["user"] }
 reqwest               = { workspace = true }
+serde                 = { workspace = true }
 serde_json            = { workspace = true }
 serde_yaml            = { workspace = true }
 thiserror             = { workspace = true }

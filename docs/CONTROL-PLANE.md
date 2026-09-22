@@ -203,6 +203,43 @@ With pins, the two planes structurally reject each other's certificates,
 revocation is removing a pin, and remote control survives a broken cluster
 PKI.
 
+### How it works (P5)
+
+* **The daemon's side.** `control.remote.{enable, listen_addr,
+  authorized_clients}` in the declared file (Nix:
+  `services.engenho.config.control.remote`). Each client is
+  `{name, spki_sha256, tier}`: the tier is the daemon's word for that pin,
+  never the certificate's. The listener's key is created in
+  `data_dir/control/identity/key.pem` (0600) on first start whether or not
+  remote control is on, so `engenho ctl control show` prints its pin
+  (`identity.spki`) before it is. A key others can read is refused.
+* **The client's side.** `engenho remote keygen <name>` makes this
+  machine's key for a daemon (`~/.config/engenho/remotes/<name>.key`, 0600,
+  never replaced) and prints its pin; `~/.config/engenho/remotes.yaml` lists
+  each daemon's `address` and `server_spki` (a list, so a rotation can
+  overlap); `engenho ctl --remote <name> …` then speaks the same API as over
+  the socket, and `hello` answers `transport: mtls` with the pinned client as
+  the principal.
+* **The handshake.** TLS 1.3 only, ring, both sides self-signed ed25519. The
+  server admits a client certificate iff its key's pin is in the set; the
+  client trusts the server iff its key's pin is listed. Both still verify the
+  handshake signature, so a pinned certificate presented without its key
+  fails — a test proves it, and a negative control (the verification stubbed
+  out) proves the test would notice. `engenho-control-types`' `pin` module is
+  the one place both verifiers live.
+* **Revocation.** The daemon follows its declared file (one watcher, shared
+  with the supervisor): a pin removed there is refused on the client's next
+  request, over an open connection too, because the pin is looked up per
+  request rather than per connection. Turning the listener on or moving it
+  takes a restart.
+* **Never fatal.** What keeps the listener from serving is its state,
+  reported by `engenho ctl control show`: `serving{addr}`, or
+  `absent{disabled | no_authorized_clients | control_config_invalid |
+  identity_unavailable | bind_failed{retry_in}}`; a failed bind (the tailnet
+  address not up yet) is retried on a doubling backoff to 60 s.
+* **Not overridable.** `control.remote.*` is `not_overridable`: a mutate-tier
+  caller could otherwise pin a key of its own at destructive.
+
 ## P0b spike: forge-gen vs. the fallback
 
 The org standard is spec-first: one OpenAPI spec projected by `forge-gen`.
@@ -243,11 +280,11 @@ Deviations the spec settled while being authored:
 | Crate | Holds |
 |---|---|
 | `engenho-serve` | the owned-connection serve loop (`Listener`, `Handshake`, `serve`, `StopHandle`) |
-| `engenho-control-types` | everything derived from the spec, plus `Principal` (Serialize-only), `ControlError`, the HTTP rendering helpers |
+| `engenho-control-types` | everything derived from the spec, plus `Principal` (Serialize-only), `ControlError`, the HTTP rendering helpers; with feature `tls`, SPKI pins and both rustls pin verifiers |
 | `engenho-config` | the configuration, its leaves (`leaf`), their sealed classes (`mutability`), and the fold with the override tier |
 | `engenho-runtime` | the supervisor, the boot journal, the publish records, the override store and apply pipeline, and `control::DaemonControl` — the one `EngenhoControl` |
-| `engenho-control-server` | the socket, the grant, the router, the audit chain |
-| `engenho-control-client` | typed and generic calls, and the socket resolution `engenho ctl` shares with the daemon |
+| `engenho-control-server` | the socket, the remote listener, its identity and pins, the grant, the router, the audit chain |
+| `engenho-control-client` | typed and generic calls, the socket resolution `engenho ctl` shares with the daemon, and remote endpoints (`remotes.yaml`, client keys) |
 
 ## Phases
 
@@ -259,7 +296,7 @@ Deviations the spec settled while being authored:
 | P2 | Local UDS, observe tier, `engenho ctl` | done |
 | P3 | Operate verbs, authorization tiers, audit chain, restart on failure only | done |
 | P4 | Persisted config overrides, sealed mutability, drift | done |
-| P5 | Remote mTLS with SPKI pins | — |
+| P5 | Remote mTLS with SPKI pins | done (the fleet's Nix wiring: the `pleme-io/nix` repo) |
 | P6 | Child control | — |
 | P7 | Gated destructive re-init | — |
 | P8 | MCP tools, completions, docs | — |

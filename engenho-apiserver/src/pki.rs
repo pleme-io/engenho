@@ -1390,6 +1390,26 @@ mod tests {
     }
 
     #[test]
+    fn a_control_plane_certificate_is_not_a_kubernetes_identity() {
+        // The daemon's control plane authenticates by SPKI pin with
+        // self-signed certificates (engenho-control-types' `pin`). None of
+        // them chains to the cluster CA, so the apiserver's verifier refuses
+        // every one: a control credential never doubles as a Kubernetes one.
+        let (_dir, ca) = ca_in_tempdir();
+        let verifier = client_verifier(&ca).unwrap();
+        let key = engenho_control_types::pin::KeyMaterial::generate().unwrap();
+        let (cert, _) = key
+            .certificate(engenho_control_types::pin::CERT_NAME)
+            .unwrap();
+        assert!(
+            verifier
+                .verify_client_cert(&cert, &[], rustls::pki_types::UnixTime::now())
+                .is_err(),
+            "a control-plane certificate was accepted as a cluster identity"
+        );
+    }
+
+    #[test]
     fn admin_cert_chains_to_the_cluster_ca() {
         // The minted admin client cert verifies against the CA root store —
         // proves the leaf actually chains to the cluster CA the verifier

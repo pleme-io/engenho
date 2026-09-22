@@ -20,4 +20,4 @@ pub use apply::{ApplyEffect, LeafChange};
 pub use logs::{LOGS, LogEntry, LogLayer};
 pub use overrides::{Durability, OverrideSet, OverrideStore};
 pub use ring::{Page, Ring, Sequenced};
-pub use service::{DaemonControl, DaemonControlParts, SocketFacts, wire};
+pub use service::{DaemonControl, DaemonControlParts, RemoteFacts, SocketFacts, wire};

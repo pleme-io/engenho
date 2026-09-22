@@ -6,7 +6,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use engenho_config::{GroupTier, SocketAccess};
 use engenho_control_server::{
-    AuditLog, GrantPolicy, Incoming, NoAudit, PeerCred, Router, verify_chain,
+    AuditLog, GrantPolicy, Incoming, NoAudit, Peer, PeerCred, Router, verify_chain,
 };
 use engenho_control_types::ops::Unserved;
 use engenho_control_types::types::{Refusal, RefusalReason};
@@ -14,12 +14,12 @@ use engenho_control_types::{AuthorityTier, CATALOG, OperationSpec};
 
 const DAEMON: u32 = 501;
 
-fn peer(uid: u32) -> PeerCred {
-    PeerCred {
+fn peer(uid: u32) -> Peer {
+    Peer::Local(PeerCred {
         uid,
         gid: 20,
         pid: Some(4242),
-    }
+    })
 }
 
 /// A request for `row` with every path parameter filled with a valid value.

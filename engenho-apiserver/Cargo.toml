@@ -83,3 +83,5 @@ tempfile = "3"
 rcgen = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 http-body-util = "0.1"
+# The control plane's certificates, to prove the apiserver refuses them.
+engenho-control-types = { workspace = true, features = ["tls"] }

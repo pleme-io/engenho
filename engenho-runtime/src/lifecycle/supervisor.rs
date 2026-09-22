@@ -418,9 +418,18 @@ pub struct SupervisorHandle {
     requests: mpsc::Sender<Request>,
     snapshot: watch::Receiver<Snapshot>,
     events: Arc<Ring<DaemonEvent>>,
+    declared_changes: watch::Receiver<u64>,
 }
 
 impl SupervisorHandle {
+    /// A counter bumped by every change to the declared file the supervisor
+    /// watches — for what else reads the file (the remote listener's pins)
+    /// to follow it without a second watcher.
+    #[must_use]
+    pub fn declared_changes(&self) -> watch::Receiver<u64> {
+        self.declared_changes.clone()
+    }
+
     /// The event stream.
     #[must_use]
     pub fn events(&self) -> &Arc<Ring<DaemonEvent>> {
@@ -679,9 +688,10 @@ impl Supervisor {
             started_at,
         };
         let (declared_tx, declared_rx) = mpsc::unbounded_channel();
+        let (declared_count, declared_changes) = watch::channel(0u64);
         let watcher = declared
             .as_deref()
-            .and_then(|path| watch_declared(path, declared_tx));
+            .and_then(|path| watch_declared(path, declared_tx, declared_count));
 
         let journal = control.read_journal();
         let identity = control.read_identity();
@@ -728,6 +738,7 @@ impl Supervisor {
             requests: requests_tx,
             snapshot: snapshot_rx,
             events,
+            declared_changes,
         };
         Ok((supervisor, handle))
     }
@@ -1333,14 +1344,16 @@ impl Supervisor {
 }
 
 /// Watch the declared configuration file; every change that may have
-/// altered its content is one `()` on `changed`.
+/// altered its content is one `()` on `changed` and one bump of `count`.
 fn watch_declared(
     path: &std::path::Path,
     changed: mpsc::UnboundedSender<()>,
+    count: watch::Sender<u64>,
 ) -> Option<shikumi::ConfigWatcher> {
     let started = shikumi::ConfigWatcher::watch(path, move |event| {
         if shikumi::WatchEventClass::classify(&event.kind) == shikumi::WatchEventClass::Reload {
             let _ = changed.send(());
+            count.send_modify(|n| *n = n.wrapping_add(1));
         }
     });
     match started {

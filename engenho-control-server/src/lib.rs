@@ -5,7 +5,11 @@
 //!
 //! * [`socket`] binds the local control socket — one daemon per socket, only
 //!   a socket ever unlinked, a directory nobody else can write.
-//! * [`grant`] turns the kernel's peer credentials into a
+//! * [`remote`] runs the remote listener: TLS 1.3, clients admitted by the
+//!   pins of their keys ([`pins`]), the listener known by its own
+//!   ([`identity`]).
+//! * [`grant`] turns what the transport proved — the kernel's peer
+//!   credentials, or a pinned key — into a
 //!   [`engenho_control_types::Principal`] with a tier.
 //! * [`router`] routes each request through the spec's catalog, checks the
 //!   tier, and dispatches it through the generated operation visitor to one
@@ -18,14 +22,20 @@
 
 pub mod audit;
 pub mod grant;
+pub mod identity;
+pub mod pins;
+pub mod remote;
 pub mod router;
 pub mod serve;
 pub mod socket;
 
 pub use audit::{Audit, AuditEntry, AuditLog, ChainBreak, NoAudit, verify_chain};
-pub use grant::{GrantPolicy, PeerCred};
+pub use grant::{GrantPolicy, Peer, PeerCred};
+pub use identity::{ControlIdentity, IdentityError};
+pub use pins::{AuthorizedSet, Client, Pins};
+pub use remote::{Absence, RemoteListener, RemoteState};
 pub use router::{Answer, Incoming, Router};
-pub use serve::{GRACE, serve_uds};
+pub use serve::{GRACE, serve_tls, serve_uds};
 pub use socket::{BoundSocket, SocketError, SocketGuard, bind};
 
 /// The daemon's effective uid.

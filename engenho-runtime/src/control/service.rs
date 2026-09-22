@@ -85,6 +85,23 @@ pub struct SocketFacts {
     pub group_tier: GroupTier,
 }
 
+/// The remote listener, as the control API reports it.
+pub struct RemoteFacts {
+    /// Where it is.
+    pub state: tokio::sync::watch::Receiver<engenho_control_server::RemoteState>,
+    /// The listener's own key: its pin and when it was made, or why it is
+    /// unavailable.
+    pub identity: Result<
+        (
+            engenho_control_types::pin::Spki,
+            chrono::DateTime<chrono::Utc>,
+        ),
+        String,
+    >,
+    /// Who it admits.
+    pub pins: engenho_control_server::Pins,
+}
+
 /// What [`DaemonControl`] is built from.
 pub struct DaemonControlParts {
     /// The supervisor.
@@ -99,6 +116,8 @@ pub struct DaemonControlParts {
     pub declared: Option<PathBuf>,
     /// The local socket.
     pub socket: SocketFacts,
+    /// The remote listener.
+    pub remote: RemoteFacts,
     /// The daemon's recent log.
     pub logs: Arc<Ring<LogEntry>>,
     /// The audit chain.
@@ -647,6 +666,10 @@ impl EngenhoControl for DaemonControl {
                 .filter(|id| Self::serves(**id))
                 .map(|id| id.as_str().to_owned())
                 .collect(),
+            transport: match by.view().attested {
+                types::AttestedView::LocalUid { .. } => types::Transport::Uds,
+                types::AttestedView::RemotePin { .. } => types::Transport::Mtls,
+            },
             principal: by.view(),
             grant: by.grant().clone(),
             cluster: types::ClusterIdentity {
@@ -654,7 +677,6 @@ impl EngenhoControl for DaemonControl {
                 node_name: config.runtime.node_name,
                 ca: self.ca_binding(),
             },
-            transport: types::Transport::Uds,
             lifecycle: Self::lifecycle(&snapshot)?,
         })
     }
@@ -1082,7 +1104,7 @@ impl EngenhoControl for DaemonControl {
         _: &Principal,
         _: GetControlRequest,
     ) -> Result<types::ControlView, ControlError> {
-        let snapshot = self.snapshot();
+        let remote = &self.p.remote;
         Ok(types::ControlView {
             uds: types::UdsListenerState {
                 path: self.p.socket.path.display().to_string(),
@@ -1095,14 +1117,17 @@ impl EngenhoControl for DaemonControl {
                     GroupTier::Mutate => AuthorityTier::Mutate,
                 },
             },
-            remote: types::RemoteListenerState::Absent {
-                since: snapshot.daemon.started_at.utc(),
-                absence: types::RemoteAbsence::Disabled,
+            remote: remote.state.borrow().view(),
+            identity: match &remote.identity {
+                Ok((spki, created_at)) => types::ControlIdentityView::Present {
+                    spki: types::SpkiSha256::try_from(spki.to_string()).map_err(internal)?,
+                    created_at: *created_at,
+                },
+                Err(detail) => types::ControlIdentityView::Unavailable {
+                    detail: detail.clone(),
+                },
             },
-            identity: types::ControlIdentityView::Unavailable {
-                detail: "remote control is not configured on this daemon".into(),
-            },
-            authorized_clients: Vec::new(),
+            authorized_clients: remote.pins.current().views(),
         })
     }
 

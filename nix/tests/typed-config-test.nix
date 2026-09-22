@@ -19,6 +19,11 @@ let
       type = lib.types.listOf lib.types.str;
       default = [ ];
     };
+    # Likewise `assertions`.
+    options.assertions = lib.mkOption {
+      type = lib.types.listOf lib.types.attrs;
+      default = [ ];
+    };
   };
 
   # Evaluate typed-config.nix with a stub for the option the trio owns.
@@ -40,6 +45,12 @@ let
     }).config;
   evalWith = userConfig: (evalConfig userConfig).services.engenho.settings;
   warningsOf = userConfig: (evalConfig userConfig).warnings;
+  # The messages of the assertions that do not hold.
+  failingAssertions = userConfig:
+    map (a: a.message) (builtins.filter (a: !a.assertion) (evalConfig userConfig).assertions);
+
+  pinA = "sha256:${lib.fixedWidthString 64 "a" ""}";
+  pinB = "sha256:${lib.fixedWidthString 64 "b" ""}";
 
   # Same, but with a home-manager-shaped context: `config.home.homeDirectory`
   # exists. This is what `dataDir`'s default keys off to tell a per-user agent
@@ -269,6 +280,44 @@ let
              services.engenho.config.control.socket.groupTier = "destructive";
            }))).success;
       got = "groupTier = destructive evaluated"; }
+
+    { name = "control-remote-renders-at-its-wire-keys";
+      ok = ((evalWith {
+             services.engenho.config.control.remote = {
+               enable = true;
+               listenAddr = "100.64.0.1:7443";
+               authorizedClients = [ { name = "ryn"; spkiSha256 = pinA; tier = "destructive"; } ];
+             };
+           }).control or { }).remote or null == {
+             enable = true;
+             listen_addr = "100.64.0.1:7443";
+             authorized_clients = [ { name = "ryn"; spki_sha256 = pinA; tier = "destructive"; } ];
+           };
+      got = builtins.toJSON ((evalWith {
+             services.engenho.config.control.remote.enable = true;
+           }).control or null); }
+
+    { name = "a-malformed-pin-fails-eval";
+      ok = !(builtins.tryEval (builtins.toJSON (evalWith {
+             services.engenho.config.control.remote.authorizedClients =
+               [ { name = "ryn"; spkiSha256 = "sha256:ABC"; tier = "observe"; } ];
+           }))).success;
+      got = "a malformed pin evaluated"; }
+
+    { name = "remote-control-with-nobody-pinned-is-an-assertion";
+      ok = lib.any (lib.hasInfix "needs authorizedClients")
+             (failingAssertions { services.engenho.config.control.remote.enable = true; })
+        && failingAssertions { } == [ ];
+      got = builtins.toJSON (failingAssertions { services.engenho.config.control.remote.enable = true; }); }
+
+    { name = "two-clients-with-one-name-or-one-pin-is-an-assertion";
+      ok = lib.all (clients: lib.any (lib.hasInfix "its own name and its own pin")
+             (failingAssertions { services.engenho.config.control.remote.authorizedClients = clients; }))
+           [
+             [ { name = "a"; spkiSha256 = pinA; tier = "observe"; } { name = "a"; spkiSha256 = pinB; tier = "observe"; } ]
+             [ { name = "a"; spkiSha256 = pinA; tier = "observe"; } { name = "b"; spkiSha256 = pinA; tier = "observe"; } ]
+           ];
+      got = "duplicates passed"; }
 
     { name = "explicit-data_dir-still-wins-on-the-hm-arm";
       ok = ((evalAsHomeManager {

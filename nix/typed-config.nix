@@ -412,6 +412,50 @@ in
       '';
     };
 
+    # Remote control (`engenho ctl --remote`): TLS 1.3, each client admitted by
+    # the pin of its key, the daemon known to clients by the pin of its own
+    # (`data_dir/control/identity/`, printed by `engenho ctl control show`).
+    # Never engenho's cluster CA. Off unless enabled.
+    control.remote = {
+      enable = optional types.bool ''
+        Listen for remote control. engenho's default is off; the local socket
+        is always on.
+      '';
+      listenAddr = optional types.str ''
+        `address:port` to listen on (engenho's default `0.0.0.0:7443`). The
+        pins are what admit a client; a deployment still restricts the port to
+        its tailnet with the firewall.
+      '';
+      authorizedClients = mkOption {
+        default = [ ];
+        description = ''
+          Who may connect, and what each may do. The pin is the SHA-256 of the
+          client key's DER SubjectPublicKeyInfo — `engenho remote fingerprint
+          <name>` prints it on the client. Revoking a client is removing it
+          here: the daemon follows this file without a restart.
+        '';
+        type = types.listOf (types.submodule {
+          options = {
+            name = mkOption {
+              type = types.strMatching "[^[:space:]]+";
+              description = "The client's name: recorded as who acted.";
+            };
+            spkiSha256 = mkOption {
+              type = types.strMatching "sha256:[0-9a-f]{64}";
+              description = "The client key's pin: `sha256:<64 lowercase hex>`.";
+            };
+            tier = mkOption {
+              type = types.enum [ "observe" "mutate" "destructive" ];
+              description = ''
+                What it may do. Declared here, on the daemon: a client's
+                certificate never carries a tier.
+              '';
+            };
+          };
+        });
+      };
+    };
+
     fabric = optional (types.enum [ "in_binary" ]) ''
       How engenho's parts reach one another. `in_binary` is the only value and
       engenho's own default, so leaving this unset is equivalent. There is no
@@ -453,6 +497,25 @@ in
       (t.servers != [ ] || t.cluster != null || t.credentialsPath != null
         || t.connectTimeoutSeconds != null)
       "services.engenho.config.teia is deprecated and ignored: NATS is not engenho's fabric, and engenho no longer reads a `teia` section. Its replacement is `services.engenho.config.fabric = \"in_binary\"`, which is also the default. Remove the teia settings.";
+
+  # Remote control with nobody pinned is a listener nobody can use, and two
+  # clients sharing a name or a pin make the audit's "who acted" ambiguous.
+  # engenho refuses both at boot too; here they are eval errors.
+  config.assertions =
+    let
+      remote = config.services.engenho.config.control.remote;
+      unique = f: let xs = map f remote.authorizedClients; in lib.length (lib.unique xs) == lib.length xs;
+    in
+    [
+      {
+        assertion = remote.enable != true || remote.authorizedClients != [ ];
+        message = "services.engenho.config.control.remote.enable needs authorizedClients: with none pinned, no client could connect.";
+      }
+      {
+        assertion = unique (c: c.name) && unique (c: c.spkiSha256);
+        message = "services.engenho.config.control.remote.authorizedClients: every client needs its own name and its own pin.";
+      }
+    ];
 
   # ── The projection: typed options → the trio's YAML `settings` ──────────
   #
@@ -541,6 +604,13 @@ in
       control.socket = {
         inherit (cfg.control.socket) path access;
         group_tier = cfg.control.socket.groupTier;
+      };
+      control.remote = {
+        inherit (cfg.control.remote) enable;
+        listen_addr = cfg.control.remote.listenAddr;
+        authorized_clients = map
+          (c: { inherit (c) name tier; spki_sha256 = c.spkiSha256; })
+          cfg.control.remote.authorizedClients;
       };
       # No `teia`: engenho does not read it (§5.1). The deprecated options
       # above warn instead of rendering.

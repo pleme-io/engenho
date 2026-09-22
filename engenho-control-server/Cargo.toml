@@ -16,9 +16,18 @@ keywords.workspace = true
 workspace = true
 
 [dependencies]
-engenho-control-types = { workspace = true }
+engenho-control-types = { workspace = true, features = ["tls"] }
 engenho-config        = { workspace = true }
 engenho-serve         = { workspace = true }
+# The control identity's key is written 0600 from the moment it exists.
+engenho-substrate-core = { workspace = true }
+# The pinned-client set, swapped whole when the declared file changes and
+# read by every handshake.
+arc-swap              = { workspace = true }
+rustls                = { workspace = true }
+# engenho-serve's TLS handshake yields this stream; its peer certificate is
+# where a remote connection's peer comes from.
+tokio-rustls          = { version = "0.26", default-features = false, features = ["ring"] }
 # The flock a socket is claimed with (`<sock>.lock`) is the store's
 # DataDirLock: one exclusive-claim primitive, not a copy.
 engenho-store         = { workspace = true }
@@ -40,4 +49,7 @@ tracing               = { workspace = true }
 
 [dev-dependencies]
 async-trait           = { workspace = true }
+# The remote listener is tested with the client that talks to it.
+engenho-control-client = { workspace = true }
+reqwest               = { workspace = true }
 tempfile              = "3"

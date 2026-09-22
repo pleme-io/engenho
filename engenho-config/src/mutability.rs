@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use crate::leaf::LeafPath;
 use crate::{
     ClusterConfig, ConsistencyConfig, ControlConfig, ControlSocketConfig, ControllerEnable,
-    ControllersConfig, EngenhoConfig, LegacyTeiaSection, NetworkingConfig, RevoadaConfig,
-    RuntimeConfig, SchedulerConfig, TlsConfig, TopologyConfig,
+    ControllersConfig, EngenhoConfig, LegacyTeiaSection, NetworkingConfig, RemoteControlConfig,
+    RevoadaConfig, RuntimeConfig, SchedulerConfig, TlsConfig, TopologyConfig,
 };
 
 /// What applying a change to one leaf does. The spellings are the control
@@ -275,11 +275,19 @@ fn build() -> Vec<LeafSpec> {
         key_path => restart,
         extra_sans => restart,
     });
-    section!(rows, "control", ControlConfig { socket });
+    section!(rows, "control", ControlConfig { socket, remote });
     section!(rows, "control.socket", ControlSocketConfig {
         path => anchored(Anchor::OverlayAnchor),
         access => anchored(Anchor::OverlayAnchor),
         group_tier => anchored(Anchor::OverlayAnchor),
+    });
+    // Who may control this daemon remotely is never settable through the
+    // control plane itself: a mutate-tier caller could otherwise pin a key
+    // of its own at destructive.
+    section!(rows, "control.remote", RemoteControlConfig {
+        enable => anchored(Anchor::OverlayAnchor),
+        listen_addr => anchored(Anchor::OverlayAnchor),
+        authorized_clients => anchored(Anchor::OverlayAnchor),
     });
     rows
 }

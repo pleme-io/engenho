@@ -56,8 +56,9 @@ chrono              = { version = "0.4", features = ["serde"] }
 # The declared config file's digest (drift since a boot read it).
 blake3              = { workspace = true }
 # The control plane: the spec's types and trait this crate implements
-# (control/), and the audit chain `listAudit` pages.
-engenho-control-types  = { workspace = true }
+# (control/), the audit chain `listAudit` pages, and the remote listener's
+# pins `getControl` reports.
+engenho-control-types  = { workspace = true, features = ["tls"] }
 engenho-control-server = { workspace = true }
 # The log ring the control plane serves is a tracing layer.
 tracing-subscriber  = { workspace = true }

@@ -54,6 +54,128 @@ pub struct ControlSocketConfig {
     pub group_tier: GroupTier,
 }
 
+/// What a remote client may do: declared on the server, per pin. A client's
+/// certificate never carries a tier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteTier {
+    /// Read everything.
+    Observe,
+    /// Also operate.
+    Mutate,
+    /// Also the confirmation-gated re-initializations.
+    Destructive,
+}
+
+/// One client the remote listener admits.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorizedClientConfig {
+    /// Its name: recorded as who acted.
+    pub name: String,
+    /// The SHA-256 of its key's DER `SubjectPublicKeyInfo`, as
+    /// `sha256:<64 lowercase hex>` (`engenho remote fingerprint <name>`
+    /// prints it on the client).
+    pub spki_sha256: String,
+    /// What it may do.
+    pub tier: RemoteTier,
+}
+
+/// Where the remote listener binds by default. A deployment restricts it to
+/// the tailnet with its firewall; the pins are what admit a client.
+pub const DEFAULT_REMOTE_LISTEN: &str = "0.0.0.0:7443";
+
+/// The remote control listener: TLS 1.3, each client admitted by the pin of
+/// its key, and the listener known to clients by the pin of its own
+/// (`data_dir/control/identity/`) — never by engenho's cluster CA.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteControlConfig {
+    /// Listen at all. Off by default: the local socket is always on.
+    #[serde(default)]
+    pub enable: bool,
+    /// Where.
+    #[serde(default = "default_remote_listen")]
+    pub listen_addr: String,
+    /// Who may connect, and what each may do.
+    #[serde(default)]
+    pub authorized_clients: Vec<AuthorizedClientConfig>,
+}
+
+fn default_remote_listen() -> String {
+    DEFAULT_REMOTE_LISTEN.to_owned()
+}
+
+impl Default for RemoteControlConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            listen_addr: default_remote_listen(),
+            authorized_clients: Vec::new(),
+        }
+    }
+}
+
+/// Whether `s` is spelled `sha256:<64 lowercase hex>`.
+fn is_pin(s: &str) -> bool {
+    s.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+impl RemoteControlConfig {
+    /// Validate the remote section: a listen address that parses, and
+    /// clients with names and pins that are well formed and unique.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::InvalidField`] naming the offending field.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let invalid = |field: &str, reason: String| ConfigError::InvalidField {
+            field: ["control.remote.", field].concat(),
+            reason,
+        };
+        if self.listen_addr.parse::<std::net::SocketAddr>().is_err() {
+            return Err(invalid(
+                "listen_addr",
+                format!("{:?} is not an address:port", self.listen_addr),
+            ));
+        }
+        let mut names = std::collections::BTreeSet::new();
+        let mut pins = std::collections::BTreeSet::new();
+        for client in &self.authorized_clients {
+            if client.name.trim().is_empty() {
+                return Err(invalid("authorized_clients", "a client has no name".into()));
+            }
+            if !is_pin(&client.spki_sha256) {
+                return Err(invalid(
+                    "authorized_clients",
+                    format!(
+                        "{}: {:?} is not a pin (sha256:<64 lowercase hex>)",
+                        client.name, client.spki_sha256
+                    ),
+                ));
+            }
+            if !names.insert(client.name.as_str()) {
+                return Err(invalid(
+                    "authorized_clients",
+                    format!("{} is named twice", client.name),
+                ));
+            }
+            if !pins.insert(client.spki_sha256.as_str()) {
+                return Err(invalid(
+                    "authorized_clients",
+                    format!("{}'s pin is another client's too", client.name),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The control plane.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -61,6 +183,9 @@ pub struct ControlConfig {
     /// The local control socket: always on, the recovery path.
     #[serde(default)]
     pub socket: ControlSocketConfig,
+    /// The remote listener.
+    #[serde(default)]
+    pub remote: RemoteControlConfig,
 }
 
 /// The longest path a Unix socket address holds, NUL excluded: `sun_path` is
@@ -183,12 +308,14 @@ impl TieredConfig for ControlConfig {
         // `access` and `group_tier` carry an explicit value on every tier
         // (their serde defaults are the prescribed ones), so the overlay's
         // wins; an absent `path` inherits.
+        // `remote` likewise: every field carries its serde default.
         Self {
             socket: ControlSocketConfig {
                 path: self.socket.path.or_else(|| base.socket.path.clone()),
                 access: self.socket.access,
                 group_tier: self.socket.group_tier,
             },
+            remote: self.remote,
         }
     }
 }
@@ -198,9 +325,11 @@ impl ControlConfig {
     ///
     /// # Errors
     ///
-    /// See [`ControlSocketConfig::validate`].
+    /// See [`ControlSocketConfig::validate`] and
+    /// [`RemoteControlConfig::validate`].
     pub fn validate(&self) -> Result<(), ConfigError> {
-        self.socket.validate()
+        self.socket.validate()?;
+        self.remote.validate()
     }
 }
 
@@ -258,6 +387,46 @@ mod tests {
             ..ControlSocketConfig::default()
         };
         assert!(long.validate().is_err());
+    }
+
+    #[test]
+    fn remote_clients_need_names_and_pins_both_well_formed_and_unique() {
+        let pin = |c: char| ["sha256:", &c.to_string().repeat(64)].concat();
+        let client = |name: &str, spki: String| AuthorizedClientConfig {
+            name: name.into(),
+            spki_sha256: spki,
+            tier: RemoteTier::Observe,
+        };
+        let with = |clients: Vec<AuthorizedClientConfig>| RemoteControlConfig {
+            enable: true,
+            authorized_clients: clients,
+            ..RemoteControlConfig::default()
+        };
+        with(vec![client("a", pin('a')), client("b", pin('b'))])
+            .validate()
+            .expect("valid");
+        for bad in [
+            with(vec![client("", pin('a'))]),
+            with(vec![client("a", "sha256:ABC".into())]),
+            with(vec![client("a", pin('A'))]),
+            with(vec![client("a", pin('a')), client("a", pin('b'))]),
+            with(vec![client("a", pin('a')), client("b", pin('a'))]),
+            RemoteControlConfig {
+                listen_addr: "tailnet:7443".into(),
+                ..RemoteControlConfig::default()
+            },
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?}");
+        }
+        let parsed: ControlConfig = serde_yaml::from_str(
+            "remote:\n  enable: true\n  authorized_clients:\n    - {name: ryn, spki_sha256: sha256:0000000000000000000000000000000000000000000000000000000000000000, tier: destructive}\n",
+        )
+        .expect("parse");
+        assert_eq!(parsed.remote.listen_addr, DEFAULT_REMOTE_LISTEN);
+        assert_eq!(
+            parsed.remote.authorized_clients[0].tier,
+            RemoteTier::Destructive
+        );
     }
 
     #[test]

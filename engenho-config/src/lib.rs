@@ -128,8 +128,9 @@ mod tls;
 pub use cluster::ClusterConfig;
 pub use consistency::{ConsistencyConfig, ConsistencyTierKind};
 pub use control::{
-    ControlConfig, ControlSocketConfig, GroupTier, SOCKET_PATH_MAX, SYSTEM_SOCKET_PATH,
-    SocketAccess, SocketDefaults, check_socket_path_len,
+    AuthorizedClientConfig, ControlConfig, ControlSocketConfig, DEFAULT_REMOTE_LISTEN, GroupTier,
+    RemoteControlConfig, RemoteTier, SOCKET_PATH_MAX, SYSTEM_SOCKET_PATH, SocketAccess,
+    SocketDefaults, check_socket_path_len,
 };
 pub use controllers::{ControllerEnable, ControllersConfig};
 pub use discovery::{HostnameLayer, NODE_NAME_FALLBACK};

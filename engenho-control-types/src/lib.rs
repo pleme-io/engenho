@@ -55,6 +55,11 @@ pub use ops::{EngenhoControl, OperationVisitor, visit};
 
 pub use types::{AuthorityTier, ReinitOp};
 
+/// SPKI pins and the rustls verifiers of the remote control plane (feature
+/// `tls`).
+#[cfg(feature = "tls")]
+pub mod pin;
+
 /// The spec, byte for byte as authored — served by `GET /v1/spec`.
 pub const SPEC_YAML: &str = include_str!("../../spec/engenho-control.openapi.yaml");
 

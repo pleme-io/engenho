@@ -58,11 +58,14 @@ use engenho_config::{
     ConfigError, ConfigTier, EngenhoConfig, OverrideLayer, SocketDefaults, TieredConfig,
     render_provenance,
 };
-use engenho_control_server::{AuditLog, GrantPolicy, Router, serve_uds};
+use engenho_control_server::{
+    AuditLog, AuthorizedSet, ControlIdentity, GrantPolicy, Pins, RemoteListener, Router, identity,
+    serve_uds,
+};
 use engenho_kube_client::{emit_kubeconfig, emit_kubeconfig_with_admin};
 use engenho_runtime::census::{self, ApiSource, Catalog, DataDirSource, Predicate};
 use engenho_runtime::control::{
-    DaemonControl, DaemonControlParts, LogLayer, OverrideStore, SocketFacts,
+    DaemonControl, DaemonControlParts, LogLayer, OverrideStore, RemoteFacts, SocketFacts,
 };
 use engenho_runtime::lifecycle::{
     ConfigSource, ControlBootstrap, ControlDir, ExitIntent, ResolvedConfig, Supervisor,
@@ -76,6 +79,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 mod ctl;
+mod remote;
 
 /// The verb list, written ONCE.
 ///
@@ -85,9 +89,10 @@ mod ctl;
 /// actually dispatched by [`Command::parse`], which closes the other
 /// direction: a verb added to the match arms without a row here fails
 /// the suite rather than becoming silently undiscoverable.
-const SUBCOMMAND_NAMES: [&str; 6] = [
+const SUBCOMMAND_NAMES: [&str; 7] = [
     "daemon",
     "ctl",
+    "remote",
     "kubeconfig",
     "config-show",
     "config-diff",
@@ -117,6 +122,8 @@ enum Command {
     /// `ctl …` — talk to the running daemon over its control socket; the
     /// arguments are parsed by [`ctl::CtlCommand::parse`].
     Ctl(Vec<String>),
+    /// `remote …` — this machine's keys for remote daemons ([`remote::run`]).
+    Remote(Vec<String>),
     /// `--help` / `-h` / `help` — print usage to stdout and exit 0.
     Help,
     /// `--version` / `-V` / `version` — print the version to stdout and exit 0.
@@ -144,6 +151,7 @@ impl Command {
             Some("config-show") => Ok(Command::ConfigShow(args.next())),
             Some("census") => Ok(Command::Census(CensusCommand::parse(args)?)),
             Some("ctl") => Ok(Command::Ctl(args.collect())),
+            Some("remote") => Ok(Command::Remote(args.collect())),
             Some("config-diff") => match (args.next(), args.next()) {
                 (Some(from), Some(to)) => Ok(Command::ConfigDiff(from, to)),
                 _ => Err(anyhow::anyhow!(
@@ -295,6 +303,7 @@ async fn main() -> anyhow::Result<()> {
         Command::ConfigDiff(from, to) => run_config_diff(&from, &to),
         Command::Census(census) => run_census(census).await,
         Command::Ctl(args) => std::process::exit(i32::from(ctl::run(args).await)),
+        Command::Remote(args) => std::process::exit(i32::from(remote::run(&args))),
         Command::Help => {
             print!("{}", help_text());
             Ok(())
@@ -358,7 +367,24 @@ async fn run_daemon() -> anyhow::Result<ExitIntent> {
         declared: bootstrap.declared.clone(),
     })?;
 
-    // 4. The local control socket, bound before the first boot: fatal if
+    // 4. The remote listener's own identity and the pins it admits — the
+    //    identity made whether or not remote control is enabled, so
+    //    `engenho ctl control show` names the pin a client needs before it
+    //    is turned on. Neither depends on anything a boot creates.
+    let identity =
+        ControlIdentity::load_or_create(&ControlDir::under(&data_dir).root().join(identity::DIR))
+            .map(Arc::new)
+            .map_err(|e| e.to_string());
+    if let Err(why) = &identity {
+        tracing::warn!(error = %why, "no control identity: remote control is unavailable");
+    }
+    let remote_config = bootstrap.control.remote.clone();
+    let pins = Pins::new(
+        AuthorizedSet::from_config(&remote_config.authorized_clients).unwrap_or_default(),
+    );
+    let (remote_state, remote_watch) = RemoteListener::channel();
+
+    // 5. The local control socket, bound before the first boot: fatal if
     //    it cannot be, since it is the recovery path.
     let audit = Arc::new(AuditLog::open(
         &data_dir.join(ControlDir::NAME).join("audit"),
@@ -373,6 +399,14 @@ async fn run_daemon() -> anyhow::Result<ExitIntent> {
             path: socket_path.clone(),
             access: socket_config.access,
             group_tier: socket_config.group_tier,
+        },
+        remote: RemoteFacts {
+            state: remote_watch,
+            identity: identity
+                .as_ref()
+                .map(|id| (id.spki(), id.created_at()))
+                .map_err(Clone::clone),
+            pins: pins.clone(),
         },
         logs,
         audit: Arc::clone(&audit),
@@ -389,13 +423,26 @@ async fn run_daemon() -> anyhow::Result<ExitIntent> {
     let (control_stop, control_signal) = stop_channel();
     let serving = tokio::spawn(serve_uds(
         bound.listener,
-        router,
-        control_signal,
+        Arc::clone(&router),
+        control_signal.clone(),
         engenho_control_server::GRACE,
     ));
     tracing::info!(socket = %socket_path.display(), "control socket serving");
 
-    // 5. A stop signal is an exit request: the supervisor drains the runtime
+    // 6. The remote listener: never fatal — what keeps it from serving is its
+    //    state, which `engenho ctl control show` reports. Its pins follow the
+    //    declared file.
+    let remote = RemoteListener::spawn(
+        &remote_config,
+        identity,
+        pins.clone(),
+        router,
+        control_signal,
+        remote_state,
+    );
+    tokio::spawn(follow_pins(handle.declared_changes(), pins));
+
+    // 7. A stop signal is an exit request: the supervisor drains the runtime
     //    (if it is up) and the process exits 0. The signal streams live
     //    OUTSIDE the loop, so a signal that lands while a request is in
     //    flight stays recorded and is not lost.
@@ -415,8 +462,30 @@ async fn run_daemon() -> anyhow::Result<ExitIntent> {
     if let Err(err) = serving.await {
         tracing::warn!(error = %err, "the control socket's server ended abnormally");
     }
+    remote.stopped().await;
     drop(bound.guard);
     Ok(intent)
+}
+
+/// Keep the remote listener's pins what the declared file says: a client
+/// added or revoked there is admitted or refused from its next request,
+/// without a restart. (Turning the listener on or moving it takes one.)
+async fn follow_pins(mut changes: tokio::sync::watch::Receiver<u64>, pins: Pins) {
+    while changes.changed().await.is_ok() {
+        let remote = ControlBootstrap::discover().control.remote;
+        match AuthorizedSet::from_config(&remote.authorized_clients) {
+            Ok(set) => {
+                tracing::info!(
+                    clients = remote.authorized_clients.len(),
+                    "remote control pins reloaded"
+                );
+                pins.replace(set);
+            }
+            Err(why) => {
+                tracing::warn!(error = %why, "the declared remote pins do not parse; keeping those in force");
+            }
+        }
+    }
 }
 
 /// The config one boot runs on, via the sealed progressive-discovery fold
@@ -790,7 +859,11 @@ SUBCOMMANDS:
     ctl <RESOURCE> <VERB>     Talk to the running daemon over its control
                               socket: its lifecycle, boots, init state,
                               config, children, PKI, store, logs and audit.
-                              `ctl --list` prints every resource and verb.
+                              `ctl --list` prints every resource and verb;
+                              `ctl --remote <NAME>` talks to another machine's.
+    remote list | keygen <NAME> | fingerprint <NAME>
+                              This machine's keys for remote daemons, and the
+                              daemons remotes.yaml names.
     kubeconfig [FLAGS]        Print a kubeconfig for the persisted cluster CA.
                               Flags: --data-dir <dir>, --server <url>
     config-show [TIER]        Print the resolved config and each leaf's

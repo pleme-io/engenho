@@ -1,27 +1,36 @@
 //! The HTTP layer: one [`Router`] behind engenho-serve's owned-connection
-//! loop, over the local socket.
+//! loop, over the local socket ([`serve_uds`]) and the remote listener
+//! ([`serve_tls`]). Either way a connection's peer is decided once, when it
+//! connects, from what the transport proved — never from the request.
 
 use std::convert::Infallible;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use engenho_serve::{Plain, ServeReport, StopSignal};
+use engenho_control_types::pin::Spki;
+use engenho_serve::{Plain, ServeReport, StopSignal, Tls};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming as HyperBody;
 use hyper::header::{CONTENT_TYPE, HeaderValue};
 use hyper::{Request, Response, StatusCode};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
+use tokio_rustls::server::TlsStream;
 
-use crate::grant::PeerCred;
+use crate::grant::{Peer, PeerCred};
+use crate::pins::Pins;
 use crate::router::{Answer, Incoming, MAX_BODY, Router};
 
 /// How long a stop waits for in-flight control requests before severing
 /// them. Long enough for a stop request to answer after its drain.
 pub const GRACE: Duration = Duration::from_secs(5);
+
+/// How long a remote peer has to finish its TLS handshake.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Serve `router` on `listener` until `stop`.
 pub async fn serve_uds(
@@ -35,7 +44,35 @@ pub async fn serve_uds(
         Plain,
         move |stream: &UnixStream, _: &tokio::net::unix::SocketAddr| Connection {
             router: Arc::clone(&router),
-            peer: peer_of(stream),
+            peer: PeerSource::Local(peer_of(stream)),
+        },
+        stop,
+        grace,
+    )
+    .await
+}
+
+/// Serve `router` over TLS on `listener` until `stop`. The handshake admits
+/// only a client whose key `pins` holds; each REQUEST's peer is that client
+/// as `pins` has it then, so a pin revoked (or a tier lowered) while a
+/// connection is open takes effect on its next request.
+pub async fn serve_tls(
+    listener: TcpListener,
+    tls: Arc<rustls::ServerConfig>,
+    pins: Pins,
+    router: Arc<Router>,
+    stop: StopSignal,
+    grace: Duration,
+) -> ServeReport {
+    engenho_serve::serve(
+        listener,
+        Tls::new(tls, HANDSHAKE_TIMEOUT),
+        move |stream: &TlsStream<TcpStream>, _: &SocketAddr| Connection {
+            router: Arc::clone(&router),
+            peer: PeerSource::Remote {
+                spki: proven_key(stream),
+                pins: pins.clone(),
+            },
         },
         stop,
         grace,
@@ -52,11 +89,36 @@ fn peer_of(stream: &UnixStream) -> Option<PeerCred> {
     })
 }
 
-/// One connection's service: its peer is fixed when it connects.
+/// The pin of the key the handshake proved the client holds.
+fn proven_key(stream: &TlsStream<TcpStream>) -> Option<Spki> {
+    let cert = stream.get_ref().1.peer_certificates()?.first()?;
+    Spki::of_certificate(cert).ok()
+}
+
+/// Where a connection's peer comes from: fixed when it connects (a local
+/// peer's credentials), or its proven key looked up per request.
+#[derive(Clone)]
+enum PeerSource {
+    Local(Option<PeerCred>),
+    Remote { spki: Option<Spki>, pins: Pins },
+}
+
+impl PeerSource {
+    fn peer(&self) -> Option<Peer> {
+        match self {
+            Self::Local(cred) => cred.map(Peer::Local),
+            Self::Remote { spki, pins } => {
+                spki.and_then(|spki| pins.client(&spki)).map(Peer::Remote)
+            }
+        }
+    }
+}
+
+/// One connection's service.
 #[derive(Clone)]
 struct Connection {
     router: Arc<Router>,
-    peer: Option<PeerCred>,
+    peer: PeerSource,
 }
 
 type Reply = Pin<Box<dyn Future<Output = Result<Response<Full<Bytes>>, Infallible>> + Send>>;
@@ -72,7 +134,7 @@ impl tower_service::Service<Request<HyperBody>> for Connection {
 
     fn call(&mut self, req: Request<HyperBody>) -> Reply {
         let router = Arc::clone(&self.router);
-        let peer = self.peer;
+        let peer = self.peer.peer();
         Box::pin(async move {
             let (parts, body) = req.into_parts();
             let answer = match Limited::new(body, MAX_BODY).collect().await {

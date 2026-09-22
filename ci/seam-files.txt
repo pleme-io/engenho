@@ -35,3 +35,9 @@ engenho-kubelet/src/native_backend.rs
 engenho-config/src/mutability.rs
 engenho-runtime/src/control/apply.rs
 engenho-runtime/src/control/overrides.rs
+
+# Remote control (P5): whether a key is pinned, whether a handshake's
+# signature holds, and what tier a pinned or local caller gets.
+engenho-control-types/src/pin.rs
+engenho-control-server/src/pins.rs
+engenho-control-server/src/grant.rs

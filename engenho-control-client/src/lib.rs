@@ -6,19 +6,39 @@
 //!   the table-driven `engenho ctl` uses.
 //! * [`resolve_socket`] — where the local daemon's socket is, found the way
 //!   the daemon placed it.
+//! * [`ControlClient::remote`] + [`remote`] — a daemon on another machine,
+//!   over mTLS: this client's key, the daemon's pin, from `remotes.yaml`.
 
 #![forbid(unsafe_code)]
+
+pub mod remote;
 
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 use engenho_config::{EngenhoConfig, SYSTEM_SOCKET_PATH, SocketDefaults};
+use engenho_control_types::pin::{KeyMaterial, client_config};
 use engenho_control_types::types::{Blind, Refusal};
 use engenho_control_types::wire::{HttpRequest, OperationRequest};
 use engenho_control_types::{AuthorityTier, ControlError, MediaType, Operation, OperationId};
 
+pub use remote::{RemoteEndpoint, RemoteError, RemotesConfig};
+
 /// The environment variable that names the socket outright.
 pub const SOCKET_ENV: &str = "ENGENHO_CONTROL_SOCKET";
+
+/// An error and every cause under it, `: `-joined — a TLS pin failure is
+/// three levels down a transport error, and it is the part that says why.
+fn chain(err: &dyn std::error::Error) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    out
+}
 
 /// Why a call did not produce a response body.
 #[derive(Debug, thiserror::Error)]
@@ -27,7 +47,7 @@ pub enum ClientError {
     #[error(transparent)]
     Control(#[from] ControlError),
     /// The daemon could not be reached.
-    #[error("cannot reach the engenho daemon at {endpoint}: {source}")]
+    #[error("cannot reach the engenho daemon at {endpoint}: {}", chain(source))]
     Unreachable {
         /// Where it was looked for.
         endpoint: String,
@@ -74,6 +94,29 @@ impl ControlClient {
             // The host is not resolved over a socket; it names the daemon.
             base: "http://engenho".into(),
             endpoint: path.display().to_string(),
+            actor: None,
+            ceiling: None,
+        })
+    }
+
+    /// Talk to the remote daemon `endpoint` names, over TLS 1.3: presenting
+    /// `key`, and trusting only a server whose key is one of the endpoint's
+    /// pins.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Protocol`] if the TLS or HTTP client cannot be built.
+    pub fn remote(endpoint: &RemoteEndpoint, key: &KeyMaterial) -> Result<Self, ClientError> {
+        let tls = client_config(key, endpoint.server_spki.clone())
+            .map_err(|e| ClientError::Protocol(format!("build the TLS client: {e}")))?;
+        let http = reqwest::Client::builder()
+            .use_preconfigured_tls(tls)
+            .build()
+            .map_err(|e| ClientError::Protocol(format!("build the HTTP client: {e}")))?;
+        Ok(Self {
+            http,
+            base: ["https://", &endpoint.address].concat(),
+            endpoint: endpoint.address.clone(),
             actor: None,
             ceiling: None,
         })

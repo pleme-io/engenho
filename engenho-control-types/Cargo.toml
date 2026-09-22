@@ -22,6 +22,16 @@ chrono      = { version = "0.4", default-features = false, features = ["serde", 
 regress     = "0.12"
 serde       = { workspace = true }
 serde_json  = { workspace = true }
+# The `tls` feature: SPKI pins and the two rustls verifiers that check them
+# (the server pinning its clients, a client pinning its server), in the one
+# crate both sides already depend on.
+rcgen       = { workspace = true, optional = true }
+rustls      = { workspace = true, optional = true }
+sha2        = { version = "0.10", optional = true }
+x509-parser = { version = "0.16", optional = true }
+
+[features]
+tls = ["dep:rcgen", "dep:rustls", "dep:sha2", "dep:x509-parser"]
 
 [build-dependencies]
 heck         = "0.5"

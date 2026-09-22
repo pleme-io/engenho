@@ -20,7 +20,9 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use engenho_control_client::{ClientError, ControlClient, Reply, resolve_socket};
+use engenho_control_client::{
+    ClientError, ControlClient, RemotesConfig, Reply, remote, resolve_socket,
+};
 use engenho_control_types::wire::{HttpParts, HttpRequest, OperationRequest};
 use engenho_control_types::{
     AuthorityTier, CATALOG, ControlError, MediaType, Operation, OperationId, OperationSpec,
@@ -36,11 +38,21 @@ pub const EXIT_REFUSED: u8 = 3;
 /// The daemon could not answer, or could not be reached.
 pub const EXIT_BLIND: u8 = 4;
 
+/// Which daemon `engenho ctl` talks to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Endpoint {
+    /// This machine's, over its socket: `--socket PATH`, else the one
+    /// [`resolve_socket`] finds.
+    Local(Option<PathBuf>),
+    /// `--remote NAME`: a daemon listed in `remotes.yaml`, over mTLS.
+    Remote(String),
+}
+
 /// A parsed `engenho ctl` invocation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CtlCommand {
-    /// `--socket`.
-    pub socket: Option<PathBuf>,
+    /// `--socket` or `--remote`.
+    pub endpoint: Endpoint,
     /// `--json`: print the response body as JSON.
     pub json: bool,
     /// `--actor`.
@@ -70,6 +82,8 @@ pub enum CtlAction {
 pub enum CtlUsage {
     /// A global flag this command does not take.
     UnknownFlag(String),
+    /// `--socket` and `--remote` together: one daemon at a time.
+    TwoEndpoints,
     /// A flag given no value.
     NeedsValue(String),
     /// `--ceiling` named no tier.
@@ -130,6 +144,7 @@ impl fmt::Display for CtlUsage {
         let spelled = |op: &OperationId| op.spec().cli;
         match self {
             Self::UnknownFlag(flag) => write!(f, "unknown flag {flag}\n\n{Usage}"),
+            Self::TwoEndpoints => f.write_str("--socket and --remote name two daemons; give one"),
             Self::NeedsValue(flag) => write!(f, "{flag} needs a value"),
             Self::BadCeiling(tier) => {
                 write!(
@@ -182,7 +197,7 @@ impl CtlCommand {
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, CtlUsage> {
         let mut args = args.into_iter().peekable();
         let mut command = Self {
-            socket: None,
+            endpoint: Endpoint::Local(None),
             json: false,
             actor: None,
             ceiling: None,
@@ -197,7 +212,17 @@ impl CtlCommand {
             match arg.as_str() {
                 "--json" => command.json = true,
                 "--list" | "--help" => return Ok(command),
-                "--socket" => command.socket = Some(PathBuf::from(value(&mut args, &arg)?)),
+                "--socket" | "--remote" => {
+                    let given = value(&mut args, &arg)?;
+                    if command.endpoint != Endpoint::Local(None) {
+                        return Err(CtlUsage::TwoEndpoints);
+                    }
+                    command.endpoint = if arg == "--socket" {
+                        Endpoint::Local(Some(PathBuf::from(given)))
+                    } else {
+                        Endpoint::Remote(given)
+                    };
+                }
                 "--actor" => command.actor = Some(value(&mut args, &arg)?),
                 "--ceiling" => {
                     let tier = value(&mut args, &arg)?;
@@ -320,8 +345,8 @@ impl fmt::Display for Usage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
-            "usage: engenho ctl [--socket PATH] [--json] [--actor A] [--ceiling TIER] \
-             <resource> <verb> [args] [--param value]…\n"
+            "usage: engenho ctl [--socket PATH | --remote NAME] [--json] [--actor A] \
+             [--ceiling TIER] <resource> <verb> [args] [--param value]…\n"
         )?;
         let width = CATALOG
             .iter()
@@ -383,13 +408,28 @@ pub async fn run(args: impl IntoIterator<Item = String>) -> u8 {
             return EXIT_USAGE;
         }
     };
-    let socket = resolve_socket(command.socket.clone());
-    let client = match ControlClient::uds(&socket.path) {
-        Ok(client) => client,
-        Err(err) => {
-            eprintln!("engenho ctl: {err}");
-            return EXIT_BLIND;
+    // Where it looked, for an unreachable local daemon; a remote one names
+    // its own address.
+    let mut looked: Vec<PathBuf> = Vec::new();
+    let client = match &command.endpoint {
+        Endpoint::Local(explicit) => {
+            let socket = resolve_socket(explicit.clone());
+            looked = socket.considered;
+            match ControlClient::uds(&socket.path) {
+                Ok(client) => client,
+                Err(err) => {
+                    eprintln!("engenho ctl: {err}");
+                    return EXIT_BLIND;
+                }
+            }
         }
+        Endpoint::Remote(name) => match remote_client(name) {
+            Ok(client) => client,
+            Err(why) => {
+                eprintln!("engenho ctl: --remote {name}: {why}");
+                return EXIT_USAGE;
+            }
+        },
     };
     let client = client.with_actor(command.actor.clone().unwrap_or_else(|| "human".into()));
     let client = match command.ceiling {
@@ -414,13 +454,11 @@ pub async fn run(args: impl IntoIterator<Item = String>) -> u8 {
         }
         Err(err @ ClientError::Unreachable { .. }) => {
             eprintln!("engenho ctl: {err}");
-            let looked: Vec<String> = socket
-                .considered
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect();
-            eprintln!("  looked at: {}", looked.join(", "));
-            eprintln!("  (--socket PATH or $ENGENHO_CONTROL_SOCKET names it outright)");
+            if !looked.is_empty() {
+                let looked: Vec<String> = looked.iter().map(|p| p.display().to_string()).collect();
+                eprintln!("  looked at: {}", looked.join(", "));
+                eprintln!("  (--socket PATH or $ENGENHO_CONTROL_SOCKET names it outright)");
+            }
             EXIT_BLIND
         }
         Err(err) => {
@@ -428,6 +466,17 @@ pub async fn run(args: impl IntoIterator<Item = String>) -> u8 {
             EXIT_BLIND
         }
     }
+}
+
+/// A client for the remote daemon `name`: its address and pins from
+/// `remotes.yaml`, this machine's key for it.
+fn remote_client(name: &str) -> Result<ControlClient, String> {
+    let dir = remote::config_dir().map_err(|e| e.to_string())?;
+    let remotes = RemotesConfig::load(&dir).map_err(|e| e.to_string())?;
+    let endpoint = remotes.get(&dir, name).map_err(|e| e.to_string())?;
+    let key = remote::read_key(&remote::key_path(&dir, name, Some(endpoint)))
+        .map_err(|e| e.to_string())?;
+    ControlClient::remote(endpoint, &key).map_err(|e| e.to_string())
 }
 
 /// Print a success body: YAML text as it is; JSON as JSON with `--json`,
@@ -487,8 +536,18 @@ mod tests {
     #[test]
     fn globals_resource_verb_and_parameters_are_read() {
         let command = parse("--socket /x.sock --json runtime show").expect("parses");
-        assert_eq!(command.socket, Some(PathBuf::from("/x.sock")));
+        assert_eq!(
+            command.endpoint,
+            Endpoint::Local(Some(PathBuf::from("/x.sock")))
+        );
         assert!(command.json);
+        let remote = parse("--remote plo runtime show").expect("parses");
+        assert_eq!(remote.endpoint, Endpoint::Remote("plo".into()));
+        assert_eq!(
+            parse("--remote plo --socket /x.sock runtime show"),
+            Err(CtlUsage::TwoEndpoints),
+            "one daemon at a time"
+        );
         assert!(matches!(
             command.action,
             CtlAction::Call {
