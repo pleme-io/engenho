@@ -524,7 +524,15 @@ impl Runtime {
         //    listeners, into ONE owned set that `main` watches. The parts
         //    they are built from are kept, so any of them can be built again.
         rec.enter_committed(BootPhase::SpawnChildren);
-        let parts = Parts::assemble(boot, store, backend, scheduler, &handler_sink, windows);
+        let parts = Parts::assemble(
+            boot,
+            store,
+            backend,
+            scheduler,
+            &handler_sink,
+            &router_state_for_logs,
+            windows,
+        );
         let children = spawn_children(&parts);
         info!(count = children.len(), "children spawned");
         // From here the health endpoints report every spawned child, each
@@ -3304,6 +3312,10 @@ struct Parts {
     events: Arc<dyn EventSink>,
     scheduler: Arc<ConfiguredSchedulerLoop>,
     kubelet: KubeletSlot,
+    /// The apiserver's own route table (the SAME Arc-backed state it
+    /// serves): the node-manifests driver applies through it, so a node's
+    /// declared objects take the path `kubectl apply --server-side` takes.
+    router: RouterState,
 }
 
 /// A child's shared piece built afresh before it is respawned
@@ -3324,6 +3336,7 @@ impl Parts {
         backend: &Arc<dyn ContainerRuntime>,
         scheduler: ConfiguredScheduler,
         handler_sink: &Arc<dyn DynamicHandlerSink>,
+        router: &RouterState,
         windows: Windows,
     ) -> Self {
         let ns = boot.controllers_namespace.clone();
@@ -3350,6 +3363,7 @@ impl Parts {
             events,
             scheduler,
             kubelet: Arc::new(ArcSwap::new(kubelet)),
+            router: router.clone(),
         }
     }
 
@@ -3634,6 +3648,19 @@ impl Parts {
                     self.boot.node_name.clone(),
                     std::path::PathBuf::from(CNI_CONFIG_DIR),
                     CNI_INSTALL,
+                ),
+            ),
+            // Node-declared manifests: server-side apply every object in
+            // `runtime.node_manifests_dir` through the apiserver's own
+            // router and prune what is no longer declared. It reads nothing
+            // from the store — the directory is polled by its fallback tick
+            // (`Windows::of_child`).
+            Driver::NodeManifests => self.watch(
+                driver,
+                crate::node_manifests::NodeManifestsController::new(
+                    self.boot.node_manifests_dir.clone(),
+                    &self.boot.data_dir,
+                    self.router.clone(),
                 ),
             ),
             // Kubelet: bound Pod → container via the backend.
@@ -4258,6 +4285,8 @@ mod tests {
             SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
         cfg.runtime.data_dir = std::env::temp_dir().join(unique);
+        // Hermetic: never the host's `/etc/engenho/manifests.d`.
+        cfg.runtime.node_manifests_dir = cfg.runtime.data_dir.join("manifests.d");
         cfg.controllers.fallback_interval_seconds = 1;
         cfg.controllers.debounce_milliseconds = 20;
         // Ephemeral ports for both listeners: parallel tests (or a real
@@ -4299,11 +4328,12 @@ mod tests {
         // converging that kind), so the arithmetic here is the tripwire.
         // Moving it is correct ONLY alongside an intentional change to the
         // driver set — which is what added served_capability, then
-        // volume_snapshot (19 → 20), and now pvc_protection (20 → 21, W9).
+        // volume_snapshot (19 → 20), then pvc_protection (20 → 21, W9), and
+        // now node_manifests (21 → 22).
         // Every driver in the catalog is on in this config, so it is also the
         // catalog's size.
-        assert_eq!(running_drivers(&rt), 21);
-        assert_eq!(Driver::ALL.len(), 21);
+        assert_eq!(running_drivers(&rt), 22);
+        assert_eq!(Driver::ALL.len(), 22);
         rt.shutdown().await.unwrap();
     }
 
@@ -4605,11 +4635,11 @@ mod tests {
     #[tokio::test]
     async fn disabling_service_routing_drops_one_driver() {
         // Gating works: turning off enable.service_routing removes exactly
-        // one spawned driver (21 → 20).
+        // one spawned driver (22 → 21).
         let mut cfg = ephemeral_test_config();
         cfg.controllers.enable.service_routing = false;
         let rt = Runtime::start(cfg).await.unwrap();
-        assert_eq!(running_drivers(&rt), 20);
+        assert_eq!(running_drivers(&rt), 21);
         assert!(
             rt.children()
                 .get(Child::Driver(Driver::ServiceRouting))
@@ -4681,6 +4711,7 @@ mod tests {
                 None
             )],
             Driver::CniStatus => vec![file!("engenho-controllers/src/cni_status.rs")],
+            Driver::NodeManifests => vec![file!("engenho-runtime/src/node_manifests.rs")],
             Driver::Kubelet => vec![file!("engenho-kubelet/src/kubelet.rs")],
         }
     }
@@ -4802,6 +4833,53 @@ mod tests {
         assert_eq!(wiring.reads().kinds(), Some(&[][..]));
         assert!(!wiring.wakes().wakes_on("CSINode"));
         assert!(!wiring.wakes().wakes_on("Pod"));
+    }
+
+    /// End to end: a booted runtime's `node-manifests` driver applies the
+    /// directory through its own apiserver on its first tick, stamped with
+    /// the driver's label, and wakes on no store event.
+    #[tokio::test]
+    async fn the_node_manifests_driver_applies_the_directory_at_boot() {
+        let cfg = ephemeral_test_config();
+        let dir = cfg.runtime.node_manifests_dir.clone();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("declared.yaml"),
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: node-declared\ndata:\n  k: v\n",
+        )
+        .unwrap();
+        let rt = Runtime::start(cfg).await.unwrap();
+        let wiring = rt
+            .children()
+            .get(Child::Driver(Driver::NodeManifests))
+            .and_then(ChildHandle::wiring)
+            .cloned()
+            .expect("the node-manifests driver is spawned with its wiring");
+        assert_eq!(wiring.reads().kinds(), Some(&[][..]));
+        assert!(!wiring.wakes().wakes_on("ConfigMap"));
+
+        let key = engenho_store::ResourceKey::namespaced(
+            "",
+            "v1",
+            "ConfigMap",
+            "default",
+            "node-declared",
+        );
+        let mut found = None;
+        for _ in 0..100 {
+            if let Some(v) = rt.store().get(&key).await {
+                found = Some(v);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        rt.shutdown().await.unwrap();
+        let object = found.expect("the declared ConfigMap was applied");
+        assert_eq!(object["data"]["k"], "v");
+        assert_eq!(
+            object["metadata"]["labels"][crate::node_manifests::DECLARED_BY_LABEL],
+            crate::node_manifests::DECLARED_BY_VALUE
+        );
     }
 
     // ── T5.11: every controller type is spawned or declared dormant ──────

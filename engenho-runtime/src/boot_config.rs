@@ -76,6 +76,8 @@ pub(crate) struct BootConfig {
     pub(crate) podman_binary: Option<String>,
     /// `runtime.host_path_allowlist`.
     pub(crate) host_path_allowlist: Vec<String>,
+    /// `runtime.node_manifests_dir`: what the `node-manifests` driver applies.
+    pub(crate) node_manifests_dir: PathBuf,
     /// `runtime.leadership_timeout_seconds`.
     pub(crate) leadership_timeout_seconds: u32,
     /// `runtime.tls`, as the apiserver serves it.
@@ -162,6 +164,7 @@ impl BootConfig {
             kubelet_backend,
             podman_binary,
             host_path_allowlist,
+            node_manifests_dir,
             leadership_timeout_seconds,
             tls,
         } = runtime;
@@ -182,6 +185,7 @@ impl BootConfig {
             kubelet_backend: *kubelet_backend,
             podman_binary: podman_binary.clone(),
             host_path_allowlist: host_path_allowlist.clone(),
+            node_manifests_dir: node_manifests_dir.clone(),
             leadership_timeout_seconds: *leadership_timeout_seconds,
             tls: ApiserverTls::read(tls)?,
             scheduler: scheduler.clone(),

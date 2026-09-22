@@ -257,6 +257,7 @@ fn build() -> Vec<LeafSpec> {
         kubelet_backend => restart,
         podman_binary => restart,
         host_path_allowlist => restart,
+        node_manifests_dir => restart,
         leadership_timeout_seconds => M::NextBoot,
         tls,
     });

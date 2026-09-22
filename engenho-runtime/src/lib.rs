@@ -151,6 +151,7 @@ mod health;
 #[cfg(test)]
 mod impl_census;
 mod node_lease;
+mod node_manifests;
 mod node_registration;
 mod panics;
 pub mod publish;

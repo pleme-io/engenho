@@ -75,6 +75,9 @@ shikumi             = "0.1.0"
 engenho-serve       = { workspace = true }
 # The KubeletLogReader adapter implements the apiserver's async PodLogReader trait.
 async-trait         = { workspace = true }
+# The node-manifests driver drives the apiserver's own router in-process
+# (`ServiceExt::oneshot`) — the path `kubectl apply --server-side` reaches.
+tower               = { workspace = true, features = ["util"] }
 # OS entropy for the bootstrap admin bearer token (no plaintext secret in the
 # tree; the token is minted + persisted 0600 at first boot).
 getrandom           = "0.3"

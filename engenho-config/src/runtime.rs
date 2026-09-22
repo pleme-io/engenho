@@ -137,6 +137,10 @@ pub enum KubeletBackendRefusal {
     CriIncomplete,
 }
 
+/// Where a node's declared manifests live unless its config says otherwise
+/// (`runtime.node_manifests_dir`).
+pub const DEFAULT_NODE_MANIFESTS_DIR: &str = "/etc/engenho/manifests.d";
+
 /// Process-level assembly config.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -353,6 +357,22 @@ pub struct RuntimeConfig {
     /// that.
     #[serde(default)]
     pub host_path_allowlist: Vec<String>,
+    /// The directory of NODE-DECLARED manifests: every `*.yaml` / `*.yml`
+    /// in it (multi-document files included) is server-side applied through
+    /// this node's own apiserver by the `node-manifests` driver, and every
+    /// object that driver applied which is no longer declared is pruned.
+    ///
+    /// ── ★ WHY A DIRECTORY AND NOT A GITOPS SOURCE ─────────────────────
+    /// It is the one input a node's own configuration management (NixOS
+    /// `environment.etc`, a darwin activation) can write without a running
+    /// cluster to talk to: the node declares its workloads the same way it
+    /// declares this file. A directory that does not exist declares
+    /// nothing — which, like an empty one, prunes what it once declared.
+    ///
+    /// Empty means "not set here": the tier below supplies it
+    /// (`/etc/engenho/manifests.d` at the prescribed tier).
+    #[serde(default)]
+    pub node_manifests_dir: PathBuf,
     /// How long to wait for raft leadership before the Runtime gives
     /// up at boot. Must be > 0.
     pub leadership_timeout_seconds: u32,
@@ -380,6 +400,7 @@ impl TieredConfig for RuntimeConfig {
             kubelet_backend: KubeletBackendKind::Fake,
             podman_binary: None,
             host_path_allowlist: Vec::new(),
+            node_manifests_dir: PathBuf::new(),
             leadership_timeout_seconds: 0,
             tls: TlsConfig::bare(),
         }
@@ -441,6 +462,7 @@ impl TieredConfig for RuntimeConfig {
             kubelet_backend: KubeletBackendKind::PodmanApi,
             podman_binary: None,
             host_path_allowlist: Vec::new(),
+            node_manifests_dir: PathBuf::from(DEFAULT_NODE_MANIFESTS_DIR),
             leadership_timeout_seconds: 10,
             tls: TlsConfig::prescribed_default(),
         }
@@ -506,6 +528,11 @@ impl TieredConfig for RuntimeConfig {
             kubeconfig_publish_visibility: self.kubeconfig_publish_visibility,
             podman_binary: self.podman_binary.or_else(|| base.podman_binary.clone()),
             host_path_allowlist: Vec::new(),
+            node_manifests_dir: if self.node_manifests_dir.as_os_str().is_empty() {
+                base.node_manifests_dir.clone()
+            } else {
+                self.node_manifests_dir
+            },
             leadership_timeout_seconds: if self.leadership_timeout_seconds == 0 {
                 base.leadership_timeout_seconds
             } else {
@@ -787,12 +814,20 @@ mod tests {
             kubelet_backend: KubeletBackendKind::Fake,
             podman_binary: None,
             host_path_allowlist: Vec::new(),
+            node_manifests_dir: PathBuf::new(),
             leadership_timeout_seconds: 0,
             tls: TlsConfig::bare(),
         };
         let base = RuntimeConfig::prescribed_default();
         let merged = overlay.extend(&base);
         assert_eq!(merged.listen_addr, "127.0.0.1:0");
+        // node_manifests_dir empty in overlay → falls back to base, which
+        // is the prescribed `/etc/engenho/manifests.d`.
+        assert_eq!(merged.node_manifests_dir, base.node_manifests_dir);
+        assert_eq!(
+            base.node_manifests_dir,
+            PathBuf::from(crate::DEFAULT_NODE_MANIFESTS_DIR)
+        );
         assert_eq!(merged.node_name, "node-A");
         // data_dir empty in overlay → falls back to base.
         assert_eq!(merged.data_dir, base.data_dir);

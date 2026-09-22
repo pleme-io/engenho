@@ -141,6 +141,17 @@ let
       ok = populated.runtime.listen_addr == "0.0.0.0:6443";
       got = builtins.toJSON (populated.runtime or { }); }
 
+    # The node-manifests directory: absent unless the operator names one,
+    # so engenho's own `/etc/engenho/manifests.d` default shows through.
+    { name = "node-manifests-dir-absent-unless-set";
+      ok = !(empty.runtime ? node_manifests_dir)
+        && (evalWith {
+             services.engenho.config.runtime.nodeManifestsDir = "/etc/engenho/manifests.d";
+           }).runtime.node_manifests_dir == "/etc/engenho/manifests.d";
+      got = builtins.toJSON (evalWith {
+              services.engenho.config.runtime.nodeManifestsDir = "/etc/engenho/manifests.d";
+            }); }
+
     { name = "nested-tls-is-projected";
       ok = populated.runtime.tls.enabled == false;
       got = builtins.toJSON (populated.runtime.tls or { }); }

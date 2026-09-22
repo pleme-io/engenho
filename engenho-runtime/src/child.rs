@@ -121,6 +121,7 @@ engenho_controllers::closed_enum! {
         NetworkPolicy,
         CsiRegistrar,
         CniStatus,
+        NodeManifests,
         Kubelet,
     }
 }
@@ -176,6 +177,7 @@ impl Driver {
             Self::NetworkPolicy => "network-policy",
             Self::CsiRegistrar => "csi-registrar",
             Self::CniStatus => "cni-status",
+            Self::NodeManifests => "node-manifests",
             Self::Kubelet => "kubelet",
         }
     }
@@ -198,7 +200,9 @@ impl Driver {
             | Self::VolumeSnapshot
             | Self::PvcProtection
             | Self::ServedCapability
-            | Self::CniStatus => TickState::Stateless,
+            | Self::CniStatus
+            // Its only memory is a skip cache; losing it costs one full pass.
+            | Self::NodeManifests => TickState::Stateless,
             // The `local` pod map lives across ticks.
             Self::Kubelet
             // The registered-handler map (a std Mutex) drives
@@ -244,6 +248,7 @@ impl Driver {
             | Self::NetworkPolicy
             | Self::CsiRegistrar
             | Self::CniStatus
+            | Self::NodeManifests
             | Self::Kubelet => None,
         }
     }
@@ -554,6 +559,7 @@ impl Child {
                 | Driver::PvcProtection
                 | Driver::ServedCapability
                 | Driver::CniStatus
+                | Driver::NodeManifests
                 | Driver::Scheduler
                 | Driver::NetworkPolicy => Respawn::Rebuild,
                 Driver::Kubelet => {

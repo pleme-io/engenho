@@ -221,6 +221,23 @@ in
         `/Users/x/data-evil`, and a path containing `..` is refused.
       '';
 
+      nodeManifestsDir = optional types.str ''
+        Directory of NODE-DECLARED manifests. Every `*.yaml` / `*.yml` in it
+        (multi-document files included) is server-side applied through this
+        node's own apiserver by the `node-manifests` driver, and every object
+        that driver applied which no file declares any more is DELETED.
+
+        Default, in engenho itself: `/etc/engenho/manifests.d` — so a NixOS
+        node declares its workloads with `environment.etc."engenho/manifests.d/
+        <name>.yaml"` and needs nothing here. Set it to point the driver
+        somewhere else (a per-user agent, a test node).
+
+        A directory that does not exist declares nothing, exactly like an
+        empty one: the objects it once declared are pruned. A file that fails
+        to parse HOLDS its own objects instead — a typo never deletes a
+        workload.
+      '';
+
       # `cri` is deliberately NOT offered. engenho refuses it when its config is
       # parsed (T5.9, pending-cri: the CRI backend still drops part of every
       # Pod), so offering it here would let a green eval render a config the
@@ -548,6 +565,7 @@ in
       remote_kubeconfig_publish_path = cfg.runtime.remoteKubeconfigPublishPath;
         kubelet_backend = cfg.runtime.kubeletBackend;
         host_path_allowlist = cfg.runtime.hostPathAllowlist;
+        node_manifests_dir = cfg.runtime.nodeManifestsDir;
         # DERIVED, never a second hand-list: an explicit `podmanBinary` wins,
         # else the package's own bin path. So "kubelet drives podman, with no
         # resolvable podman" is not constructible by default — reaching it now

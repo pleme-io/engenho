@@ -182,6 +182,10 @@ impl Windows {
     pub const fn of_child(self, child: Child) -> Self {
         match child {
             Child::Driver(Driver::Scheduler) => self.with_fallback(self.scheduler_fallback),
+            // No store event wakes it: the directory is polled.
+            Child::Driver(Driver::NodeManifests) => {
+                self.with_fallback(crate::node_manifests::POLL_INTERVAL)
+            }
             Child::NodeLease => self.node_lease(),
             Child::Driver(_) | Child::Listener(_) => self,
         }
@@ -970,6 +974,12 @@ mod tests {
                 Child::Driver(Driver::Scheduler) => assert_eq!(
                     pulse,
                     Pulse::Ticks(w.with_fallback(secs(SCHEDULER_FALLBACK_S))),
+                    "{child}"
+                ),
+                // Polled, not woken: its input is a directory.
+                Child::Driver(Driver::NodeManifests) => assert_eq!(
+                    pulse,
+                    Pulse::Ticks(w.with_fallback(crate::node_manifests::POLL_INTERVAL)),
                     "{child}"
                 ),
                 Child::Driver(_) => assert_eq!(pulse, Pulse::Ticks(w), "{child}"),

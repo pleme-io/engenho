@@ -141,7 +141,10 @@ pub use mutability::{Anchor, InertWhy, LeafSpec, LiveEffect, Mutability, Respawn
 pub use networking::{DatapathMode, NetworkingConfig, ResolvedDatapath, parse_ipv4_cidr};
 pub use node_local::{ListenerAddrRejection, LoopbackAddr, NodeLocalListener};
 pub use revoada::{RevoadaConfig, TopologyConfig, TopologyStrategyKind};
-pub use runtime::{KubeconfigVisibility, KubeletBackendKind, KubeletBackendRefusal, RuntimeConfig};
+pub use runtime::{
+    DEFAULT_NODE_MANIFESTS_DIR, KubeconfigVisibility, KubeletBackendKind, KubeletBackendRefusal,
+    RuntimeConfig,
+};
 pub use scheduler::{SchedulerConfig, SchedulerStrategyKind};
 pub use teia::TeiaConfig;
 pub use tls::TlsConfig;

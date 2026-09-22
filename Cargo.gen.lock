@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "134cbade7bdf8b329e90b4147fcec27acb972f18e731fc802407ad4a2b5e3f8a",
+  "cargo_lock_sha256": "a1d08e96621f30450e27bd02dcccd85d8e3c37e83790b6e3e297cabb9f0b5190",
   "manifest_sha256": {
     "Cargo.toml": "468f98c06a9a3961cb4d2949d07a354d16ffc39fe44219ec79d54b41ba346a6c",
     "engenho-apiserver/Cargo.toml": "a42bf1f662ba3dbab338a871c0979aa15dfb734a22435d96e36e65cfa47d5abf",
@@ -24,7 +24,7 @@
     "engenho-mcp/Cargo.toml": "a73d0471a92fe4eeb98d75f5ca945aeafcf56c6034e36f47d06bbf980ed9e369",
     "engenho-oracle/Cargo.toml": "9b0da2a6c1d469c28eb0617b8d71df0b0bf6db7751596956e0bb74a6ac979984",
     "engenho-revoada/Cargo.toml": "08cfd6e45e8acfb75f3073e3a70a9a11a9c33575c43509d0199b1e73bb8012f9",
-    "engenho-runtime/Cargo.toml": "72a78cdbcea75a22fe5875c42fceabc59878d7323da8876cc6a94d876985a9a9",
+    "engenho-runtime/Cargo.toml": "9ac5a85fe5ab99668515357c09a5fe12342e0717d0f5f5a6cb807ed51f199014",
     "engenho-scheduler/Cargo.toml": "b8e178bbb3012942524cd91c4f5e3c1160e11d2ec81eb81ce5f18bd1504426d1",
     "engenho-serve/Cargo.toml": "e91e4b03ebb3c2537969e30bce65f374c368c8e5a668006970524d2687023cd6",
     "engenho-store/Cargo.toml": "c1630fdd51788287b06e85c72280af36a0953aa3b94f751dd64137ae2c59d404",
@@ -7295,6 +7295,18 @@
               "transport"
             ],
             "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tower",
+            "package_key": "tower-0.5.3",
+            "kind": "normal",
+            "features": [
+              "util"
+            ],
+            "uses_default_features": true,
             "optional": false,
             "target": null,
             "tree": "target"

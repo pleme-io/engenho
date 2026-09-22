@@ -72,6 +72,7 @@ driver_names!(
     NetworkPolicy,
     CsiRegistrar,
     CniStatus,
+    NodeManifests,
     Kubelet,
 );
 
