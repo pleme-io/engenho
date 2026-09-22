@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use engenho_apiserver::pki_inventory::{self, CaFact, CertFact, FileFact};
 use engenho_config::{
-    ConfigTierKind, EngenhoConfig, GroupTier, ProvenanceMap, SocketAccess, TieredConfig,
+    ConfigTierKind, EngenhoConfig, GroupTier, LeafPath, ProvenanceMap, SocketAccess, TieredConfig,
 };
 use engenho_control_server::AuditLog;
 use engenho_control_types::ops::{
@@ -43,16 +43,19 @@ use super::configure::{
     ApplyOptions, leaf_path, reconfigure_refusal, restart_now, unreadable_overrides,
 };
 use super::logs::LogEntry;
-use super::names::{child_from_wire, child_kind, child_to_wire, death_to_wire, respawn_to_wire};
+use super::names::{
+    child_from_wire, child_kind, child_to_wire, death_to_wire, driver_from_wire, driver_to_wire,
+    respawn_to_wire,
+};
 use super::overrides::Change;
 use super::ring::{Page, Ring};
-use crate::child::{Child, ChildState};
+use crate::child::{Child, ChildState, RespawnError};
 use crate::lifecycle::journal::IdentityRecord;
 use crate::lifecycle::supervisor::{CommandError, file_digest};
 use crate::lifecycle::{
     ConfigSource, DaemonEvent, DataDirSource, ExitIntent, Hold, Inspection, LifecycleState,
-    PendingApply, RefusedBecause, ResolvedConfig, RuntimeFacts, Snapshot, StoreLock,
-    SupervisorHandle,
+    PendingApply, RefusedBecause, ResolvedConfig, RestartChildError, RuntimeFacts, Snapshot,
+    StoreLock, SupervisorHandle,
 };
 use crate::publish::{KubeconfigTarget, PublishRecord, SkipReason};
 use crate::runtime::STORE_DIR;
@@ -184,11 +187,11 @@ impl DaemonControl {
             | O::UnsetConfigLeaf
             | O::ClearConfigOverrides
             | O::ReloadConfig
-            | O::PublishKubeconfig => true,
-            O::RestartChild
+            | O::PublishKubeconfig
+            | O::RestartChild
             | O::EnableDriver
-            | O::DisableDriver
-            | O::CreateConfirmation
+            | O::DisableDriver => true,
+            O::CreateConfirmation
             | O::CancelConfirmation
             | O::RotateAdminToken
             | O::ReseedPki
@@ -316,35 +319,70 @@ impl DaemonControl {
         Child::all()
             .map(|child| {
                 let fact = facts.children.iter().find(|f| f.child == child);
-                let (state, last_death) = match fact {
-                    None => (types::ChildState::Disabled, types::LastDeath::Never),
-                    Some(f) => match f.state {
-                        ChildState::Running => (
-                            types::ChildState::Running {
-                                since: f.spawned_at.utc(),
-                            },
-                            types::LastDeath::Never,
-                        ),
-                        ChildState::Dead(cause) => {
-                            let at = f.ended_at.unwrap_or(f.spawned_at).utc();
-                            let cause = death_to_wire(cause);
-                            (
-                                types::ChildState::Dead { at, cause },
-                                types::LastDeath::Recorded { at, cause },
-                            )
-                        }
+                let state = fact.map_or(types::ChildState::Disabled, |f| match f.state {
+                    ChildState::Running => types::ChildState::Running {
+                        since: f.spawned_at.utc(),
                     },
-                };
+                    ChildState::Dead(cause) => types::ChildState::Dead {
+                        at: f.ended_at.unwrap_or(f.spawned_at).utc(),
+                        cause: death_to_wire(cause),
+                    },
+                });
+                let last_death =
+                    fact.and_then(|f| f.last_death)
+                        .map_or(types::LastDeath::Never, |death| {
+                            types::LastDeath::Recorded {
+                                at: death.at.utc(),
+                                cause: death_to_wire(death.cause),
+                            }
+                        });
                 types::ChildView {
                     child: child_to_wire(child),
                     kind: child_kind(child),
                     state,
-                    generation: 0,
+                    generation: fact.map_or(0, |f| f.generation),
                     last_death,
                     respawn: respawn_to_wire(child.respawn()),
                 }
             })
             .collect()
+    }
+
+    /// `children enable|disable`: the driver's `controllers.enable` switch,
+    /// set as a persisted override through the one apply pipeline — so it is
+    /// gated, audited and reported exactly as `config set` of that leaf is.
+    async fn toggle_driver(
+        &self,
+        by: &Principal,
+        name: types::DriverName,
+        enabled: bool,
+    ) -> Result<types::DriverToggleReport, ControlError> {
+        let driver = driver_from_wire(name);
+        let Some(switch) = driver.switch() else {
+            return Err(ControlError::refused_with(
+                RefusalReason::InvalidValue,
+                [
+                    name.to_string().as_str(),
+                    " always runs: no controllers.enable switch turns it on or off",
+                ]
+                .concat(),
+                vec![["engenho ctl children restart ", name.to_string().as_str()].concat()],
+            ));
+        };
+        let path = LeafPath::parse(switch.leaf()).map_err(internal)?;
+        let body = types::SetLeafRequest {
+            dry_run: false,
+            persist: true,
+            precondition_generation: None,
+            restart_policy: None,
+            value: serde_json::Value::Bool(enabled),
+        };
+        let apply = self.set(by, path, body).await?;
+        Ok(types::DriverToggleReport {
+            driver: name,
+            enabled,
+            apply,
+        })
     }
 
     fn identity(
@@ -440,12 +478,48 @@ fn gone(err: CommandError) -> ControlError {
     refusal(err)
 }
 
+fn supervisor_gone() -> ControlError {
+    ControlError::blind(BlindReason::Internal, "the daemon's supervisor has ended")
+}
+
+/// A child restart's refusal in the control API's vocabulary.
+fn restart_refusal(err: &RestartChildError) -> ControlError {
+    let because = err.to_string();
+    let legal = |hint: &str| vec![hint.to_owned()];
+    match *err {
+        RestartChildError::Gone => supervisor_gone(),
+        RestartChildError::NotRunning => ControlError::refused_with(
+            RefusalReason::RuntimeNotRunning,
+            because,
+            legal("engenho ctl runtime start"),
+        ),
+        RestartChildError::Refused(RespawnError::RuntimeRestartOnly(_)) => {
+            ControlError::refused_with(
+                RefusalReason::RespawnRefused,
+                because,
+                legal("engenho ctl runtime restart"),
+            )
+        }
+        RestartChildError::Refused(RespawnError::NotSpawned(child)) => {
+            let enable = match child {
+                Child::Driver(driver) if driver.switch().is_some() => {
+                    let name = driver_to_wire(driver).to_string();
+                    legal(&["engenho ctl children enable ", name.as_str()].concat())
+                }
+                Child::Driver(_) | Child::Listener(_) | Child::NodeLease => Vec::new(),
+            };
+            ControlError::refused_with(RefusalReason::RespawnRefused, because, enable)
+        }
+        RestartChildError::Refused(RespawnError::Build { .. }) => {
+            ControlError::blind(BlindReason::Internal, because)
+        }
+    }
+}
+
 /// A supervisor refusal in the control API's vocabulary.
 fn refusal(err: CommandError) -> ControlError {
     match err {
-        CommandError::Gone => {
-            ControlError::blind(BlindReason::Internal, "the daemon's supervisor has ended")
-        }
+        CommandError::Gone => supervisor_gone(),
         CommandError::Refused(r) => {
             let (reason, legal): (RefusalReason, &[&str]) = match r.reason {
                 RefusedBecause::RuntimeRunning => (
@@ -596,6 +670,12 @@ fn event_kind(event: &DaemonEvent) -> Result<types::ControlEventKind, ControlErr
             child: child_to_wire(*child),
             cause: death_to_wire(*cause),
         },
+        DaemonEvent::ChildRespawned { child, generation } => {
+            types::ControlEventKind::ChildRespawned {
+                child: child_to_wire(*child),
+                generation: *generation,
+            }
+        }
         DaemonEvent::ConfigApplied {
             generation,
             leaves,
@@ -947,25 +1027,35 @@ impl EngenhoControl for DaemonControl {
     async fn restart_child(
         &self,
         _: &Principal,
-        _: RestartChildRequest,
+        req: RestartChildRequest,
     ) -> Result<types::RespawnReport, ControlError> {
-        Err(unsupported(OperationId::RestartChild, "child control"))
+        let respawned = self
+            .p
+            .supervisor
+            .restart_child(child_from_wire(req.child))
+            .await
+            .map_err(|e| restart_refusal(&e))?;
+        Ok(types::RespawnReport {
+            child: child_to_wire(respawned.child),
+            generation: respawned.generation,
+            rebuilt: respawned.rebuilt.into_iter().map(child_to_wire).collect(),
+        })
     }
 
     async fn enable_driver(
         &self,
-        _: &Principal,
-        _: EnableDriverRequest,
+        by: &Principal,
+        req: EnableDriverRequest,
     ) -> Result<types::DriverToggleReport, ControlError> {
-        Err(unsupported(OperationId::EnableDriver, "child control"))
+        self.toggle_driver(by, req.driver, true).await
     }
 
     async fn disable_driver(
         &self,
-        _: &Principal,
-        _: DisableDriverRequest,
+        by: &Principal,
+        req: DisableDriverRequest,
     ) -> Result<types::DriverToggleReport, ControlError> {
-        Err(unsupported(OperationId::DisableDriver, "child control"))
+        self.toggle_driver(by, req.driver, false).await
     }
 
     async fn get_pki(

@@ -36,8 +36,8 @@ pub enum Mutability {
         /// How.
         effect: LiveEffect,
     },
-    /// Takes a set of children respawning (a runtime restart until they can
-    /// be respawned one by one).
+    /// Applied to the running runtime by spawning, stopping or rebuilding a
+    /// set of its children.
     Respawn {
         /// Which set.
         set: RespawnSet,
@@ -107,14 +107,10 @@ impl Mutability {
         !matches!(self, Self::NotOverridable { .. })
     }
 
-    /// Whether the running runtime can take the change without a restart:
-    /// it is applied (live) or has nothing to apply (inert).
-    #[must_use]
-    pub const fn applies_in_place(self) -> bool {
-        matches!(self, Self::Inert { .. } | Self::Live { .. })
-    }
-
-    /// Whether the running runtime reflects the change only after a restart.
+    /// Whether a change the running runtime has not taken waits for a
+    /// restart. A `Respawn` leaf usually is taken, by moving children; the
+    /// runtime decides which it cannot take (a switch over a driver that is
+    /// not spawned alone), and those wait.
     #[must_use]
     pub const fn needs_restart(self) -> bool {
         matches!(self, Self::Respawn { .. } | Self::RestartRuntime)

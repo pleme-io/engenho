@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "14e9789cebdbc1919176ee29b688565a0eaa0bfbe6c79780d6360bee11ddbfa7",
+  "cargo_lock_sha256": "24b74184963e1df2a0617d9c53110ffab11e2ebb9272f2653e8bec93e961e385",
   "manifest_sha256": {
     "Cargo.toml": "998e174c9668f10229291ded499f005bf0b38b8c8de62715b8d1eb54baa4eee3",
     "engenho-apiserver/Cargo.toml": "a42bf1f662ba3dbab338a871c0979aa15dfb734a22435d96e36e65cfa47d5abf",
@@ -24,7 +24,7 @@
     "engenho-mcp/Cargo.toml": "dc06fc92995d436359c7da1e38aff4fa8fbd4ed1bdb9f70d815f1e0d27163086",
     "engenho-oracle/Cargo.toml": "9b0da2a6c1d469c28eb0617b8d71df0b0bf6db7751596956e0bb74a6ac979984",
     "engenho-revoada/Cargo.toml": "08cfd6e45e8acfb75f3073e3a70a9a11a9c33575c43509d0199b1e73bb8012f9",
-    "engenho-runtime/Cargo.toml": "0d017be5dc4063ff8c782a4d7a263c7d99301121a76a2dcb0f3add1dfd978e0b",
+    "engenho-runtime/Cargo.toml": "72a78cdbcea75a22fe5875c42fceabc59878d7323da8876cc6a94d876985a9a9",
     "engenho-scheduler/Cargo.toml": "b8e178bbb3012942524cd91c4f5e3c1160e11d2ec81eb81ce5f18bd1504426d1",
     "engenho-serve/Cargo.toml": "e91e4b03ebb3c2537969e30bce65f374c368c8e5a668006970524d2687023cd6",
     "engenho-store/Cargo.toml": "c1630fdd51788287b06e85c72280af36a0953aa3b94f751dd64137ae2c59d404",
@@ -6960,6 +6960,16 @@
       },
       "engenho-runtime-0.53.118": {
         "runtime_dependencies": [
+          {
+            "name": "arc_swap",
+            "package_key": "arc-swap-1.9.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
           {
             "name": "async_trait",
             "package_key": "async-trait-0.1.89",

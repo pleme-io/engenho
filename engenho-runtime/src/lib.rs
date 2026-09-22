@@ -163,7 +163,8 @@ mod testing;
 
 pub use boot_config::{PkiField, Unhonoured};
 pub use child::{
-    Child, ChildHandle, ChildState, Children, DeadChild, DeathCause, Driver, Fault, Listener,
+    Child, ChildHandle, ChildState, Children, ChildrenFollowed, DeadChild, Death, DeathCause,
+    Driver, EnableSwitch, Fault, Listener, Respawn, RespawnError, Respawned, StillRunning,
     Supervision, TickState, Wiring,
 };
 pub use dormant::{Dormant, DormantReason};

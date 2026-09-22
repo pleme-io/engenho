@@ -33,8 +33,12 @@
 //!   [`Child::all`]; a new top-level shape is caught by a test, not a type.
 //! * A child that dies unseen: every child's task is owned by one
 //!   [`Children`] set. [`Children::next_dead`] is how `main` learns that one
-//!   ended; it is marked [`ChildState::Dead`] and logged at ERROR. There is
-//!   no respawn.
+//!   ended; it is marked [`ChildState::Dead`] and logged at ERROR. Nothing
+//!   respawns it on its own: an operator does ([`crate::Runtime::respawn`],
+//!   `engenho ctl children restart`), by [`Child::respawn`]'s row.
+//! * A child with two tasks: [`Children::spawn_one`] refuses a child that
+//!   runs, so a respawn stops it first ([`Children::stop_one`]) — a type
+//!   (`Result`) the caller cannot ignore, not a convention.
 //! * A child built before the sibling it watches: the walk hands each
 //!   child's builder the children spawned so far, and the one child that
 //!   watches another (the node lease, which watches the kubelet) is walked
@@ -75,7 +79,7 @@
 
 #![deny(clippy::wildcard_enum_match_arm)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::fmt;
 use std::future::Future;
@@ -86,7 +90,7 @@ use engenho_config::ControllerEnable;
 pub use engenho_controllers::TickState;
 use engenho_controllers::{ControllerType, Heartbeat, KindFilter, PanicMessage, Reads};
 use tokio::task::{AbortHandle, Id, JoinSet};
-use tracing::error;
+use tracing::{error, info};
 
 use crate::boot::Timestamp;
 use crate::boot_config::BootConfig;
@@ -212,13 +216,117 @@ impl Driver {
         }
     }
 
+    /// The `controllers.enable` switch that turns this driver on; `None` for
+    /// a driver with no switch, which always runs.
+    #[must_use]
+    pub const fn switch(self) -> Option<EnableSwitch> {
+        use EnableSwitch as S;
+        match self {
+            Self::Deployment => Some(S::Deployment),
+            Self::ReplicaSet => Some(S::Replicaset),
+            Self::StatefulSet => Some(S::Statefulset),
+            Self::DaemonSet => Some(S::Daemonset),
+            Self::Job => Some(S::Job),
+            Self::CronJob => Some(S::Cronjob),
+            Self::PodDisruptionBudget => Some(S::Pdb),
+            Self::Endpoints => Some(S::Endpoints),
+            Self::ServiceRouting => Some(S::ServiceRouting),
+            Self::Gc => Some(S::Gc),
+            Self::Namespace => Some(S::Namespace),
+            // The snapshot controller snapshots the directories the binder
+            // provisions; enabling one without the other yields a controller
+            // that can only ever decline. pvc-protection guards the claims the
+            // binder binds, so it runs whenever the binder does.
+            Self::PvBinder | Self::VolumeSnapshot | Self::PvcProtection => Some(S::PvBinder),
+            Self::Crd => Some(S::Crd),
+            Self::Scheduler
+            | Self::ServedCapability
+            | Self::NetworkPolicy
+            | Self::CsiRegistrar
+            | Self::CniStatus
+            | Self::Kubelet => None,
+        }
+    }
+
     /// Whether `controllers.enable` turns this driver on. The drivers with
     /// no switch always run.
-    ///
-    /// The one reader of `controllers.enable`, destructured with no `..`
-    /// (I21): a new switch is E0027 here until a driver answers to it.
     #[must_use]
     pub const fn enabled(self, enable: &ControllerEnable) -> bool {
+        match self.switch() {
+            Some(switch) => switch.read(enable),
+            None => true,
+        }
+    }
+}
+
+engenho_controllers::closed_enum! {
+    /// One `controllers.enable` switch: the leaf the control plane toggles a
+    /// driver by ([`Driver::switch`]).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub enum EnableSwitch {
+        /// `replicaset`.
+        Replicaset,
+        /// `deployment`.
+        Deployment,
+        /// `statefulset`.
+        Statefulset,
+        /// `daemonset`.
+        Daemonset,
+        /// `job`.
+        Job,
+        /// `cronjob`.
+        Cronjob,
+        /// `endpoints`.
+        Endpoints,
+        /// `service_routing`.
+        ServiceRouting,
+        /// `gc`.
+        Gc,
+        /// `crd`.
+        Crd,
+        /// `namespace`.
+        Namespace,
+        /// `pv_binder`: the binder, the snapshot controller and pvc-protection.
+        PvBinder,
+        /// `pdb`.
+        Pdb,
+    }
+}
+
+impl EnableSwitch {
+    /// The switch whose leaf is `path`.
+    #[must_use]
+    pub fn of_leaf(path: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|switch| switch.leaf() == path)
+    }
+
+    /// The drivers it turns on and off.
+    pub fn drivers(self) -> impl Iterator<Item = Driver> {
+        Driver::ALL
+            .iter()
+            .copied()
+            .filter(move |driver| driver.switch() == Some(self))
+    }
+
+    /// Whether flipping it can be applied to a running runtime: every driver
+    /// it gates can be spawned and stopped alone ([`Child::respawn`]). A
+    /// switch that gates one that cannot waits for a runtime restart.
+    #[must_use]
+    pub fn toggles_live(self) -> bool {
+        self.drivers()
+            .all(|driver| Child::Driver(driver).respawn() != Respawn::RuntimeRestartOnly)
+    }
+
+    /// The switch's value in `enable`.
+    ///
+    /// The one reader of `controllers.enable`, destructured with no `..`
+    /// (I21): a new switch is E0027 here until it is named — and, being a
+    /// new variant, E0004 in [`Self::leaf`] until it has a leaf.
+    #[must_use]
+    pub const fn read(self, enable: &ControllerEnable) -> bool {
         let ControllerEnable {
             replicaset,
             deployment,
@@ -234,30 +342,40 @@ impl Driver {
             pv_binder,
             pdb,
         } = enable;
+        *match self {
+            Self::Replicaset => replicaset,
+            Self::Deployment => deployment,
+            Self::Statefulset => statefulset,
+            Self::Daemonset => daemonset,
+            Self::Job => job,
+            Self::Cronjob => cronjob,
+            Self::Endpoints => endpoints,
+            Self::ServiceRouting => service_routing,
+            Self::Gc => gc,
+            Self::Crd => crd,
+            Self::Namespace => namespace,
+            Self::PvBinder => pv_binder,
+            Self::Pdb => pdb,
+        }
+    }
+
+    /// Its configuration leaf, dotted.
+    #[must_use]
+    pub const fn leaf(self) -> &'static str {
         match self {
-            Self::Deployment => *deployment,
-            Self::ReplicaSet => *replicaset,
-            Self::StatefulSet => *statefulset,
-            Self::DaemonSet => *daemonset,
-            Self::Job => *job,
-            Self::CronJob => *cronjob,
-            Self::PodDisruptionBudget => *pdb,
-            Self::Endpoints => *endpoints,
-            Self::ServiceRouting => *service_routing,
-            Self::Gc => *gc,
-            Self::Namespace => *namespace,
-            // The snapshot controller snapshots the directories the binder
-            // provisions; enabling one without the other yields a controller
-            // that can only ever decline. pvc-protection guards the claims the
-            // binder binds, so it runs whenever the binder does.
-            Self::PvBinder | Self::VolumeSnapshot | Self::PvcProtection => *pv_binder,
-            Self::Crd => *crd,
-            Self::Scheduler
-            | Self::ServedCapability
-            | Self::NetworkPolicy
-            | Self::CsiRegistrar
-            | Self::CniStatus
-            | Self::Kubelet => true,
+            Self::Replicaset => "controllers.enable.replicaset",
+            Self::Deployment => "controllers.enable.deployment",
+            Self::Statefulset => "controllers.enable.statefulset",
+            Self::Daemonset => "controllers.enable.daemonset",
+            Self::Job => "controllers.enable.job",
+            Self::Cronjob => "controllers.enable.cronjob",
+            Self::Endpoints => "controllers.enable.endpoints",
+            Self::ServiceRouting => "controllers.enable.service_routing",
+            Self::Gc => "controllers.enable.gc",
+            Self::Crd => "controllers.enable.crd",
+            Self::Namespace => "controllers.enable.namespace",
+            Self::PvBinder => "controllers.enable.pv_binder",
+            Self::Pdb => "controllers.enable.pdb",
         }
     }
 }
@@ -296,6 +414,15 @@ impl Listener {
         match self {
             Self::KubeletHttp => true,
             Self::EtcdFacade => !boot.etcd_listen_addr.is_empty(),
+        }
+    }
+
+    /// The address the config binds it at.
+    #[must_use]
+    pub(crate) fn listen_addr(self, boot: &BootConfig) -> &str {
+        match self {
+            Self::KubeletHttp => &boot.kubelet_listen_addr,
+            Self::EtcdFacade => &boot.etcd_listen_addr,
         }
     }
 }
@@ -382,6 +509,19 @@ impl Child {
             // The lease proves the kubelet alive: with no kubelet there is
             // nothing for it to renew by.
             Self::NodeLease => Driver::Kubelet.enabled(&boot.enable),
+        }
+    }
+
+    /// Whether a child both `before` and `after` spawn is built differently
+    /// by them, and so is rebuilt to follow a change applied in place: a
+    /// listener moved to a new address. No driver's body reads a leaf the
+    /// control plane applies in place (those are the kubeconfig publish
+    /// leaves, the switches, and the listen addresses).
+    #[must_use]
+    pub(crate) fn rebuilt_between(self, before: &BootConfig, after: &BootConfig) -> bool {
+        match self {
+            Self::Listener(l) => l.listen_addr(before) != l.listen_addr(after),
+            Self::Driver(_) | Self::NodeLease => false,
         }
     }
 
@@ -671,8 +811,73 @@ pub enum ChildState {
     /// Its task has not ended. Whether it is making progress is the
     /// heartbeat's to say, not this.
     Running,
-    /// Its task ended. It is not respawned.
+    /// Its task ended. Nothing respawns it but an operator
+    /// (`engenho ctl children restart`).
     Dead(DeathCause),
+}
+
+/// How and when a child's task last ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Death {
+    /// When the supervisor saw it end.
+    pub at: Timestamp,
+    /// How.
+    pub cause: DeathCause,
+}
+
+/// Whether a task that ended by `cause` ended because it was being stopped
+/// (`stopping`): only an abort asked for is a stop. A child being stopped
+/// that panicked first still died, and is logged as a death.
+const fn stopped_on_purpose(stopping: bool, cause: DeathCause) -> bool {
+    stopping && matches!(cause, DeathCause::Cancelled)
+}
+
+/// A child is already running: stop it before spawning it again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("{0} is running")]
+pub struct StillRunning(pub Child);
+
+/// A child built again ([`crate::Runtime::respawn`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Respawned {
+    /// The child asked for.
+    pub child: Child,
+    /// Its generation now.
+    pub generation: u64,
+    /// Every child rebuilt: it first, then its dependents.
+    pub rebuilt: Vec<Child>,
+    /// Children that died on their own while these were stopped: the
+    /// caller's to report, as [`Children::next_dead`]'s are.
+    pub died: Vec<DeadChild>,
+}
+
+/// Why a child was not built again.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RespawnError {
+    /// Only a runtime restart rebuilds it ([`Respawn::RuntimeRestartOnly`]).
+    #[error("{0} is rebuilt only by restarting the runtime")]
+    RuntimeRestartOnly(Child),
+    /// The configuration does not spawn it.
+    #[error("{0} is not spawned: the configuration disables it")]
+    NotSpawned(Child),
+    /// What it shares with the runtime could not be built again; it was
+    /// left as it was.
+    #[error("{child} could not be built again: {reason}")]
+    Build {
+        /// Which.
+        child: Child,
+        /// Why.
+        reason: String,
+    },
+}
+
+/// What bringing the children to a configuration applied in place did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChildrenFollowed {
+    /// Every child stopped, spawned or rebuilt.
+    pub changed: Vec<Child>,
+    /// Children that died on their own meanwhile.
+    pub died: Vec<DeadChild>,
 }
 
 /// A child whose task ended, as [`Children::next_dead`] reports it.
@@ -703,9 +908,25 @@ pub struct ChildHandle {
     spawned_at: Timestamp,
     /// When the supervisor saw it end.
     ended_at: Option<Timestamp>,
+    /// How many times it has been spawned again since the first (0: never).
+    generation: u64,
+    /// How the latest of its tasks that ended ended — kept across respawns.
+    last_death: Option<Death>,
 }
 
 impl ChildHandle {
+    /// How many times the child has been spawned again since the first.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// How its latest task that ended ended; `None` if none ever has.
+    #[must_use]
+    pub const fn last_death(&self) -> Option<Death> {
+        self.last_death
+    }
+
     /// When the task was spawned.
     #[must_use]
     pub const fn spawned_at(&self) -> Timestamp {
@@ -750,14 +971,18 @@ impl ChildHandle {
 
 /// The runtime's owned children: one task set, and which child each task is.
 ///
-/// Built only by [`Children::spawn_catalog`], which walks [`Child::all`] once,
-/// so no child is spawned twice and none is spawned from outside the catalog.
-/// Dropping the set aborts every task in it.
+/// Built by [`Children::spawn_catalog`], which walks [`Child::all`] once.
+/// After that a child is spawned again only by [`Children::spawn_one`], which
+/// refuses one still running — so no child ever has two tasks — and none is
+/// spawned from outside the catalog. Dropping the set aborts every task in it.
 #[derive(Debug, Default)]
 pub struct Children {
     set: JoinSet<Infallible>,
     by_task: HashMap<Id, Child>,
     entries: BTreeMap<Child, ChildHandle>,
+    /// Children being stopped on purpose: their end is logged as a stop, not
+    /// as a death.
+    stopping: BTreeSet<Child>,
 }
 
 impl Children {
@@ -780,9 +1005,37 @@ impl Children {
         children
     }
 
-    /// Spawn one child. Private: only [`Self::spawn_catalog`] (which visits
-    /// each child once) and this module's tests reach it.
+    /// Spawn one child for the first time. Private: only
+    /// [`Self::spawn_catalog`] (which visits each child once) and this
+    /// module's tests reach it.
     fn spawn(&mut self, child: Child, task: ChildTask) {
+        self.install(child, task, 0, None);
+    }
+
+    /// Spawn `child` — for the first time (a driver enabled after boot), or
+    /// again after its task ended — keeping its last death, one generation
+    /// on. Returns its generation.
+    ///
+    /// # Errors
+    ///
+    /// [`StillRunning`]: a child has one task at a time.
+    pub(crate) fn spawn_one(&mut self, child: Child, task: ChildTask) -> Result<u64, StillRunning> {
+        let (generation, last_death) = match self.entries.get(&child) {
+            Some(entry) if entry.state == ChildState::Running => return Err(StillRunning(child)),
+            Some(entry) => (entry.generation.saturating_add(1), entry.last_death),
+            None => (0, None),
+        };
+        self.install(child, task, generation, last_death);
+        Ok(generation)
+    }
+
+    fn install(
+        &mut self,
+        child: Child,
+        task: ChildTask,
+        generation: u64,
+        last_death: Option<Death>,
+    ) {
         let abort = self.set.spawn(task.run);
         self.by_task.insert(abort.id(), child);
         self.entries.insert(
@@ -795,8 +1048,51 @@ impl Children {
                 state: ChildState::Running,
                 spawned_at: Timestamp::now(),
                 ended_at: None,
+                generation,
+                last_death,
             },
         );
+    }
+
+    /// Stop `child`: abort its task and wait for it to end; it is then Dead
+    /// (cancelled). Returns every child whose task ended meanwhile — `child`
+    /// itself, and any other that happened to die, which is marked and
+    /// logged as [`Self::next_dead`] would. Empty when `child` was not
+    /// running.
+    pub(crate) async fn stop_one(&mut self, child: Child) -> Vec<DeadChild> {
+        let Some(entry) = self.entries.get(&child) else {
+            return Vec::new();
+        };
+        if entry.state != ChildState::Running {
+            return Vec::new();
+        }
+        self.stopping.insert(child);
+        entry.task.abort();
+        let mut ended = Vec::new();
+        loop {
+            let dead = self.next_dead().await;
+            ended.push(dead);
+            if dead.child == child {
+                return ended;
+            }
+        }
+    }
+
+    /// Forget a child that is not running, as if the config had never
+    /// enabled it (a driver disabled after boot). Its health row goes with
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// [`StillRunning`]: stop it first.
+    pub(crate) fn forget(&mut self, child: Child) -> Result<(), StillRunning> {
+        match self.entries.get(&child) {
+            Some(entry) if entry.state == ChildState::Running => Err(StillRunning(child)),
+            Some(_) | None => {
+                self.entries.remove(&child);
+                Ok(())
+            }
+        }
     }
 
     /// Every spawned child as health reads it, in catalog order: what it
@@ -813,8 +1109,9 @@ impl Children {
     }
 
     /// Wait for the next child whose task ends, mark it
-    /// [`ChildState::Dead`], count a panic in its heartbeat, and log it at
-    /// ERROR. It is not respawned.
+    /// [`ChildState::Dead`], count a panic in its heartbeat, and log it — at
+    /// ERROR, unless it was being stopped on purpose ([`Self::stop_one`]).
+    /// Nothing respawns it here.
     ///
     /// Pends forever when no task is left, so a caller selecting on this
     /// beside its stop signal never spins. Cancel-safe: it holds no state
@@ -846,19 +1143,25 @@ impl Children {
                 error!(%task, %cause, "a runtime task with no catalog entry ended");
                 continue;
             };
+            let at = Timestamp::now();
             if let Some(entry) = self.entries.get_mut(&child) {
                 entry.state = ChildState::Dead(cause);
-                entry.ended_at = Some(Timestamp::now());
+                entry.ended_at = Some(at);
+                entry.last_death = Some(Death { at, cause });
                 if cause == DeathCause::Panicked {
                     entry.beat.record_panic();
                 }
             }
-            error!(
-                %child,
-                %cause,
-                panic = panic.as_ref().map(tracing::field::display),
-                "runtime child ended; it is Dead and will not be respawned"
-            );
+            if stopped_on_purpose(self.stopping.remove(&child), cause) {
+                info!(%child, "runtime child stopped");
+            } else {
+                error!(
+                    %child,
+                    %cause,
+                    panic = panic.as_ref().map(tracing::field::display),
+                    "runtime child ended; it is Dead until an operator restarts it"
+                );
+            }
             return DeadChild { child, cause };
         }
     }
@@ -868,11 +1171,16 @@ impl Children {
     pub(crate) async fn stop(&mut self) {
         self.set.shutdown().await;
         self.by_task.clear();
+        self.stopping.clear();
         let at = Timestamp::now();
         for entry in self.entries.values_mut() {
             if entry.state == ChildState::Running {
                 entry.state = ChildState::Dead(DeathCause::Cancelled);
                 entry.ended_at = Some(at);
+                entry.last_death = Some(Death {
+                    at,
+                    cause: DeathCause::Cancelled,
+                });
             }
         }
     }
@@ -1145,5 +1453,157 @@ mod tests {
                 .iter()
                 .all(|(_, e)| e.state() == ChildState::Dead(DeathCause::Cancelled))
         );
+    }
+
+    /// Only an abort that was asked for is a stop; anything else is a death,
+    /// logged as one.
+    #[test]
+    fn only_an_asked_for_abort_is_a_stop() {
+        assert!(stopped_on_purpose(true, DeathCause::Cancelled));
+        assert!(!stopped_on_purpose(true, DeathCause::Panicked));
+        assert!(!stopped_on_purpose(false, DeathCause::Cancelled));
+        assert!(!stopped_on_purpose(false, DeathCause::Panicked));
+    }
+
+    /// A child has one task at a time: spawning it again is refused while it
+    /// runs, and after it dies it comes back one generation on, still
+    /// carrying how it last died.
+    #[tokio::test]
+    async fn a_dead_child_respawns_one_generation_on_with_its_death_kept() {
+        let mut children = Children::default();
+        let child = Child::Driver(Driver::Gc);
+        children.spawn(child, body(async { panic!("first life") }).1);
+        let first = children.get(child).expect("spawned");
+        assert_eq!(first.generation(), 0);
+        assert_eq!(first.last_death(), None);
+        assert_eq!(
+            children.spawn_one(child, body(std::future::pending()).1),
+            Err(StillRunning(child)),
+            "a running child was given a second task"
+        );
+
+        let dead = tokio::time::timeout(DEADLINE, children.next_dead())
+            .await
+            .expect("reported");
+        assert_eq!(dead.cause, DeathCause::Panicked);
+        assert_eq!(
+            children.spawn_one(child, body(std::future::pending()).1),
+            Ok(1)
+        );
+
+        let handle = children.get(child).expect("respawned");
+        assert_eq!(handle.state(), ChildState::Running);
+        assert_eq!(handle.generation(), 1);
+        assert_eq!(
+            handle.last_death().map(|d| d.cause),
+            Some(DeathCause::Panicked),
+            "the respawn forgot how its previous task ended"
+        );
+        assert_eq!(handle.ended_at(), None);
+    }
+
+    /// Stopping one child ends it alone, and says so; its siblings keep
+    /// running, and a child not running is left as it is.
+    #[tokio::test]
+    async fn stopping_one_child_leaves_its_siblings_running() {
+        let mut children = Children::default();
+        let (target, sibling) = (
+            Child::Listener(Listener::KubeletHttp),
+            Child::Driver(Driver::Kubelet),
+        );
+        children.spawn(target, body(std::future::pending()).1);
+        children.spawn(sibling, body(std::future::pending()).1);
+
+        let ended = tokio::time::timeout(DEADLINE, children.stop_one(target))
+            .await
+            .expect("the stop finished");
+
+        assert_eq!(
+            ended,
+            [DeadChild {
+                child: target,
+                cause: DeathCause::Cancelled
+            }]
+        );
+        assert_eq!(children.running().collect::<Vec<_>>(), [sibling]);
+        assert!(
+            children.stopping.is_empty(),
+            "a finished stop is still pending"
+        );
+        assert!(children.stop_one(target).await.is_empty());
+        assert!(
+            children
+                .stop_one(Child::Listener(Listener::EtcdFacade))
+                .await
+                .is_empty()
+        );
+    }
+
+    /// A disabled child is forgotten as if never spawned — but only once it
+    /// has stopped.
+    #[tokio::test]
+    async fn only_a_stopped_child_is_forgotten() {
+        let mut children = Children::default();
+        let child = Child::Driver(Driver::Job);
+        children.spawn(child, body(std::future::pending()).1);
+        assert_eq!(children.forget(child), Err(StillRunning(child)));
+
+        let _ = children.stop_one(child).await;
+        assert_eq!(children.forget(child), Ok(()));
+        assert!(children.get(child).is_none());
+        assert!(children.rows().is_empty(), "its health row outlived it");
+        assert_eq!(
+            children.spawn_one(child, body(std::future::pending()).1),
+            Ok(0),
+            "a forgotten child comes back as new"
+        );
+    }
+
+    /// Every switch is one leaf, gates at least one driver, and is toggled
+    /// in place unless a driver it gates is rebuilt only by a restart.
+    #[test]
+    fn every_switch_is_a_leaf_that_gates_a_driver() {
+        for switch in EnableSwitch::ALL.iter().copied() {
+            assert_eq!(EnableSwitch::of_leaf(switch.leaf()), Some(switch));
+            assert!(
+                switch.drivers().next().is_some(),
+                "{switch:?} gates nothing"
+            );
+        }
+        let restart_only: Vec<EnableSwitch> = EnableSwitch::ALL
+            .iter()
+            .copied()
+            .filter(|s| !s.toggles_live())
+            .collect();
+        assert_eq!(
+            restart_only,
+            [EnableSwitch::ServiceRouting, EnableSwitch::Crd]
+        );
+        assert_eq!(
+            EnableSwitch::PvBinder.drivers().collect::<Vec<_>>(),
+            [
+                Driver::PvBinder,
+                Driver::VolumeSnapshot,
+                Driver::PvcProtection
+            ]
+        );
+        assert_eq!(EnableSwitch::of_leaf("controllers.enable"), None);
+    }
+
+    /// A listener moved to a new address is rebuilt to follow it; nothing
+    /// else a change applies in place rebuilds a child.
+    #[test]
+    fn only_a_moved_listener_is_rebuilt_by_a_change_in_place() {
+        let before = BootConfig::prescribed();
+        let mut after = before.clone();
+        after.kubelet_listen_addr = "127.0.0.1:20250".into();
+        for child in Child::all() {
+            assert_eq!(
+                child.rebuilt_between(&before, &after),
+                child == Child::Listener(Listener::KubeletHttp),
+                "{child}"
+            );
+        }
+        assert!(Child::all().all(|c| !c.rebuilt_between(&before, &before)));
     }
 }

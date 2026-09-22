@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use engenho_apiserver::{
     ApiServer, ChainAuthenticator, ClientMaterial, RbacAuthorizer, RouterHandlerSink, RouterState,
     SanEntry, ServerSanInputs, StoreRbacEnv, TlsMaterial, client_verifier,
@@ -11,7 +12,7 @@ use engenho_apiserver::{
     load_or_generate_ca, metrics::log_would_reject,
 };
 use engenho_config::leaf::{flatten, nest};
-use engenho_config::mutability::{self, Mutability};
+use engenho_config::mutability::{self, Mutability, RespawnSet};
 use engenho_config::{
     EngenhoConfig, KubeconfigVisibility, KubeletBackendKind as CfgBackendKind, ResolvedDatapath,
 };
@@ -49,7 +50,10 @@ use tracing::{error, info, warn};
 
 use crate::boot::{BootKind, BootPhase, BootRecorder};
 use crate::boot_config::{ApiserverTls, BootConfig};
-use crate::child::{Child, ChildTask, Children, DeadChild, Driver, Listener, TickLoop, Wiring};
+use crate::child::{
+    Child, ChildHandle, ChildTask, Children, ChildrenFollowed, DeadChild, Driver, EnableSwitch,
+    Listener, Respawn, RespawnError, Respawned, TickLoop, Wiring,
+};
 use crate::error::{RuntimeError, ShutdownStage, StrongCounts};
 use crate::health::{Health, Row, Tallied, Tally, Windows};
 use crate::node_lease::NodeLease;
@@ -68,6 +72,9 @@ pub struct Runtime {
     store: Arc<StoreMesh>,
     apiserver: ApiServer,
     children: Children,
+    /// What the children were built from, kept to build one again. Holds the
+    /// container backend: the kubelet each build drives.
+    parts: Parts,
     /// Every panic in the process, counted by the hook `start` installs.
     panics: PanicCounter,
     /// What `/livez`, `/healthz`, `/readyz` and the runtime's `/metrics`
@@ -89,12 +96,6 @@ pub struct Runtime {
     /// The SANs the apiserver's certificate was issued with; `None` with
     /// TLS off. The certificate itself lives only in memory.
     server_sans: Option<Vec<String>>,
-    /// The backend the runtime was started with. Nothing reads it: the
-    /// kubelet holds its own clone, and that clone is what keeps the backend
-    /// alive for its ticks. A test passes its own clone to
-    /// [`Runtime::start_with_backend`] and inspects that.
-    #[allow(dead_code)]
-    backend: Arc<dyn ContainerRuntime>,
 }
 
 impl Runtime {
@@ -256,6 +257,7 @@ impl Runtime {
             Ok(Assembled {
                 apiserver,
                 children,
+                parts,
                 health,
                 publish,
                 publisher,
@@ -265,6 +267,7 @@ impl Runtime {
                 store,
                 apiserver,
                 children,
+                parts,
                 panics,
                 health,
                 would_reject,
@@ -272,7 +275,6 @@ impl Runtime {
                 publish,
                 publisher,
                 server_sans,
-                backend,
             }),
             Err(error) => {
                 let phase = rec.current();
@@ -518,16 +520,16 @@ impl Runtime {
         //    scheduler / kubelet drivers (incl. the CrdController, which
         //    registers CR handlers into the shared router table via
         //    handler_sink) and the :10250 kubelet + :2379 etcd-façade
-        //    listeners, into ONE owned set that `main` watches. Returns the
-        //    Arc<Kubelet> so the Pod `/log` reader can be wired in.
+        //    listeners, into ONE owned set that `main` watches. The parts
+        //    they are built from are kept, so any of them can be built again.
         rec.enter_committed(BootPhase::SpawnChildren);
-        let (children, kubelet) =
-            spawn_children(boot, store, backend, scheduler, &handler_sink, windows);
+        let parts = Parts::assemble(boot, store, backend, scheduler, &handler_sink, windows);
+        let children = spawn_children(&parts);
         info!(count = children.len(), "children spawned");
         // From here the health endpoints report every spawned child, each
         // Unknown until its first beat.
         rec.enter_committed(BootPhase::AdoptHealth);
-        health.adopt(children.rows());
+        health.publish(children.rows());
 
         // 6b. Register the Pod `/log` handler — a StoreBackedHandler for the
         //     Pod kind whose `logs` delegates to the in-process kubelet (the
@@ -537,8 +539,7 @@ impl Runtime {
         //     IS this process's kubelet, so the read is in-process. `register`
         //     keys on (group, version, plural) so it overwrites the Pod entry
         //     atomically (same swap mechanism the CRD sink uses).
-        let log_reader = Arc::new(KubeletLogReader { kubelet });
-        if let Some(pod_handler) = build_pod_log_handler(store, &admission, log_reader) {
+        if let Some(pod_handler) = build_pod_log_handler(store, &admission, parts.log_reader()) {
             router_state_for_logs.register(pod_handler);
             info!("registered Pod /log handler (in-process kubelet log reader)");
         }
@@ -546,6 +547,7 @@ impl Runtime {
         Ok(Assembled {
             apiserver,
             children,
+            parts,
             health,
             publish,
             publisher,
@@ -585,7 +587,8 @@ impl Runtime {
     }
 
     /// Wait for the next child whose task ends. It is marked Dead and logged
-    /// at ERROR before this returns; it is NOT respawned.
+    /// at ERROR before this returns; nothing respawns it but
+    /// [`Self::respawn`].
     ///
     /// Pends forever while every child runs, and is cancel-safe, so `main`
     /// selects on it beside its stop signal.
@@ -631,29 +634,158 @@ impl Runtime {
         self.server_sans.as_deref()
     }
 
-    /// Take `effective`'s in-place leaves — the live and inert ones of the
-    /// sealed mutability table — into the running configuration, and publish
-    /// the kubeconfigs again when a live one moved. Every other leaf stays as
-    /// booted: what takes a restart is the caller's to report as pending.
+    /// Build `child` again — stopping it first when it runs — with every
+    /// dependent [`Child::respawn`] names, from the parts it was first built
+    /// from. Its generation moves on; its last death is kept.
     ///
-    /// Returns the new publish records when it published.
+    /// # Errors
+    ///
+    /// [`RespawnError`]: it is rebuilt only by a runtime restart, it is not
+    /// spawned, or its shared piece could not be built (it is left running
+    /// then).
+    pub async fn respawn(&mut self, child: Child) -> Result<Respawned, RespawnError> {
+        let dependents: &[Child] = match child.respawn() {
+            Respawn::RuntimeRestartOnly => return Err(RespawnError::RuntimeRestartOnly(child)),
+            Respawn::Rebuild => &[],
+            Respawn::RebuildWith(dependents) => dependents,
+        };
+        if self.children.get(child).is_none() {
+            return Err(RespawnError::NotSpawned(child));
+        }
+        let set: Vec<Child> = std::iter::once(child)
+            .chain(
+                dependents
+                    .iter()
+                    .copied()
+                    .filter(|d| self.children.get(*d).is_some()),
+            )
+            .collect();
+        let renewal = self.parts.renew(child).map_err(|e| RespawnError::Build {
+            child,
+            reason: e.to_string(),
+        })?;
+        // Dependents first, so none outlives what it reads.
+        let mut died = self.stop_all(set.iter().rev().copied()).await;
+        died.retain(|dead| !set.contains(&dead.child));
+        self.parts.install(renewal);
+        let rebuilt = self.spawn_all(&set);
+        let generation = self.children.get(child).map_or(0, ChildHandle::generation);
+        self.health.publish(self.children.rows());
+        info!(%child, generation, ?rebuilt, "child respawned");
+        Ok(Respawned {
+            child,
+            generation,
+            rebuilt,
+            died,
+        })
+    }
+
+    /// Stop each of `children` that runs, in order. Returns the deaths that
+    /// happened meanwhile, the stopped children's own among them.
+    async fn stop_all(&mut self, children: impl Iterator<Item = Child>) -> Vec<DeadChild> {
+        let mut ended = Vec::new();
+        for child in children {
+            ended.extend(self.children.stop_one(child).await);
+        }
+        ended
+    }
+
+    /// Spawn each of `children` (none running), in order, from the parts.
+    /// Returns those spawned: the node lease is not without a kubelet.
+    fn spawn_all(&mut self, children: &[Child]) -> Vec<Child> {
+        let mut spawned = Vec::new();
+        for &child in children {
+            let Some(task) = self.parts.task(child, &self.children) else {
+                continue;
+            };
+            match self.children.spawn_one(child, task) {
+                Ok(_) => spawned.push(child),
+                Err(running) => error!(%running, "not spawned again: it was not stopped"),
+            }
+        }
+        spawned
+    }
+
+    /// Bring the children to what `next` spawns: stop and forget each it no
+    /// longer enables, spawn each it newly enables, rebuild each it builds
+    /// differently ([`Child::rebuilt_between`]). The parts then build from
+    /// `next`.
+    async fn follow(&mut self, next: BootConfig) -> ChildrenFollowed {
+        let before = &self.parts.boot;
+        let mut stop = Vec::new();
+        let mut start = Vec::new();
+        for child in Child::all() {
+            let (was, now) = (child.enabled(before), child.enabled(&next));
+            let rebuilt = was && now && child.rebuilt_between(before, &next);
+            if was && (!now || rebuilt) {
+                stop.push(child);
+            }
+            if now && (!was || rebuilt) {
+                start.push(child);
+            }
+        }
+        let mut died = self.stop_all(stop.iter().rev().copied()).await;
+        let touched: Vec<Child> = stop.iter().chain(&start).copied().collect();
+        died.retain(|dead| !touched.contains(&dead.child));
+        for &child in stop.iter().filter(|c| !start.contains(c)) {
+            if let Err(running) = self.children.forget(child) {
+                error!(%running, "a disabled child was not stopped");
+            }
+        }
+        self.parts.boot = next;
+        let spawned = self.spawn_all(&start);
+        if !touched.is_empty() {
+            self.health.publish(self.children.rows());
+            info!(stopped = ?stop, spawned = ?spawned, "children follow the configuration");
+        }
+        let rebuilt_or_new: Vec<Child> =
+            spawned.into_iter().filter(|c| !stop.contains(c)).collect();
+        let mut changed = stop;
+        changed.extend(rebuilt_or_new);
+        ChildrenFollowed { changed, died }
+    }
+
+    /// Whether the running runtime takes `spec`'s leaf in place: an inert or
+    /// live leaf, a listener's address, or a driver switch whose drivers can
+    /// each be spawned and stopped alone ([`EnableSwitch::toggles_live`]).
+    fn takes_in_place(spec: &mutability::LeafSpec) -> bool {
+        match spec.mutability {
+            Mutability::Inert { .. }
+            | Mutability::Live { .. }
+            | Mutability::Respawn {
+                set: RespawnSet::NodeLocalListeners,
+            } => true,
+            Mutability::Respawn {
+                set: RespawnSet::EnabledDrivers,
+            } => EnableSwitch::of_leaf(spec.path.as_str()).is_some_and(EnableSwitch::toggles_live),
+            Mutability::NextBoot
+            | Mutability::RestartRuntime
+            | Mutability::NotOverridable { .. } => false,
+        }
+    }
+
+    /// Take `effective`'s leaves the runtime can take in place
+    /// ([`Self::takes_in_place`]) into the running configuration: publish the
+    /// kubeconfigs again when a live one moved, and spawn, stop or rebuild the
+    /// children a switch or listener address moved. Every other leaf stays as
+    /// booted: what takes a restart is the caller's to report as pending.
     ///
     /// # Errors
     ///
     /// The adopted configuration does not deserialize or a boot would refuse
     /// it (the caller gated it, so neither is expected), or writing the data
     /// directory's own kubeconfig failed. The runtime is unchanged then.
-    pub(crate) fn adopt(
+    pub(crate) async fn adopt(
         &mut self,
         effective: &EngenhoConfig,
-    ) -> Result<Option<Vec<PublishRecord>>, RuntimeError> {
+    ) -> Result<Adopted, RuntimeError> {
         let json = |c: &EngenhoConfig| serde_json::to_value(c).unwrap_or_default();
         let mut current = flatten(&json(&self.config));
         let target = flatten(&json(effective));
         let (mut moved, mut republish) = (false, false);
         for spec in mutability::leaves()
             .iter()
-            .filter(|spec| spec.mutability.applies_in_place())
+            .filter(|spec| Self::takes_in_place(spec))
         {
             let want = target.get(&spec.path);
             if current.get(&spec.path) == want {
@@ -667,22 +799,26 @@ impl Runtime {
             republish |= matches!(spec.mutability, Mutability::Live { .. });
         }
         if !moved {
-            return Ok(None);
+            return Ok(Adopted::default());
         }
         let adopted: EngenhoConfig = serde_json::from_value(nest(&current)).map_err(|e| {
             engenho_config::ConfigError::Parse(format!("adopting in-place leaves: {e}"))
         })?;
         let boot = BootConfig::read(&adopted)?;
-        let records = if republish {
+        let published = if republish {
             Some(self.publisher.publish(&boot)?)
         } else {
             None
         };
         self.config = adopted;
-        if let Some(records) = &records {
+        if let Some(records) = &published {
             self.publish.clone_from(records);
         }
-        Ok(records)
+        let children = self.follow(boot).await;
+        Ok(Adopted {
+            published,
+            children,
+        })
     }
 
     /// Publish the kubeconfigs again, as configured.
@@ -744,6 +880,7 @@ impl Runtime {
     pub async fn shutdown(self) -> Result<StoreReleased, RuntimeError> {
         let Self {
             mut children,
+            parts,
             apiserver,
             store,
             health,
@@ -754,8 +891,9 @@ impl Runtime {
         health.begin_drain();
         // Abort every child then await it, so its captured Arc<StoreMesh>
         // (and the controller it owns) is actually dropped before we try
-        // to unwrap the store.
+        // to unwrap the store; the parts they were built from go with them.
         children.stop().await;
+        drop(parts);
         let drivers_awaited = Arc::strong_count(&store);
 
         // Stop the apiserver: every StoreBackedHandler holds an
@@ -816,10 +954,20 @@ impl Runtime {
     }
 }
 
+/// What [`Runtime::adopt`] did.
+#[derive(Debug, Default)]
+pub(crate) struct Adopted {
+    /// The kubeconfigs published again, when a live leaf moved.
+    pub(crate) published: Option<Vec<PublishRecord>>,
+    /// The children a switch or a listener address moved.
+    pub(crate) children: ChildrenFollowed,
+}
+
 /// What [`Runtime::assemble`] built over the store.
 struct Assembled {
     apiserver: ApiServer,
     children: Children,
+    parts: Parts,
     health: Arc<Health>,
     publish: Vec<PublishRecord>,
     publisher: Publisher,
@@ -1051,9 +1199,11 @@ impl engenho_controllers::event_recorder::EventStore for MeshEventStore {
 /// Holds the kubelet STRONGLY, unlike the :10250 listener
 /// ([`WeakKubeletApi`]): it lives in the apiserver's router, which already
 /// holds the store through every handler, and is released with that router
-/// when the apiserver stops ([`ShutdownStage::ApiserverStopped`]).
+/// when the apiserver stops ([`ShutdownStage::ApiserverStopped`]). Through
+/// the runtime's [`KubeletSlot`], so a respawned kubelet's logs are read
+/// from the new one.
 struct KubeletLogReader {
-    kubelet: Arc<Kubelet>,
+    kubelet: KubeletSlot,
 }
 
 /// The kubelet HTTP surface's view of the kubelet, held WEAKLY.
@@ -1146,6 +1296,7 @@ impl engenho_apiserver::PodLogReader for KubeletLogReader {
             timestamps: query.timestamps,
         };
         self.kubelet
+            .load_full()
             .container_logs(namespace, name, query.container.as_deref(), &opts)
             .await
             .map_err(|e| match e.kind() {
@@ -3000,23 +3151,17 @@ const CNI_INSTALL: engenho_cni::exec::CniInstall = engenho_cni::exec::CniInstall
 /// or run containers is useless), the :10250 / :2379 listeners, and the
 /// node lease, built from the kubelet's row (T1.3c).
 ///
-/// Returns the set PLUS an `Arc<Kubelet>` clone. The kubelet is built once
-/// and shared (via the `Controller for Arc<C>` blanket impl) between its
-/// driver and the apiserver's Pod `/log` reader, so both see the SAME local
-/// bookkeeping; the :10250 listener reaches it through a `Weak`
-/// ([`WeakKubeletApi`]).
-fn spawn_children(
-    boot: &BootConfig,
-    store: &Arc<StoreMesh>,
-    backend: &Arc<dyn ContainerRuntime>,
-    scheduler: ConfiguredScheduler,
-    handler_sink: &Arc<dyn DynamicHandlerSink>,
-    windows: Windows,
-) -> (Children, Arc<Kubelet>) {
-    let parts = Parts::assemble(boot, store, backend, scheduler, handler_sink, windows);
-    let children = Children::spawn_catalog(boot, |child, before| parts.task(child, before));
-    (children, parts.kubelet)
+/// The kubelet is shared (via the `Controller for Arc<C>` blanket impl)
+/// between its driver and the apiserver's Pod `/log` reader through the
+/// parts' [`KubeletSlot`], so both see the SAME local bookkeeping; the
+/// :10250 listener reaches it through a `Weak` ([`WeakKubeletApi`]).
+fn spawn_children(parts: &Parts) -> Children {
+    Children::spawn_catalog(&parts.boot, |child, before| parts.task(child, before))
 }
+
+/// The kubelet the runtime runs, swapped whole when the kubelet is respawned
+/// so the Pod `/log` reader follows the one its driver drives.
+type KubeletSlot = Arc<ArcSwap<Kubelet>>;
 
 /// The scheduler as `scheduler.*` configured it (T5.8), driven as a
 /// controller: its namespace scope and strategy are inside it, and its tick
@@ -3108,17 +3253,25 @@ const KUBELET_READS: &[GroupVersionKind] = &[
 /// binds them to.
 const SCHEDULER_READS: &[GroupVersionKind] = &[gvk("", "v1", "Pod"), gvk("", "v1", "Node")];
 
-/// What every catalog child is built from, assembled ONCE before the walk.
+/// What every catalog child is built from, assembled ONCE before the walk
+/// and kept on the [`Runtime`], so a child can be built again
+/// ([`Runtime::respawn`]) from exactly what it was first built from.
 ///
 /// The shared pieces live here rather than inside any one child's arm
 /// because more than one child reads each: the event sink (two sinks over
 /// one store would be two independent lossy buffers for one cluster's
 /// events), the CSI driver table, the scheduler (built fallibly by the
 /// caller from `scheduler.*`) and the kubelet.
-struct Parts<'a> {
-    boot: &'a BootConfig,
-    store: &'a Arc<StoreMesh>,
-    handler_sink: &'a Arc<dyn DynamicHandlerSink>,
+///
+/// Holds the store: dropped with the children at
+/// [`ShutdownStage::DriversAwaited`].
+struct Parts {
+    /// The configuration the children run: as booted, plus what the control
+    /// plane applied in place since.
+    boot: BootConfig,
+    store: Arc<StoreMesh>,
+    backend: Arc<dyn ContainerRuntime>,
+    handler_sink: Arc<dyn DynamicHandlerSink>,
     /// The controllers' namespace scope (`controllers.namespace`): `None`
     /// means all namespaces. The scheduler is scoped by its own,
     /// `scheduler.namespace`.
@@ -3138,16 +3291,27 @@ struct Parts<'a> {
     /// shape) on that parent, and carry on with the rest.
     events: Arc<dyn EventSink>,
     scheduler: Arc<ConfiguredSchedulerLoop>,
-    kubelet: Arc<Kubelet>,
+    kubelet: KubeletSlot,
 }
 
-impl<'a> Parts<'a> {
+/// A child's shared piece built afresh before it is respawned
+/// ([`Parts::renew`]), installed once its old task has ended.
+enum Renewal {
+    /// It shares nothing that needs building again.
+    Nothing,
+    /// A scheduler, from `scheduler.*`.
+    Scheduler(Arc<ConfiguredSchedulerLoop>),
+    /// A kubelet, with empty bookkeeping, as a boot builds it.
+    Kubelet(Arc<Kubelet>),
+}
+
+impl Parts {
     fn assemble(
-        boot: &'a BootConfig,
-        store: &'a Arc<StoreMesh>,
+        boot: &BootConfig,
+        store: &Arc<StoreMesh>,
         backend: &Arc<dyn ContainerRuntime>,
         scheduler: ConfiguredScheduler,
-        handler_sink: &'a Arc<dyn DynamicHandlerSink>,
+        handler_sink: &Arc<dyn DynamicHandlerSink>,
         windows: Windows,
     ) -> Self {
         let ns = boot.controllers_namespace.clone();
@@ -3164,28 +3328,71 @@ impl<'a> Parts<'a> {
         let scheduler = Arc::new(ConfiguredSchedulerLoop(scheduler));
         let kubelet = build_kubelet(boot, store, backend, events.clone(), &csi_drivers);
         Self {
-            boot,
-            store,
-            handler_sink,
+            boot: boot.clone(),
+            store: store.clone(),
+            backend: backend.clone(),
+            handler_sink: handler_sink.clone(),
             ns,
             windows,
             csi_drivers,
             events,
             scheduler,
-            kubelet,
+            kubelet: Arc::new(ArcSwap::new(kubelet)),
+        }
+    }
+
+    /// Build what `child` shares with the rest of the runtime afresh, for a
+    /// respawn: the scheduler and the kubelet hold state across ticks, so a
+    /// respawn that reused them would bring back what it was asked to drop.
+    /// Every other child's controller is built anew by [`Self::task`].
+    ///
+    /// Built before the old task is stopped, so a failure here leaves it
+    /// running.
+    fn renew(&self, child: Child) -> Result<Renewal, RuntimeError> {
+        Ok(match child {
+            Child::Driver(Driver::Scheduler) => {
+                Renewal::Scheduler(Arc::new(ConfiguredSchedulerLoop(Scheduler::from_config(
+                    self.store.clone(),
+                    &self.boot.scheduler,
+                )?)))
+            }
+            Child::Driver(Driver::Kubelet) => Renewal::Kubelet(build_kubelet(
+                &self.boot,
+                &self.store,
+                &self.backend,
+                self.events.clone(),
+                &self.csi_drivers,
+            )),
+            Child::Driver(_) | Child::Listener(_) | Child::NodeLease => Renewal::Nothing,
+        })
+    }
+
+    /// The Pod `/log` reader, which follows the kubelet through its slot.
+    fn log_reader(&self) -> Arc<KubeletLogReader> {
+        Arc::new(KubeletLogReader {
+            kubelet: self.kubelet.clone(),
+        })
+    }
+
+    /// Put a [`Renewal`] in place: the next [`Self::task`] builds from it.
+    fn install(&mut self, renewal: Renewal) {
+        match renewal {
+            Renewal::Nothing => {}
+            Renewal::Scheduler(scheduler) => self.scheduler = scheduler,
+            Renewal::Kubelet(kubelet) => self.kubelet.store(kubelet),
         }
     }
 
     /// The body of one catalog child. `before` is every child spawned
-    /// ahead of it in the walk.
+    /// ahead of it in the walk (or, for a respawn, every child there is).
     fn task(&self, child: Child, before: &Children) -> Option<ChildTask> {
         match child {
             Child::Driver(driver) => Some(self.driver(driver)),
             Child::Listener(listener) => Some(listener_task(
                 listener,
-                self.boot,
-                Arc::downgrade(&self.kubelet),
-                self.store,
+                &self.boot,
+                Arc::downgrade(&self.kubelet.load()),
+                &self.store,
             )),
             // Renewed by the kubelet's row, so built from it. The kubelet is
             // walked first and always enabled; were it absent, the lease
@@ -3204,7 +3411,7 @@ impl<'a> Parts<'a> {
                 // Waking it: a `Child::RuntimeRelist` driving a `Relister`
                 // over the backend, and its ledger here.
                 Some(drive_node_lease(
-                    self.store,
+                    &self.store,
                     &self.boot.node_name,
                     kubelet,
                     self.windows,
@@ -3225,7 +3432,7 @@ impl<'a> Parts<'a> {
         drive(
             TickLoop::Driver(driver),
             controller,
-            self.store,
+            &self.store,
             self.windows.of_child(Child::Driver(driver)),
         )
     }
@@ -3235,7 +3442,7 @@ impl<'a> Parts<'a> {
         reason = "one arm per catalog driver; splitting the match would split the catalog"
     )]
     fn driver(&self, driver: Driver) -> ChildTask {
-        let store = self.store;
+        let store = &self.store;
         let ns = || self.ns.clone();
         let events = || self.events.clone();
         match driver {
@@ -3424,7 +3631,7 @@ impl<'a> Parts<'a> {
             // Kubelet: bound Pod → container via the backend.
             Driver::Kubelet => self.watch(
                 driver,
-                DeclaredHere::new(self.kubelet.clone(), Reads::of(KUBELET_READS)),
+                DeclaredHere::new(self.kubelet.load_full(), Reads::of(KUBELET_READS)),
             ),
         }
     }
@@ -3444,11 +3651,11 @@ pub(crate) fn listener_task(
     store: &Arc<StoreMesh>,
 ) -> ChildTask {
     let beat = Arc::new(Heartbeat::new());
+    let addr = listener.listen_addr(boot).to_owned();
     match listener {
         Listener::KubeletHttp => {
             let api: Arc<dyn engenho_kubelet::server::KubeletApi> =
                 Arc::new(WeakKubeletApi { kubelet });
-            let addr = boot.kubelet_listen_addr.clone();
             ChildTask::new(
                 beat.clone(),
                 serve_rebinding(listener, beat, move || {
@@ -3457,7 +3664,6 @@ pub(crate) fn listener_task(
             )
         }
         Listener::EtcdFacade => {
-            let addr = boot.etcd_listen_addr.clone();
             let etcd_store = crate::etcd_facade::MeshEtcdStore::new(store);
             ChildTask::new(
                 beat.clone(),

@@ -86,9 +86,10 @@
 use std::fmt;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use engenho_apiserver::{
     ChildLiveness, DrainState, LastTick, LivenessSource, MetricsSnapshot, MetricsSource,
     ReconcileCount, ReconcileResult,
@@ -103,7 +104,7 @@ use engenho_substrate::{
 };
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::child::{Child, Driver};
 use crate::panics::PanicCounter;
@@ -609,15 +610,18 @@ impl Row {
 /// its spawned children, its drain state and its store.
 ///
 /// Built before the apiserver binds (the router must hold it from its first
-/// request) and handed the children once they are spawned. Until then it
-/// reports no children, which the apiserver fails on a `children` check:
-/// nothing observed is never ok.
+/// request) and handed the children once they are spawned — and again each
+/// time the set changes (a child respawned, a driver enabled or disabled
+/// through the control plane). Until the first set it reports no children,
+/// which the apiserver fails on a `children` check: nothing observed is
+/// never ok.
 ///
 /// Holds the store WEAKLY: health must never be what keeps the store alive
 /// past shutdown.
 #[derive(Debug)]
 pub struct Health {
-    rows: OnceLock<Vec<Row>>,
+    /// Swapped whole, never edited: a reader holds one consistent set.
+    rows: ArcSwap<Vec<Row>>,
     windows: Windows,
     draining: AtomicBool,
     store: Weak<StoreMesh>,
@@ -629,7 +633,7 @@ pub struct Health {
 impl Health {
     pub(crate) fn new(store: &Arc<StoreMesh>, windows: Windows, panics: PanicCounter) -> Self {
         Self {
-            rows: OnceLock::new(),
+            rows: ArcSwap::from_pointee(Vec::new()),
             windows,
             draining: AtomicBool::new(false),
             store: Arc::downgrade(store),
@@ -638,11 +642,9 @@ impl Health {
         }
     }
 
-    /// Take the spawned children's rows. Once: the catalog is spawned once.
-    pub(crate) fn adopt(&self, rows: Vec<Row>) {
-        if self.rows.set(rows).is_err() {
-            error!("the runtime's children were handed to health twice; keeping the first set");
-        }
+    /// Take the spawned children's rows, replacing the set held so far.
+    pub(crate) fn publish(&self, rows: Vec<Row>) {
+        self.rows.store(Arc::new(rows));
     }
 
     /// The node has begun to stop: `/readyz` fails its `shutdown` check from
@@ -651,8 +653,8 @@ impl Health {
         self.draining.store(true, Ordering::Release);
     }
 
-    fn rows(&self) -> &[Row] {
-        self.rows.get().map_or(&[], Vec::as_slice)
+    fn rows(&self) -> Arc<Vec<Row>> {
+        self.rows.load_full()
     }
 
     /// The windows a tick loop is judged against.
@@ -754,7 +756,7 @@ impl MetricsSource for Health {
         let wall_now = WallClock.now();
         let mut reconciles = Vec::new();
         let mut last_ticks = Vec::new();
-        for row in self.rows() {
+        for row in self.rows().iter() {
             let Some(tally) = &row.tally else {
                 continue;
             };
@@ -1038,7 +1040,7 @@ mod tests {
             "every body is a child the config enables"
         );
         let health = Health::new(store, windows(), PanicCounter::install());
-        health.adopt(children.rows());
+        health.publish(children.rows());
         (children, health)
     }
 

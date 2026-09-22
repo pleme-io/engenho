@@ -41,3 +41,8 @@ engenho-runtime/src/control/overrides.rs
 engenho-control-types/src/pin.rs
 engenho-control-server/src/pins.rs
 engenho-control-server/src/grant.rs
+
+# Child control (P6): whether a child may be spawned again, what stopping
+# one ends, whether a switch can flip in place, whether a change rebuilds a
+# child.
+engenho-runtime/src/child.rs

@@ -55,6 +55,8 @@ serde_yaml          = { workspace = true }
 chrono              = { version = "0.4", features = ["serde"] }
 # The declared config file's digest (drift since a boot read it).
 blake3              = { workspace = true }
+# Health's child rows, swapped whole when a child is respawned.
+arc-swap            = { workspace = true }
 # The control plane: the spec's types and trait this crate implements
 # (control/), the audit chain `listAudit` pages, and the remote listener's
 # pins `getControl` reports.

@@ -50,7 +50,8 @@ pub enum ApplyEffect {
     PlannedOnly,
     /// The running runtime took it in place.
     AppliedLive,
-    /// These children were respawned with it.
+    /// The running runtime took it in place by spawning, stopping or
+    /// rebuilding these children.
     Respawned {
         /// Which.
         children: Vec<Child>,
@@ -196,18 +197,25 @@ pub fn effect(changed: &[LeafChange], outcome: &Reconfigured) -> ApplyEffect {
         }
         Reconfigured::Running {
             republished,
+            respawned,
             pending,
             restarted,
         } => {
             let any = |test: fn(Mutability) -> bool| changed.iter().any(|c| test(c.mutability));
             if *restarted {
                 ApplyEffect::RestartScheduled
-            } else if any(Mutability::needs_restart) {
+            } else if changed.iter().any(|c| pending.contains(&c.path)) {
+                // Every pending leaf, not only this change's: the restart
+                // that brings this one in brings them all.
                 ApplyEffect::RestartDeferred {
                     leaves: pending.clone(),
                 }
             } else if changed.is_empty() {
                 ApplyEffect::NoChange
+            } else if !respawned.is_empty() {
+                ApplyEffect::Respawned {
+                    children: respawned.clone(),
+                }
             } else if *republished || !any(|m| matches!(m, Mutability::NextBoot)) {
                 ApplyEffect::AppliedLive
             } else {
@@ -311,6 +319,7 @@ mod tests {
         let pending = vec![leaf("scheduler.tick_interval_seconds")];
         let running = |restarted| Reconfigured::Running {
             republished: true,
+            respawned: Vec::new(),
             pending: pending.clone(),
             restarted,
         };
@@ -338,9 +347,42 @@ mod tests {
         let changed = diff(&base(), &boot_only);
         let quiet = Reconfigured::Running {
             republished: false,
+            respawned: Vec::new(),
             pending: Vec::new(),
             restarted: false,
         };
         assert_eq!(effect(&changed, &quiet), ApplyEffect::NextBoot);
+    }
+
+    #[test]
+    fn a_switch_taken_in_place_reports_the_children_it_moved() {
+        let mut after = base();
+        after.controllers.enable.gc = !after.controllers.enable.gc;
+        let changed = diff(&base(), &after);
+        let gc = vec![crate::child::Child::Driver(crate::child::Driver::Gc)];
+        let taken = Reconfigured::Running {
+            republished: false,
+            respawned: gc.clone(),
+            pending: Vec::new(),
+            restarted: false,
+        };
+        assert_eq!(
+            effect(&changed, &taken),
+            ApplyEffect::Respawned { children: gc }
+        );
+    }
+
+    #[test]
+    fn an_earlier_pending_leaf_does_not_defer_a_live_change() {
+        let mut after = base();
+        after.runtime.kubeconfig_publish_path = "/tmp/kc".into();
+        let live = diff(&base(), &after);
+        let earlier = Reconfigured::Running {
+            republished: true,
+            respawned: Vec::new(),
+            pending: vec![leaf("runtime.listen_addr")],
+            restarted: false,
+        };
+        assert_eq!(effect(&live, &earlier), ApplyEffect::AppliedLive);
     }
 }

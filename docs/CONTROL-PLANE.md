@@ -167,13 +167,52 @@ There is no ConfigMap tier.
   is retried by an override change, exactly as by a change to the declared
   file, so a broken declared file is repaired without touching it:
   `engenho ctl config set scheduler.tick_interval_seconds --value 5`.
-  `respawn` leaves apply as a restart until children can be respawned one by
-  one (P6).
+  `respawn` leaves apply in place by moving children (see Children below):
+  the effect is `respawned` with the children it moved. A driver switch
+  whose drivers cannot be spawned alone (`crd`, `service_routing`) is
+  `restart_deferred` instead.
 * **Drift** (`engenho ctl config drift`): a unified diff against the declared
   file alone, and per override whether removing it would change its leaf
   (`shadowing`) or not (`redundant`).
 * **Persisted by default.** `--persist false` keeps an override in memory
   only; it is gone when the process ends.
+
+## Children
+
+Every long-lived task the runtime runs — each controller driver, the
+:10250 and :2379 listeners, the node lease — is one row of the closed
+catalog in `engenho-runtime/src/child.rs`, and a dead one is never
+respawned on its own. The control plane respawns it on request:
+
+* **`engenho ctl children restart <child>`** builds a child again, stopping
+  it first if it runs, from the parts it was first built from (kept on the
+  runtime for that). Its `generation` moves on and its `last_death` is kept.
+  How is the child's `respawn` row, one exhaustive match:
+  * `rebuild` — alone: every stateless driver, the scheduler (a fresh one
+    from `scheduler.*`), a listener, the node lease;
+  * `rebuild_with` — the kubelet, fresh, with the node lease and its HTTP
+    listener after it, since both were built against the old one. The Pod
+    `/log` reader follows it through the runtime's kubelet slot;
+  * `runtime_restart_only` — `crd`, `service_routing`, `csi_registrar`,
+    refused (`respawn_refused`, pointing at `runtime restart`). Each shares
+    state with the rest of the runtime (the router's CRD handlers, the
+    installed service routes, the CSI driver table) and is not rebuilt alone
+    until it is shown to resync from scratch — a stated limit.
+* **`engenho ctl children enable|disable <driver>`** sets the driver's
+  `controllers.enable` switch as a persisted override through the one apply
+  pipeline, so it is gated, audited and reported as `config set` of that
+  leaf is. The runtime follows at once: a disabled driver is stopped and
+  forgotten, exactly as if the boot had never enabled it; an enabled one is
+  spawned. One switch can gate several drivers (`pv_binder` gates the
+  binder, the snapshot controller and pvc-protection). A driver with no
+  switch always runs, and toggling it is refused.
+* **A listener's address** (`runtime.kubelet_listen_addr`,
+  `runtime.etcd_listen_addr`) set while running rebuilds that listener at the
+  new address; an empty etcd address stops the façade.
+
+Every respawn is on the event stream as `child_respawned`; a child that
+happens to die while others are being stopped is still reported as
+`child_died`.
 
 ## Remote trust: SPKI pins, not the cluster CA
 
@@ -297,6 +336,6 @@ Deviations the spec settled while being authored:
 | P3 | Operate verbs, authorization tiers, audit chain, restart on failure only | done |
 | P4 | Persisted config overrides, sealed mutability, drift | done |
 | P5 | Remote mTLS with SPKI pins | done (the fleet's Nix wiring: the `pleme-io/nix` repo) |
-| P6 | Child control | — |
+| P6 | Child control: respawn, driver switches and listener moves in place | done |
 | P7 | Gated destructive re-init | — |
 | P8 | MCP tools, completions, docs | — |

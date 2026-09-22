@@ -1818,6 +1818,7 @@ dependencies = [
 name = "engenho-runtime"
 version = "0.53.118"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "axum 0.7.9",
  "blake3",

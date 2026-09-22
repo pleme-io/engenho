@@ -50,7 +50,7 @@ use super::machine::{
     LifecycleState, PendingApply, Refused, RefusedBecause, RetryClass, StoreOutcome,
 };
 use crate::boot::{BootKind, BootPhase, BootProgress, BootRecorder, FailureClass, Timestamp};
-use crate::child::{Child, ChildState, DeadChild, DeathCause};
+use crate::child::{Child, ChildState, DeadChild, Death, DeathCause, RespawnError, Respawned};
 use crate::control::apply::ApplyEffect;
 use crate::control::overrides::OverrideStore;
 use crate::control::ring::Ring;
@@ -270,6 +270,10 @@ enum Request {
         reply: oneshot::Sender<Result<Reconfigured, ReconfigureError>>,
     },
     Republish(oneshot::Sender<Result<Vec<PublishRecord>, ReconfigureError>>),
+    RestartChild {
+        child: Child,
+        reply: oneshot::Sender<Result<Respawned, RestartChildError>>,
+    },
 }
 
 /// What the supervisor did with a configuration change
@@ -280,6 +284,8 @@ pub enum Reconfigured {
     Running {
         /// Whether that republished the kubeconfigs.
         republished: bool,
+        /// The children it spawned, stopped or rebuilt to follow the change.
+        respawned: Vec<Child>,
         /// Every leaf it reflects only after a restart.
         pending: Vec<engenho_config::LeafPath>,
         /// Whether a restart was asked for, and started.
@@ -302,6 +308,20 @@ pub enum ReconfigureError {
     /// The runtime refused or failed to apply it.
     #[error("the running runtime could not apply it: {0}")]
     Runtime(String),
+    /// No runtime is up.
+    #[error("no runtime is running")]
+    NotRunning,
+    /// The supervisor has ended.
+    #[error("the supervisor has ended")]
+    Gone,
+}
+
+/// Why a child was not restarted ([`SupervisorHandle::restart_child`]).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RestartChildError {
+    /// The runtime refused.
+    #[error(transparent)]
+    Refused(#[from] RespawnError),
     /// No runtime is up.
     #[error("no runtime is running")]
     NotRunning,
@@ -361,6 +381,10 @@ pub struct ChildFact {
     pub spawned_at: Timestamp,
     /// When it ended.
     pub ended_at: Option<Timestamp>,
+    /// How many times it has been spawned again since the first.
+    pub generation: u64,
+    /// How its latest task that ended ended, across respawns.
+    pub last_death: Option<Death>,
 }
 
 /// Everything [`SupervisorHandle::inspect`] reads in the loop.
@@ -392,6 +416,13 @@ pub enum DaemonEvent {
         child: Child,
         /// How.
         cause: DeathCause,
+    },
+    /// A child of the running runtime was spawned again.
+    ChildRespawned {
+        /// Which.
+        child: Child,
+        /// Its generation now.
+        generation: u64,
     },
     /// A configuration change was applied.
     ConfigApplied {
@@ -541,6 +572,21 @@ impl SupervisorHandle {
         answer.await.map_err(|_| ReconfigureError::Gone)?
     }
 
+    /// Build a child of the running runtime again, with its dependents
+    /// ([`Runtime::respawn`]).
+    ///
+    /// # Errors
+    ///
+    /// [`RestartChildError`].
+    pub async fn restart_child(&self, child: Child) -> Result<Respawned, RestartChildError> {
+        let (reply, answer) = oneshot::channel();
+        self.requests
+            .send(Request::RestartChild { child, reply })
+            .await
+            .map_err(|_| RestartChildError::Gone)?;
+        answer.await.map_err(|_| RestartChildError::Gone)?
+    }
+
     async fn ask<T>(&self, request: impl FnOnce(Reply<T>) -> Request) -> Result<T, CommandError> {
         let (reply, answer) = oneshot::channel();
         self.requests
@@ -606,7 +652,8 @@ async fn slot_event(slot: &mut Slot) -> SlotEvent {
             Some(report) = progress.recv() => SlotEvent::Progress(report),
             done = task => SlotEvent::BootDone(Box::new(done)),
         },
-        // Logged at ERROR by the runtime as it returns; not respawned.
+        // Logged at ERROR by the runtime as it returns; respawned only when
+        // an operator asks (`restart_child`).
         Slot::Up(running) => SlotEvent::ChildDied(running.runtime.next_dead_child().await),
         Slot::Draining(task) => SlotEvent::Drained(task.await),
         Slot::Idle(_) | Slot::Wedged => std::future::pending().await,
@@ -765,8 +812,16 @@ impl Supervisor {
             }
             tokio::select! {
                 request = self.requests.recv(), if requests_open => match request {
+                    // Answered here, awaiting the runtime: they read or
+                    // change its children, which only the loop holds.
                     Some(Request::Inspect(reply)) => {
                         let _ = reply.send(self.inspect().await);
+                    }
+                    Some(Request::Reconfigure { restart_now, reply }) => {
+                        let _ = reply.send(self.reconfigure(restart_now, Timestamp::now()).await);
+                    }
+                    Some(Request::RestartChild { child, reply }) => {
+                        let _ = reply.send(self.restart_child(child).await);
                     }
                     Some(request) => self.on_request(request),
                     None => requests_open = false,
@@ -817,18 +872,50 @@ impl Supervisor {
                 let result = self.apply(LifecycleEvent::Exit { intent });
                 let _ = reply.send(result.map(|()| self.accepted(at)));
             }
-            Request::Reconfigure { restart_now, reply } => {
-                let _ = reply.send(self.reconfigure(restart_now, at));
-            }
             Request::Republish(reply) => {
                 let _ = reply.send(self.republish());
             }
-            // Answered by the loop, which awaits the store.
-            Request::Inspect(_) => {}
+            // Answered by the loop, which awaits the runtime.
+            Request::Inspect(_) | Request::Reconfigure { .. } | Request::RestartChild { .. } => {}
         }
     }
 
-    fn reconfigure(
+    async fn restart_child(&mut self, child: Child) -> Result<Respawned, RestartChildError> {
+        let Slot::Up(running) = &mut self.slot else {
+            return Err(RestartChildError::NotRunning);
+        };
+        let respawned = running.runtime.respawn(child).await?;
+        self.report_children(&respawned.rebuilt, &respawned.died);
+        Ok(respawned)
+    }
+
+    /// Put `changed` children (the ones now running) and `died` ones on the
+    /// event stream.
+    fn report_children(&self, changed: &[Child], died: &[DeadChild]) {
+        for dead in died {
+            self.events.push(DaemonEvent::ChildDied {
+                child: dead.child,
+                cause: dead.cause,
+            });
+        }
+        let Slot::Up(running) = &self.slot else {
+            return;
+        };
+        let children = running.runtime.children();
+        for &child in changed {
+            if let Some(handle) = children
+                .get(child)
+                .filter(|h| h.state() == ChildState::Running)
+            {
+                self.events.push(DaemonEvent::ChildRespawned {
+                    child,
+                    generation: handle.generation(),
+                });
+            }
+        }
+    }
+
+    async fn reconfigure(
         &mut self,
         restart_now: bool,
         at: Timestamp,
@@ -851,19 +938,22 @@ impl Supervisor {
         let Slot::Up(running) = &mut self.slot else {
             return Ok(Reconfigured::NotRunning);
         };
-        let published = running
+        let adopted = running
             .runtime
             .adopt(&resolved.config)
+            .await
             .map_err(|e| ReconfigureError::Runtime(e.to_string()))?;
         let pending =
             crate::control::apply::restart_pending(running.runtime.config(), &resolved.config);
         running.provenance = resolved.provenance;
 
-        let republished = published.is_some();
-        for record in published.into_iter().flatten() {
+        let republished = adopted.published.is_some();
+        for record in adopted.published.into_iter().flatten() {
             self.events
                 .push(DaemonEvent::KubeconfigPublished { record });
         }
+        let respawned = adopted.children.changed;
+        self.report_children(&respawned, &adopted.children.died);
         self.apply_logged(LifecycleEvent::ConfigApplied {
             pending: if pending.is_empty() {
                 PendingApply::InSync
@@ -881,6 +971,7 @@ impl Supervisor {
         }
         Ok(Reconfigured::Running {
             republished,
+            respawned,
             pending,
             restarted,
         })
@@ -928,6 +1019,8 @@ impl Supervisor {
                             state: handle.state(),
                             spawned_at: handle.spawned_at(),
                             ended_at: handle.ended_at(),
+                            generation: handle.generation(),
+                            last_death: handle.last_death(),
                         })
                         .collect(),
                     publish: rt.publish_records().to_vec(),
