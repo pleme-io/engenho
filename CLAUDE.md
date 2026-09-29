@@ -127,6 +127,13 @@ controller fleet alone:
 | appended to `KUBE-SERVICES` without creating it | kube-proxy owns that chain and its hooks | Service routing worked off the *dead* k3s rules still in the kernel, and would have vanished at the next reboot |
 | left `Secret.type` unset | the apiserver defaults it to `Opaque` | a consumer that branches on type takes its not-mine path and does nothing, silently |
 
+Measured 2026-09-29 on a native node, when the daemon restarted onto a new
+release (rows in [`docs/QUALIFICATION.md`](./docs/QUALIFICATION.md) 7-15):
+
+| what engenho did | what the replaced component promised | how it surfaced |
+|---|---|---|
+| kept a `DaemonSet`/`StatefulSet` pod because its NAME was covered | every pod carries `controller-revision-hash`, and `RollingUpdate` (the default) replaces out-of-date pods within `maxUnavailable` | the re-rendered `DaemonSet`s named the new closure; the eight old pods kept the old one and nothing replaced them |
+
 **The test to run before claiming a capability is embedded:** name what the
 thing you replaced did that nobody writes down — its defaults, the modes it
 sets, the state it installs in the kernel, the fields it fills on decode.

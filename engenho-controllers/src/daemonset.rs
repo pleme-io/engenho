@@ -25,6 +25,21 @@
 //! Self-heal: a deleted pod is recreated on its node on the next tick
 //! (the node still exists + has no owned pod → step 2 fires).
 //!
+//! ## Updates (`spec.updateStrategy`)
+//!
+//! Every pod is stamped with the revision of the template it was built from
+//! ([`crate::rollout`]). Under `RollingUpdate` (the default, as upstream,
+//! with `maxUnavailable: 1`) an out-of-date pod is deleted and its node gets
+//! a pod from the current template; out-of-date pods that are not Ready go at
+//! once, Ready ones one budget's worth at a time. Under `OnDelete` a pod is
+//! only replaced once something else deletes it. A pod in phase `Failed` is
+//! deleted and replaced under either strategy, with a per-node backoff.
+//!
+//! This is what turns a template change — a new image after the daemon
+//! restarts onto a new release — into replaced pods without an operator.
+//! Before it, a node with a pod was covered whatever the pod was built from,
+//! and a pod whose image had been garbage-collected waited forever.
+//!
 //! ## Why node enumeration lives in `reconcile_one`
 //!
 //! The shared [`OwnedChildrenReconciler`] blanket hands each parent its
@@ -43,18 +58,21 @@ use engenho_store::{
     resource::ResourceKey,
 };
 use serde_json::{Value, json};
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::error::ControllerError;
 use crate::event_recorder::Reason as EventReason;
 use crate::meta::{ObjectMeta, ShapeError};
 use crate::owned_children::{
-    OwnedChildrenReconciler, ParentGvk, ReconcileDelta, pod_from_template, template_object_mut,
+    OwnedChildrenReconciler, ParentGvk, ReconcileDelta, live_children, pod_from_template,
+    template_object_mut,
 };
 use crate::owner::{OwnerReference, owner_ref_for};
 use crate::reads::gvk;
+use crate::rollout::{TemplateRevision, UpdateStrategy, pod_is_failed};
 use crate::status::pod_is_ready;
 use crate::sweep::{Sweep, impl_sweep_event_sink};
+use engenho_substrate::Clock;
 use engenho_types::kind::GroupVersionKind;
 
 /// DaemonSet controller — one node-pinned Pod per schedulable node.
@@ -63,6 +81,10 @@ pub struct DaemonSetController {
     namespace: Option<String>,
     /// Per-DaemonSet isolation (`FailedCreate` on a malformed template).
     sweep: Sweep,
+    /// The clock the failed-pod backoff reads.
+    clock: Arc<dyn Clock>,
+    /// How soon a node's failed pod may be deleted again.
+    failed_backoff: FailedPodBackoff,
 }
 
 impl_sweep_event_sink!(DaemonSetController);
@@ -75,7 +97,16 @@ impl DaemonSetController {
             store,
             namespace,
             sweep: Sweep::new("daemonset-controller", EventReason::FailedCreate),
+            clock: Arc::new(engenho_substrate::WallClock),
+            failed_backoff: FailedPodBackoff::default(),
         }
+    }
+
+    /// Builder: the clock the failed-pod backoff reads (tests pin one).
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// A node's `metadata.name`, if present.
@@ -128,6 +159,52 @@ impl DaemonSetController {
         Ok(Some((pod_name, pod)))
     }
 
+    /// The failed pods to delete this pass.
+    ///
+    /// Upstream's `podsShouldBeOnNode` deletes a daemon pod in phase `Failed`
+    /// so the node gets a fresh one from the CURRENT template. engenho kept
+    /// it forever: the node was covered by name. A native pod whose closure
+    /// is gone fails as `ImageUnavailable`, so this is also what recovers a
+    /// node from a garbage-collected image. Rate-limited per node, as
+    /// upstream's `failedPodsBackoff` is, so a template that fails every
+    /// time does not create and delete at the loop's speed; a node whose pod
+    /// is Ready is forgiven.
+    fn failed_deletions<'o>(
+        &self,
+        ds_name: &str,
+        ds_uid: &str,
+        owned: &'o [(ResourceKey, Value)],
+        deleting: &std::collections::BTreeSet<&ResourceKey>,
+    ) -> Vec<&'o ResourceKey> {
+        let mut out = Vec::new();
+        for (pod_key, pod_value) in live_children(owned) {
+            let node = Self::pod_node(pod_value).unwrap_or_default();
+            if pod_is_ready(pod_value) {
+                self.failed_backoff.clear(ds_uid, node);
+            }
+            if deleting.contains(pod_key) || !pod_is_failed(pod_value) {
+                continue;
+            }
+            if self
+                .failed_backoff
+                .admit(ds_uid, node, self.clock.unix_ms())
+            {
+                info!(
+                    daemonset = %ds_name,
+                    pod = %pod_key.label(),
+                    node,
+                    reason = pod_value
+                        .pointer("/status/reason")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(""),
+                    "deleting failed daemon pod so its node gets a fresh one"
+                );
+                out.push(pod_key);
+            }
+        }
+        out
+    }
+
     /// The node an owned pod is pinned to (`spec.nodeName`), if present.
     fn pod_node(pod: &Value) -> Option<&str> {
         pod.get("spec")
@@ -177,12 +254,17 @@ impl OwnedChildrenReconciler for DaemonSetController {
     ) -> Result<ReconcileDelta, ControllerError> {
         // No name / owner-ref → no-op (parent freshly minted; the blanket
         // already skipped no-uid parents).
-        let Some(_ds_name) = ds_value.name() else {
+        let Some(ds_name) = ds_value.name() else {
             return Ok(ReconcileDelta::none());
         };
         let Some(owner_ref) = owner_ref_for(ds_value, "apps/v1", "DaemonSet") else {
             return Ok(ReconcileDelta::none());
         };
+        // A strategy engenho cannot read refuses THIS DaemonSet (an Event on
+        // it), before anything is created or deleted for it.
+        let strategy = UpdateStrategy::of(ds_value)?;
+        let revision = TemplateRevision::of(ds_value);
+        let generation = crate::status::generation_of(ds_value).ok();
 
         // Enumerate schedulable nodes (cluster-scoped). The desired set is
         // one pod per schedulable node — node-pinned.
@@ -202,26 +284,34 @@ impl OwnedChildrenReconciler for DaemonSetController {
 
         // The nodes already covered by an owned pod. A Terminating pod
         // still covers its node: its replacement would take the same name
-        // (`{ds}-{node}`), so it waits for the old one to go. Upstream
-        // names daemon pods by hash and replaces at once. Deleting a
-        // Terminating pod again is left out by the blanket (I3).
+        // (`{ds}-{node}`), so it waits for the old one to go. Upstream names
+        // daemon pods by hash and replaces at once. Deleting a Terminating
+        // pod again is left out by the blanket (I3). A Failed pod covers its
+        // node too, until the delete below has removed it.
         let covered: std::collections::BTreeSet<String> = owned
             .iter()
             .filter_map(|(_, p)| Self::pod_node(p).map(String::from))
             .collect();
 
         let mut commands = Vec::new();
+        let mut deleting: std::collections::BTreeSet<&ResourceKey> =
+            std::collections::BTreeSet::new();
 
-        // Create one pod per schedulable node NOT yet covered.
+        // Create one pod per schedulable node NOT yet covered, stamped with
+        // the template revision it is built from.
         for node_name in &schedulable {
             if covered.contains(node_name) {
                 continue;
             }
-            let Some((pod_name, pod)) =
+            let Some((pod_name, mut pod)) =
                 Self::build_pod_for_node(ds_value, node_name, owner_ref.clone())?
             else {
                 continue;
             };
+            if let Some(rev) = &revision {
+                rev.stamp(&mut pod, generation)
+                    .map_err(|e| e.under(crate::owned_children::TEMPLATE))?;
+            }
             let pod_key = ResourceKey::namespaced("", "v1", "Pod", &pod_ns, &pod_name);
             debug!(node = %node_name, pod = %pod_name, "creating node-pinned daemon pod");
             commands.push(ResourceCommand::Put {
@@ -241,6 +331,39 @@ impl OwnedChildrenReconciler for DaemonSetController {
             if !on_scheduled_node {
                 debug!(pod = %pod_key.label(), "deleting daemon pod on missing/unschedulable node");
                 commands.push(ResourceCommand::delete(pod_key.clone(), Reason::Controller));
+                deleting.insert(pod_key);
+            }
+        }
+
+        // ── ★ A FAILED DAEMON POD IS REPLACED (see `failed_deletions`) ──────
+        let ds_uid = ds_value.uid().unwrap_or(ds_name);
+        for key in self.failed_deletions(ds_name, ds_uid, owned, &deleting) {
+            commands.push(ResourceCommand::delete(key.clone(), Reason::Controller));
+            deleting.insert(key);
+        }
+
+        // ── ★ ROLLING UPDATE ───────────────────────────────────────────────
+        if let (
+            Some(rev),
+            UpdateStrategy::RollingUpdate {
+                max_unavailable, ..
+            },
+        ) = (&revision, strategy)
+        {
+            let budget = max_unavailable.resolve(schedulable.len());
+            for (pod_key, pod_value) in
+                rolling_deletions(rev, budget, &schedulable, owned, &deleting)
+            {
+                info!(
+                    daemonset = %ds_name,
+                    pod = %pod_key.label(),
+                    node = Self::pod_node(pod_value).unwrap_or_default(),
+                    from = TemplateRevision::of_pod(pod_value).unwrap_or("<none>"),
+                    to = rev.as_str(),
+                    max_unavailable = budget,
+                    "rolling update: replacing out-of-date daemon pod"
+                );
+                commands.push(ResourceCommand::delete(pod_key.clone(), Reason::Controller));
             }
         }
 
@@ -249,7 +372,7 @@ impl OwnedChildrenReconciler for DaemonSetController {
 
     fn compute_status(
         &self,
-        _ds_value: &Value,
+        ds_value: &Value,
         owned_now: &[(ResourceKey, Value)],
         observed_generation: i64,
     ) -> Option<Value> {
@@ -259,18 +382,121 @@ impl OwnedChildrenReconciler for DaemonSetController {
         //     report the OWNED-pod-derived counts, which after a converged
         //     tick equal the desired set. `desiredNumberScheduled` ==
         //     `currentNumberScheduled` == owned pod count (one per node);
-        //     `numberReady` counts Ready=True owned pods.
+        //     `numberReady` counts Ready=True owned pods;
+        //     `updatedNumberScheduled` counts the pods built from the
+        //     CURRENT template revision — the number `kubectl rollout status`
+        //     waits on.
         let scheduled = i64::try_from(owned_now.len()).unwrap_or(i64::MAX);
         let ready = i64::try_from(owned_now.iter().filter(|(_, p)| pod_is_ready(p)).count())
             .unwrap_or(i64::MAX);
+        let updated = TemplateRevision::of(ds_value).map_or(scheduled, |rev| {
+            i64::try_from(owned_now.iter().filter(|(_, p)| rev.is_current(p)).count())
+                .unwrap_or(i64::MAX)
+        });
         Some(json!({
             "desiredNumberScheduled": scheduled,
             "currentNumberScheduled": scheduled,
             "numberReady": ready,
             "numberAvailable": ready,
-            "updatedNumberScheduled": scheduled,
+            "numberUnavailable": scheduled - ready,
+            "updatedNumberScheduled": updated,
             "observedGeneration": observed_generation,
         }))
+    }
+}
+
+/// The out-of-date pods a `RollingUpdate` deletes this pass — upstream's
+/// `DaemonSetsController.rollingUpdate`, with the budget counted per
+/// schedulable node:
+///
+/// * a node whose pod is missing, Terminating or already being deleted is
+///   UNAVAILABLE. Upstream does not count a node with no pod, because it
+///   names the replacement by hash and creates it at once; engenho's
+///   replacement takes the same name and waits for the old pod to go, so the
+///   gap between delete and create is real downtime and is charged;
+/// * a node whose pod is current and not Ready is unavailable;
+/// * an out-of-date pod that is not Ready is deleted WHATEVER the budget —
+///   it serves nothing, so replacing it costs nothing. This is the arm that
+///   frees a node whose pod can never start (its image is gone);
+/// * an out-of-date Ready pod is deleted only while the budget has room.
+///
+/// Candidates are taken in node order, so the choice is deterministic.
+fn rolling_deletions<'o>(
+    rev: &TemplateRevision,
+    budget: usize,
+    schedulable: &std::collections::BTreeSet<String>,
+    owned: &'o [(ResourceKey, Value)],
+    deleting: &std::collections::BTreeSet<&ResourceKey>,
+) -> Vec<&'o (ResourceKey, Value)> {
+    let mut unavailable = 0usize;
+    let mut replace_now = Vec::new();
+    let mut candidates = Vec::new();
+    for node in schedulable {
+        let on_node: Vec<&(ResourceKey, Value)> = owned
+            .iter()
+            .filter(|(_, p)| DaemonSetController::pod_node(p) == Some(node.as_str()))
+            .collect();
+        let live: Vec<&(ResourceKey, Value)> = on_node
+            .iter()
+            .copied()
+            .filter(|(k, p)| !p.is_terminating() && !deleting.contains(k) && !pod_is_failed(p))
+            .collect();
+        let [pod] = live.as_slice() else {
+            // No live pod (missing, Terminating, Failed or being deleted), or
+            // more than one: the node is not serving a current pod.
+            unavailable += 1;
+            continue;
+        };
+        let (_, value) = pod;
+        match (rev.is_current(value), pod_is_ready(value)) {
+            (true, true) => {}
+            (true, false) => unavailable += 1,
+            (false, false) => replace_now.push(*pod),
+            (false, true) => candidates.push(*pod),
+        }
+    }
+    let room = budget.saturating_sub(unavailable + replace_now.len());
+    replace_now.extend(candidates.into_iter().take(room));
+    replace_now
+}
+
+/// Per-node backoff before a failed daemon pod is deleted again: upstream's
+/// `failedPodsBackoff` (1 s doubling to 15 min), keyed by `DaemonSet` uid and
+/// node. The first failure on a node is replaced at once; a node whose pod
+/// comes up Ready is forgiven.
+#[derive(Debug, Default)]
+struct FailedPodBackoff {
+    entries: std::sync::Mutex<std::collections::BTreeMap<(String, String), (u32, u64)>>,
+}
+
+impl FailedPodBackoff {
+    const INITIAL_MS: u64 = 1_000;
+    const MAX_MS: u64 = 15 * 60 * 1_000;
+
+    /// Whether a failed pod on `node` may be deleted at `now_ms`; records the
+    /// deletion when it may.
+    fn admit(&self, ds_uid: &str, node: &str, now_ms: u64) -> bool {
+        let Ok(mut entries) = self.entries.lock() else {
+            return true;
+        };
+        let key = (ds_uid.to_string(), node.to_string());
+        let admit = entries.get(&key).is_none_or(|&(n, last)| {
+            let wait = Self::INITIAL_MS
+                .saturating_mul(1u64 << (n.saturating_sub(1)).min(20))
+                .min(Self::MAX_MS);
+            now_ms.saturating_sub(last) >= wait
+        });
+        if admit {
+            let n = entries.get(&key).map_or(0, |&(n, _)| n);
+            entries.insert(key, (n.saturating_add(1), now_ms));
+        }
+        admit
+    }
+
+    fn clear(&self, ds_uid: &str, node: &str) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.remove(&(ds_uid.to_string(), node.to_string()));
+        }
     }
 }
 

@@ -86,6 +86,7 @@ pub mod pvc_protection;
 pub mod reads;
 pub mod replicaset;
 pub mod roceiro;
+pub mod rollout;
 pub mod runtime;
 pub mod selector;
 pub mod served_capability;

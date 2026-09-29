@@ -18,6 +18,15 @@
 //! Identity is preserved across restart: pod `web-2` always has
 //! the same volume claims + (with R13 wiring) the same persistent
 //! volume.
+//!
+//! ## Updates (`spec.updateStrategy`)
+//!
+//!   5. every pod is stamped with its template revision
+//!      ([`crate::rollout`]); a `Failed` ordinal is deleted and recreated;
+//!   6. under `RollingUpdate` (the default, as upstream) the highest
+//!      out-of-date ordinal at or above `partition` is deleted, one at a
+//!      time, the next only once every ordinal above it is current and
+//!      Ready; under `OnDelete` nothing is replaced by the controller.
 
 use std::sync::Arc;
 
@@ -28,7 +37,7 @@ use engenho_store::{
     resource::ResourceKey,
 };
 use serde_json::{Value, json};
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::error::ControllerError;
 use crate::event_recorder::Reason as EventReason;
@@ -38,6 +47,7 @@ use crate::owned_children::{OwnedChildrenReconciler, ParentGvk, ReconcileDelta};
 use crate::owned_children::{TEMPLATE, pod_from_template};
 use crate::owner::{OwnerReference, owner_ref_for};
 use crate::reads::gvk;
+use crate::rollout::{TemplateRevision, UpdateStrategy, pod_is_failed};
 use crate::status::pod_is_ready;
 use crate::sweep::{Sweep, impl_sweep_event_sink};
 use engenho_types::kind::GroupVersionKind;
@@ -242,6 +252,78 @@ impl StatefulSetController {
         format!("{template_name}-{sts_name}-{ordinal}")
     }
 
+    /// The pods to delete for an update this pass.
+    fn update_deletions<'o>(
+        sts_name: &str,
+        desired: usize,
+        owned: &'o [(ResourceKey, Value)],
+        revision: Option<&TemplateRevision>,
+        strategy: UpdateStrategy,
+    ) -> Vec<&'o ResourceKey> {
+        let mut out = Vec::new();
+        // ── ★ A FAILED ORDINAL IS RECREATED ────────────────────────────────
+        // Upstream deletes a pod in phase `Failed` and recreates it under the
+        // same ordinal, from the current template. engenho kept it: the
+        // ordinal was held by name. A native pod whose closure is gone fails
+        // as `ImageUnavailable`, so this is what frees an ordinal the rollout
+        // below would otherwise wait on forever (upstream waits on an
+        // unhealthy pod, and so does this).
+        let by_ordinal: std::collections::BTreeMap<usize, &(ResourceKey, Value)> = owned
+            .iter()
+            .filter_map(|kv| Self::ordinal_of(&kv.0.name, sts_name).map(|o| (o, kv)))
+            .collect();
+        let mut deleted: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        for (&ord, &kv) in &by_ordinal {
+            let (pod_key, pod) = kv;
+            if ord < desired && !pod.is_terminating() && pod_is_failed(pod) {
+                info!(
+                    sts = sts_name,
+                    pod = %pod_key.label(),
+                    "deleting failed pod so its ordinal is recreated"
+                );
+                out.push(&kv.0);
+                deleted.insert(ord);
+            }
+        }
+
+        // ── ★ ROLLING UPDATE ───────────────────────────────────────────────
+        // Upstream's `updateStatefulSet` for `RollingUpdate`: from the highest
+        // ordinal down to `partition`, delete the first pod not built from the
+        // current revision and stop; stop too at the first pod that is not
+        // Ready (or is still going), so exactly one ordinal is ever down for
+        // an update. `OnDelete` replaces only what something else deleted.
+        if let (Some(rev), UpdateStrategy::RollingUpdate { partition, .. }) = (revision, strategy)
+            && deleted.is_empty()
+        {
+            let floor = (partition as usize).min(desired);
+            for ord in (floor..desired).rev() {
+                let Some(&kv) = by_ordinal.get(&ord) else {
+                    break; // being created: wait for it
+                };
+                let (pod_key, pod) = kv;
+                if pod.is_terminating() {
+                    break;
+                }
+                if !rev.is_current(pod) {
+                    info!(
+                        sts = sts_name,
+                        pod = %pod_key.label(),
+                        from = TemplateRevision::of_pod(pod).unwrap_or("<none>"),
+                        to = rev.as_str(),
+                        "rolling update: replacing out-of-date pod"
+                    );
+                    out.push(&kv.0);
+                    break;
+                }
+                if !pod_is_ready(pod) {
+                    break;
+                }
+            }
+        }
+
+        out
+    }
+
     /// Extract the ordinal from "{sts}-{n}". Returns None for
     /// names that don't match.
     fn ordinal_of(pod_name: &str, sts_name: &str) -> Option<usize> {
@@ -303,6 +385,10 @@ impl OwnedChildrenReconciler for StatefulSetController {
         let Some(owner_ref) = owner_ref_for(sts_value, "apps/v1", "StatefulSet") else {
             return Ok(ReconcileDelta::none());
         };
+        // A strategy engenho cannot read refuses THIS StatefulSet (an Event
+        // on it), before anything is created or deleted for it.
+        let strategy = UpdateStrategy::of(sts_value)?;
+        let revision = TemplateRevision::of(sts_value);
         // Pods go in the StatefulSet's OWN namespace (where owned-pod
         // gathering looks), not the controller scope ns — same fix as
         // deployment→RS and replicaset→pod. Keying under the scope ns
@@ -372,10 +458,13 @@ impl OwnedChildrenReconciler for StatefulSetController {
             if existing_ordinals.contains(&ordinal) {
                 continue;
             }
-            let Some((pod_name, pod)) = Self::build_pod(sts_value, ordinal, owner_ref.clone())?
+            let Some((pod_name, mut pod)) = Self::build_pod(sts_value, ordinal, owner_ref.clone())?
             else {
                 continue;
             };
+            if let Some(rev) = &revision {
+                rev.stamp(&mut pod, None).map_err(|e| e.under(TEMPLATE))?;
+            }
             let pod_key = ResourceKey::namespaced("", "v1", "Pod", &pod_ns, &pod_name);
             debug!(sts = sts_name, ordinal, "creating ordered pod");
             commands.push(ResourceCommand::Put {
@@ -396,30 +485,46 @@ impl OwnedChildrenReconciler for StatefulSetController {
             }
         }
 
+        // Failed ordinals, then the rolling update (see `update_deletions`).
+        commands.extend(
+            Self::update_deletions(sts_name, desired, owned, revision.as_ref(), strategy)
+                .into_iter()
+                .map(|k| ResourceCommand::delete(k.clone(), Reason::Controller)),
+        );
+
         Ok(ReconcileDelta::from_commands(commands))
     }
 
     fn compute_status(
         &self,
-        _sts_value: &Value,
+        sts_value: &Value,
         owned_now: &[(ResourceKey, Value)],
         observed_generation: i64,
     ) -> Option<Value> {
         // Computed from the LIVE owned pods after the reconcile.
         // `replicas` = owned pod count; `readyReplicas`/`availableReplicas`
-        // = ready owned pods; `updatedReplicas`/`currentReplicas` ==
-        // replicas (single revision at M0.1).
+        // = ready owned pods; `updatedReplicas` = pods built from the current
+        // template revision, which `updateRevision` names.
         let replicas = i64::try_from(owned_now.len()).unwrap_or(i64::MAX);
         let ready = i64::try_from(owned_now.iter().filter(|(_, p)| pod_is_ready(p)).count())
             .unwrap_or(i64::MAX);
-        Some(json!({
+        let revision = TemplateRevision::of(sts_value);
+        let updated = revision.as_ref().map_or(replicas, |rev| {
+            i64::try_from(owned_now.iter().filter(|(_, p)| rev.is_current(p)).count())
+                .unwrap_or(i64::MAX)
+        });
+        let mut status = json!({
             "replicas": replicas,
             "readyReplicas": ready,
             "availableReplicas": ready,
-            "updatedReplicas": replicas,
+            "updatedReplicas": updated,
             "currentReplicas": replicas,
             "observedGeneration": observed_generation,
-        }))
+        });
+        if let Some(rev) = revision {
+            status["updateRevision"] = Value::from(rev.as_str());
+        }
+        Some(status)
     }
 }
 
