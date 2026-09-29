@@ -339,14 +339,24 @@ async fn run_async(command: Command) -> anyhow::Result<()> {
     }
 }
 
+/// The daemon's log filter when `RUST_LOG` is unset.
+///
+/// The controllers and the kubelet are named because what they do on their
+/// own is what an operator must be able to read afterwards without having
+/// raised a level first: a rolling update replacing a pod after the daemon
+/// restarted onto a new release, a failed pod replaced, an image found
+/// unavailable, a closure root released. A target missing from this list logs
+/// NOTHING at any level.
+const DEFAULT_LOG_DIRECTIVES: &str = "engenho=info,engenho_runtime=info,engenho_store=info,\
+                                      engenho_controllers=info,engenho_kubelet=info";
+
 /// Run the engenho daemon: a [`Supervisor`] that stays up above the runtime,
 /// booting it, retrying it and stopping it, until SIGTERM, SIGINT or an
 /// exit request ends the process. Returns how it should end.
 async fn run_daemon() -> anyhow::Result<ExitIntent> {
     // 1. Tracing — env-filtered, info default for our crates: to stdout, and
     //    into the ring the control plane serves (`engenho ctl logs list`).
-    let directives = std::env::var("RUST_LOG")
-        .unwrap_or_else(|_| "engenho=info,engenho_runtime=info,engenho_store=info".into());
+    let directives = std::env::var("RUST_LOG").unwrap_or_else(|_| DEFAULT_LOG_DIRECTIVES.into());
     let filter = || EnvFilter::try_new(&directives).unwrap_or_else(|_| EnvFilter::new("info"));
     let (log_layer, logs) = LogLayer::new();
     tracing_subscriber::registry()
@@ -930,6 +940,23 @@ mod tests {
 
     /// Each stop cause is logged under its conventional signal name, so the
     /// log says WHICH signal stopped the daemon rather than just that one did.
+    /// A rollout after a restart, a replaced failed pod and an unavailable
+    /// image are logged by the controllers and the kubelet at info; with a
+    /// default filter that did not name them, none of it reached the log.
+    #[test]
+    fn the_default_log_filter_admits_the_controllers_and_the_kubelet() {
+        let filter = tracing_subscriber::EnvFilter::try_new(super::DEFAULT_LOG_DIRECTIVES)
+            .expect("the default directives parse");
+        let shown = filter.to_string();
+        for target in [
+            "engenho_controllers=info",
+            "engenho_kubelet=info",
+            "engenho=info",
+        ] {
+            assert!(shown.contains(target), "{target} missing from {shown}");
+        }
+    }
+
     #[test]
     fn stop_cause_is_logged_by_signal_name() {
         assert_eq!(StopCause::Interrupt.to_string(), "SIGINT");

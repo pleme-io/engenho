@@ -234,6 +234,44 @@ async fn ready_pods_roll_one_at_a_time_by_default() {
     );
 }
 
+/// The daemon restarting onto a new release is the case that matters: the
+/// re-rendered `DaemonSet` reaches a controller that was just constructed and
+/// holds no memory of the old pods. The rollout needs none — revisions are on
+/// the pods — so a fresh controller after every step still replaces exactly
+/// one Ready pod at a time, with no operator action.
+#[tokio::test]
+async fn a_controller_built_after_a_restart_rolls_one_pod_at_a_time() {
+    let (store, first) = ds_at_old("r16-ds-restart", None).await;
+    for p in DS_PODS {
+        mark_ready(&store, p).await;
+    }
+    drop(first);
+    roll_ds_to_new(&store, None).await;
+    for step in 1..=3 {
+        let c = DaemonSetController::new(store.clone(), None);
+        c.tick().await.unwrap();
+        let now = images(&store, &DS_PODS).await;
+        assert_eq!(
+            now.iter().filter(|i| i.is_none()).count(),
+            1,
+            "step {step}: {now:?}"
+        );
+        let c = DaemonSetController::new(store.clone(), None);
+        c.tick().await.unwrap();
+        for (p, img) in DS_PODS.iter().zip(images(&store, &DS_PODS).await) {
+            if img.as_deref() == Some(NEW) {
+                mark_ready(&store, p).await;
+            }
+        }
+        let fresh = images(&store, &DS_PODS)
+            .await
+            .iter()
+            .filter(|i| i.as_deref() == Some(NEW))
+            .count();
+        assert_eq!(fresh, step, "{step} replaced so far");
+    }
+}
+
 #[tokio::test]
 async fn max_unavailable_two_replaces_two_at_once() {
     let strategy = json!({"type": "RollingUpdate", "rollingUpdate": {"maxUnavailable": 2}});
