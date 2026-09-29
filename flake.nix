@@ -79,8 +79,15 @@
         buildInputs = [ "openssl" ];
       };
 
+      # The build reads code, not prose: a documentation edit must not rebuild
+      # (and on a consumer's rebuild, restart) the daemon. substrate's
+      # source-policy drops top-level docs/ and *.md; no crate embeds them, and
+      # ci/doc-sources reads docs/ from the checkout, not from the build.
+      prose = "excluded";
+
       base = substrate.rust.workspace {
         src = ./.;
+        inherit prose;
         member = "engenho";
         tests.cargo = testsCargo;
       };
@@ -91,6 +98,7 @@
       # build dropped it. Restore as a second member build grafted per-system.
       mcpBase = substrate.rust.workspace {
         src = ./.;
+        inherit prose;
         member = "engenho-mcp";
       };
       # `engenho-cluster-config-render` — the SAME graft, for the same
@@ -112,6 +120,7 @@
       # nothing else flagged it.
       renderBase = substrate.rust.workspace {
         src = ./.;
+        inherit prose;
         member = "engenho-cluster-config-render";
       };
       mcpSystems = [ "aarch64-darwin" "x86_64-darwin" "x86_64-linux" "aarch64-linux" ];
@@ -170,6 +179,7 @@
         inherit toolName;
         packageName = toolName;
         src = ./.;
+        inherit prose;
         repo = "pleme-io/engenho";
         genBuild = true;
         architectures = [ "amd64" "arm64" ];
