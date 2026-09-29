@@ -3867,9 +3867,36 @@ fn build_kubelet(
             _ => Arc::new(engenho_kubelet::NoServiceAccountProjection),
         };
 
+    // The node's Nix store, on a native node: fetch a pod's closure before
+    // its first start and root every closure a pod bound here names, so a
+    // garbage collection cannot take an image out from under its pods
+    // (engenho-kubelet `closure_store`). The roots live with the kubelet's
+    // per-pod state. A native node with no `nix-store` found keeps the
+    // unmanaged default, said once at warn.
+    let closures: Arc<dyn engenho_kubelet::ClosureStore> = match boot.kubelet_backend {
+        CfgBackendKind::Native => {
+            match engenho_kubelet::NixClosureStore::discover(
+                Area::Pods.path(&boot.data_dir).join("gcroots"),
+            ) {
+                Some(store) => {
+                    info!(roots = %store.root_dir().display(), "kubelet roots pod closures in the nix store");
+                    Arc::new(store)
+                }
+                None => {
+                    warn!(
+                        "no nix-store found: pod closures are neither fetched nor rooted, and garbage collection can remove a running pod's image"
+                    );
+                    Arc::new(engenho_kubelet::UnmanagedClosures)
+                }
+            }
+        }
+        _ => Arc::new(engenho_kubelet::UnmanagedClosures),
+    };
+
     Arc::new(
         Kubelet::new(store.clone(), backend.clone(), boot.node_name.clone())
             .with_event_sink(events)
+            .with_closure_store(closures)
             .with_sa_projector(sa_projector)
             .with_volume_materializer(csi_materializer)
             // Deny-all unless this node named prefixes. Load-bearing for the

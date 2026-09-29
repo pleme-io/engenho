@@ -283,6 +283,28 @@ impl std::fmt::Display for BackOffMessage<'_> {
     }
 }
 
+/// The pod `status.reason` (and container waiting reason) of a native pod
+/// whose closure is not in the store and could not be realised.
+pub const IMAGE_UNAVAILABLE: &str = "ImageUnavailable";
+
+/// Why a pod's image cannot exist on this node.
+struct ImageUnavailable<'a> {
+    path: &'a std::path::Path,
+    detail: &'a str,
+}
+
+impl std::fmt::Display for ImageUnavailable<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "closure {} is not in the node's store and could not be realised from its \
+             substituters: {}",
+            self.path.display(),
+            self.detail
+        )
+    }
+}
+
 /// The key a pod's backoff state is filed under: its name AND its uid.
 ///
 /// ── ★ A POD RECREATED UNDER THE SAME NAME IS A NEW POD ──────────────────
@@ -775,6 +797,11 @@ pub struct Kubelet {
     /// resolve; a pod no longer bound here is dropped at the top of every
     /// tick, beside the start ledger.
     volume_pending: Mutex<crate::backoff::VolumePendingLedger>,
+    /// The node's Nix store: fetch a pod's closures before its first start,
+    /// and root every closure a pod bound here names
+    /// ([`crate::closure_store`]). Defaults to [`UnmanagedClosures`], which
+    /// checks, fetches and roots nothing — the behaviour before it existed.
+    closures: Arc<dyn crate::closure_store::ClosureStore>,
     /// Where lifecycle events go. Defaults to the null sink so emission is
     /// safe to add to a code path before the plumbing exists — the
     /// alternative being an `Option` check at every call site.
@@ -824,6 +851,7 @@ impl Kubelet {
             start_ledger: Mutex::new(crate::backoff::StartLedger::default()),
             volume_pending: Mutex::new(crate::backoff::VolumePendingLedger::default()),
             events: Arc::new(engenho_controllers::event_recorder::NullEventSink),
+            closures: Arc::new(crate::closure_store::UnmanagedClosures),
             sweep: Sweep::new(
                 KUBELET_COMPONENT,
                 engenho_controllers::event_recorder::Reason::Failed,
@@ -883,6 +911,16 @@ impl Kubelet {
     ) -> Self {
         self.sweep = self.sweep.with_event_sink(events.clone());
         self.events = events;
+        self
+    }
+
+    /// Builder: the node's closure store (see [`crate::closure_store`]).
+    #[must_use]
+    pub fn with_closure_store(
+        mut self,
+        closures: Arc<dyn crate::closure_store::ClosureStore>,
+    ) -> Self {
+        self.closures = closures;
         self
     }
 
@@ -2601,6 +2639,10 @@ impl Controller for Kubelet {
         self.cleanup_orphans(&bound, &mut report, &mut soonest_requeue)
             .await;
 
+        // ── CLOSURE ROOTS. Level-triggered from the pods bound here, so a
+        // daemon restart neither loses a root nor leaks one.
+        self.sync_closure_roots(&bound).await;
+
         // ── PROJECTED-TOKEN REFRESH. After cleanup so a pod on its way out
         // is not re-minted, and before the start/status work so a long-lived
         // pod's credential is renewed on the same tick that keeps it running.
@@ -2789,6 +2831,12 @@ impl Kubelet {
                     debug!(pod = %key.label(), "pod is being deleted; not starting it");
                     return Ok(());
                 }
+                // ── ★ FETCH BEFORE SPAWN; A CLOSURE THAT CANNOT EXIST IS TERMINAL
+                if let Some((path, detail)) = self.ensure_pod_closures(key, value).await {
+                    return self
+                        .fail_image_unavailable(key, value, &path, &detail, report)
+                        .await;
+                }
                 self.start_bound_pod(key, value, report, soonest_requeue)
                     .await
             }
@@ -2811,6 +2859,137 @@ impl Kubelet {
                     .await
             }
         }
+    }
+
+    /// The GC root a pod's container is filed under.
+    fn closure_root(
+        key: &ResourceKey,
+        value: &Value,
+        container: &str,
+    ) -> crate::closure_store::RootName {
+        let identity = value
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .filter(|u| !u.is_empty())
+            .map_or_else(|| key.label(), String::from);
+        crate::closure_store::RootName::new(&identity, container)
+    }
+
+    /// Reconcile the node's closure roots with the pods bound here: release
+    /// every root no non-terminal pod names, and root every named closure
+    /// that is present but not yet rooted (a pod a previous daemon started).
+    /// A missing closure is left to the pod's own start path, which fetches.
+    async fn sync_closure_roots(&self, bound: &BTreeMap<ResourceKey, Value>) {
+        let mut desired: BTreeMap<crate::closure_store::RootName, std::path::PathBuf> =
+            BTreeMap::new();
+        for (key, value) in bound {
+            if Self::pod_already_terminal(value) {
+                continue;
+            }
+            for (cname, path) in crate::closure_store::pod_closures(value) {
+                desired.insert(Self::closure_root(key, value, &cname), path);
+            }
+        }
+        let held = match self.closures.roots() {
+            Ok(held) => held,
+            Err(e) => {
+                warn!(store = self.closures.name(), error = %e, "cannot list closure roots");
+                return;
+            }
+        };
+        for root in held.keys().filter(|r| !desired.contains_key(*r)) {
+            match self.closures.release(root) {
+                Ok(()) => info!(
+                    root = root.as_str(),
+                    "released closure root: no pod here names it"
+                ),
+                Err(e) => warn!(root = root.as_str(), error = %e, "cannot release closure root"),
+            }
+        }
+        for (root, path) in &desired {
+            if held.get(root) == Some(path) || !self.closures.is_present(path) {
+                continue;
+            }
+            match self.closures.ensure(root, path).await {
+                crate::closure_store::ClosureState::PresentUnrooted { detail } => {
+                    warn!(root = root.as_str(), closure = %path.display(), %detail,
+                          "closure in use but NOT rooted; garbage collection could remove it");
+                }
+                state => debug!(root = root.as_str(), ?state, "closure root reconciled"),
+            }
+        }
+    }
+
+    /// Fetch (when missing) and root every closure `value` names before its
+    /// first start. `Some((path, why))` for the first that cannot exist.
+    async fn ensure_pod_closures(
+        &self,
+        key: &ResourceKey,
+        value: &Value,
+    ) -> Option<(std::path::PathBuf, String)> {
+        for (cname, path) in crate::closure_store::pod_closures(value) {
+            let root = Self::closure_root(key, value, &cname);
+            match self.closures.ensure(&root, &path).await {
+                crate::closure_store::ClosureState::Unavailable { path, detail } => {
+                    return Some((path, detail));
+                }
+                crate::closure_store::ClosureState::PresentUnrooted { detail } => warn!(
+                    pod = %key.label(), closure = %path.display(), %detail,
+                    "starting with a closure that could not be rooted"
+                ),
+                crate::closure_store::ClosureState::Rooted
+                | crate::closure_store::ClosureState::Unmanaged => {}
+            }
+        }
+        None
+    }
+
+    /// Publish a pod whose image cannot exist `Failed` with reason
+    /// `ImageUnavailable`, every container `Waiting{ImageUnavailable}` naming
+    /// the path. Terminal: a controller that keeps one pod per slot replaces
+    /// it from its current template, and nothing here retries a spawn of a
+    /// program that is not on the node.
+    async fn fail_image_unavailable(
+        &self,
+        key: &ResourceKey,
+        value: &Value,
+        path: &std::path::Path,
+        detail: &str,
+        report: &mut ReconcileReport,
+    ) -> Result<(), ControllerError> {
+        use engenho_types::curated_enums::PodPhase;
+        let why = ImageUnavailable { path, detail };
+        let message = why.to_string();
+        let statuses: Vec<ContainerStatusOut> = value
+            .pointer("/spec/containers")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|c| c.get("name").and_then(Value::as_str))
+            .map(|name| ContainerStatusOut {
+                name: name.to_string(),
+                ready: false,
+                state: ContainerState::Waiting {
+                    reason: IMAGE_UNAVAILABLE.to_string(),
+                    message: Some(message.clone()),
+                },
+                container_id: None,
+                restart_count: 0,
+            })
+            .collect();
+        let mut desired = Self::build_pod_status(value, PodPhase::Failed, &statuses, None);
+        if let Some(status) = desired.as_object_mut() {
+            status.insert("reason".into(), Value::from(IMAGE_UNAVAILABLE));
+            status.insert("message".into(), Value::from(message.clone()));
+        }
+        warn!(pod = %key.label(), %why, "pod image unavailable; published Failed");
+        self.emit(
+            key,
+            engenho_controllers::event_recorder::Reason::Failed,
+            message,
+        )
+        .await;
+        self.write_pod_status(key, value, &desired, report).await
     }
 
     /// (A) Delete-cleanup: local entries no longer in the bound set.

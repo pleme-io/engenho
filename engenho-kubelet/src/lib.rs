@@ -42,6 +42,7 @@
 
 pub mod backend;
 pub mod backoff;
+pub mod closure_store;
 pub mod config_bridge;
 pub mod cri;
 pub mod cri_backend;
@@ -79,6 +80,9 @@ pub use backend::{
     ContainerRuntime, ContainerStatus, ExecOutcome, FakeBackend, FakeExecFault, FakeNetProber,
     HttpProbeTarget, LogOptions, NetProber, PodmanBackend, ProbeIoError, ProbeSetupStage, ProbeUrl,
     PullPolicy, Readoption, TcpProbeTarget, TerminationGrace, TokioNetProber,
+};
+pub use closure_store::{
+    ClosureState, ClosureStore, NixClosureStore, RootName, UnmanagedClosures, pod_closures,
 };
 pub use config_bridge::{
     BackendRefused, make_container_runtime, make_container_runtime_with_apiserver,

@@ -99,6 +99,11 @@ pub enum NativeError {
     OciImage { reference: String },
     /// The image reference itself was malformed.
     Image(crate::image_source::ImageSourceError),
+    /// The closure is not in the store. The kubelet's closure store fetches
+    /// before the first start and fails the pod `ImageUnavailable` when it
+    /// cannot; this is the floor for a kubelet with no store, so the error
+    /// names the missing closure rather than a missing entrypoint inside it.
+    ClosureMissing { closure: PathBuf },
     /// No command, and the closure's `bin/` holds no executable to infer one
     /// from.
     NoEntrypoint { closure: PathBuf },
@@ -163,6 +168,11 @@ impl std::fmt::Display for NativeError {
                  the podman or CRI backend."
             ),
             Self::Image(e) => write!(f, "{e}"),
+            Self::ClosureMissing { closure } => write!(
+                f,
+                "closure {} is not in the store (ImageUnavailable)",
+                closure.display()
+            ),
             Self::NoEntrypoint { closure } => write!(
                 f,
                 "the container declares no command and {}/bin holds no \
@@ -660,6 +670,9 @@ impl NativeBackend {
     /// operator would debug the wrong thing.
     fn closure_of(spec: &ContainerSpec) -> Result<PathBuf, NativeError> {
         match ImageSource::parse(&spec.image).map_err(NativeError::Image)? {
+            ImageSource::NixClosure(p) if !p.exists() => {
+                Err(NativeError::ClosureMissing { closure: p })
+            }
             ImageSource::NixClosure(p) => Ok(p),
             ImageSource::Oci(reference) => Err(NativeError::OciImage { reference }),
         }
@@ -1238,6 +1251,39 @@ mod tests {
             .await
             .expect("dropping the handle must end the workload, not leave it running")
             .expect("read to EOF");
+    }
+
+    /// Gap (docs/QUALIFICATION.md row 13): a native workload does not
+    /// survive a daemon restart. `KillMode=control-group` (Linux) and the
+    /// launchd job's process group (macOS) end it with the daemon, and the
+    /// next backend cannot find it, so every restart — every release — takes
+    /// every native workload down at once. The destination: the workload
+    /// outlives the daemon (its own unit or process group, recorded on disk by
+    /// pod uid) and the next backend adopts it by identity. The kubelet reads
+    /// exactly this answer to decide adopt-or-start.
+    #[test]
+    #[ignore = "gap: docs/QUALIFICATION.md row 13 (native workloads are not re-adopted across a daemon restart)"]
+    fn gap_the_next_backend_adopts_a_running_native_workload() {
+        let b = NativeBackend::new(Isolation::HostProcess, "/tmp/nb-test-logs");
+        assert_eq!(b.readoption(), Readoption::AdoptsRunning);
+    }
+
+    /// ★ The floor under the kubelet's closure store: a closure that is not
+    /// in the store is named as missing, not reported as a closure with no
+    /// entrypoint.
+    #[tokio::test]
+    async fn a_missing_closure_is_named_not_mistaken_for_a_missing_entrypoint() {
+        let b = NativeBackend::new(Isolation::HostProcess, "/tmp/nb-test-logs");
+        let gone = "/nix/store/00000000000000000000000000000000-gone";
+        let err = b
+            .start(&spec(&format!("nix:{gone}"), &[]))
+            .await
+            .expect_err("a missing closure cannot start")
+            .to_string();
+        assert!(
+            err.contains(gone) && err.contains("ImageUnavailable"),
+            "{err}"
+        );
     }
 
     /// ★ T2.10: a workload that ignores SIGTERM is killed with SIGKILL once its grace
