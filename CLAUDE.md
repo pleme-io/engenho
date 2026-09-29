@@ -133,6 +133,7 @@ release (rows in [`docs/QUALIFICATION.md`](./docs/QUALIFICATION.md) 7-15):
 | what engenho did | what the replaced component promised | how it surfaced |
 |---|---|---|
 | kept a `DaemonSet`/`StatefulSet` pod because its NAME was covered | every pod carries `controller-revision-hash`, and `RollingUpdate` (the default) replaces out-of-date pods within `maxUnavailable` | the re-rendered `DaemonSet`s named the new closure; the eight old pods kept the old one and nothing replaced them |
+| filed a pod's start backoff under its NAME | container backoff is keyed by pod UID | a pod recreated under the same name waited ~4.5 min on its predecessor's backoff, showing a bare `ContainerCreating` |
 
 **The test to run before claiming a capability is embedded:** name what the
 thing you replaced did that nobody writes down — its defaults, the modes it

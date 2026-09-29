@@ -365,6 +365,11 @@ pub enum ContainerState {
     Waiting {
         /// Short reason string (e.g. `"ContainerCreating"`).
         reason: String,
+        /// Upstream's `waiting.message`: what the container waits for, in
+        /// words (`back-off 40s restarting failed container=…`). `None`
+        /// renders no `message`, as before it existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
     },
     /// The container is up. Renders `state: { running: {} }`.
     Running,
@@ -409,6 +414,7 @@ impl ContainerState {
     pub fn creating() -> Self {
         ContainerState::Waiting {
             reason: "ContainerCreating".to_string(),
+            message: None,
         }
     }
 }
@@ -558,6 +564,7 @@ impl ContainerObservation {
             name: name.into(),
             state: ContainerState::Waiting {
                 reason: reason.to_string(),
+                message: None,
             },
             container_id: Some(container_id.into()),
             restart_count,
@@ -582,6 +589,20 @@ impl ContainerObservation {
             // decide "start it", and the reason `ever_started` is latched by
             // the kubelet rather than re-derived from `state` each tick.
             ever_started: false,
+        }
+    }
+
+    /// A never-started container held by its start curve: `Waiting` with
+    /// `reason` and a `message` saying how long, still `Pending` (no
+    /// container id).
+    #[must_use]
+    pub fn held(name: impl Into<String>, reason: &str, message: String) -> Self {
+        Self {
+            state: ContainerState::Waiting {
+                reason: reason.to_string(),
+                message: Some(message),
+            },
+            ..Self::waiting(name)
         }
     }
 
@@ -630,7 +651,14 @@ impl ContainerStatusOut {
     pub fn to_wire(&self) -> serde_json::Value {
         use serde_json::json;
         let state = match &self.state {
-            ContainerState::Waiting { reason } => json!({ "waiting": { "reason": reason } }),
+            ContainerState::Waiting {
+                reason,
+                message: None,
+            } => json!({ "waiting": { "reason": reason } }),
+            ContainerState::Waiting {
+                reason,
+                message: Some(message),
+            } => json!({ "waiting": { "reason": reason, "message": message } }),
             ContainerState::Running => json!({ "running": {} }),
             ContainerState::Terminated(exit) => json!({
                 "terminated": { "exitCode": exit.exit_code(), "reason": exit.reason() }

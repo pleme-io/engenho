@@ -256,6 +256,52 @@ impl std::fmt::Display for Unseen {
     }
 }
 
+/// Upstream's held-start message: `back-off 10s restarting failed
+/// container=app pod=home_default(<uid>)`.
+struct BackOffMessage<'a> {
+    remaining: Duration,
+    container: &'a str,
+    key: &'a ResourceKey,
+    value: &'a Value,
+}
+
+impl std::fmt::Display for BackOffMessage<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let secs = self.remaining.as_secs() + u64::from(self.remaining.subsec_nanos() > 0);
+        let uid = self
+            .value
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        write!(
+            f,
+            "back-off {secs}s restarting failed container={} pod={}_{}({uid})",
+            self.container,
+            self.key.name,
+            self.key.namespace.as_deref().unwrap_or("default"),
+        )
+    }
+}
+
+/// The key a pod's backoff state is filed under: its name AND its uid.
+///
+/// ── ★ A POD RECREATED UNDER THE SAME NAME IS A NEW POD ──────────────────
+/// The start curve and the volume-pending streak were keyed by
+/// `namespace/name`, so a pod deleted and recreated under the same name —
+/// what a `DaemonSet` (`{ds}-{node}`) or `StatefulSet` (`{sts}-{n}`) does —
+/// inherited the dead pod's streak. Measured on a native node: two new pods
+/// sat `ContainerCreating` for ~4.5 min with no log line, waiting out the
+/// cap their predecessors' thousands of failures had earned. Upstream keys
+/// container backoff by pod UID. A pod with no uid (only in tests) falls
+/// back to its name.
+fn pod_instance(key: &ResourceKey, value: &Value) -> String {
+    let label = key.label();
+    match value.pointer("/metadata/uid").and_then(Value::as_str) {
+        Some(uid) if !uid.is_empty() => format!("{label}#{uid}"),
+        _ => label,
+    }
+}
+
 /// A start the runtime refused, and what it cost on that container's start
 /// curve ([`crate::backoff::StartLedger`]).
 struct LaunchFailed {
@@ -2536,7 +2582,7 @@ impl Controller for Kubelet {
         // it covers a pod that never started (no local record, so the cleanup
         // below never visits it) as well as one that did.
         {
-            let live: BTreeSet<String> = bound.keys().map(ResourceKey::label).collect();
+            let live: BTreeSet<String> = bound.iter().map(|(k, v)| pod_instance(k, v)).collect();
             self.start_ledger
                 .lock()
                 .await
@@ -3133,6 +3179,7 @@ impl Kubelet {
                 ready: false,
                 state: ContainerState::Waiting {
                     reason: reason.to_string(),
+                    message: None,
                 },
                 container_id: None,
                 restart_count: 0,
@@ -3177,7 +3224,10 @@ impl Kubelet {
             .await
         {
             Ok(map) => {
-                self.volume_pending.lock().await.resolved(&key.label());
+                self.volume_pending
+                    .lock()
+                    .await
+                    .resolved(&pod_instance(key, value));
                 Ok(Some(map))
             }
             Err(e) => {
@@ -3218,7 +3268,7 @@ impl Kubelet {
             .volume_pending
             .lock()
             .await
-            .unresolved(&key.label(), self.now());
+            .unresolved(&pod_instance(key, value), self.now());
         match retry {
             // Logged at the curve's cadence, not the loop's.
             crate::backoff::VolumeRetry::Missed {
@@ -3392,7 +3442,7 @@ impl Kubelet {
             if recorded.contains(cname) {
                 continue;
             }
-            match self.start_permit(key, cname).await {
+            match self.start_permit(key, value, cname).await {
                 Ok(permit) => {
                     permits.insert(cname.clone(), permit);
                 }
@@ -3912,12 +3962,13 @@ impl Kubelet {
     async fn start_permit(
         &self,
         key: &ResourceKey,
+        value: &Value,
         cname: &str,
     ) -> Result<crate::backoff::StartPermit, crate::backoff::StartHeld> {
         self.start_ledger
             .lock()
             .await
-            .permit(&key.label(), cname, self.now())
+            .permit(&pod_instance(key, value), cname, self.now())
     }
 
     /// ★ THE ONE PLACE A CONTAINER IS STARTED. It takes a permit, so the
@@ -4003,7 +4054,7 @@ impl Kubelet {
         old_restart_count: u32,
         crash_backoff: Option<crate::backoff::CrashBackoff>,
     ) -> Relaunch {
-        let permit = match self.start_permit(key, cname).await {
+        let permit = match self.start_permit(key, value, cname).await {
             Ok(permit) => permit,
             Err(held) => return Relaunch::Held(held),
         };
@@ -4218,8 +4269,30 @@ impl Kubelet {
             let record = lp.containers.get(cname);
             let Some(record) = record else {
                 // Recorded by neither start nor record → the container hasn't
-                // been started yet (partial start). Waiting → pod Pending.
-                observations.push(ContainerObservation::waiting(cname));
+                // been started yet (partial start). Waiting → pod Pending —
+                // and when its start curve is holding it, it says so and for
+                // how long, as upstream's `CrashLoopBackOff` does, rather
+                // than a bare `ContainerCreating` nobody can tell from "not
+                // reached yet".
+                let held =
+                    self.start_ledger
+                        .lock()
+                        .await
+                        .permit(&pod_instance(key, value), cname, now);
+                observations.push(match held {
+                    Err(held) => ContainerObservation::held(
+                        cname,
+                        crate::backoff::CRASH_LOOP_BACK_OFF,
+                        BackOffMessage {
+                            remaining: held.remaining,
+                            container: cname,
+                            key,
+                            value,
+                        }
+                        .to_string(),
+                    ),
+                    Ok(_) => ContainerObservation::waiting(cname),
+                });
                 continue;
             };
             match self.poll(&record.container_id).await {
@@ -5085,10 +5158,11 @@ impl Kubelet {
     async fn init_start_permit(
         &self,
         key: &ResourceKey,
+        value: &Value,
         cname: &str,
         report: &mut ReconcileReport,
     ) -> Option<crate::backoff::StartPermit> {
-        match self.start_permit(key, cname).await {
+        match self.start_permit(key, value, cname).await {
             Ok(permit) => Some(permit),
             Err(held) => {
                 debug!(
@@ -5151,7 +5225,7 @@ impl Kubelet {
                 // curve allows. An init container whose start keeps failing
                 // was retried on every tick, and this path re-ticks every
                 // second while init is pending.
-                let Some(permit) = self.init_start_permit(key, cname, report).await else {
+                let Some(permit) = self.init_start_permit(key, value, cname, report).await else {
                     return Ok(None);
                 };
                 debug!(
@@ -5188,7 +5262,8 @@ impl Kubelet {
                         // AwaitInit for it) OR vanished → (re)start fresh,
                         // when its start curve allows. Asked BEFORE the old
                         // container is touched: a held restart leaves it.
-                        let Some(permit) = self.init_start_permit(key, cname, report).await else {
+                        let Some(permit) = self.init_start_permit(key, value, cname, report).await
+                        else {
                             return Ok(None);
                         };
                         let new_count = record.restart_count + 1;
