@@ -71,6 +71,18 @@ Same shape as Crossplane's ban on `format!()` of Go syntax
 and NixAST's ban on string-concat of Nix
 ([`pleme-io/theory/NIX-AST.md`](https://github.com/pleme-io/theory/blob/main/NIX-AST.md)).
 
+## Consumers' needs are engenho's backlog
+
+A local engenho cluster is used to qualify manifests bound for upstream
+Kubernetes. When a qualification needs something engenho does not do (a type
+check upstream enforces, an OpenAPI document, an OCI pod, a webhook call),
+**engenho gains the capability**: measure it, prove the divergence with
+`engenho-diff`, fix it with a case that goes red without the fix. The consumer
+never works around it or lowers its qualification; until the fix lands it
+reports which tier is blocked. The measured gaps and their source locations
+live in [`docs/QUALIFICATION.md`](./docs/QUALIFICATION.md); add a row there
+the day a new one is found.
+
 ## One binary — the shape every change is measured against
 
 **engenho IS the Kubernetes system, it does not supervise one.** One
