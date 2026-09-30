@@ -82,7 +82,9 @@
       # The build reads code, not prose: a documentation edit must not rebuild
       # (and on a consumer's rebuild, restart) the daemon. substrate's
       # source-policy drops top-level docs/ and *.md; no crate embeds them, and
-      # ci/doc-sources reads docs/ from the checkout, not from the build.
+      # ci/doc-sources reads docs/ from the checkout, not from the build. The
+      # cargo test check still gets the whole tree (substrate `testSrc`), since
+      # engenho-revoada's retracted_safety_claims reads docs/*.md.
       prose = "excluded";
 
       base = substrate.rust.workspace {
