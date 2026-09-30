@@ -1,34 +1,34 @@
-//! In-memory `RaftLogStorage` + `RaftStateMachine` impls for
-//! engenho-revoada.
+//! `RaftLogStorage` + `RaftStateMachine` for engenho-revoada.
 //!
-//! This is the R2 minimum-viable store: log and state-machine
-//! state live in `Arc<Mutex<...>>`. Sufficient for the in-process
-//! single-node integration test that proves the openraft wiring
-//! correctly applies a [`RoleAssignment`] to the typed [`MeshShape`].
-//!
-//! R2.5+ replaces this with a persistent backend (sled or redb)
-//! and adds full snapshot-builder semantics so log compaction is
-//! sound. The shape of the public API does not change between
-//! R2 and R2.5 — only the backing storage.
+//! [`RaftStore::durable`] keeps Raft's hard state (vote, committed log
+//! id, log, purge point, latest snapshot) in one file, written with
+//! tmp + fsync + rename and a directory fsync before any mutating call
+//! returns, so openraft never answers a peer on the strength of a fact
+//! a crash would erase. The state machine is not persisted: it is
+//! re-derived on boot from the snapshot and a replay of the log.
+//! [`RaftStore::volatile`] keeps everything in memory, for the
+//! in-process simulator and tests (docs/RECOVERABLE-STATE.md I1).
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::io::Cursor;
 use std::ops::RangeBounds;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use openraft::storage::{LogFlushed, LogState, RaftLogStorage, RaftStateMachine, Snapshot};
 use openraft::{
-    Entry, EntryPayload, LogId, OptionalSend, RaftLogReader, RaftSnapshotBuilder, SnapshotMeta,
-    StorageError, StorageIOError, StoredMembership, Vote,
+    Entry, EntryPayload, ErrorSubject, ErrorVerb, LogId, OptionalSend, RaftLogReader,
+    RaftSnapshotBuilder, SnapshotMeta, StorageError, StorageIOError, StoredMembership, Vote,
 };
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::attestation::{AttestationChain, NodeIdentity};
 use crate::consensus::MeshShape;
 use crate::consensus::type_config::{ApplyResult, RaftNodeId, TypeConfig};
 
-/// Combined in-memory store. Both [`RaftLogStorage`] and
+/// Combined log store and state machine. Both [`RaftLogStorage`] and
 /// [`RaftStateMachine`] share the same Arc<Mutex<Inner>> so a
 /// single owner can clone the handle and drive both traits.
 ///
@@ -38,7 +38,7 @@ use crate::consensus::type_config::{ApplyResult, RaftNodeId, TypeConfig};
 /// chain — so EVERY node (leader and follower) maintains its own
 /// auditor-verifiable chain. Leader changes preserve history.
 #[derive(Clone)]
-pub struct InMemoryStore {
+pub struct RaftStore {
     inner: Arc<Mutex<Inner>>,
     identity: NodeIdentity,
     chain: AttestationChain,
@@ -46,6 +46,64 @@ pub struct InMemoryStore {
     /// Production wires `WallClock`; tests pin via `FrozenClock` for
     /// byte-deterministic chain replay.
     clock: Arc<dyn engenho_substrate::Clock>,
+    persistence: Arc<Persistence>,
+}
+
+enum Persistence {
+    Volatile,
+    Durable(PathBuf),
+}
+
+const HARD_STATE_FILE: &str = "raft-hard-state.json";
+
+#[derive(Default, Serialize, Deserialize)]
+struct HardState {
+    vote: Option<Vote<RaftNodeId>>,
+    committed: Option<LogId<RaftNodeId>>,
+    log: Vec<Entry<TypeConfig>>,
+    last_purged: Option<LogId<RaftNodeId>>,
+    snapshot: Option<PersistedSnapshot>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedSnapshot {
+    meta: SnapshotMeta<RaftNodeId, openraft::BasicNode>,
+    bytes: Vec<u8>,
+}
+
+struct Recorded(HardState);
+
+impl Persistence {
+    fn record(&self, state: HardState) -> Result<Recorded, StorageError<RaftNodeId>> {
+        if let Self::Durable(dir) = self {
+            let bytes = serde_json::to_vec(&state).map_err(|e| write_error(&e))?;
+            engenho_substrate::write_atomic(&dir.join(HARD_STATE_FILE), &bytes)
+                .map_err(|e| write_error(&e))?;
+            std::fs::File::open(dir)
+                .and_then(|d| d.sync_all())
+                .map_err(|e| write_error(&e))?;
+        }
+        Ok(Recorded(state))
+    }
+
+    fn load(dir: &Path) -> std::io::Result<HardState> {
+        match std::fs::read(dir.join(HARD_STATE_FILE)) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HardState::default()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+fn write_error<E: std::error::Error + 'static>(e: &E) -> StorageError<RaftNodeId> {
+    StorageError::IO {
+        source: StorageIOError::new(
+            ErrorSubject::Store,
+            ErrorVerb::Write,
+            openraft::AnyError::new(e),
+        ),
+    }
 }
 
 #[derive(Default)]
@@ -70,12 +128,93 @@ struct Inner {
     snapshot_index: u64,
 }
 
-impl InMemoryStore {
+impl Inner {
+    fn hard_state(&self) -> HardState {
+        HardState {
+            vote: self.vote,
+            committed: self.committed,
+            log: self.log.values().cloned().collect(),
+            last_purged: self.last_purged,
+            snapshot: self.snapshot.as_ref().map(|s| PersistedSnapshot {
+                meta: s.meta.clone(),
+                bytes: s.snapshot.get_ref().clone(),
+            }),
+        }
+    }
+
+    fn install(&mut self, Recorded(state): Recorded) {
+        self.vote = state.vote;
+        self.committed = state.committed;
+        self.log = state.log.into_iter().map(|e| (e.log_id.index, e)).collect();
+        self.last_purged = state.last_purged;
+        self.snapshot = state.snapshot.map(|p| Snapshot {
+            meta: p.meta,
+            snapshot: Box::new(Cursor::new(p.bytes)),
+        });
+    }
+}
+
+impl RaftStore {
     /// Construct with this node's identity + a fresh attestation chain.
     /// Production clock — uses `engenho_substrate::WallClock`. Tests
     /// pinning timestamps should use [`Self::with_clock`].
     pub fn new(identity: NodeIdentity) -> Self {
+        Self::volatile(identity)
+    }
+
+    /// Everything in memory: a restart forgets the vote and the log.
+    #[must_use]
+    pub fn volatile(identity: NodeIdentity) -> Self {
         Self::with_clock(identity, Arc::new(engenho_substrate::WallClock))
+    }
+
+    /// Hard state persisted under `dir`, restored from it if present.
+    /// The state machine is rebuilt from the persisted snapshot; openraft
+    /// replays the log after it.
+    ///
+    /// # Errors
+    ///
+    /// The directory cannot be created, or a hard-state file in it cannot
+    /// be read or parsed. A file that cannot be parsed is refused, never
+    /// read as empty: an empty hard state would let this node vote again.
+    pub fn durable(identity: NodeIdentity, dir: impl Into<PathBuf>) -> std::io::Result<Self> {
+        Self::durable_with_clock(identity, dir, Arc::new(engenho_substrate::WallClock))
+    }
+
+    /// [`Self::durable`] with an explicit clock.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::durable`].
+    pub fn durable_with_clock(
+        identity: NodeIdentity,
+        dir: impl Into<PathBuf>,
+        clock: Arc<dyn engenho_substrate::Clock>,
+    ) -> std::io::Result<Self> {
+        let dir = dir.into();
+        std::fs::create_dir_all(&dir)?;
+        let state = Persistence::load(&dir)?;
+        let mut inner = Inner::default();
+        if let Some(snap) = &state.snapshot {
+            inner.shape = serde_json::from_slice(&snap.bytes)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            inner.last_applied = snap.meta.last_log_id;
+            inner.last_membership = snap.meta.last_membership.clone();
+        }
+        inner.install(Recorded(state));
+        Ok(Self {
+            inner: Arc::new(Mutex::new(inner)),
+            identity,
+            chain: AttestationChain::new(),
+            clock,
+            persistence: Arc::new(Persistence::Durable(dir)),
+        })
+    }
+
+    /// True when a restart keeps this store's hard state.
+    #[must_use]
+    pub fn is_durable(&self) -> bool {
+        matches!(*self.persistence, Persistence::Durable(_))
     }
 
     /// Construct with an explicit typed clock — tests should pass a
@@ -86,7 +225,20 @@ impl InMemoryStore {
             identity,
             chain: AttestationChain::new(),
             clock,
+            persistence: Arc::new(Persistence::Volatile),
         }
+    }
+
+    async fn mutate_hard_state(
+        &self,
+        change: impl FnOnce(&mut HardState),
+    ) -> Result<(), StorageError<RaftNodeId>> {
+        let mut guard = self.inner.lock().await;
+        let mut next = guard.hard_state();
+        change(&mut next);
+        let recorded = self.persistence.record(next)?;
+        guard.install(recorded);
+        Ok(())
     }
 
     /// Read-only snapshot of the typed MeshShape (the application
@@ -105,7 +257,7 @@ impl InMemoryStore {
 //   RaftLogReader
 // ============================================================
 
-impl RaftLogReader<TypeConfig> for InMemoryStore {
+impl RaftLogReader<TypeConfig> for RaftStore {
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + OptionalSend>(
         &mut self,
         range: RB,
@@ -121,7 +273,7 @@ impl RaftLogReader<TypeConfig> for InMemoryStore {
 //   RaftLogStorage
 // ============================================================
 
-impl RaftLogStorage<TypeConfig> for InMemoryStore {
+impl RaftLogStorage<TypeConfig> for RaftStore {
     type LogReader = Self;
 
     async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<RaftNodeId>> {
@@ -144,8 +296,8 @@ impl RaftLogStorage<TypeConfig> for InMemoryStore {
     }
 
     async fn save_vote(&mut self, vote: &Vote<RaftNodeId>) -> Result<(), StorageError<RaftNodeId>> {
-        self.inner.lock().await.vote = Some(*vote);
-        Ok(())
+        let vote = *vote;
+        self.mutate_hard_state(|h| h.vote = Some(vote)).await
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<RaftNodeId>>, StorageError<RaftNodeId>> {
@@ -156,8 +308,7 @@ impl RaftLogStorage<TypeConfig> for InMemoryStore {
         &mut self,
         committed: Option<LogId<RaftNodeId>>,
     ) -> Result<(), StorageError<RaftNodeId>> {
-        self.inner.lock().await.committed = committed;
-        Ok(())
+        self.mutate_hard_state(|h| h.committed = committed).await
     }
 
     async fn read_committed(
@@ -175,13 +326,14 @@ impl RaftLogStorage<TypeConfig> for InMemoryStore {
         I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
-        let mut guard = self.inner.lock().await;
-        for e in entries {
-            let idx = e.log_id.index;
-            guard.log.insert(idx, e);
-        }
-        drop(guard);
-        // In-memory => I/O is synchronous. Signal callback immediately.
+        let entries: Vec<Entry<TypeConfig>> = entries.into_iter().collect();
+        self.mutate_hard_state(|h| {
+            if let Some(first) = entries.first().map(|e| e.log_id.index) {
+                h.log.retain(|e| e.log_id.index < first);
+            }
+            h.log.extend(entries);
+        })
+        .await?;
         callback.log_io_completed(Ok(()));
         Ok(())
     }
@@ -190,16 +342,16 @@ impl RaftLogStorage<TypeConfig> for InMemoryStore {
         &mut self,
         log_id: LogId<RaftNodeId>,
     ) -> Result<(), StorageError<RaftNodeId>> {
-        let mut guard = self.inner.lock().await;
-        guard.log.retain(|&idx, _| idx < log_id.index);
-        Ok(())
+        self.mutate_hard_state(|h| h.log.retain(|e| e.log_id.index < log_id.index))
+            .await
     }
 
     async fn purge(&mut self, log_id: LogId<RaftNodeId>) -> Result<(), StorageError<RaftNodeId>> {
-        let mut guard = self.inner.lock().await;
-        guard.last_purged = Some(log_id);
-        guard.log.retain(|&idx, _| idx > log_id.index);
-        Ok(())
+        self.mutate_hard_state(|h| {
+            h.last_purged = Some(log_id);
+            h.log.retain(|e| e.log_id.index > log_id.index);
+        })
+        .await
     }
 }
 
@@ -208,11 +360,11 @@ impl RaftLogStorage<TypeConfig> for InMemoryStore {
 // ============================================================
 
 #[derive(Clone)]
-pub struct InMemorySnapshotBuilder {
-    store: InMemoryStore,
+pub struct RaftSnapshotBuilderHandle {
+    store: RaftStore,
 }
 
-impl RaftSnapshotBuilder<TypeConfig> for InMemorySnapshotBuilder {
+impl RaftSnapshotBuilder<TypeConfig> for RaftSnapshotBuilderHandle {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<RaftNodeId>> {
         let mut guard = self.store.inner.lock().await;
         let last_applied = guard.last_applied;
@@ -222,7 +374,7 @@ impl RaftSnapshotBuilder<TypeConfig> for InMemorySnapshotBuilder {
         })?;
         guard.snapshot_index += 1;
         let snapshot_id = format!("snap-{}", guard.snapshot_index);
-        let snapshot = Snapshot {
+        let snapshot: Snapshot<TypeConfig> = Snapshot {
             meta: SnapshotMeta {
                 last_log_id: last_applied,
                 last_membership: last_membership.clone(),
@@ -230,7 +382,13 @@ impl RaftSnapshotBuilder<TypeConfig> for InMemorySnapshotBuilder {
             },
             snapshot: Box::new(Cursor::new(shape_bytes)),
         };
-        guard.snapshot = Some(snapshot.clone_snapshot_data_or_skip());
+        let mut next = guard.hard_state();
+        next.snapshot = Some(PersistedSnapshot {
+            meta: snapshot.meta.clone(),
+            bytes: snapshot.snapshot.get_ref().clone(),
+        });
+        let recorded = self.store.persistence.record(next)?;
+        guard.install(recorded);
         Ok(snapshot)
     }
 }
@@ -255,8 +413,8 @@ impl SnapshotClone for Snapshot<TypeConfig> {
 //   RaftStateMachine
 // ============================================================
 
-impl RaftStateMachine<TypeConfig> for InMemoryStore {
-    type SnapshotBuilder = InMemorySnapshotBuilder;
+impl RaftStateMachine<TypeConfig> for RaftStore {
+    type SnapshotBuilder = RaftSnapshotBuilderHandle;
 
     async fn applied_state(
         &mut self,
@@ -317,7 +475,7 @@ impl RaftStateMachine<TypeConfig> for InMemoryStore {
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        InMemorySnapshotBuilder {
+        RaftSnapshotBuilderHandle {
             store: self.clone(),
         }
     }
@@ -338,6 +496,13 @@ impl RaftStateMachine<TypeConfig> for InMemoryStore {
             source: StorageIOError::read_snapshot(Some(meta.signature()), &e),
         })?;
         let mut guard = self.inner.lock().await;
+        let mut next = guard.hard_state();
+        next.snapshot = Some(PersistedSnapshot {
+            meta: meta.clone(),
+            bytes,
+        });
+        let recorded = self.persistence.record(next)?;
+        guard.install(recorded);
         guard.shape = shape;
         guard.last_applied = meta.last_log_id;
         guard.last_membership = meta.last_membership.clone();
@@ -384,7 +549,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_store_reports_no_log_state() {
-        let mut s = InMemoryStore::new(NodeIdentity::from_seed([0xee; 32]));
+        let mut s = RaftStore::new(NodeIdentity::from_seed([0xee; 32]));
         let state = s.get_log_state().await.unwrap();
         assert!(state.last_log_id.is_none());
         assert!(state.last_purged_log_id.is_none());
@@ -392,7 +557,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_promote_mutates_mesh_shape() {
-        let mut s = InMemoryStore::new(NodeIdentity::from_seed([0xee; 32]));
+        let mut s = RaftStore::new(NodeIdentity::from_seed([0xee; 32]));
         let entry = promote_entry(1);
         let results = s.apply(vec![entry]).await.unwrap();
         assert_eq!(results.len(), 1);
@@ -405,7 +570,7 @@ mod tests {
 
     #[tokio::test]
     async fn vote_round_trips() {
-        let mut s = InMemoryStore::new(NodeIdentity::from_seed([0xee; 32]));
+        let mut s = RaftStore::new(NodeIdentity::from_seed([0xee; 32]));
         assert!(s.read_vote().await.unwrap().is_none());
         let vote = Vote::new(1, 42);
         s.save_vote(&vote).await.unwrap();
@@ -421,8 +586,8 @@ mod tests {
         // replayable consensus chains.
         let identity = NodeIdentity::from_seed([0xee; 32]);
         let clock = std::sync::Arc::new(engenho_substrate::FrozenClock::at(1_700_000_000_000));
-        let mut s1 = InMemoryStore::with_clock(identity.clone(), clock.clone());
-        let mut s2 = InMemoryStore::with_clock(identity, clock);
+        let mut s1 = RaftStore::with_clock(identity.clone(), clock.clone());
+        let mut s2 = RaftStore::with_clock(identity, clock);
         let entry1 = promote_entry(1);
         let entry2 = promote_entry(1);
         s1.apply(vec![entry1]).await.unwrap();

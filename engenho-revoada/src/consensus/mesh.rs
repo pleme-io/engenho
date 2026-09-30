@@ -1,5 +1,5 @@
 //! `RaftMesh` — the public wrapper that ties together
-//! [`InMemoryStore`], [`InProcessRouter`], and openraft's `Raft<C>`
+//! [`RaftStore`], [`InProcessRouter`], and openraft's `Raft<C>`
 //! into a single ergonomic surface.
 //!
 //! At R2 the API is intentionally minimal:
@@ -29,7 +29,7 @@ use tokio::sync::mpsc;
 
 use crate::attestation::{AttestationChain, NodeIdentity};
 use crate::consensus::network::{InProcessRouter, RpcRequest};
-use crate::consensus::store::InMemoryStore;
+use crate::consensus::store::RaftStore;
 use crate::consensus::type_config::{ApplyResult, RaftNodeId, TypeConfig};
 use crate::consensus::{MeshShape, RoleAssignment};
 
@@ -56,14 +56,14 @@ engenho_substrate::impl_error_kind! {
 
 /// Wrapping handle for a single engenho-revoada Raft node.
 ///
-/// At R4.5 the attestation chain LIVES in the [`InMemoryStore`]
+/// At R4.5 the attestation chain LIVES in the [`RaftStore`]
 /// (the state machine), so every node — leader and follower —
 /// builds its own auditor-verifiable chain by signing each
 /// committed entry on apply. Per-node M-of-N attestation emerges
 /// naturally from the parallel chains.
 pub struct RaftMesh {
     raft: Raft<TypeConfig>,
-    store: InMemoryStore,
+    store: RaftStore,
     node_id: RaftNodeId,
     listen_addr: String,
     router: InProcessRouter,
@@ -108,9 +108,37 @@ impl RaftMesh {
         config: Arc<Config>,
         identity: NodeIdentity,
     ) -> Result<Self, RaftError> {
-        // The store owns the identity now (R4.5) — apply() signs
-        // every committed entry to this node's chain.
-        let store = InMemoryStore::new(identity.clone());
+        let store = RaftStore::volatile(identity.clone());
+        Self::start_with_store(node_id, listen_addr, router, config, identity, store).await
+    }
+
+    /// Boot a Raft node whose hard state lives under `dir` and survives a
+    /// restart (docs/RECOVERABLE-STATE.md I1).
+    ///
+    /// # Errors
+    ///
+    /// [`RaftError::Fatal`] when the hard state under `dir` cannot be opened.
+    pub async fn start_durable(
+        node_id: RaftNodeId,
+        listen_addr: String,
+        router: InProcessRouter,
+        config: Arc<Config>,
+        identity: NodeIdentity,
+        dir: impl Into<std::path::PathBuf>,
+    ) -> Result<Self, RaftError> {
+        let store = RaftStore::durable(identity.clone(), dir)
+            .map_err(|e| RaftError::Fatal(format!("open hard state: {e}")))?;
+        Self::start_with_store(node_id, listen_addr, router, config, identity, store).await
+    }
+
+    async fn start_with_store(
+        node_id: RaftNodeId,
+        listen_addr: String,
+        router: InProcessRouter,
+        config: Arc<Config>,
+        identity: NodeIdentity,
+        store: RaftStore,
+    ) -> Result<Self, RaftError> {
         let log_store = store.clone();
         let state_machine = store.clone();
 

@@ -16,7 +16,7 @@
 //! Modules:
 //!   * `role_assignment` — the typed command set (R0)
 //!   * `type_config` — openraft TypeConfig declaration
-//!   * `store` — InMemoryStore (RaftLogStorage + RaftStateMachine)
+//!   * `store` — RaftStore (RaftLogStorage + RaftStateMachine)
 //!   * `network` — InProcessRouter / InProcessNetwork
 
 pub mod mesh;
@@ -28,7 +28,7 @@ pub mod type_config;
 pub use mesh::{RaftError, RaftMesh, default_config};
 pub use network::InProcessRouter;
 pub use role_assignment::{Reason, RoleAssignment};
-pub use store::InMemoryStore;
+pub use store::RaftStore;
 pub use type_config::{ApplyResult, RaftNodeId, TypeConfig};
 
 use serde::{Deserialize, Serialize};
