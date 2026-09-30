@@ -33,7 +33,9 @@ use engenho_kubelet::config_bridge::KubeletBackendKind;
 use engenho_kubelet::{
     ContainerRuntime, Kubelet, LogOptions, make_container_runtime_with_apiserver,
 };
-use engenho_scheduler::{ConfiguredScheduler, Scheduler};
+use engenho_scheduler::{
+    ConfiguredScheduler, NodeCapabilities, Runtime as SchedRuntime, Scheduler,
+};
 use engenho_store::{
     InProcessRouter, ResourceKey, StoreMesh,
     command::{Reason, ResourceCommand},
@@ -199,6 +201,9 @@ impl Runtime {
         let boot = BootConfig::read(&config).map_err(|e| rec.failed(e.into()))?;
         rec.enter(BootPhase::PreflightBackend)
             .map_err(|e| rec.failed(e))?;
+        let advertised = backend
+            .is_none()
+            .then(|| advertised_capabilities(boot.kubelet_backend));
         let backend = if let Some(backend) = backend {
             backend
         } else {
@@ -207,7 +212,7 @@ impl Runtime {
             preflight_backend(&boot).map_err(|e| rec.failed(e))?;
             build_backend(&boot).map_err(|e| rec.failed(e))?
         };
-        Self::start_inner(config, boot, backend, rec).await
+        Self::start_inner(config, boot, backend, advertised, rec).await
     }
 
     /// Boot over a read config: open the store, then [`Self::assemble`]
@@ -218,6 +223,7 @@ impl Runtime {
         config: EngenhoConfig,
         boot: BootConfig,
         backend: Arc<dyn ContainerRuntime>,
+        advertised: Option<NodeCapabilities>,
         rec: &mut BootRecorder,
     ) -> Result<Self, BootFailed> {
         // 0. Count every panic in the process from here on (T2.7): the hook
@@ -254,7 +260,17 @@ impl Runtime {
         // 3–6. Everything else is built over the store. On failure the
         //    assembly has dropped what it built and stopped the apiserver if
         //    it had bound, so `store` is this frame's alone to take back.
-        match Self::assemble(&boot, &backend, &store, panics, &would_reject, rec).await {
+        match Self::assemble(
+            &boot,
+            &backend,
+            advertised.as_ref(),
+            &store,
+            panics,
+            &would_reject,
+            rec,
+        )
+        .await
+        {
             Ok(Assembled {
                 apiserver,
                 children,
@@ -306,6 +322,7 @@ impl Runtime {
     async fn assemble(
         boot: &BootConfig,
         backend: &Arc<dyn ContainerRuntime>,
+        advertised: Option<&NodeCapabilities>,
         store: &Arc<StoreMesh>,
         panics: PanicCounter,
         would_reject: &Arc<WouldRejectLedger>,
@@ -340,7 +357,8 @@ impl Runtime {
         //    restart never undoes a cordon, a taint or an operator's label.
         rec.enter(BootPhase::RegisterNode)?;
         let node_name = &boot.node_name;
-        register_node(store, node_name, &HostOwned::measured(node_name)).await?;
+        let host = HostOwned::measured(node_name).advertising(advertised);
+        register_node(store, node_name, &host).await?;
         rec.enter(BootPhase::SeedCluster)?;
 
         // 4.5. Seed the bootstrap RBAC policy (Brick B) — cluster-admin +
@@ -1739,6 +1757,16 @@ fn apiserver_reachability(boot: &BootConfig) -> ApiserverReachability {
 /// [`build_backend`] for construction, so the kind that is checked is the kind
 /// that is built. pending-I39: the two enums have identical arms and are to
 /// collapse into one.
+fn advertised_capabilities(kind: CfgBackendKind) -> NodeCapabilities {
+    match kind {
+        CfgBackendKind::Native => NodeCapabilities::running([SchedRuntime::Native]),
+        CfgBackendKind::Cri | CfgBackendKind::PodmanApi | CfgBackendKind::Podman => {
+            NodeCapabilities::running([SchedRuntime::Oci])
+        }
+        CfgBackendKind::Fake => NodeCapabilities::running(SchedRuntime::ALL),
+    }
+}
+
 const fn kubelet_backend_kind(kind: CfgBackendKind) -> KubeletBackendKind {
     match kind {
         CfgBackendKind::Cri => KubeletBackendKind::Cri,

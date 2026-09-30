@@ -44,6 +44,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod affinity;
+pub mod capability;
 pub mod config_bridge;
 pub mod error;
 pub mod filter;
@@ -56,6 +57,10 @@ pub mod scheduler;
 pub mod scope;
 pub mod strategy;
 
+pub use capability::{
+    CapabilityMatcher, LabelCapabilityMatcher, NodeCapabilities, Requirement, Runtime,
+    WorkloadRequirements,
+};
 pub use config_bridge::{ConfiguredScheduler, make_scheduling_strategy};
 pub use error::SchedulerError;
 pub use filter::{

@@ -8,58 +8,13 @@
 
 mod common;
 
-use std::sync::Arc;
-use std::time::Duration;
-
-use engenho_scheduler::{RoundRobinStrategy, Scheduler, TickReport};
+use common::{boot_store, bound_node, get_pod, put_node, teardown, tick, unschedulable_message};
+use engenho_scheduler::RoundRobinStrategy;
 use engenho_store::{
-    InProcessRouter, ResourceKey, StoreMesh,
+    ResourceKey, StoreMesh,
     command::{Reason, ResourceCommand},
-    default_config,
 };
 use serde_json::{Value, json};
-
-async fn boot_store() -> Arc<StoreMesh> {
-    let router = InProcessRouter::new();
-    let cfg = default_config("scheduler-filter").unwrap();
-    let store = Arc::new(
-        StoreMesh::start(1, "in-process://1".into(), router, cfg)
-            .await
-            .unwrap(),
-    );
-    store.initialize_singleton().await.unwrap();
-    assert!(store.wait_for_leadership(Duration::from_secs(3)).await);
-    store
-}
-
-async fn teardown(store: Arc<StoreMesh>) {
-    let mesh = Arc::try_unwrap(store).ok().expect("only owner left");
-    mesh.terminate().await.unwrap();
-}
-
-/// A heartbeating, sized node with the given labels and taints.
-async fn put_node(store: &StoreMesh, name: &str, labels: Value, taints: Value) {
-    common::put_fresh_lease(store, name).await;
-    store
-        .propose(ResourceCommand::Put {
-            key: ResourceKey::cluster_scoped("", "v1", "Node", name),
-            value: json!({
-                "kind": "Node",
-                "apiVersion": "v1",
-                "metadata": { "name": name, "labels": labels },
-                "spec": { "unschedulable": false, "taints": taints },
-                "status": {
-                    "capacity": { "cpu": "4", "memory": "8Gi" },
-                    "allocatable": { "cpu": "4", "memory": "8Gi" },
-                    "conditions": [{ "type": "Ready", "status": "True" }]
-                }
-            }),
-            expected: None,
-            reason: Reason::Operator,
-        })
-        .await
-        .unwrap();
-}
 
 /// A pending pod whose `spec` carries `extra` beside one container.
 async fn put_pod(store: &StoreMesh, name: &str, extra: Value) {
@@ -83,40 +38,6 @@ async fn put_pod(store: &StoreMesh, name: &str, extra: Value) {
         })
         .await
         .unwrap();
-}
-
-async fn get_pod(store: &StoreMesh, name: &str) -> Value {
-    store
-        .get(&ResourceKey::namespaced("", "v1", "Pod", "default", name))
-        .await
-        .expect("pod exists")
-}
-
-fn bound_node(pod: &Value) -> Option<&str> {
-    pod.pointer("/spec/nodeName")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-}
-
-/// The message of the pod's `PodScheduled=False / Unschedulable` condition.
-fn unschedulable_message(pod: &Value) -> Option<&str> {
-    pod.pointer("/status/conditions")
-        .and_then(Value::as_array)?
-        .iter()
-        .find(|c| {
-            c.get("type").and_then(Value::as_str) == Some("PodScheduled")
-                && c.get("status").and_then(Value::as_str) == Some("False")
-                && c.get("reason").and_then(Value::as_str) == Some("Unschedulable")
-        })?
-        .get("message")
-        .and_then(Value::as_str)
-}
-
-async fn tick(store: &Arc<StoreMesh>, strategy: RoundRobinStrategy) -> TickReport {
-    Scheduler::new(store.clone(), strategy, None)
-        .tick()
-        .await
-        .unwrap()
 }
 
 fn gpu_selector() -> Value {

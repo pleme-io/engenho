@@ -41,6 +41,9 @@ use std::num::NonZeroUsize;
 
 use serde_json::Value;
 
+use crate::capability::{
+    CapabilityMatcher, LabelCapabilityMatcher, NodeCapabilities, Requirement, WorkloadRequirements,
+};
 use crate::fit::PodRequests;
 use crate::ledger::NodeLedger;
 use crate::observed::ObservedNode;
@@ -91,6 +94,7 @@ filter_plugins! {
     NodeName,
     /// The node's labels satisfy the pod's `spec.nodeSelector`.
     NodeSelector,
+    Capability,
     /// The pod tolerates every `NoSchedule` / `NoExecute` taint on the node.
     TaintToleration,
     /// The pod's requests fit the node's remaining capacity in the ledger.
@@ -124,6 +128,13 @@ impl FilterPlugin {
                 predicates::matches_node_selector(pod, node.value()),
                 Rejection::NodeSelectorMismatch,
             ),
+            Self::Capability => match LabelCapabilityMatcher.unmet(
+                &WorkloadRequirements::infer(pod),
+                &NodeCapabilities::observe(node.value()),
+            ) {
+                Some(requirement) => Err(Rejection::MissingCapability { requirement }),
+                None => Ok(()),
+            },
             Self::TaintToleration => match predicates::untolerated_taint(pod, node.value()) {
                 Some(taint) => Err(Rejection::UntoleratedTaint { key: taint.key }),
                 None => Ok(()),
@@ -179,6 +190,9 @@ pub enum Rejection {
     NodeNameMismatch,
     /// [`FilterPlugin::NodeSelector`].
     NodeSelectorMismatch,
+    MissingCapability {
+        requirement: Requirement,
+    },
     /// [`FilterPlugin::TaintToleration`]: the first blocking taint the pod
     /// does not tolerate.
     UntoleratedTaint {
@@ -201,6 +215,7 @@ impl Rejection {
             Self::Cordoned => FilterPlugin::Cordon,
             Self::NodeNameMismatch => FilterPlugin::NodeName,
             Self::NodeSelectorMismatch => FilterPlugin::NodeSelector,
+            Self::MissingCapability { .. } => FilterPlugin::Capability,
             Self::UntoleratedTaint { .. } => FilterPlugin::TaintToleration,
             Self::InsufficientResources | Self::UnreadableRequests => FilterPlugin::Resources,
         }
@@ -215,6 +230,15 @@ impl fmt::Display for Rejection {
             Self::Cordoned => f.write_str("node(s) were unschedulable"),
             Self::NodeNameMismatch => f.write_str("node(s) didn't match the requested node name"),
             Self::NodeSelectorMismatch => f.write_str("node(s) didn't match Pod's node selector"),
+            Self::MissingCapability {
+                requirement: Requirement::Unreadable(key),
+            } => write!(
+                f,
+                "node(s) could not satisfy the unreadable requirement {key}"
+            ),
+            Self::MissingCapability { requirement } => {
+                write!(f, "node(s) lacked capability {requirement}")
+            }
             Self::UntoleratedTaint { key } => {
                 write!(f, "node(s) had untolerated taint {{{key}}}")
             }
@@ -478,7 +502,9 @@ mod tests {
 
     #[test]
     fn plugins_run_in_the_documented_order_under_their_own_names() {
-        use FilterPlugin::{Cordon, NodeName, NodeReady, NodeSelector, Resources, TaintToleration};
+        use FilterPlugin::{
+            Capability, Cordon, NodeName, NodeReady, NodeSelector, Resources, TaintToleration,
+        };
         assert_eq!(
             FilterPlugin::ALL,
             &[
@@ -486,6 +512,7 @@ mod tests {
                 Cordon,
                 NodeName,
                 NodeSelector,
+                Capability,
                 TaintToleration,
                 Resources
             ][..]
@@ -498,6 +525,7 @@ mod tests {
                 "Cordon",
                 "NodeName",
                 "NodeSelector",
+                "Capability",
                 "TaintToleration",
                 "Resources"
             ]

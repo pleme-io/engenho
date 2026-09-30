@@ -56,7 +56,7 @@ world (a disk that lies about fsync, a clock that jumps) is typed and stays.
 | I5 | **A stale leader cannot write (fencing).** | Fencing tokens (Kleppmann); leader leases for liveness only, never for safety. | Designed with FLEET-DESIGN §4: a role lease is a fencing token whose `LeaseEpoch` is the meta-log index of the grant, so epochs only grow. Role write paths take a `LeaseEpoch` (a role writing without one does not compile: truly-unrep once built); the store's write border and a node's runtime refuse a stale epoch (parse-time, one border). | **not built**: designed truly-unrep / parse-time | Today no write path takes an epoch; a side effect a deposed leader performs after its last commit is not refused. Lease expiry timing needs bounded clock drift, for liveness only. |
 | I6 | **Membership change safety.** | Joint consensus, or single-server change one at a time (Ongaro §4). | `RaftMesh::add_voter` goes learner, then `change_membership`, which openraft runs as joint consensus. | **only-mitigated** | Nothing stops a caller issuing two changes concurrently; openraft serialises them. A typed `MembershipChange` queue with one in flight is the seal. |
 | I7 | **The capability view converges.** | SWIM + Lifeguard for liveness; the advertised record as an LWW register per node keyed by (node, generation) with a hybrid logical clock; Merkle anti-entropy (chitchat's scuttlebutt digest) to repair. | Single-node today: the capability record is a pure function of the node's own config (runtime backend, arch) rendered into Node labels at registration, so it cannot disagree with the node. Mesh: the same record gossiped, last-writer-wins on the node's own generation. | **truly-unrep single-node**; **only-mitigated in the mesh** | Gossip convergence is probabilistic in bounded time; a reader acting on a stale view is only corrected by the placement being committed (I8). |
-| I8 | **Placement decided exactly once and survives leader change.** | Decision committed through the log; idempotent by pod UID; a new leader re-derives pending work from committed state, never from memory. Destination (FLEET-DESIGN §5): `Placement { pod, node, epoch }` committed once to the meta group, and a kubelet starts only pods with a committed placement naming it. | Today the bind is a store write (`spec.nodeName`), and the store is the resource Raft log. `Feasible` is built only by `filter`, which now runs the `Capability` plugin. An unmet requirement is a typed `Rejection::MissingCapability`, surfaced as `PodScheduled=False / Unschedulable`, never a silent drop. | **truly-unrep for "placed on a node lacking a required capability"**; **only-mitigated for exactly-once** | Exactly-once rests on the store's compare-and-set; a second scheduler instance on a stale store view is refused by the conflict, not by a type. |
+| I8 | **Placement decided exactly once and survives leader change.** | Decision committed through the log; idempotent by pod UID; a new leader re-derives pending work from committed state, never from memory. Destination (FLEET-DESIGN §5): `Placement { pod, node, epoch }` committed once to the meta group, and a kubelet starts only pods with a committed placement naming it. | Today the bind is a store write (`spec.nodeName`), and the store is the resource Raft log. `Feasible` is built only by `filter`, which now runs the `Capability` plugin. An unmet requirement is a typed `Rejection::MissingCapability`, surfaced as `PodScheduled=False / Unschedulable`, never a silent drop. | **truly-unrep for "placed on a node that advertises a required capability as absent"** (the only constructor of `Feasible` runs the plugin); **only-mitigated for a node that advertises nothing** and **for exactly-once** | Exactly-once rests on the store's compare-and-set; a second scheduler instance on a stale store view is refused by the conflict, not by a type. |
 
 ## 2. The steps, and their status
 
@@ -65,7 +65,7 @@ world (a disk that lies about fsync, a clock that jumps) is typed and stays.
 | S1 | landed | Durable Raft hard state in revoada (`RaftStore::durable`, `RaftMesh::start_durable`); the directory is fsynced after the rename | `tests/durable_vote.rs::restarted_node_refuses_a_second_vote_in_the_same_term` granted the lower vote after a restart on the volatile store; `a_committed_promotion_survives_a_restart`; `a_corrupt_hard_state_is_refused_not_read_as_empty` | I1, I2 as in §1 |
 | S2 | landed | Quorum-gated loss reaction in `TopologyReactor`: `observe` returns an `Observation` whose `withheld` names `NoQuorum { reachable_voters, configured_voters }`; before any voter exists a failed node is still evicted (bookkeeping only, no role moves) | `tests/topology_reactor.rs::a_minority_partition_cannot_promote` promoted a worker to master and evicted the majority from one of three voters' view; `the_majority_side_of_the_same_partition_does_promote`; `a_withheld_reaction_says_why`. `reactor_handles_full_cluster_lifecycle` used to promote after losing three of four masters, which no Raft group could commit; it now loses a minority of the voters | I3 reactor: truly-unrep |
 | S3 | landed | Majority-gated `AutoReplacementPolicy` through `policy::voters_reachable` (the Etcd holders are the voters) | `policy::tests::a_minority_partition_cannot_promote_a_replacement` demoted three Etcd holders and promoted a bystander with 2 of 5 visible | I3 policy: only-mitigated |
-| S4 | planned | Typed capability record + `Capability` filter plugin in engenho-scheduler, advertised at node registration | `capability` tests: an OCI pod never lands on a native-only node; a requirement met nowhere yields `Unschedulable` with the missing capability named | I7 single-node, I8 capability |
+| S4 | landed | `engenho_scheduler::capability` (`NodeCapabilities`, `WorkloadRequirements`, `CapabilityMatcher`, `LabelCapabilityMatcher`) as the `Capability` filter plugin; engenho-runtime advertises its backend's runtime at registration | `engenho-scheduler/tests/capability_placement.rs`: `an_oci_workload_never_lands_on_a_native_only_node` (bound it before), `each_workload_lands_on_the_node_whose_runtime_it_needs_whichever_is_listed_first`, `a_requirement_met_nowhere_is_pending_with_a_typed_reason_not_dropped`, `an_unreadable_requirement_fits_no_node_and_says_so` (all four red before the plugin); `a_node_that_advertises_no_runtime_is_not_judged_on_runtime` pins the ceiling. engenho-runtime `a_node_advertises_the_runtime_it_runs_and_a_restart_on_another_backend_overwrites_it` | I7 single-node, I8 capability |
 
 revoada stays behind the fence of IMPROVEMENT-PLAN §5.3: S1 to S3 change
 its safety story, not its shipping status. Shipping multi-node is still
@@ -83,25 +83,37 @@ from Node labels under `capability.engenho.pleme.io/`:
 
 | Label | Meaning | Written by |
 |---|---|---|
-| `runtime.native` = `true` | Runs `nix:` closures as host processes | registration, from `kubelet_backend = native` |
-| `runtime.oci` = `true` | Runs OCI images | registration, from `podman_api` / `podman` |
-| `gpu` = `<count>` | GPU devices | operator or a device plugin (not auto-detected yet) |
-| `house` = `true` | The house node (radios, resolver) | operator |
+| `runtime.native` = `true` / `false` | Runs `nix:` closures as host processes | registration, from `kubelet_backend = native` |
+| `runtime.oci` = `true` / `false` | Runs OCI images | registration, from `podman_api` / `podman` / `cri` (`fake` advertises both) |
+| `gpu` = `<count>` | GPU devices | declared by the operator today; FLEET-DESIGN §5 wants it measured |
+| `house` = `true` | The house node (FLEET-DESIGN §5's "protection") | declared by the operator today |
 | `kubernetes.io/arch` | Go `GOARCH` spelling | registration (already) |
+
+Both runtime labels are always written, `true` or `false`, because
+registration merges onto the existing Node: a node moved from `native` to
+`podman_api` must overwrite `runtime.native`, not leave it behind. A boot with
+an injected backend (`Runtime::start_with_backend`, the test harness) writes
+no runtime labels, and a Node with none is not judged on runtime.
 
 **The requirement** (`WorkloadRequirements`) is inferred from the pod, never
 from a node name: a container image `nix:/nix/store/...` requires
 `runtime.native`; any other image requires `runtime.oci`; annotations
-`requirements.engenho.pleme.io/gpu` and `.../house` add the rest.
+`requirements.engenho.pleme.io/gpu` (a count) and `.../house` (`true`) add
+the rest. An annotation that does not parse is `Requirement::Unreadable`,
+which no node meets, so the pod is Pending and names the annotation.
+Matching an OCI image's platform list against the node's arch (FLEET-DESIGN
+§5) is not done yet; `nodeSelector` on `kubernetes.io/arch` still works.
 
 **The matcher** is a trait, `CapabilityMatcher`, with one shipped
 implementation (`LabelCapabilityMatcher`). It runs as the `Capability`
 filter plugin, after `NodeSelector` and before `TaintToleration`, so an
 unmet requirement is reported in upstream's `FailedScheduling` shape:
-`0/2 nodes are available: 2 node(s) lacked capability runtime.oci.` That is
-written as `PodScheduled=False / reason=Unschedulable` on the pod. The facade
-shows `spec.nodeName`, the condition and the message; nothing underneath is
-visible to kubectl.
+`0/2 nodes are available: 1 node(s) lacked capability runtime.oci, 1 node(s)
+lacked capability gpu.` That is written as `PodScheduled=False /
+reason=Unschedulable` on the pod. The facade shows `spec.nodeName`, the
+condition and the message; nothing underneath is visible to kubectl. The
+scheduler writes no `FailedScheduling` Event yet; the condition is the only
+surface, as it was before this plugin.
 
 Mesh-ready: the matcher consumes Node objects, so it does not change when
 Nodes come from gossip instead of one registration. What changes is I7's
@@ -168,6 +180,22 @@ S1 to S4.
 6. **Capability view in the mesh** (I7). Gossip is eventually consistent;
    only the commit (I8) makes a placement exact.
 7. **Exactly-once placement** (I8) rests on the store's compare-and-set.
+   The destination is FLEET-DESIGN §5's committed `Placement` in the meta
+   group.
+8. **A node that advertises no runtime** (§3) is not judged on runtime. The
+   construction: a Node written by an older build, or a boot through
+   `start_with_backend`. Refusing such a node would strand every pod on a
+   node registered before this change until it re-registers, which is the
+   mis-scoped refusal UNREPRESENTABILITY §II.2.1 warns about; every
+   `Runtime::start` boot now advertises, so the window closes on restart.
+9. **GPU and house are declared, not measured** (§3). A wrong label places
+   a pod wrongly; measuring devices at registration is owed.
+10. **No `FailedScheduling` Event** is written; the pod condition carries the
+    reason.
+11. **The volatile paths are not `cfg(test)`**, and the hard-state file is
+    rewritten whole on every append, which is fine for a role log and wrong
+    for a resource log. FLEET-DESIGN §3's Multi-Raft engine on fjall is the
+    destination for both.
 
 ## 7. Later
 

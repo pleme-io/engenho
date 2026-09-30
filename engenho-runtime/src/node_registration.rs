@@ -164,6 +164,16 @@ impl HostOwned {
         Self::of_host(node_name, cpu, memory)
     }
 
+    pub(crate) fn advertising(
+        mut self,
+        caps: Option<&engenho_scheduler::NodeCapabilities>,
+    ) -> Self {
+        if let Some(caps) = caps {
+            self.labels.extend(caps.runtime_labels());
+        }
+        self
+    }
+
     /// The fields for a Node named `node_name` on a host with `cpu` logical
     /// CPUs and `memory` total memory (both as Kubernetes quantities).
     pub(crate) fn of_host(node_name: &str, cpu: String, memory: String) -> Self {
@@ -609,6 +619,29 @@ mod registration_tests {
             n["spec"]["taints"],
             json!([taint]),
             "a restart must not drop the node's taints: {n}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_node_advertises_the_runtime_it_runs_and_a_restart_on_another_backend_overwrites_it()
+    {
+        use engenho_scheduler::{NodeCapabilities, Runtime};
+        let store = boot().await;
+        let native = NodeCapabilities::running([Runtime::Native]);
+        let oci = NodeCapabilities::running([Runtime::Oci]);
+
+        register_node(&store, NODE, &host().advertising(Some(&native)))
+            .await
+            .expect("first boot");
+        assert_eq!(NodeCapabilities::observe(&node(&store).await), native);
+
+        register_node(&store, NODE, &host().advertising(Some(&oci)))
+            .await
+            .expect("restart on an OCI backend");
+        assert_eq!(
+            NodeCapabilities::observe(&node(&store).await),
+            oci,
+            "a runtime the node no longer runs is still advertised"
         );
     }
 
