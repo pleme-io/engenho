@@ -73,6 +73,7 @@ fn the_override_tier_repairs_changes_and_outlives_the_process() {
     let mut relaunched = Daemon::spawn(root, &config);
     kept_across_a_relaunch(&sock);
     shown_by_config_show(root, &config);
+    printed_by_kubeconfig(root, &config);
     exits(&mut relaunched, &sock);
 }
 
@@ -371,4 +372,24 @@ fn shown_by_config_show(root: &Path, config: &Path) {
         .find(|l| l.contains("scheduler.tick_interval_seconds  <-"))
         .unwrap_or_default();
     assert!(credited.contains("overrides.yaml"), "{credited}");
+}
+
+fn printed_by_kubeconfig(root: &Path, config: &Path) {
+    let out = Command::new(env!("CARGO_BIN_EXE_engenho"))
+        .arg("kubeconfig")
+        .env("ENGENHO_CONFIG", config)
+        .env("HOME", root.join("home"))
+        .output()
+        .expect("run engenho kubeconfig");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "the declared file alone does not validate; the override tier repairs it for \
+         kubeconfig as it does for the daemon\n{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("server: https://127.0.0.1:6443"),
+        "{stdout}"
+    );
 }

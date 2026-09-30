@@ -50,13 +50,13 @@
 compile_error!("the engenho daemon is unix-only: its stop path is SIGTERM/SIGINT (see StopCause)");
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use engenho_apiserver::{PkiFile, load_or_generate_ca};
 use engenho_config::{
-    ConfigError, ConfigTier, EngenhoConfig, OverrideLayer, SocketDefaults, TieredConfig,
-    render_provenance,
+    ConfigError, ConfigTier, EngenhoConfig, OverrideLayer, ProgressiveResolution, SocketDefaults,
+    TieredConfig, render_provenance,
 };
 use engenho_control_server::{
     AuditLog, AuthorizedSet, ControlIdentity, GrantPolicy, Pins, RemoteListener, Router, identity,
@@ -564,10 +564,6 @@ fn resolve_declared_config(
 /// address). The CA is the SAME one the running daemon's server cert
 /// chains to, so the emitted kubeconfig verifies the live server.
 fn run_kubeconfig(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
-    // Resolve config first so the data_dir + cluster name + listen port
-    // defaults come from the operator's discovered config.
-    let config = EngenhoConfig::discover()?;
-
     let mut data_dir: Option<PathBuf> = None;
     let mut server: Option<String> = None;
     let mut args = args.peekable();
@@ -592,6 +588,10 @@ fn run_kubeconfig(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
         }
     }
 
+    let control_data_dir = data_dir
+        .clone()
+        .unwrap_or_else(|| ControlBootstrap::discover().data_dir);
+    let config = resolve_with_override_tier(&control_data_dir)?.into_value();
     let data_dir = data_dir.unwrap_or_else(|| config.runtime.data_dir.clone());
     // The persisted CA. `load_or_generate_ca` LOADS when the CA already
     // exists (the daemon minted it at first boot); it only generates if
@@ -621,6 +621,20 @@ fn run_kubeconfig(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!("emit kubeconfig: {e}"))?;
     print!("{yaml}");
     Ok(())
+}
+
+fn resolve_with_override_tier(
+    data_dir: &Path,
+) -> Result<ProgressiveResolution<EngenhoConfig>, ConfigError> {
+    let overrides = OverrideStore::open(ControlDir::under(data_dir).root());
+    let layer = match overrides.layer() {
+        Ok(layer) => Some(layer),
+        Err(err) => {
+            eprintln!("engenho: without the override tier: {err}");
+            None
+        }
+    };
+    EngenhoConfig::resolve_progressively_with(layer.as_ref())
 }
 
 /// `https://127.0.0.1:<port>` where `<port>` is the configured
@@ -655,16 +669,7 @@ fn run_config_show(tier_arg: Option<String>) -> anyhow::Result<()> {
             // The rich default: the progressive fold with typed provenance,
             // the override tier included — found where the daemon keeps it,
             // under the data directory the bootstrap decides.
-            let bootstrap = ControlBootstrap::discover();
-            let overrides = OverrideStore::open(ControlDir::under(&bootstrap.data_dir).root());
-            let layer = match overrides.layer() {
-                Ok(layer) => Some(layer),
-                Err(err) => {
-                    eprintln!("engenho: without the override tier: {err}");
-                    None
-                }
-            };
-            let resolution = EngenhoConfig::resolve_progressively_with(layer.as_ref())?;
+            let resolution = resolve_with_override_tier(&ControlBootstrap::discover().data_dir)?;
             print!("{}", resolution.value().to_yaml()?);
             print!("{}", render_provenance(resolution.provenance()));
         }
