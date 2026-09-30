@@ -196,6 +196,10 @@ S1 to S4.
     rewritten whole on every append, which is fine for a role log and wrong
     for a resource log. FLEET-DESIGN §3's Multi-Raft engine on fjall is the
     destination for both.
+12. **No PreVote, no explicit CheckQuorum** (I2, I3). openraft 0.9 has
+    neither as such; a follower refuses a vote while its leader's lease is
+    live (`Engine::handle_vote_req`), which covers the disruptive-rejoin case
+    only while heartbeats arrive. Both are FLEET-DESIGN R1 work.
 
 ## 7. Later
 
