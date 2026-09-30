@@ -221,22 +221,79 @@ impl RoleAssignment {
     /// once, and an assignment with no voters has no majority.
     ///
     /// A majority check is not a safety property on its own. The
-    /// promotion path does not call this yet, and the votes it would
-    /// count are not durable (docs/IMPROVEMENT-PLAN.md §5.3).
+    /// reactor's loss path calls it through [`Self::quorum_witness`];
+    /// what makes it safe is that the votes behind a commit are durable
+    /// and the commit itself needs a quorum (docs/RECOVERABLE-STATE.md I3).
     #[must_use]
     pub fn has_majority<'a>(&self, reachable: impl IntoIterator<Item = &'a NodeId>) -> bool {
+        self.quorum_witness(reachable).is_ok()
+    }
+
+    /// Proof that `reachable` holds a strict majority of the configured
+    /// voters, or the counts that fell short.
+    ///
+    /// # Errors
+    ///
+    /// [`Withheld::NoQuorum`] with the reachable and configured voter counts.
+    pub fn quorum_witness<'a>(
+        &self,
+        reachable: impl IntoIterator<Item = &'a NodeId>,
+    ) -> Result<QuorumWitness, Withheld> {
         let voters = self.voters();
-        let Some(configured) = NonZeroUsize::new(voters.len()) else {
-            return false;
-        };
-        let mut tally = Tally::majority_of(configured);
+        let mut seen = HashSet::new();
         for node in reachable {
             if voters.contains(node) {
-                tally.record(node, ());
+                seen.insert(node);
             }
         }
-        tally.verdict().is_reached()
+        let refused = Withheld::NoQuorum {
+            reachable_voters: seen.len(),
+            configured_voters: voters.len(),
+        };
+        let Some(configured) = NonZeroUsize::new(voters.len()) else {
+            return Err(refused);
+        };
+        let mut tally = Tally::majority_of(configured);
+        for node in &seen {
+            tally.record(*node, ());
+        }
+        if tally.verdict().is_reached() {
+            Ok(QuorumWitness { _sealed: () })
+        } else {
+            Err(refused)
+        }
     }
+}
+
+/// A strict majority of the configured voters was reachable when this was
+/// built. The field is private: [`RoleAssignment::quorum_witness`] is the
+/// only constructor, so a reaction that needs one cannot run on a minority
+/// view.
+#[derive(Debug)]
+pub struct QuorumWitness {
+    _sealed: (),
+}
+
+/// Why the reactor withheld its reaction to a loss.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Withheld {
+    /// Fewer than a strict majority of the configured voters were
+    /// reachable, so this view may be the minority side of a partition.
+    NoQuorum {
+        /// Configured voters present in the observed view.
+        reachable_voters: usize,
+        /// Voters in the committed assignment.
+        configured_voters: usize,
+    },
+}
+
+/// What one membership observation produced.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Observation {
+    /// Transitions to commit, in order.
+    pub transitions: Vec<Transition>,
+    /// Set when the reaction to a loss was withheld, and why.
+    pub withheld: Option<Withheld>,
 }
 
 /// A single proposed change to the role assignment. The reactor
@@ -753,6 +810,14 @@ impl TopologyReactor {
         eligible_now: &[NodeId],
         failed_now: &[NodeId],
     ) -> Vec<Transition> {
+        self.observe(eligible_now, failed_now).transitions
+    }
+
+    /// [`Self::observe_membership`], also saying when and why the reaction
+    /// to a loss was withheld. A loss is reacted to only when `eligible_now`
+    /// holds a strict majority of the configured voters.
+    pub fn observe(&self, eligible_now: &[NodeId], failed_now: &[NodeId]) -> Observation {
+        let mut withheld = None;
         let current = self.current.lock().unwrap().clone();
         let mut tx = Vec::new();
 
@@ -797,8 +862,38 @@ impl TopologyReactor {
             }
         }
 
-        // 2. React to losses.
         if !failed_now.is_empty() {
+            match current.quorum_witness(eligible_now) {
+                Ok(witness) => {
+                    tx.extend(self.react_to_loss(&witness, &current, eligible_now, failed_now));
+                }
+                Err(
+                    why @ Withheld::NoQuorum {
+                        configured_voters: 0,
+                        ..
+                    },
+                ) => {
+                    tx.extend(failed_now.iter().cloned().map(Transition::Evict));
+                    withheld = Some(why);
+                }
+                Err(why) => withheld = Some(why),
+            }
+        }
+        Observation {
+            transitions: tx,
+            withheld,
+        }
+    }
+
+    fn react_to_loss(
+        &self,
+        _quorum: &QuorumWitness,
+        current: &RoleAssignment,
+        eligible_now: &[NodeId],
+        failed_now: &[NodeId],
+    ) -> Vec<Transition> {
+        let mut tx = Vec::new();
+        {
             let mut effective = current.clone();
             for id in eligible_now {
                 if effective.get(id).is_none() {

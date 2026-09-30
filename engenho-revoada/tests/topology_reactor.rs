@@ -110,17 +110,26 @@ fn reactor_handles_full_cluster_lifecycle() {
     let masters = r.current().nodes_with_role(Role::Master).len();
     assert_eq!(masters, Phalanx::target_masters(10));
 
-    // Lose 3 nodes.
-    let failed = vec![NodeId::new("n0"), NodeId::new("n1"), NodeId::new("n2")];
-    let surviving: Vec<NodeId> = initial.iter().skip(3).cloned().collect();
+    // Lose 3 nodes, one of them a master: a majority of the voters
+    // stays reachable, so the loss is reacted to.
+    let failed = vec![NodeId::new("n0"), NodeId::new("n8"), NodeId::new("n9")];
+    let surviving: Vec<NodeId> = initial
+        .iter()
+        .filter(|n| !failed.contains(n))
+        .cloned()
+        .collect();
     let tx = r.observe_membership(&surviving, &failed);
     r.apply_transitions(&tx);
     let masters_now = r.current().nodes_with_role(Role::Master).len();
     assert_eq!(masters_now, Phalanx::target_masters(7));
 
-    // Lose 2 more.
-    let failed2 = vec![NodeId::new("n3"), NodeId::new("n4")];
-    let surviving2: Vec<NodeId> = surviving.iter().skip(2).cloned().collect();
+    // Lose 2 more, again leaving a majority of the voters reachable.
+    let failed2 = vec![NodeId::new("n6"), NodeId::new("n7")];
+    let surviving2: Vec<NodeId> = surviving
+        .iter()
+        .filter(|n| !failed2.contains(n))
+        .cloned()
+        .collect();
     let tx = r.observe_membership(&surviving2, &failed2);
     r.apply_transitions(&tx);
     let masters_after = r.current().nodes_with_role(Role::Master).len();
@@ -211,4 +220,61 @@ fn reactor_idempotency_double_observe_no_change() {
     r.apply_transitions(&tx2);
     let snapshot2 = r.current();
     assert_eq!(snapshot, snapshot2, "idempotent re-observation");
+}
+
+fn three_masters_two_workers() -> (TopologyReactor, Vec<NodeId>) {
+    let nodes = ids(5);
+    let r = TopologyReactor::new(Box::new(Quorum3M));
+    let tx = r.observe_membership(&nodes, &[]);
+    r.apply_transitions(&tx);
+    assert_eq!(r.current().nodes_with_role(Role::Master).len(), 3);
+    (r, nodes)
+}
+
+#[test]
+fn a_minority_partition_cannot_promote() {
+    let (r, n) = three_masters_two_workers();
+    let minority_view = [n[0].clone(), n[3].clone()];
+    let lost_from_its_view = [n[1].clone(), n[2].clone(), n[4].clone()];
+
+    let tx = r.observe_membership(&minority_view, &lost_from_its_view);
+
+    assert!(
+        !tx.iter()
+            .any(|t| matches!(t, Transition::Promote(..) | Transition::Reassign(..))),
+        "one of three voters promoted from its own gossip view: {tx:?}"
+    );
+    assert!(
+        !tx.iter().any(|t| matches!(t, Transition::Evict(_))),
+        "one of three voters evicted the majority from its own gossip view: {tx:?}"
+    );
+}
+
+#[test]
+fn the_majority_side_of_the_same_partition_does_promote() {
+    let (r, n) = three_masters_two_workers();
+    let majority_view = [n[1].clone(), n[2].clone(), n[4].clone()];
+    let lost_from_its_view = [n[0].clone(), n[3].clone()];
+
+    let tx = r.observe_membership(&majority_view, &lost_from_its_view);
+
+    assert!(
+        tx.iter()
+            .any(|t| matches!(t, Transition::Promote(id, Role::Master) if *id == n[4])),
+        "two of three voters must replace the lost master: {tx:?}"
+    );
+}
+
+#[test]
+fn a_withheld_reaction_says_why() {
+    let (r, n) = three_masters_two_workers();
+    let observation = r.observe(&[n[0].clone()], &[n[1].clone(), n[2].clone()]);
+    assert!(observation.transitions.is_empty());
+    assert_eq!(
+        observation.withheld,
+        Some(engenho_revoada::topology::Withheld::NoQuorum {
+            reachable_voters: 1,
+            configured_voters: 3
+        })
+    );
 }
