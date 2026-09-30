@@ -150,6 +150,9 @@ impl Policy for AutoReplacementPolicy {
 
         // Set of NodeIds currently alive according to gossip.
         let alive: BTreeSet<NodeId> = membership.members.iter().map(|m| m.node_id).collect();
+        if !voters_reachable(consensus, &alive) {
+            return proposals;
+        }
 
         // Iterate the four control-plane roles.
         for &role in &[
@@ -218,6 +221,23 @@ impl Policy for AutoReplacementPolicy {
 }
 
 /// Configuration for [`PolicyEngine::start`].
+/// True when gossip sees a strict majority of the committed Etcd holders,
+/// the mesh's voters, counted through the one quorum fold. A mesh with no
+/// Etcd holder yet has nothing to split, so it is always true there
+/// (docs/RECOVERABLE-STATE.md I3).
+#[must_use]
+pub fn voters_reachable(consensus: &crate::consensus::MeshShape, alive: &BTreeSet<NodeId>) -> bool {
+    let voters = consensus.holders(NodeRole::Etcd);
+    let Some(configured) = std::num::NonZeroUsize::new(voters.len()) else {
+        return true;
+    };
+    let mut tally = engenho_substrate::Tally::majority_of(configured);
+    for v in voters.intersection(alive) {
+        tally.record(v, ());
+    }
+    tally.verdict().is_reached()
+}
+
 pub struct PolicyEngineConfig {
     /// Periodic audit interval (proposals get re-evaluated on this
     /// timer even if gossip didn't change).
@@ -457,6 +477,44 @@ mod tests {
         assert!(
             proposals.is_empty(),
             "expected no proposals at target: {proposals:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_minority_partition_cannot_promote_a_replacement() {
+        let voters: Vec<NodeId> = (1..=5).map(|i| NodeId::new([i; 32])).collect();
+        let bystander = NodeId::new([9; 32]);
+        let mut consensus = MeshShape::default();
+        for v in &voters {
+            consensus
+                .assignments
+                .insert(*v, [NodeRole::Etcd].into_iter().collect());
+        }
+        let membership = MembershipView {
+            members: [voters[0], voters[1], bystander]
+                .iter()
+                .map(|id| MembershipEntry {
+                    node_id: *id,
+                    gossip_addr: "127.0.0.1:0".into(),
+                    state: ns(*id, NodeRole::Worker),
+                })
+                .collect(),
+        };
+        let target = TargetTopology {
+            api_servers: 0,
+            etcd_replicas: 5,
+            schedulers: 0,
+            controller_managers: 0,
+            min_workers: 0,
+        };
+
+        let proposals = AutoReplacementPolicy
+            .evaluate(&membership, &consensus, &target)
+            .await;
+
+        assert!(
+            proposals.is_empty(),
+            "two of five Etcd holders proposed role changes from their own gossip view: {proposals:?}"
         );
     }
 
