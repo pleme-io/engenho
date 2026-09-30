@@ -221,10 +221,6 @@ impl Policy for AutoReplacementPolicy {
 }
 
 /// Configuration for [`PolicyEngine::start`].
-/// True when gossip sees a strict majority of the committed Etcd holders,
-/// the mesh's voters, counted through the one quorum fold. A mesh with no
-/// Etcd holder yet has nothing to split, so it is always true there
-/// (docs/RECOVERABLE-STATE.md I3).
 #[must_use]
 pub fn voters_reachable(consensus: &crate::consensus::MeshShape, alive: &BTreeSet<NodeId>) -> bool {
     let voters = consensus.holders(NodeRole::Etcd);

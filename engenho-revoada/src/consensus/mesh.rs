@@ -112,12 +112,6 @@ impl RaftMesh {
         Self::start_with_store(node_id, listen_addr, router, config, identity, store).await
     }
 
-    /// Boot a Raft node whose hard state lives under `dir` and survives a
-    /// restart (docs/RECOVERABLE-STATE.md I1).
-    ///
-    /// # Errors
-    ///
-    /// [`RaftError::Fatal`] when the hard state under `dir` cannot be opened.
     pub async fn start_durable(
         node_id: RaftNodeId,
         listen_addr: String,

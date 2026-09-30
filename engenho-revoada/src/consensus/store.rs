@@ -162,30 +162,15 @@ impl RaftStore {
         Self::volatile(identity)
     }
 
-    /// Everything in memory: a restart forgets the vote and the log.
     #[must_use]
     pub fn volatile(identity: NodeIdentity) -> Self {
         Self::with_clock(identity, Arc::new(engenho_substrate::WallClock))
     }
 
-    /// Hard state persisted under `dir`, restored from it if present.
-    /// The state machine is rebuilt from the persisted snapshot; openraft
-    /// replays the log after it.
-    ///
-    /// # Errors
-    ///
-    /// The directory cannot be created, or a hard-state file in it cannot
-    /// be read or parsed. A file that cannot be parsed is refused, never
-    /// read as empty: an empty hard state would let this node vote again.
     pub fn durable(identity: NodeIdentity, dir: impl Into<PathBuf>) -> std::io::Result<Self> {
         Self::durable_with_clock(identity, dir, Arc::new(engenho_substrate::WallClock))
     }
 
-    /// [`Self::durable`] with an explicit clock.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::durable`].
     pub fn durable_with_clock(
         identity: NodeIdentity,
         dir: impl Into<PathBuf>,
@@ -211,7 +196,6 @@ impl RaftStore {
         })
     }
 
-    /// True when a restart keeps this store's hard state.
     #[must_use]
     pub fn is_durable(&self) -> bool {
         matches!(*self.persistence, Persistence::Durable(_))

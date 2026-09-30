@@ -229,12 +229,6 @@ impl RoleAssignment {
         self.quorum_witness(reachable).is_ok()
     }
 
-    /// Proof that `reachable` holds a strict majority of the configured
-    /// voters, or the counts that fell short.
-    ///
-    /// # Errors
-    ///
-    /// [`Withheld::NoQuorum`] with the reachable and configured voter counts.
     pub fn quorum_witness<'a>(
         &self,
         reachable: impl IntoIterator<Item = &'a NodeId>,
@@ -265,34 +259,22 @@ impl RoleAssignment {
     }
 }
 
-/// A strict majority of the configured voters was reachable when this was
-/// built. The field is private: [`RoleAssignment::quorum_witness`] is the
-/// only constructor, so a reaction that needs one cannot run on a minority
-/// view.
 #[derive(Debug)]
 pub struct QuorumWitness {
     _sealed: (),
 }
 
-/// Why the reactor withheld its reaction to a loss.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Withheld {
-    /// Fewer than a strict majority of the configured voters were
-    /// reachable, so this view may be the minority side of a partition.
     NoQuorum {
-        /// Configured voters present in the observed view.
         reachable_voters: usize,
-        /// Voters in the committed assignment.
         configured_voters: usize,
     },
 }
 
-/// What one membership observation produced.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Observation {
-    /// Transitions to commit, in order.
     pub transitions: Vec<Transition>,
-    /// Set when the reaction to a loss was withheld, and why.
     pub withheld: Option<Withheld>,
 }
 
@@ -813,9 +795,6 @@ impl TopologyReactor {
         self.observe(eligible_now, failed_now).transitions
     }
 
-    /// [`Self::observe_membership`], also saying when and why the reaction
-    /// to a loss was withheld. A loss is reacted to only when `eligible_now`
-    /// holds a strict majority of the configured voters.
     pub fn observe(&self, eligible_now: &[NodeId], failed_now: &[NodeId]) -> Observation {
         let mut withheld = None;
         let current = self.current.lock().unwrap().clone();
