@@ -43,9 +43,9 @@
 //!
 //! `/version` is a typed serde struct (`VersionInfo`) — NEVER
 //! `serde_json::json!()` of an ad-hoc map (per the ★★ TYPED EMISSION
-//! rule). The version is sourced from the SINGLE
-//! [`engenho_types::KUBE_VERSION`] anchor so `/version`, discovery, and
-//! the vendored OpenAPI surface can never drift.
+//! rule). The version is sourced from the router's
+//! [`engenho_types::ApiFace`], by default [`engenho_types::ApiFace::VENDORED`],
+//! so `/version` and the vendored OpenAPI surface can never drift.
 
 use std::fmt;
 use std::time::Duration;
@@ -58,7 +58,7 @@ use serde::Serialize;
 
 use engenho_store::{Revision, StoreError};
 pub use engenho_substrate::freshness::Liveness;
-use engenho_types::{KUBE_VERSION, KUBE_VERSION_MAJOR, KUBE_VERSION_MINOR};
+use engenho_types::ApiFace;
 
 use crate::router::RouterState;
 
@@ -68,7 +68,7 @@ use crate::router::RouterState;
 ///
 /// We are not a Go server, so `goVersion` is empty and `compiler` is
 /// `rustc`; everything kubectl actually negotiates on (`major`, `minor`,
-/// `gitVersion`) is sourced from [`engenho_types::KUBE_VERSION`].
+/// `gitVersion`) is sourced from an [`engenho_types::ApiFace`].
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct VersionInfo {
     /// Major version (`"1"`).
@@ -100,14 +100,20 @@ pub struct VersionInfo {
 
 impl VersionInfo {
     /// The version this build reports. Sources `major` / `minor` /
-    /// `gitVersion` from the single [`engenho_types::KUBE_VERSION`]
-    /// anchor; `platform` from the compile-time target triple.
+    /// `gitVersion` from [`engenho_types::ApiFace::VENDORED`];
+    /// `platform` from the compile-time target triple.
     #[must_use]
     pub fn current() -> Self {
+        Self::of(ApiFace::VENDORED)
+    }
+
+    #[must_use]
+    pub fn of(face: ApiFace) -> Self {
+        let version = face.version();
         Self {
-            major: KUBE_VERSION_MAJOR,
-            minor: KUBE_VERSION_MINOR,
-            git_version: KUBE_VERSION,
+            major: version.major(),
+            minor: version.minor(),
+            git_version: version.git_version(),
             git_commit: "",
             git_tree_state: "clean",
             build_date: "",
@@ -137,8 +143,8 @@ impl VersionInfo {
 // ── axum route handlers ────────────────────────────────────────────────
 
 /// `GET /version` → the typed [`VersionInfo`]. 200.
-pub async fn version() -> impl IntoResponse {
-    Json(VersionInfo::current())
+pub async fn version(State(state): State<RouterState>) -> impl IntoResponse {
+    Json(VersionInfo::of(state.api_face))
 }
 
 // ── derived health: /livez, /healthz, /readyz ──────────────────────────
@@ -633,6 +639,23 @@ mod tests {
             .await
             .unwrap();
         (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn version_answers_from_the_routers_face_which_defaults_to_the_vendored_one() {
+        let state = RouterState::new(vec![]);
+        assert_eq!(state.api_face, ApiFace::VENDORED);
+        assert_eq!(VersionInfo::of(state.api_face), VersionInfo::current());
+        let app = crate::router::build(state.with_api_face(ApiFace::VENDORED));
+        let (status, body) = get(&app, "/version").await;
+        assert_eq!(status, StatusCode::OK);
+        let served: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            served,
+            serde_json::to_value(VersionInfo::of(ApiFace::VENDORED)).unwrap()
+        );
+        assert_eq!(served["gitVersion"], engenho_types::KUBE_VERSION);
+        assert_eq!(served["gitVersion"], "v1.34.0");
     }
 
     #[tokio::test]

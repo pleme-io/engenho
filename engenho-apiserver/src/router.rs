@@ -146,6 +146,7 @@ pub struct RouterState {
     /// `None` ⇒ those families are absent from the scrape (a dashboard
     /// reads "no data"), never rendered as zeros it would chart as real.
     pub metrics_source: Option<Arc<dyn crate::metrics::MetricsSource>>,
+    pub api_face: engenho_types::ApiFace,
 }
 
 impl RouterState {
@@ -176,7 +177,14 @@ impl RouterState {
             liveness: None,
             readyz_store_read_timeout: crate::health::DEFAULT_STORE_READ_TIMEOUT,
             metrics_source: None,
+            api_face: engenho_types::ApiFace::VENDORED,
         }
+    }
+
+    #[must_use]
+    pub fn with_api_face(mut self, face: engenho_types::ApiFace) -> Self {
+        self.api_face = face;
+        self
     }
 
     /// Install what the health endpoints are derived from. Builder style

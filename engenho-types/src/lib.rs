@@ -58,6 +58,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod api;
+pub mod api_face;
 pub mod auth;
 pub mod client;
 pub mod consistency_tier;
@@ -82,27 +83,29 @@ pub mod time;
 pub mod translator;
 pub mod watch;
 
+pub use api_face::{ApiFace, Flavour, KubeVersion};
 pub use consistency_tier::{CONSISTENCY_TIER_ANNOTATION, ConsistencyTier, tier_from_metadata};
 pub use spec_int::SpecInt;
 
 /// The single Kubernetes API surface version this engenho build vendors,
-/// as a `vMAJOR.MINOR.PATCH` string. EVERY surface that reports a
-/// Kubernetes version (the apiserver's `/version` endpoint, discovery,
-/// conformance gating) MUST source it from here so they can never drift
-/// from the vendored OpenAPI schemas under `vendor/openapi/v1.34.0/` or
-/// the generated kinds in [`generated_v1_34`].
+/// as a `vMAJOR.MINOR.PATCH` string: the version of [`ApiFace::VENDORED`].
+/// EVERY surface that reports a Kubernetes version (the apiserver's
+/// `/version` endpoint, the kubelet's probe `User-Agent`, conformance
+/// gating) reads it from an [`ApiFace`] so they can never drift from the
+/// vendored OpenAPI schemas under `vendor/openapi/v1.34.0/` or the
+/// generated kinds in [`generated_v1_34`].
 ///
 /// Per `theory/ENGENHO.md` §XIII the ship gate is Kubernetes 1.34
 /// conformance — this const is the compile-time anchor for that surface.
-pub const KUBE_VERSION: &str = "v1.34.0";
+pub const KUBE_VERSION: &str = ApiFace::VENDORED.version().git_version();
 
 /// The Kubernetes `major` version component kubectl negotiates against
 /// (`version.Info.major`). Derived from [`KUBE_VERSION`] but exposed as a
 /// const so `/version` emits it without re-parsing.
-pub const KUBE_VERSION_MAJOR: &str = "1";
+pub const KUBE_VERSION_MAJOR: &str = ApiFace::VENDORED.version().major();
 
 /// The Kubernetes `minor` version component (`version.Info.minor`).
-pub const KUBE_VERSION_MINOR: &str = "34";
+pub const KUBE_VERSION_MINOR: &str = ApiFace::VENDORED.version().minor();
 
 #[cfg(test)]
 mod kube_version_tests {

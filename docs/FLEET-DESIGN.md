@@ -317,9 +317,19 @@ subset it implements. For the fleet this means:
 
 Charts already say which Kubernetes they expect: `kubeVersion` in `Chart.yaml`,
 `.Capabilities.KubeVersion` and `.Capabilities.APIVersions.Has` in templates, and
-the `apiVersion` of every object they render. Today engenho presents one face, a
-compile-time constant (`engenho_types::KUBE_VERSION`) behind `/version` and
-discovery. Here the face becomes a value, chosen per release while running.
+the `apiVersion` of every object they render. Today engenho presents one face.
+Here the face becomes a value, chosen per release while running.
+
+**The seam, landed.** `engenho_types::ApiFace` is that value, and its readers take
+it instead of a constant: `/version` answers from the router's face
+(`RouterState::api_face`), and the kubelet's probe `User-Agent` from its prober's
+(`TokioNetProber::from(face)`). Both default to `ApiFace::VENDORED`, whose version
+is `KUBE_VERSION`, so nothing a client sees changed. Discovery reads no version:
+its served set is folded from the handler registry, which is where `served` comes
+from when R7a adds it. A face's fields are private and `ApiFace::REGISTRY` holds
+only the vendored one, so a face outside the registry cannot be built; a registry
+entry whose `gitVersion` does not spell its own major and minor fails const
+evaluation, and one with no `vendor/openapi/<gitVersion>/` fails a test.
 
 - **The type.** `ApiFace { version, served, flavour }`: a Kubernetes version, the
   set of group-versions served, and a flavour (upstream, or a named provider
@@ -471,7 +481,7 @@ Every gate is recorded red once before it lands.
 | **R5 Allocation** | meta-group allocators; IP blocks; ports; volumes | no double grant and no leak under simulated leader changes |
 | **R6 Movement** | the move state machine for stateless, then singleton, then stateful | Stateright over the handoff; a singleton never runs twice |
 | **R7 Native GitOps** | HelmRelease / GitRepository in-process; values-driven switches | a component turns on and off by changing only its values |
-| **R7a Faces per release** | `ApiFace` from the conversion registry; tiered resolution; per-face views; `.Capabilities` from the face | one chart pinned to an older `kubeVersion` and one to the current face run side by side on one store, each seeing its own `/version` and discovery |
+| **R7a Faces per release** | `ApiFace` from the conversion registry (the type and its readers landed, §9.1); tiered resolution; per-face views; `.Capabilities` from the face | one chart pinned to an older `kubeVersion` and one to the current face run side by side on one store, each seeing its own `/version` and discovery |
 | **R7b The node is a release** | `NixClosure` realisation with GC roots; `NixProfile`; `NodeGeneration` with a health-gated switch and rollback; the floor assertion; placed builds | a node's packages, services and system generation change by editing only release values, and a generation that fails its gate rolls back with no operator |
 | **R8 OCI-capable nodes** | nodes with an OCI runtime join the fleet and third-party charts land on them by inference | a chart whose images are amd64-only lands on an amd64 OCI node without any node named |
 | **Later** | the tatara-lisp / WASM-WASI face | a WASM workload moves with no observed restart |

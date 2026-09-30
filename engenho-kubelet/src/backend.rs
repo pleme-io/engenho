@@ -2486,13 +2486,21 @@ pub trait NetProber: Send + Sync {
 /// * `User-Agent: kube-probe/<major>.<minor>` and `Accept: */*` unless the
 ///   probe's `httpHeaders` set them, `Connection: close`.
 #[derive(Default)]
-pub struct TokioNetProber;
+pub struct TokioNetProber {
+    face: engenho_types::ApiFace,
+}
 
 impl TokioNetProber {
     /// New real net prober.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+}
+
+impl From<engenho_types::ApiFace> for TokioNetProber {
+    fn from(face: engenho_types::ApiFace) -> Self {
+        Self { face }
     }
 }
 
@@ -2543,6 +2551,7 @@ fn local_redirects_only() -> reqwest::redirect::Policy {
 /// value that cannot be a header. Nothing is sent.
 fn probe_request_headers(
     user: &[(String, String)],
+    face: engenho_types::ApiFace,
 ) -> Result<reqwest::header::HeaderMap, ProbeIoError> {
     use reqwest::header::{ACCEPT, CONNECTION, HeaderMap, HeaderName, HeaderValue, USER_AGENT};
     let setup = |reason: String| ProbeIoError::Setup {
@@ -2557,9 +2566,9 @@ fn probe_request_headers(
     }
     let user_agent = [
         "kube-probe/",
-        engenho_types::KUBE_VERSION_MAJOR,
+        face.version().major(),
         ".",
-        engenho_types::KUBE_VERSION_MINOR,
+        face.version().minor(),
     ]
     .concat();
     for (name, default) in [
@@ -2593,7 +2602,7 @@ impl NetProber for TokioNetProber {
                 reason: e.to_string(),
             }
         })?;
-        let headers = probe_request_headers(&target.headers)?;
+        let headers = probe_request_headers(&target.headers, self.face)?;
         let client = reqwest::Client::builder()
             .timeout(target.timeout)
             // Probes accept self-signed certs (K8s does not verify probe TLS).
@@ -3993,7 +4002,8 @@ mod probe_request_tests {
             .iter()
             .map(|(n, v)| ((*n).to_string(), (*v).to_string()))
             .collect();
-        probe_request_headers(&user).unwrap_or_else(|e| panic!("headers: {e}"))
+        probe_request_headers(&user, TokioNetProber::new().face)
+            .unwrap_or_else(|e| panic!("headers: {e}"))
     }
 
     fn values(h: &HeaderMap, name: &reqwest::header::HeaderName) -> Vec<String> {
@@ -4043,10 +4053,18 @@ mod probe_request_tests {
             engenho_types::KUBE_VERSION_MINOR,
         ]
         .concat();
+        assert_eq!(agent, "kube-probe/1.34");
         assert_eq!(values(&h, &USER_AGENT), [agent]);
         assert_eq!(values(&h, &ACCEPT), ["*/*"]);
         assert_eq!(values(&h, &CONNECTION), ["close"]);
         assert_eq!(h.len(), 3, "nothing else: {h:?}");
+    }
+
+    #[test]
+    fn a_prober_built_from_the_vendored_face_is_the_default_prober() {
+        let from_face = TokioNetProber::from(engenho_types::ApiFace::VENDORED);
+        assert_eq!(from_face.face, TokioNetProber::new().face);
+        assert_eq!(from_face.face, TokioNetProber::default().face);
     }
 
     #[test]
