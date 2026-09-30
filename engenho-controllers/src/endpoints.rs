@@ -45,6 +45,7 @@ use crate::meta::ObjectMeta;
 use crate::owner::{owner_ref_for, set_owner_reference};
 use crate::reads::{DeclaresReads, Reads, gvk};
 use crate::selector::{matches_labels, service_selector};
+use crate::status::pod_is_ready;
 use crate::sweep::{ObjectOutcome, Sweep, impl_sweep_event_sink};
 
 pub struct EndpointsController {
@@ -89,22 +90,6 @@ impl EndpointsController {
         pod.get("status")
             .and_then(|s| s.get("podIP"))
             .and_then(|i| i.as_str())
-    }
-
-    /// Pod considered Ready iff `status.conditions[Ready].status == "True"`.
-    /// Pods without status yet are treated as not-ready (won't be added
-    /// to Endpoints until kubelet reports them).
-    fn pod_is_ready(pod: &Value) -> bool {
-        pod.get("status")
-            .and_then(|s| s.get("conditions"))
-            .and_then(|c| c.as_array())
-            .map(|conds| {
-                conds.iter().any(|c| {
-                    c.get("type").and_then(|t| t.as_str()) == Some("Ready")
-                        && c.get("status").and_then(|s| s.as_str()) == Some("True")
-                })
-            })
-            .unwrap_or(false)
     }
 
     /// Resolve a Service's ports to the POD-SIDE ports an Endpoints object
@@ -347,7 +332,7 @@ impl EndpointsController {
         let matched_pods: Vec<&Value> = all_pods
             .iter()
             .filter(|(_, pod)| matches_labels(pod, selector))
-            .filter(|(_, pod)| Self::pod_is_ready(pod))
+            .filter(|(_, pod)| pod_is_ready(pod))
             .map(|(_, pod)| pod)
             .collect();
 
@@ -355,7 +340,7 @@ impl EndpointsController {
         let mut addresses: Vec<(String, String)> = all_pods
             .iter()
             .filter(|(_, pod)| matches_labels(pod, selector))
-            .filter(|(_, pod)| Self::pod_is_ready(pod))
+            .filter(|(_, pod)| pod_is_ready(pod))
             .filter_map(|(_, pod)| {
                 let ip = Self::pod_ip(pod)?.to_string();
                 let name = pod
@@ -464,7 +449,7 @@ mod tests {
                 "conditions": [{"type": "Ready", "status": "True"}]
             }
         });
-        assert!(EndpointsController::pod_is_ready(&p));
+        assert!(crate::status::pod_is_ready(&p));
     }
 
     #[test]
@@ -474,13 +459,13 @@ mod tests {
                 "conditions": [{"type": "Ready", "status": "False"}]
             }
         });
-        assert!(!EndpointsController::pod_is_ready(&p));
+        assert!(!crate::status::pod_is_ready(&p));
     }
 
     #[test]
     fn pod_is_ready_false_when_no_status() {
         let p = json!({"metadata": {"name": "p"}});
-        assert!(!EndpointsController::pod_is_ready(&p));
+        assert!(!crate::status::pod_is_ready(&p));
     }
 
     #[test]

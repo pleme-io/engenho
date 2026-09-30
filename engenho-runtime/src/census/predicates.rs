@@ -193,47 +193,9 @@ pub(super) fn would_reject(gvk: &Gvk, objects: &[Value], schema: Option<&Value>)
     found
 }
 
-/// Every [`ImageInconsistency`], in the store's declaration order.
-///
-/// The store's enum has no list of its variants, so this is one, held to it
-/// at compile time: [`image_kind_index`] matches the enum exhaustively (a
-/// variant the store adds stops it compiling until it has an index), and the
-/// `const` block below proves each row sits at its own index, so no kind is
-/// listed twice. That a new variant's row is ADDED here is left to whoever
-/// gives it an index.
-const IMAGE_KINDS: [ImageInconsistency; 5] = [
-    ImageInconsistency::SnapshotNewerThanBlob,
-    ImageInconsistency::SnapshotUnreadable,
-    ImageInconsistency::BlobAheadOfLastApplied,
-    ImageInconsistency::ReplayGap,
-    ImageInconsistency::AlreadyApplied,
-];
-
-/// The position of `kind` in [`IMAGE_KINDS`].
-const fn image_kind_index(kind: ImageInconsistency) -> usize {
-    match kind {
-        ImageInconsistency::SnapshotNewerThanBlob => 0,
-        ImageInconsistency::SnapshotUnreadable => 1,
-        ImageInconsistency::BlobAheadOfLastApplied => 2,
-        ImageInconsistency::ReplayGap => 3,
-        ImageInconsistency::AlreadyApplied => 4,
-    }
-}
-
-const _: () = {
-    let mut i = 0;
-    while i < IMAGE_KINDS.len() {
-        assert!(
-            image_kind_index(IMAGE_KINDS[i]) == i,
-            "IMAGE_KINDS is out of order"
-        );
-        i += 1;
-    }
-};
-
 /// T3.4: each kind of disagreement the boot counted, with its hits.
 pub(super) fn image_inconsistent(tripwire: &ImageTripwire) -> Vec<Match> {
-    IMAGE_KINDS
+    ImageInconsistency::ALL
         .iter()
         .filter_map(|&kind| {
             let hits = tripwire.count(kind);

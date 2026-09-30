@@ -170,39 +170,41 @@ type RSnapshotMeta = SnapshotMeta<RaftNodeId, openraft::BasicNode>;
 /// `engenho_would_reject_total{gate,reason}` will count it under.
 pub const IMAGE_GATE: &str = "store_image";
 
-/// One way a durable image was found disagreeing with itself (T3.4).
-///
-/// ★ SHADOW, NOT FATAL. Each hit is logged at WARN under [`IMAGE_GATE`] and
-/// counted in the store's [`ImageTripwire`]; none refuses a boot. A node that
-/// booted yesterday must still boot, so the check ships watching.
-/// [`Self::ReplayGap`] is the only state neither the snapshot nor the log can
-/// rebuild — the one a later release may make fatal, once a release has run
-/// with zero hits on every node.
-///
-/// This release cannot WRITE any of them: every writer lands the image and
-/// the snapshot through one batch (see [`CATALOG_PERSIST_EVERY`]). A hit means
-/// an image an earlier release wrote, or a disk that lost part of a batch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ImageInconsistency {
-    /// The persisted snapshot is ahead of the catalog blob — what a
-    /// `build_snapshot` before T3.4 left, since it wrote neither the blob nor
-    /// `last_applied`. `open` boots from the snapshot instead of the blob.
-    SnapshotNewerThanBlob,
-    /// The snapshot's meta could not be read, or it is ahead of the blob and
-    /// its data could not be read or decoded. `open` boots from the blob, as
-    /// the previous release did.
-    SnapshotUnreadable,
-    /// The blob holds commands past the persisted `last_applied` — a split
-    /// write (the catalog landed, `last_applied` did not) from the separate
-    /// inserts used before one batch. The boot replay re-offers those
-    /// commands; `apply` skips them.
-    BlobAheadOfLastApplied,
-    /// Log entries after the image's applied position were purged, so the
-    /// boot replay cannot reach them and no snapshot covers them.
-    ReplayGap,
-    /// `apply` was handed entries the image already holds, and skipped them
-    /// rather than apply them twice. One hit per entry.
-    AlreadyApplied,
+engenho_substrate::closed_enum! {
+    /// One way a durable image was found disagreeing with itself (T3.4).
+    ///
+    /// ★ SHADOW, NOT FATAL. Each hit is logged at WARN under [`IMAGE_GATE`] and
+    /// counted in the store's [`ImageTripwire`]; none refuses a boot. A node that
+    /// booted yesterday must still boot, so the check ships watching.
+    /// [`Self::ReplayGap`] is the only state neither the snapshot nor the log can
+    /// rebuild — the one a later release may make fatal, once a release has run
+    /// with zero hits on every node.
+    ///
+    /// This release cannot WRITE any of them: every writer lands the image and
+    /// the snapshot through one batch (see [`CATALOG_PERSIST_EVERY`]). A hit means
+    /// an image an earlier release wrote, or a disk that lost part of a batch.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub enum ImageInconsistency {
+        /// The persisted snapshot is ahead of the catalog blob — what a
+        /// `build_snapshot` before T3.4 left, since it wrote neither the blob nor
+        /// `last_applied`. `open` boots from the snapshot instead of the blob.
+        SnapshotNewerThanBlob,
+        /// The snapshot's meta could not be read, or it is ahead of the blob and
+        /// its data could not be read or decoded. `open` boots from the blob, as
+        /// the previous release did.
+        SnapshotUnreadable,
+        /// The blob holds commands past the persisted `last_applied` — a split
+        /// write (the catalog landed, `last_applied` did not) from the separate
+        /// inserts used before one batch. The boot replay re-offers those
+        /// commands; `apply` skips them.
+        BlobAheadOfLastApplied,
+        /// Log entries after the image's applied position were purged, so the
+        /// boot replay cannot reach them and no snapshot covers them.
+        ReplayGap,
+        /// `apply` was handed entries the image already holds, and skipped them
+        /// rather than apply them twice. One hit per entry.
+        AlreadyApplied,
+    }
 }
 
 impl ImageInconsistency {

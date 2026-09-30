@@ -43,7 +43,7 @@ use crate::error::ControllerError;
 use crate::meta::warn_unreadable;
 use crate::reads::{DeclaresReads, Reads, gvk};
 use crate::selector::{matches_labels, selector_match_labels};
-use crate::status::generation_of;
+use crate::status::{generation_of, pod_is_ready};
 
 /// The five status numbers a PDB reconcile computes. Carrying them in
 /// one typed struct keeps the "compute" step (pure, unit-testable) and
@@ -82,22 +82,6 @@ impl PodDisruptionBudgetController {
 
     fn max_unavailable(pdb: &Value) -> Option<&Value> {
         pdb.get("spec").and_then(|s| s.get("maxUnavailable"))
-    }
-
-    /// True iff `status.conditions` carries `type=Ready,status=True`.
-    /// A pod without a status (unbound / not yet reported by kubelet) is
-    /// NOT ready — it never counts toward `currentHealthy`.
-    fn pod_is_ready(pod: &Value) -> bool {
-        pod.get("status")
-            .and_then(|s| s.get("conditions"))
-            .and_then(|c| c.as_array())
-            .map(|conds| {
-                conds.iter().any(|c| {
-                    c.get("type").and_then(|t| t.as_str()) == Some("Ready")
-                        && c.get("status").and_then(|s| s.as_str()) == Some("True")
-                })
-            })
-            .unwrap_or(false)
     }
 
     /// Resolve a `minAvailable` / `maxUnavailable` `IntOrString` against a
@@ -240,7 +224,7 @@ impl Controller for PodDisruptionBudgetController {
                 })
                 .collect();
             let total = matching.len() as i64;
-            let healthy = matching.iter().filter(|p| Self::pod_is_ready(p)).count() as i64;
+            let healthy = matching.iter().filter(|p| pod_is_ready(p)).count() as i64;
 
             let desired = Self::compute_status(
                 Self::min_available(pdb_value),
@@ -308,19 +292,19 @@ mod tests {
     #[test]
     fn pod_is_ready_true_when_condition_true() {
         let p = json!({"status": {"conditions": [{"type": "Ready", "status": "True"}]}});
-        assert!(PodDisruptionBudgetController::pod_is_ready(&p));
+        assert!(crate::status::pod_is_ready(&p));
     }
 
     #[test]
     fn pod_is_ready_false_when_condition_false() {
         let p = json!({"status": {"conditions": [{"type": "Ready", "status": "False"}]}});
-        assert!(!PodDisruptionBudgetController::pod_is_ready(&p));
+        assert!(!crate::status::pod_is_ready(&p));
     }
 
     #[test]
     fn pod_is_ready_false_when_no_status() {
         let p = json!({"metadata": {"name": "x"}});
-        assert!(!PodDisruptionBudgetController::pod_is_ready(&p));
+        assert!(!crate::status::pod_is_ready(&p));
     }
 
     // ── int-or-percent IntOrString parse ──────────────────────────────

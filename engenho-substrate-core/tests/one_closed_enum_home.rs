@@ -17,12 +17,14 @@
 //!      would satisfy every other assertion by finding zero of everything,
 //!      which is an empty result read as a verdict.
 //!   2. **The ceiling.** Every OTHER definition of `closed_enum` or
-//!      `filter_plugins` is one of the three in [`KNOWN_UNMIGRATED`]. A new
-//!      one fails here.
+//!      `filter_plugins` is a row of [`KNOWN_UNMIGRATED`]. A new one fails
+//!      here.
 //!
 //! The ceiling is deliberately one-sided: a row disappearing is the
-//! migration landing, and must not turn this red. Emptying the list is the
-//! deferred half of sub-core-01 — those three crates belong to other lanes.
+//! migration landing, and must not turn this red. The controllers copy and the
+//! apiserver test copy are retired (`engenho_controllers::closed_enum` is now a
+//! re-export of this one); the scheduler's `filter_plugins!` is the one row
+//! left, deferred to the scheduler's own lane.
 //!
 //! Tier: a gate, not a type. Nothing stops a fourth copy being *written*;
 //! this fails the build when one is. The shape is only unrepresentable for a
@@ -33,14 +35,7 @@ use std::path::{Path, PathBuf};
 /// Definitions that predate this crate's home for the macro, each with the
 /// crate that must be edited to retire it. Every one is outside sub-core-01's
 /// file boundary, so the migration is deferred, not forgotten.
-const KNOWN_UNMIGRATED: &[(&str, &str)] = &[
-    ("engenho-controllers/src/closed_enum.rs", "closed_enum"),
-    ("engenho-scheduler/src/filter.rs", "filter_plugins"),
-    (
-        "engenho-apiserver/tests/w1_one_write_pipeline.rs",
-        "closed_enum",
-    ),
-];
+const KNOWN_UNMIGRATED: &[(&str, &str)] = &[("engenho-scheduler/src/filter.rs", "filter_plugins")];
 
 /// The macro names that must have exactly one home.
 const CENSUSED: [&str; 2] = ["closed_enum", "filter_plugins"];
@@ -168,7 +163,7 @@ fn the_scan_reads_the_name_and_not_a_fixed_string() {
     assert_eq!(macros_defined(&src), vec!["closed_enum", "filter_plugins"]);
 }
 
-/// The ceiling: no definition beyond the home and the three known copies.
+/// The ceiling: no definition beyond the home and the known unmigrated copies.
 #[test]
 fn no_crate_defines_a_fourth_copy_of_the_shape() {
     let found = census();

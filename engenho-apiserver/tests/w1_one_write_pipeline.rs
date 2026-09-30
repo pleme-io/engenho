@@ -43,23 +43,10 @@ use engenho_types::patch::PatchType;
 //  The two axes.
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// An enum whose `ALL` list is emitted from the same variant list, so a
-/// variant cannot exist without being iterated: a new verb or rule runs in
-/// the matrix the moment it compiles.
-macro_rules! closed_enum {
-    ($(#[$meta:meta])* enum $name:ident { $($(#[$vmeta:meta])* $variant:ident,)+ }) => {
-        $(#[$meta])*
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-        enum $name { $($(#[$vmeta])* $variant,)+ }
-        impl $name {
-            const ALL: &'static [$name] = &[$($name::$variant,)+];
-        }
-    };
-}
-
-closed_enum! {
+engenho_substrate::closed_enum! {
     /// A write verb. Server-side apply is an upsert, so it is two verbs: one
     /// that creates and one that updates.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Verb {
         Post,
         ApplyCreate,
@@ -114,8 +101,9 @@ impl Verb {
     }
 }
 
-closed_enum! {
+engenho_substrate::closed_enum! {
     /// A write rule: something every write the rule applies to must obey.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Rule {
         /// Built-in defaulting fills what the object omits.
         Defaulted,
