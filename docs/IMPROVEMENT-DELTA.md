@@ -81,7 +81,7 @@ records the plan's reason rather than a date.
 | Item | Why it is not done | Gate |
 |---|---|---|
 | Multi-node / a second Raft voter | Needs a FaultRouter partition test with a recorded red, every Raft RPC reply a `Result`, read fences, `/readyz` typed per role, durable votes, and an in-binary transport. | edge 18 |
-| revoada going live (**13,740** lines as of 2026-09-19, in no binary) | Its safety rests on a durable vote store, a real `has_majority`, and a quorum check on promotion — none of which exist. Kept as a fenced typed draft. **"In no binary" is not prose here: `engenho/tests/shipped_closure.rs` asserts `!linked.contains("engenho-revoada")`, so the day something links it, that test goes red.** | §5.3, edge 18 |
+| revoada going live (**13,740** lines as of 2026-09-19, in no binary) | Its safety rests on a durable vote store, a real `has_majority`, and a quorum check on promotion — all three landed 2026-09-30 (RECOVERABLE-STATE.md S1–S3); fencing epochs and a quorum-seeded bootstrap are still missing. Kept as a fenced typed draft. **"In no binary" is not prose here: `engenho/tests/shipped_closure.rs` asserts `!linked.contains("engenho-revoada")`, so the day something links it, that test goes red.** | §5.3, edge 18 |
 | fonte fixes beyond fencing | fonte is not shipped and runs only mocks; hardening code no binary runs is refused. | §9 |
 | CSI protocol work | Zero CSI drivers are registered; hardening an unexercised surface is refused. | §9 |
 | A keyed WorkQueue | The single requeue slot covers every observed failure mode. | §9 |

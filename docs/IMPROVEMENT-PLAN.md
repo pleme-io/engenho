@@ -336,7 +336,7 @@ teia is not deleted: MODULARIZE-DON'T-DELETE keeps code that was retired because
 Keep `substrate::maquina`. From now on, a state machine exists only as the implementation itself, or with a differential test over every (state, event) pair.
 
 **5.3 revoada (13,358 lines, in no binary): keep it as a typed draft, fenced off, not hardened.**
-- Its safety depends on things that do not exist yet: a durable vote store, a real `has_majority`, and a quorum check on promotion.
+- Its safety depended on three things that did not exist: a durable vote store, a real `has_majority`, and a quorum check on promotion. All three landed 2026-09-30 (RECOVERABLE-STATE.md S1–S3); what it still lacks is fencing epochs and a quorum-seeded bootstrap (RECOVERABLE-STATE.md §6).
 - Now: T5.4's corrections, delete RoundRobin, and T5.1 asserts revoada stays outside the shipped closure.
 - CI reports test counts for shipped and unshipped crates separately.
 - No reliability work until a decision to ship multi-node, which edge 18 gates.

@@ -74,8 +74,9 @@ const RETRACTED: &[Retracted] = &[
     Retracted {
         file: "../docs/DISTRIBUTED.md",
         retracted: "split-brain is impossible",
-        corrected: "split-brain freedom cannot be claimed until three missing pieces exist",
-        until: "a durable Raft vote and log, a real has_majority, and a quorum check on promotion",
+        corrected: "Split-brain freedom still cannot be claimed for revoada.",
+        until: "fencing epochs on every role write path, a quorum-seeded bootstrap, and \
+                no volatile Raft store outside tests (RECOVERABLE-STATE.md §6)",
     },
     Retracted {
         file: "../docs/CONSISTENCY-FABRIC.md",
@@ -110,7 +111,8 @@ const RETRACTED: &[Retracted] = &[
         file: "src/topology.rs",
         retracted: "True if the assignment satisfies Raft majority",
         corrected: "A majority check is not a safety property on its own.",
-        until: "a promotion path that calls has_majority and a durable vote for it to count",
+        until: "never on its own: the promotion paths now call it and the votes are \
+                durable, and safety still needs fencing (RECOVERABLE-STATE.md I5)",
     },
     // The three rows below leave this crate. Each sentence was written in
     // the source file it describes, so the tripwire has to read THAT file.
