@@ -65,6 +65,35 @@ caught (C2)** until the store's write API requires a class in its signature, at
 which point a new stored kind without a class does not compile (**truly
 unrepresentable** for new kinds).
 
+**Landed for stored kinds (C2).** `engenho_types::state_class` holds the enum and
+`STORED_KINDS`, one row per kind. The gate is `engenho-runtime`'s
+`state_class_census`, which reads two declaration forms: every row of the
+generated `RESOURCE_CATALOG`, and every kind a shipped source keys the store with
+(`ResourceKey::namespaced`/`cluster_scoped`, `store.list*`), by literal or through
+a `&str` constant. Test-only modules and `#[cfg(test)]` items are not read. It
+checks both directions: a keyed or cataloged kind with no row fails, and a row
+that neither the catalog nor any source names fails. It asserts a floor (at least
+100 keyed sites and 30 distinct kinds; measured 2026-09-30: 111 sites, 84
+resolved, 33 kinds), and its first run was red on three kinds nobody had
+classified: `engenho.io/Plantio` and the snapshot group's `VolumeSnapshot` and
+`VolumeSnapshotContent`. A kind computed at run time (from a descriptor, an owner
+reference, a request) is counted, not named; a CRD's kinds take
+`CUSTOM_RESOURCE_CLASS` (Declared). What is not Declared:
+
+| Class | Kinds |
+|---|---|
+| Identity and secrets | `Secret` |
+| Derived | `Endpoints`, `EndpointSlice`, `ControllerRevision`, `VolumeAttachment` |
+| Observed | `Event`, `CSINode`, `CSIStorageCapacity`, `engenho.io/MaterializationReceipt` |
+| Content | `engenho.io/Derivation` (named by its hash) |
+| Ephemeral | the review kinds: `TokenReview`, `SubjectAccessReview`, `SelfSubjectAccessReview`, `SelfSubjectRulesReview`, `LocalSubjectAccessReview` |
+
+A kind that is sometimes derived and sometimes written by hand (`ReplicaSet`,
+`Pod`, `PersistentVolume`) takes the class that must survive either: Declared.
+`Node` is Declared because its labels and taints are. Still open: the in-memory
+half (every long-lived map declaring a class, §13 R0), and the destination, the
+store's write API taking a class.
+
 **Known violations, from IMPROVEMENT-PLAN §2, each a rung-0 fix (§12):**
 
 - The catalog blob can fall more than the purge window behind the log, and
@@ -473,7 +502,7 @@ Every gate is recorded red once before it lands.
 
 | Rung | Delivers | Proof it is done |
 |---|---|---|
-| **R0 Recoverable single node** | the §1 known violations fixed; `StateClass` registry and its gate | a restart during a write burst boots; a snapshot restores a node from empty; labels and taints survive a reboot; a native pod is re-adopted, not re-run |
+| **R0 Recoverable single node** | the §1 known violations fixed; `StateClass` registry and its gate (stored kinds landed, C2; long-lived in-memory maps and a write API that takes a class still to do) | a restart during a write burst boots; a snapshot restores a node from empty; labels and taints survive a reboot; a native pod is re-adopted, not re-run |
 | **R1 One consensus engine** | revoada on the durable log; PreVote, CheckQuorum; complete snapshots; versioned log format | the restart-and-vote test and the minority-cannot-promote test (RECOVERABLE-STATE.md) |
 | **R2 Capabilities and placement, one node** | capability record; requirements inferred from specs; filter-and-score; committed placements; typed `Pending` reasons | an OCI pod never lands on a native-only node; an impossible pod reports why |
 | **R3 Two nodes and a witness** | learner join; gossiped capabilities; cross-node placement | deterministic simulation of join, crash and rejoin |

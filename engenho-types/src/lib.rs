@@ -79,6 +79,7 @@ pub mod openapi_v3;
 pub mod patch;
 pub mod primitives;
 pub mod spec_int;
+pub mod state_class;
 pub mod time;
 pub mod translator;
 pub mod watch;

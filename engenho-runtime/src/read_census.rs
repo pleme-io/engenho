@@ -356,7 +356,7 @@ fn matching_close(tokens: &[Tok], open: usize) -> usize {
 
 /// When `tokens[i]` is the `.` of `store.<method>(` or `store().<method>(`,
 /// the method name.
-fn store_call(tokens: &[Tok], i: usize) -> Option<&str> {
+pub(crate) fn store_call(tokens: &[Tok], i: usize) -> Option<&str> {
     if tokens.get(i) != Some(&Tok::Punct('.')) || i == 0 {
         return None;
     }
@@ -380,7 +380,7 @@ fn store_call(tokens: &[Tok], i: usize) -> Option<&str> {
 
 /// The top-level, comma-separated arguments of the call whose `(` is at
 /// `open`.
-fn call_args(tokens: &[Tok], open: usize) -> Vec<Vec<Tok>> {
+pub(crate) fn call_args(tokens: &[Tok], open: usize) -> Vec<Vec<Tok>> {
     let close = matching_close(tokens, open);
     let mut args = vec![Vec::new()];
     let mut depth = 0usize;

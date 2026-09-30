@@ -162,6 +162,8 @@ mod release;
 mod runtime;
 mod runtime_health;
 #[cfg(test)]
+mod state_class_census;
+#[cfg(test)]
 mod testing;
 
 pub use boot_config::{PkiField, Unhonoured};
