@@ -679,6 +679,17 @@ impl NativeBackend {
     }
 }
 
+
+fn read_log_from(path: &Path, offset: u64) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    file.seek(SeekFrom::Start(offset.min(len)))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 #[async_trait::async_trait]
 impl ContainerRuntime for NativeBackend {
     fn name(&self) -> &'static str {
@@ -826,7 +837,7 @@ impl ContainerRuntime for NativeBackend {
             }
             .into());
         };
-        let body = std::fs::read_to_string(&path).map_err(|e| NativeError::Log {
+        let body = read_log_from(&path, opts.from_byte.unwrap_or(0)).map_err(|e| NativeError::Log {
             path: path.clone(),
             detail: e.to_string(),
         })?;

@@ -599,6 +599,9 @@ pub struct LogOptions {
     /// `--timestamps` — prefix each line with an RFC3339 timestamp. Default
     /// `false`. Forward-compat (kubectl `--timestamps`).
     pub timestamps: bool,
+    /// Read from this byte offset of the log instead of its start.
+    #[serde(default)]
+    pub from_byte: Option<u64>,
 }
 
 impl LogOptions {
@@ -1299,6 +1302,10 @@ impl ContainerRuntime for FakeBackend {
             // No buffer → no such container. Typed error, never an empty Ok.
             KubeletError::Backend(format!("no such container for logs: {container_id}"))
         })?;
+        if let Some(offset) = opts.from_byte {
+            let start = usize::try_from(offset).unwrap_or(usize::MAX).min(buf.len());
+            return Ok(String::from_utf8_lossy(&buf.as_bytes()[start..]).into_owned());
+        }
         // Honor --tail by returning only the last N lines (mirrors podman's
         // `--tail` line semantics) so the fake's behavior matches the real
         // backend for the test assertions.
@@ -2290,6 +2297,11 @@ impl ContainerRuntime for PodmanBackend {
     }
 
     async fn logs(&self, container_id: &str, opts: &LogOptions) -> Result<String, KubeletError> {
+        if opts.from_byte.is_some() {
+            return Err(KubeletError::Backend(
+                "podman logs: reading from a byte offset is not supported on this backend".into(),
+            ));
+        }
         let argv = Self::logs_argv(container_id, opts);
         let out = self
             .command(&argv)
@@ -3661,6 +3673,7 @@ mod tests {
         let opts = LogOptions {
             tail: Some(10),
             timestamps: true,
+            from_byte: None,
         };
         assert_eq!(
             PodmanBackend::logs_argv("cid", &opts),

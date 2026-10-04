@@ -30,6 +30,10 @@ pub struct LogQuery {
     /// (kubectl `--timestamps`). Default `false`.
     #[serde(default)]
     pub timestamps: bool,
+    #[serde(default)]
+    pub follow: bool,
+    #[serde(skip)]
+    pub from_byte: Option<u64>,
 }
 
 /// The in-process Pod-log reader the apiserver's Pod handler delegates to.
@@ -53,4 +57,27 @@ pub trait PodLogReader: Send + Sync {
         name: &str,
         query: &LogQuery,
     ) -> Result<String, ApiError>;
+}
+
+#[must_use]
+pub fn last_lines(text: &str, n: u32) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(n as usize);
+    let mut out = lines[start..].join("\n");
+    if !out.is_empty() && text.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::last_lines;
+
+    #[test]
+    fn last_lines_keeps_the_tail_and_its_newline() {
+        assert_eq!(last_lines("a\nb\nc\n", 2), "b\nc\n");
+        assert_eq!(last_lines("a\nb", 5), "a\nb");
+        assert_eq!(last_lines("a\nb\n", 0), "");
+    }
 }

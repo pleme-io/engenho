@@ -1321,6 +1321,7 @@ impl engenho_apiserver::PodLogReader for KubeletLogReader {
         let opts = LogOptions {
             tail: query.tail_lines,
             timestamps: query.timestamps,
+            from_byte: query.from_byte,
         };
         self.kubelet
             .load_full()

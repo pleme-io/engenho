@@ -112,6 +112,7 @@ impl LogQuery {
         LogOptions {
             tail: self.tail_lines,
             timestamps: self.timestamps,
+            from_byte: None,
         }
     }
 }

@@ -2121,12 +2121,62 @@ async fn do_get_log(
     name: &str,
     query: &crate::pod_logs::LogQuery,
 ) -> Result<Response, ApiError> {
+    if query.follow {
+        return follow_log(h, ns, name, query).await;
+    }
     let text = h.logs(ns, name, query).await?;
     // text/plain — the log stream body. kubectl reads stdout verbatim.
     Ok((
         StatusCode::OK,
         [(CONTENT_TYPE, "text/plain; charset=utf-8")],
         text,
+    )
+        .into_response())
+}
+
+const LOG_FOLLOW_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+async fn follow_log(
+    h: &Arc<dyn ResourceHandler>,
+    ns: Option<&str>,
+    name: &str,
+    query: &crate::pod_logs::LogQuery,
+) -> Result<Response, ApiError> {
+    let whole = crate::pod_logs::LogQuery {
+        tail_lines: None,
+        follow: false,
+        from_byte: None,
+        ..query.clone()
+    };
+    let text = h.logs(ns, name, &whole).await?;
+    let offset = text.len() as u64;
+    let first = match query.tail_lines {
+        Some(n) => crate::pod_logs::last_lines(&text, n),
+        None => text,
+    };
+    let state = (Arc::clone(h), ns.map(str::to_owned), name.to_owned(), whole, offset, Some(first));
+    let stream = futures::stream::unfold(state, |(h, ns, name, q, offset, first)| async move {
+        if let Some(first) = first {
+            let chunk = bytes::Bytes::from(first);
+            return Some((Ok::<_, std::io::Error>(chunk), (h, ns, name, q, offset, None)));
+        }
+        loop {
+            tokio::time::sleep(LOG_FOLLOW_POLL).await;
+            let next = crate::pod_logs::LogQuery { from_byte: Some(offset), ..q.clone() };
+            match h.logs(ns.as_deref(), &name, &next).await {
+                Ok(more) if more.is_empty() => {}
+                Ok(more) => {
+                    let offset = offset + more.len() as u64;
+                    return Some((Ok(bytes::Bytes::from(more)), (h, ns, name, q, offset, None)));
+                }
+                Err(_) => return None,
+            }
+        }
+    });
+    Ok((
+        StatusCode::OK,
+        [(CONTENT_TYPE, "text/plain; charset=utf-8")],
+        axum::body::Body::from_stream(stream),
     )
         .into_response())
 }

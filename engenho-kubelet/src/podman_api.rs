@@ -1459,6 +1459,11 @@ impl crate::backend::ContainerRuntime for PodmanApiBackend {
         // one text blob, stdout first. The two are collected separately because
         // the WIRE separates them; joining is a presentation choice made here
         // rather than a distinction lost on the way in.
+        if opts.from_byte.is_some() {
+            return Err(KubeletError::Backend(
+                "podman logs: reading from a byte offset is not supported on this backend".into(),
+            ));
+        }
         let out = self.api.logs(container_id, opts).await?;
         let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
         if !out.stderr.is_empty() {
