@@ -79,7 +79,9 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 mod ctl;
+mod face;
 mod remote;
+mod status;
 mod unit_run;
 
 /// The verb list, written ONCE.
@@ -90,8 +92,9 @@ mod unit_run;
 /// actually dispatched by [`Command::parse`], which closes the other
 /// direction: a verb added to the match arms without a row here fails
 /// the suite rather than becoming silently undiscoverable.
-const SUBCOMMAND_NAMES: [&str; 8] = [
+const SUBCOMMAND_NAMES: [&str; 9] = [
     "daemon",
+    "status",
     "ctl",
     "remote",
     "kubeconfig",
@@ -124,6 +127,7 @@ enum Command {
     /// `ctl …` — talk to the running daemon over its control socket; the
     /// arguments are parsed by [`ctl::CtlCommand::parse`].
     Ctl(Vec<String>),
+    Status(Vec<String>),
     /// `remote …` — this machine's keys for remote daemons ([`remote::run`]).
     Remote(Vec<String>),
     /// `unit-run …` — run a rendered systemd `.service` file as this pod's
@@ -158,6 +162,7 @@ impl Command {
             Some("config-show") => Ok(Command::ConfigShow(args.next())),
             Some("census") => Ok(Command::Census(CensusCommand::parse(args)?)),
             Some("ctl") => Ok(Command::Ctl(args.collect())),
+            Some("status") => Ok(Command::Status(args.collect())),
             Some("unit-run") => Ok(Command::UnitRun(args.collect())),
             Some("remote") => Ok(Command::Remote(args.collect())),
             Some("config-diff") => match (args.next(), args.next()) {
@@ -323,6 +328,7 @@ async fn run_async(command: Command) -> anyhow::Result<()> {
         Command::ConfigDiff(from, to) => run_config_diff(&from, &to),
         Command::Census(census) => run_census(census).await,
         Command::Ctl(args) => std::process::exit(i32::from(ctl::run(args).await)),
+        Command::Status(args) => std::process::exit(i32::from(status::run(args).await)),
         // Dispatched in `main`, before the runtime: unreachable here, and an
         // exhaustive match rather than a wildcard so a new verb still fails
         // to compile until it is dispatched.
@@ -891,6 +897,12 @@ USAGE:
 SUBCOMMANDS:
     daemon                    Boot the runtime. This is the default when no
                               subcommand is given, so bare `engenho` runs it.
+    status [--remote <NAME>] [--json] [--events <N>]
+                              One report on the daemon the client speaks to:
+                              lifecycle, store, children, boot, PKI,
+                              kubeconfigs, config drift, control listeners and
+                              recent events. Exits 0 healthy, 1 degraded,
+                              4 unreachable.
     ctl <RESOURCE> <VERB>     Talk to the running daemon over its control
                               socket: its lifecycle, boots, init state,
                               config, children, PKI, store, logs and audit.

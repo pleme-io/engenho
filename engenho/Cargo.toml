@@ -36,6 +36,9 @@ engenho-control-client = { workspace = true }
 engenho-serve          = { workspace = true }
 
 anyhow             = { workspace = true }
+chrono             = { version = "0.4", default-features = false, features = ["clock", "std"] }
+kazari             = { workspace = true }
+serde              = { workspace = true }
 serde_json         = { workspace = true }
 serde_yaml         = { workspace = true }
 tokio              = { workspace = true }

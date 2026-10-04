@@ -1,8 +1,8 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "5a8e10ab5de55921c0506ddd1204a49eba21033a9368625f52b0f6d52f40fb3f",
+  "cargo_lock_sha256": "59fa66bc31cb5ac76137744739f07e2b1aa16ade026fb4a57c3bd50de438a62e",
   "manifest_sha256": {
-    "Cargo.toml": "f08a4df9a7720e16e9e02b46ba0676087bf6e6d146dc8c6a84f311845b25471b",
+    "Cargo.toml": "f1589bbd663b08efd3fa027b0d180a7343077e578667dc618e7bf41ae17f6cd0",
     "engenho-apiserver/Cargo.toml": "a42bf1f662ba3dbab338a871c0979aa15dfb734a22435d96e36e65cfa47d5abf",
     "engenho-cluster-config-render/Cargo.toml": "5f5f6d40c2b9a572f18418d12e568412517972684259f34a9aa3d34de0a5dc8c",
     "engenho-cluster-config/Cargo.toml": "49d8ea7131956ec2d6323ae41968f624fab66bbbbca1afbb0537b2327a683391",
@@ -36,7 +36,7 @@
     "engenho-teia/Cargo.toml": "c0b840a05f7e1a944503ea3701d4f1f2a4e3656b3c334d9029e8ceb6ee8cbbcc",
     "engenho-types/Cargo.toml": "ed835cbe693033a0b05c49550da9b34545d51a477a28a053bd0a86878bc917c3",
     "engenho-unit/Cargo.toml": "217104ea4d3291e03dd9bf80316fba80abf0a05a103813d2e63306f925320c67",
-    "engenho/Cargo.toml": "5d13ee2e29e72d84c549f3ed82fcc8a399ef20795d9201a47bab1867b419f0ae"
+    "engenho/Cargo.toml": "99f5aa512d4dbd227658b8abae14cd29e4526c6690fa28b563118d6c73754b6a"
   },
   "target_resolves": {
     "base": {
@@ -3653,6 +3653,19 @@
             "tree": "target"
           },
           {
+            "name": "chrono",
+            "package_key": "chrono-0.4.44",
+            "kind": "normal",
+            "features": [
+              "clock",
+              "std"
+            ],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
             "name": "engenho_apiserver",
             "package_key": "engenho-apiserver-0.53.123",
             "kind": "normal",
@@ -3747,6 +3760,30 @@
             "package_key": "engenho-unit-0.53.123",
             "kind": "normal",
             "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "kazari",
+            "package_key": "pleme-io-kazari-0.2.2",
+            "kind": "normal",
+            "features": [
+              "json"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "serde",
+            "package_key": "serde-1.0.228",
+            "kind": "normal",
+            "features": [
+              "derive"
+            ],
             "uses_default_features": true,
             "optional": false,
             "target": null,
@@ -11881,7 +11918,7 @@
           },
           {
             "name": "hashbrown",
-            "package_key": "hashbrown-0.15.5",
+            "package_key": "hashbrown-0.17.1",
             "kind": "normal",
             "features": [
               "default-hasher",
@@ -15069,9 +15106,21 @@
         ]
       },
       "hashbrown-0.17.1": {
-        "runtime_dependencies": [],
+        "runtime_dependencies": [
+          {
+            "name": "foldhash",
+            "package_key": "foldhash-0.2.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": true,
+            "target": null,
+            "tree": "target"
+          }
+        ],
         "build_dependencies": [],
         "features": [
+          "default-hasher",
           "inline-more"
         ]
       },
@@ -19125,6 +19174,64 @@
         ],
         "build_dependencies": [],
         "features": []
+      },
+      "pleme-io-kazari-0.2.2": {
+        "runtime_dependencies": [
+          {
+            "name": "anstyle",
+            "package_key": "anstyle-1.0.14",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "irodori",
+            "package_key": "irodori-0.2.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "serde_json",
+            "package_key": "serde_json-1.0.150",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": true,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "terminal_size",
+            "package_key": "terminal_size-0.4.4",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "unicode_width",
+            "package_key": "unicode-width-0.2.2",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": [
+          "json"
+        ]
       },
       "potential_utf-0.1.5": {
         "runtime_dependencies": [
@@ -40119,6 +40226,13 @@
       "edition": "2018"
     },
     "pleme-io-kazari-0.1.3": {
+      "edition": "2024",
+      "lib_target": {
+        "name": "kazari",
+        "path": "src/lib.rs"
+      }
+    },
+    "pleme-io-kazari-0.2.2": {
       "edition": "2024",
       "lib_target": {
         "name": "kazari",

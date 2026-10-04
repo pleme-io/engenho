@@ -28,6 +28,10 @@ use std::fmt;
 use std::io::IsTerminal as _;
 use std::path::PathBuf;
 
+use kazari::Stream;
+use kazari::prelude::*;
+
+use crate::face;
 use engenho_control_client::{
     ClientError, ControlClient, RemotesConfig, Reply, remote, render, resolve_socket,
 };
@@ -66,6 +70,20 @@ pub enum Endpoint {
     Local(Option<PathBuf>),
     /// `--remote NAME`: a daemon listed in `remotes.yaml`, over mTLS.
     Remote(String),
+}
+
+impl Endpoint {
+    pub fn set(&mut self, flag: &str, value: String) -> Result<(), CtlUsage> {
+        if *self != Endpoint::Local(None) {
+            return Err(CtlUsage::TwoEndpoints);
+        }
+        *self = if flag == "--socket" {
+            Endpoint::Local(Some(PathBuf::from(value)))
+        } else {
+            Endpoint::Remote(value)
+        };
+        Ok(())
+    }
 }
 
 /// A parsed `engenho ctl` invocation.
@@ -234,14 +252,7 @@ impl CtlCommand {
                 "--list" | "--help" => return Ok(command),
                 "--socket" | "--remote" => {
                     let given = value(&mut args, &arg)?;
-                    if command.endpoint != Endpoint::Local(None) {
-                        return Err(CtlUsage::TwoEndpoints);
-                    }
-                    command.endpoint = if arg == "--socket" {
-                        Endpoint::Local(Some(PathBuf::from(given)))
-                    } else {
-                        Endpoint::Remote(given)
-                    };
+                    command.endpoint.set(&arg, given)?;
                 }
                 "--actor" => command.actor = Some(value(&mut args, &arg)?),
                 "--ceiling" => {
@@ -281,7 +292,7 @@ impl CtlCommand {
     }
 }
 
-fn value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, CtlUsage> {
+pub fn value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, CtlUsage> {
     args.next()
         .ok_or_else(|| CtlUsage::NeedsValue(flag.to_owned()))
 }
@@ -357,17 +368,16 @@ fn request_parts(
     Ok(parts)
 }
 
+const USAGE_LINE: &str = "usage: engenho ctl [--socket PATH | --remote NAME] [--json] [--actor A] \
+                          [--ceiling TIER] <resource> <verb> [args] [--param value]…";
+
 /// The usage summary: every `<resource> <verb>`, its path parameters, its
 /// tier and its operation.
 pub struct Usage;
 
 impl fmt::Display for Usage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(
-            f,
-            "usage: engenho ctl [--socket PATH | --remote NAME] [--json] [--actor A] \
-             [--ceiling TIER] <resource> <verb> [args] [--param value]…\n"
-        )?;
+        writeln!(f, "{USAGE_LINE}\n")?;
         let width = CATALOG
             .iter()
             .map(|r| r.cli.resource.len() + r.cli.verb.len() + 1)
@@ -410,7 +420,12 @@ pub async fn run(args: impl IntoIterator<Item = String>) -> u8 {
         }
     };
     let CtlAction::Call { id, mut parts } = command.action else {
-        print!("{Usage}");
+        if face::colored(Stream::Stdout) {
+            println!("{USAGE_LINE}\n");
+            let _ = usage_table().print();
+        } else {
+            print!("{Usage}");
+        }
         return EXIT_OK;
     };
     // A destructive operation without a challenge: the handshake below
@@ -434,28 +449,9 @@ pub async fn run(args: impl IntoIterator<Item = String>) -> u8 {
             None
         }
     };
-    // Where it looked, for an unreachable local daemon; a remote one names
-    // its own address.
-    let mut looked: Vec<PathBuf> = Vec::new();
-    let client = match &command.endpoint {
-        Endpoint::Local(explicit) => {
-            let socket = resolve_socket(explicit.clone());
-            looked = socket.considered;
-            match ControlClient::uds(&socket.path) {
-                Ok(client) => client,
-                Err(err) => {
-                    eprintln!("engenho ctl: {err}");
-                    return EXIT_BLIND;
-                }
-            }
-        }
-        Endpoint::Remote(name) => match remote_client(name) {
-            Ok(client) => client,
-            Err(why) => {
-                eprintln!("engenho ctl: --remote {name}: {why}");
-                return EXIT_USAGE;
-            }
-        },
+    let (client, looked) = match connect(&command.endpoint, "engenho ctl") {
+        Ok(connected) => connected,
+        Err(code) => return code,
     };
     let client = client.with_actor(command.actor.clone().unwrap_or_else(|| "human".into()));
     let client = match command.ceiling {
@@ -483,8 +479,40 @@ pub async fn run(args: impl IntoIterator<Item = String>) -> u8 {
     }
 }
 
+/// A client for `endpoint`, and where it looked for a local daemon's
+/// socket (a remote one names its own address). On failure, what went
+/// wrong is said on stderr under `who` and the exit code is returned.
+pub fn connect(endpoint: &Endpoint, who: &str) -> Result<(ControlClient, Vec<PathBuf>), u8> {
+    match endpoint {
+        Endpoint::Local(explicit) => {
+            let socket = resolve_socket(explicit.clone());
+            match ControlClient::uds(&socket.path) {
+                Ok(client) => Ok((client, socket.considered)),
+                Err(err) => {
+                    eprintln!("{who}: {err}");
+                    Err(EXIT_BLIND)
+                }
+            }
+        }
+        Endpoint::Remote(name) => match remote_client(name) {
+            Ok(client) => Ok((client, Vec::new())),
+            Err(why) => {
+                eprintln!("{who}: --remote {name}: {why}");
+                Err(EXIT_USAGE)
+            }
+        },
+    }
+}
+
 /// Say why a call got no answer; the exit code that says so.
-fn report(err: &ClientError, looked: &[PathBuf]) -> u8 {
+pub fn report(err: &ClientError, looked: &[PathBuf]) -> u8 {
+    report_as("engenho ctl", err, looked)
+}
+
+pub fn report_as(who: &str, err: &ClientError, looked: &[PathBuf]) -> u8 {
+    if face::colored(Stream::Stderr) {
+        return report_styled(err, looked);
+    }
     match err {
         ClientError::Control(ControlError::Refused(r)) => {
             eprintln!("refused ({}): {}", r.reason, r.because);
@@ -498,7 +526,7 @@ fn report(err: &ClientError, looked: &[PathBuf]) -> u8 {
             EXIT_BLIND
         }
         ClientError::Unreachable { .. } => {
-            eprintln!("engenho ctl: {err}");
+            eprintln!("{who}: {err}");
             if !looked.is_empty() {
                 let looked: Vec<String> = looked.iter().map(|p| p.display().to_string()).collect();
                 eprintln!("  looked at: {}", looked.join(", "));
@@ -507,10 +535,77 @@ fn report(err: &ClientError, looked: &[PathBuf]) -> u8 {
             EXIT_BLIND
         }
         ClientError::Protocol(_) => {
-            eprintln!("engenho ctl: {err}");
+            eprintln!("{who}: {err}");
             EXIT_BLIND
         }
     }
+}
+
+fn report_styled(err: &ClientError, looked: &[PathBuf]) -> u8 {
+    let (code, callout, notes) = match err {
+        ClientError::Control(ControlError::Refused(r)) => (
+            EXIT_REFUSED,
+            kazari::error(r.because.clone())
+                .with_title(["refused (", &r.reason.to_string(), ")"].concat()),
+            r.legal
+                .iter()
+                .map(|legal| ["instead: ", legal].concat())
+                .collect(),
+        ),
+        ClientError::Control(ControlError::Blind(b)) => (
+            EXIT_BLIND,
+            kazari::warn(b.because.clone())
+                .with_title(["blind (", &b.reason.to_string(), ")"].concat()),
+            Vec::new(),
+        ),
+        ClientError::Unreachable { .. } => {
+            let mut notes = Vec::new();
+            if !looked.is_empty() {
+                let looked: Vec<String> = looked.iter().map(|p| p.display().to_string()).collect();
+                notes.push(["looked at: ", &looked.join(", ")].concat());
+                notes.push("--socket PATH or $ENGENHO_CONTROL_SOCKET names it outright".to_owned());
+            }
+            (
+                EXIT_BLIND,
+                kazari::error(err.to_string()).with_title("unreachable"),
+                notes,
+            )
+        }
+        ClientError::Protocol(_) => (
+            EXIT_BLIND,
+            kazari::error(err.to_string()).with_title("protocol"),
+            Vec::new(),
+        ),
+    };
+    let _ = callout.eprint();
+    for note in notes {
+        let _ = kazari::note(note).eprint();
+    }
+    code
+}
+
+fn usage_table() -> kazari::Table {
+    let mut table = kazari::table(["command", "arguments", "tier", "operation"]);
+    for row in &CATALOG {
+        let path: Vec<String> = row
+            .params
+            .iter()
+            .filter(|p| p.location == ParamLocation::Path)
+            .map(|p| ["<", p.name, ">"].concat())
+            .collect();
+        let tier = match row.tier {
+            AuthorityTier::Observe => Role::Info,
+            AuthorityTier::Mutate => Role::Warn,
+            AuthorityTier::Destructive => Role::Error,
+        };
+        table = table.row_fragments([
+            Fragment::styled([row.cli.resource, " ", row.cli.verb].concat(), Role::Text),
+            Fragment::styled(path.join(" "), Role::Ident),
+            Fragment::styled(row.tier.to_string(), tier),
+            Fragment::styled(row.id.as_str(), Role::TextDim),
+        ]);
+    }
+    table
 }
 
 /// The re-initialization `op` names with the parameters in `parts`' body —
@@ -647,6 +742,10 @@ fn print_reply(id: OperationId, reply: &Reply, json: bool) {
         println!("{text}");
         return;
     };
+    if !json && face::colored(Stream::Stdout) {
+        let _ = face::document(&value).print();
+        return;
+    }
     let rendered = if json {
         serde_json::to_string_pretty(&value).unwrap_or_else(|_| text.into_owned())
     } else {

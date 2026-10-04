@@ -24,6 +24,7 @@ engenho daemon ─┬─ Supervisor (typed lifecycle; outlives every boot)
                 ├─ control listener: UDS    (kernel peer credentials)
                 └─ control listener: TLS    (SPKI-pinned clients, both ways)
 engenho ctl <resource> <verb>   — the client, same binary
+engenho status                  — one report over the observe operations
 engenho-mcp                     — control tools (observe; mutate behind --allow-mutate)
 ```
 
@@ -133,6 +134,18 @@ no switch to turn it off.
   header parameters, other `--field value` pairs build the body, and the
   daemon's own generated parser checks the request before it is sent. Exit
   codes: 0 answered, 2 usage, 3 refused, 4 blind or unreachable.
+  At a terminal, replies render through kazari (the fleet's line-output
+  library): nested replies as coloured YAML with state words painted at their
+  severity, the catalog as a table, refusals as callouts. Piped or under
+  `NO_COLOR`, the bytes are what they were before.
+* **`engenho status [--socket PATH | --remote NAME] [--json] [--events N]`**
+  is the whole-daemon report: it issues `hello`, `getStore`, `listChildren`,
+  `getBoot`, `getPki`, `listKubeconfigs`, `getConfigDrift`, `getControl` and
+  pages `listEvents` concurrently over the same client and endpoint
+  resolution as `ctl`, then prints a verdict and one section per answer. A
+  section that cannot be read is named as an issue rather than failing the
+  report. Exit codes: 0 healthy, 1 degraded, 2 usage, 4 unreachable;
+  `--json` emits every answer plus the issues.
 * **A halt stays halted.** Every service unit the module trio renders for
   engenho restarts it on failure only (`daemonRestartPolicy = "on-failure"`
   in `flake.nix`, projected by substrate's `lib/hm/restart-policy.nix`):
