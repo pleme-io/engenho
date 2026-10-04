@@ -785,6 +785,10 @@ mod tests {
         let (name, pod) = JobController::build_pod(&j, 0, owner).unwrap().unwrap();
         assert_eq!(name, "compute-0");
         assert_eq!(
+            pod["status"]["phase"], "Pending",
+            "a controller-built pod is born with status: {pod}"
+        );
+        assert_eq!(
             pod.get("spec").unwrap().get("restartPolicy").unwrap(),
             "Never"
         );

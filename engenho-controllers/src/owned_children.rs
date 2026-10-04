@@ -225,6 +225,7 @@ fn stamp_pod(
         metadata.insert("namespace".into(), Value::from(ns));
     }
     set_owner_reference(pod, owner)?;
+    engenho_types::pod::stamp_birth_status(pod);
     Ok(())
 }
 

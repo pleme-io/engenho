@@ -582,6 +582,10 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(name, format!("web-{ord}"));
+            assert_eq!(
+                pod["status"]["phase"], "Pending",
+                "a controller-built pod is born with status: {pod}"
+            );
             assert_eq!(pod.get("kind").unwrap(), "Pod");
             assert_eq!(pod.get("metadata").unwrap().get("name").unwrap(), &name);
         }

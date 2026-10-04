@@ -310,6 +310,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(name, "rs1-0");
+        assert_eq!(
+            pod["status"]["phase"], "Pending",
+            "a controller-built pod is born with status: {pod}"
+        );
         assert_eq!(pod.get("kind").unwrap(), "Pod");
         assert_eq!(pod.get("apiVersion").unwrap(), "v1");
         assert_eq!(pod.get("metadata").unwrap().get("name").unwrap(), "rs1-0");

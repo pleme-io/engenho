@@ -91,7 +91,7 @@ use engenho_types::patch::PatchType;
 use super::{
     ResourceHandler, StoreBackedHandler, admission_request, inject_type_meta,
     preserve_immutable_meta, preserve_status, stamp_creation_timestamp, stamp_namespace,
-    stamp_namespace_create_defaults, stamp_pod_create_status,
+    stamp_namespace_create_defaults,
 };
 use crate::error::ApiError;
 use crate::field_validation::{KindRef, PatchFields};
@@ -736,7 +736,7 @@ impl StoreBackedHandler {
                     stamp_namespace_create_defaults(candidate);
                 }
                 if self.group.is_empty() && self.kind == "Pod" {
-                    stamp_pod_create_status(candidate);
+                    engenho_types::pod::stamp_birth_status(candidate);
                 }
             }
             Lifecycle::Update { prior, .. } => {

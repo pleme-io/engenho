@@ -77,6 +77,7 @@ pub mod name;
 pub mod nomad_v1;
 pub mod openapi_v3;
 pub mod patch;
+pub mod pod;
 pub mod primitives;
 pub mod spec_int;
 pub mod state_class;

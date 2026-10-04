@@ -601,6 +601,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(name, "vector-node-A");
+        assert_eq!(
+            pod["status"]["phase"], "Pending",
+            "a controller-built pod is born with status: {pod}"
+        );
         assert_eq!(pod.get("kind").unwrap(), "Pod");
         // Namespace inherited from the parent DS — NOT "default".
         assert_eq!(

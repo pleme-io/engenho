@@ -1927,59 +1927,6 @@ fn creation_timestamp_is_unset(slot: Option<&Value>) -> bool {
     }
 }
 
-fn stamp_pod_create_status(body: &mut Value) {
-    let qos = pod_qos_class(body.get("spec"));
-    let Some(obj) = body.as_object_mut() else {
-        return;
-    };
-    let status = obj
-        .entry("status".to_string())
-        .or_insert_with(|| Value::Object(serde_json::Map::new()));
-    if !status.is_object() {
-        *status = Value::Object(serde_json::Map::new());
-    }
-    if let Some(status) = status.as_object_mut() {
-        status
-            .entry("phase".to_string())
-            .or_insert_with(|| Value::String("Pending".to_string()));
-        status
-            .entry("qosClass".to_string())
-            .or_insert_with(|| Value::String(qos.to_string()));
-    }
-}
-
-fn pod_qos_class(spec: Option<&Value>) -> &'static str {
-    let containers: Vec<&Value> = ["containers", "initContainers"]
-        .iter()
-        .filter_map(|f| spec.and_then(|s| s.get(*f)).and_then(Value::as_array))
-        .flatten()
-        .collect();
-    let quantity = |c: &Value, kind: &str, res: &str| {
-        c.get("resources")
-            .and_then(|r| r.get(kind))
-            .and_then(|m| m.get(res))
-            .cloned()
-    };
-    let mut any = false;
-    let mut guaranteed = !containers.is_empty();
-    for c in &containers {
-        for res in ["cpu", "memory"] {
-            let request = quantity(c, "requests", res);
-            let limit = quantity(c, "limits", res);
-            any |= request.is_some() || limit.is_some();
-            let effective_request = request.or_else(|| limit.clone());
-            if limit.is_none() || effective_request != limit {
-                guaranteed = false;
-            }
-        }
-    }
-    match (any, guaranteed) {
-        (false, _) => "BestEffort",
-        (true, true) => "Guaranteed",
-        (true, false) => "Burstable",
-    }
-}
-
 /// At Namespace create, seed the three server-side defaults the
 /// namespace-lifecycle admission plugin stamps upstream:
 ///
@@ -2157,53 +2104,6 @@ mod tests {
             body.get("metadata").unwrap().get("namespace").unwrap(),
             "team-x"
         );
-    }
-
-    #[test]
-    fn a_pod_is_born_pending_with_its_qos_class() {
-        let mut body = serde_json::json!({"metadata": {"name": "p"}, "spec": {"containers": [{"name": "c", "image": "x"}]}});
-        stamp_pod_create_status(&mut body);
-        assert_eq!(body["status"]["phase"], "Pending");
-        assert_eq!(body["status"]["qosClass"], "BestEffort");
-    }
-
-    #[test]
-    fn pod_qos_class_follows_requests_and_limits() {
-        let pod = |resources: Value| serde_json::json!({"containers": [{"name": "c", "resources": resources}]});
-        let both = serde_json::json!({"cpu": "1", "memory": "1Gi"});
-        assert_eq!(
-            pod_qos_class(Some(&pod(serde_json::json!({})))),
-            "BestEffort"
-        );
-        assert_eq!(
-            pod_qos_class(Some(&pod(serde_json::json!({"limits": both.clone()})))),
-            "Guaranteed"
-        );
-        assert_eq!(
-            pod_qos_class(Some(&pod(
-                serde_json::json!({"requests": both.clone(), "limits": both.clone()})
-            ))),
-            "Guaranteed"
-        );
-        assert_eq!(
-            pod_qos_class(Some(&pod(serde_json::json!({"requests": {"cpu": "1"}})))),
-            "Burstable"
-        );
-        assert_eq!(
-            pod_qos_class(Some(&pod(
-                serde_json::json!({"requests": {"cpu": "1", "memory": "1Gi"}, "limits": {"cpu": "2", "memory": "1Gi"}})
-            ))),
-            "Burstable"
-        );
-        assert_eq!(pod_qos_class(None), "BestEffort");
-    }
-
-    #[test]
-    fn a_pod_status_the_client_set_is_kept() {
-        let mut body = serde_json::json!({"metadata": {"name": "p"}, "status": {"phase": "Running", "qosClass": "Guaranteed"}});
-        stamp_pod_create_status(&mut body);
-        assert_eq!(body["status"]["phase"], "Running");
-        assert_eq!(body["status"]["qosClass"], "Guaranteed");
     }
 
     #[test]
