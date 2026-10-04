@@ -147,7 +147,8 @@ impl JobController {
             return Ok(None);
         };
         let pod_name = format!("{job_name}-{idx}");
-        let Some(mut pod) = pod_from_template(job, &pod_name, None, owner)? else {
+        let job_namespace = job.namespace().unwrap_or("default");
+        let Some(mut pod) = pod_from_template(job, &pod_name, job_namespace, owner)? else {
             return Ok(None);
         };
         // RestartPolicy: Never (Jobs don't restart pods).

@@ -679,7 +679,6 @@ impl NativeBackend {
     }
 }
 
-
 fn read_log_from(path: &Path, offset: u64) -> std::io::Result<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path)?;
@@ -837,10 +836,11 @@ impl ContainerRuntime for NativeBackend {
             }
             .into());
         };
-        let body = read_log_from(&path, opts.from_byte.unwrap_or(0)).map_err(|e| NativeError::Log {
-            path: path.clone(),
-            detail: e.to_string(),
-        })?;
+        let body =
+            read_log_from(&path, opts.from_byte.unwrap_or(0)).map_err(|e| NativeError::Log {
+                path: path.clone(),
+                detail: e.to_string(),
+            })?;
         Ok(match opts.tail {
             Some(n) => {
                 let lines: Vec<&str> = body.lines().collect();
@@ -959,6 +959,17 @@ unsafe extern "C" {
 mod tests {
     use super::*;
     use crate::backend::PodIdentity;
+
+    #[test]
+    fn a_log_read_from_an_offset_returns_only_what_follows_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.log");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        assert_eq!(read_log_from(&path, 0).unwrap(), "one\ntwo\n");
+        assert_eq!(read_log_from(&path, 4).unwrap(), "two\n");
+        assert_eq!(read_log_from(&path, 8).unwrap(), "");
+        assert_eq!(read_log_from(&path, 99).unwrap(), "");
+    }
 
     fn spec(image: &str, command: &[&str]) -> ContainerSpec {
         ContainerSpec {

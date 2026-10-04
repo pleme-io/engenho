@@ -112,7 +112,7 @@ impl StatefulSetController {
         };
         let sts_namespace = sts.namespace().unwrap_or("default");
         let pod_name = format!("{sts_name}-{ordinal}");
-        let Some(mut pod) = pod_from_template(sts, &pod_name, Some(sts_namespace), owner)? else {
+        let Some(mut pod) = pod_from_template(sts, &pod_name, sts_namespace, owner)? else {
             return Ok(None);
         };
 

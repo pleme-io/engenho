@@ -179,7 +179,7 @@ pub const fn child_write_target(command: &ResourceCommand) -> Option<&ResourceKe
 
 /// A Pod cloned from `parent`'s `spec.template`: `kind`/`apiVersion`
 /// stamped, `metadata.name` set to `name`, `metadata.namespace` to
-/// `namespace` when given, and owned by `owner`.
+/// `namespace`, and owned by `owner`.
 ///
 /// `Ok(None)` when the parent declares no template (absent or `null`) —
 /// nothing to clone, the caller creates nothing.
@@ -193,7 +193,7 @@ pub const fn child_write_target(command: &ResourceCommand) -> Option<&ResourceKe
 pub fn pod_from_template(
     parent: &Value,
     name: &str,
-    namespace: Option<&str>,
+    namespace: &str,
     owner: OwnerReference,
 ) -> Result<Option<Value>, ShapeError> {
     let Some(template) = parent
@@ -213,7 +213,7 @@ pub fn pod_from_template(
 fn stamp_pod(
     pod: &mut Value,
     name: &str,
-    namespace: Option<&str>,
+    namespace: &str,
     owner: OwnerReference,
 ) -> Result<(), ShapeError> {
     let root = object_mut(pod, &[])?;
@@ -221,9 +221,7 @@ fn stamp_pod(
     root.insert("apiVersion".into(), Value::from("v1"));
     let metadata = object_mut(pod, &["metadata"])?;
     metadata.insert("name".into(), Value::from(name));
-    if let Some(ns) = namespace {
-        metadata.insert("namespace".into(), Value::from(ns));
-    }
+    metadata.insert("namespace".into(), Value::from(namespace));
     set_owner_reference(pod, owner)?;
     engenho_types::pod::stamp_birth_status(pod);
     Ok(())

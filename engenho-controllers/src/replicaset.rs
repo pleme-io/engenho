@@ -86,7 +86,7 @@ impl ReplicaSetController {
         // deterministic for test reproducibility. R9.5+ can swap
         // in nanoid if name collisions matter.)
         let pod_name = format!("{rs_name}-{index}");
-        let pod = pod_from_template(rs, &pod_name, Some(rs_namespace), owner)?;
+        let pod = pod_from_template(rs, &pod_name, rs_namespace, owner)?;
         Ok(pod.map(|pod| (pod_name, pod)))
     }
 }

@@ -864,6 +864,13 @@ enum ResponseCodec {
 }
 
 impl ResponseCodec {
+    fn including(self, include_object: Option<&str>) -> Self {
+        match self {
+            Self::Table(_) => Self::Table(crate::table::IncludeObject::parse(include_object)),
+            other => other,
+        }
+    }
+
     /// Negotiate from the request's `Accept`: protobuf when upstream's
     /// ranking puts a protobuf range first ([`accept::negotiate`]), JSON
     /// otherwise and when `Accept` is absent.
@@ -2154,15 +2161,28 @@ async fn follow_log(
         Some(n) => crate::pod_logs::last_lines(&text, n),
         None => text,
     };
-    let state = (Arc::clone(h), ns.map(str::to_owned), name.to_owned(), whole, offset, Some(first));
+    let state = (
+        Arc::clone(h),
+        ns.map(str::to_owned),
+        name.to_owned(),
+        whole,
+        offset,
+        Some(first),
+    );
     let stream = futures::stream::unfold(state, |(h, ns, name, q, offset, first)| async move {
         if let Some(first) = first {
             let chunk = bytes::Bytes::from(first);
-            return Some((Ok::<_, std::io::Error>(chunk), (h, ns, name, q, offset, None)));
+            return Some((
+                Ok::<_, std::io::Error>(chunk),
+                (h, ns, name, q, offset, None),
+            ));
         }
         loop {
             tokio::time::sleep(LOG_FOLLOW_POLL).await;
-            let next = crate::pod_logs::LogQuery { from_byte: Some(offset), ..q.clone() };
+            let next = crate::pod_logs::LogQuery {
+                from_byte: Some(offset),
+                ..q.clone()
+            };
             match h.logs(ns.as_deref(), &name, &next).await {
                 Ok(more) if more.is_empty() => {}
                 Ok(more) => {
@@ -2254,7 +2274,8 @@ async fn resource_get_or_list(
         // ArcSwap-snapshot clone) — exactly what the watch unfold stream
         // needs, no extra `.clone()`.
         None => {
-            let codec = ResponseCodec::from_headers(&headers)?;
+            let codec =
+                ResponseCodec::from_headers(&headers)?.including(p.include_object.as_deref());
             do_list_or_watch(h, coords.namespace, info.is_watch(), p, codec).await
         }
         // Instance GET → the shared `do_get` body. Bind the owned `Arc`,

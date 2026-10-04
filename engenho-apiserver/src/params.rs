@@ -44,6 +44,9 @@ pub struct ListWatchParams {
     /// `labelSelector=k1=v1,k2=v2`.
     #[serde(rename = "labelSelector")]
     pub label_selector: Option<String>,
+    /// `includeObject=None|Metadata|Object` — what a Table row embeds.
+    #[serde(rename = "includeObject")]
+    pub include_object: Option<String>,
     /// `fieldSelector=metadata.name=x,metadata.namespace=y`.
     #[serde(rename = "fieldSelector")]
     pub field_selector: Option<String>,

@@ -151,7 +151,7 @@ impl DaemonSetController {
         };
         let ds_namespace = ds.namespace().unwrap_or("default");
         let pod_name = format!("{ds_name}-{node_name}");
-        let Some(mut pod) = pod_from_template(ds, &pod_name, Some(ds_namespace), owner)? else {
+        let Some(mut pod) = pod_from_template(ds, &pod_name, ds_namespace, owner)? else {
             return Ok(None);
         };
         // Node-pin: pre-set spec.nodeName so the scheduler never binds it.
