@@ -1253,3 +1253,58 @@ async fn invalid_list_and_watch_options_are_a_422_before_any_stream() {
     }
     server.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_pod_carries_status_from_its_first_event() {
+    let (_store, server) = boot_store_and_server().await;
+    let addr = server.local_addr();
+    let client = reqwest::Client::new();
+    let mut watch = open_watch(&client, addr, "/api/v1/namespaces/default/pods?watch=true").await;
+
+    let created: serde_json::Value = client
+        .post(format!("http://{addr}/api/v1/namespaces/default/pods"))
+        .json(&pod_body("born"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        created["status"]["phase"], "Pending",
+        "create response: {created}"
+    );
+    assert_eq!(
+        created["status"]["qosClass"], "BestEffort",
+        "create response: {created}"
+    );
+
+    let added = watch.next_event().await;
+    assert_eq!(added["type"], "ADDED");
+    assert!(
+        added["object"]["status"].is_object(),
+        "ADDED event has no status map: {added}"
+    );
+    assert_eq!(added["object"]["status"]["phase"], "Pending");
+
+    let patched = client
+        .patch(format!("http://{addr}/api/v1/namespaces/default/pods/born"))
+        .header("Content-Type", "application/merge-patch+json")
+        .body(r#"{"metadata":{"labels":{"touched":"yes"}}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        patched.status().is_success(),
+        "PATCH failed: {}",
+        patched.status()
+    );
+
+    let modified = watch.next_event().await;
+    assert_eq!(modified["type"], "MODIFIED");
+    assert!(
+        modified["object"]["status"].is_object(),
+        "MODIFIED event has no status map: {modified}"
+    );
+    assert_eq!(modified["object"]["status"]["phase"], "Pending");
+}
