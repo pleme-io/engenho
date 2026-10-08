@@ -9,7 +9,7 @@
 //!
 //! | Crate | Holds | Who may depend on it |
 //! |---|---|---|
-//! | `engenho-substrate-core` (this crate) | the ten modules below | anyone |
+//! | `engenho-substrate-core` (this crate) | the eleven modules below | anyone |
 //! | `engenho-substrate` (the leaf) | every module a shipped crate references; re-exports this crate whole | shipped crates |
 //! | `engenho-substrate-incubator` | modules no shipped crate references | tests and drafts only |
 //!
@@ -31,6 +31,8 @@
 //!   * [`magic_blob`] — versioned magic header + BLAKE3-hashed payload
 //!   * [`risca`] — `Risca<T>` redaction + `assert_risca_no_leak!`
 //!   * [`relogio`] — `Clock`, `Instant` and the wall/frozen/HLC clocks
+//!   * [`host_root`] — `HostRoot`, the root every absolute host path
+//!     resolves under (`/` on a node, a temporary directory in tests)
 
 #![warn(clippy::pedantic)]
 #![warn(missing_docs)]
@@ -42,6 +44,7 @@ pub mod error_kind;
 pub mod fingerprint;
 pub mod hash_newtype;
 pub mod hex;
+pub mod host_root;
 pub mod magic_blob;
 pub mod named;
 pub mod relogio;
@@ -54,6 +57,7 @@ pub use hash_newtype::{
     HashNewtypeError, hex_full, hex_prefix, parse_hex_32_padded, parse_hex_32_strict,
 };
 pub use hex::{Hex, hex_encode};
+pub use host_root::HostRoot;
 pub use magic_blob::{MagicBlob, MagicBlobError};
 pub use named::Named;
 pub use relogio::{Clock, FrozenClock, HlcClock, Instant, LogicalClock, WallClock};

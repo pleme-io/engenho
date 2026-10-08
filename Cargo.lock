@@ -2035,6 +2035,7 @@ dependencies = [
 name = "engenho-unit"
 version = "0.53.127"
 dependencies = [
+ "engenho-substrate-core",
  "rustix",
  "tempfile",
  "tracing",

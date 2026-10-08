@@ -10,48 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-/// The filesystem the runner acts on. `/` on a node; a temporary directory
-/// in tests.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HostRoot(PathBuf);
-
-impl Default for HostRoot {
-    fn default() -> Self {
-        Self::system()
-    }
-}
-
-impl HostRoot {
-    /// The real filesystem.
-    #[must_use]
-    pub fn system() -> Self {
-        Self(PathBuf::from("/"))
-    }
-
-    /// A filesystem rooted at `root` — for tests.
-    #[must_use]
-    pub fn at(root: impl Into<PathBuf>) -> Self {
-        Self(root.into())
-    }
-
-    /// Where an absolute unit-file path lands under this root.
-    ///
-    /// A relative path is returned unchanged: the caller (the exec path,
-    /// which resolves a bare program name through `PATH`) owns that case.
-    #[must_use]
-    pub fn resolve(&self, path: &Path) -> PathBuf {
-        match path.strip_prefix("/") {
-            Ok(relative) => self.0.join(relative),
-            Err(_) => path.to_path_buf(),
-        }
-    }
-
-    /// The root itself.
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.0
-    }
-}
+pub use engenho_substrate_core::HostRoot;
 
 /// The well-known directories, as absolute host paths (what the service
 /// sees), together with the root they are created under.

@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "232e59fab69fed8f4272012da479b25c0c11d0ec2e1d8dfcda6eb6fd63d3df2a",
+  "cargo_lock_sha256": "f571e464217cebf16a3854b914339e056b0291586122d131dcd326c45a1bfc27",
   "manifest_sha256": {
     "Cargo.toml": "886a9b9ec7a7dbda4493fa24ec24cba60d956c78ee934d9e70bcadff53ffd5dc",
     "engenho-apiserver/Cargo.toml": "a42bf1f662ba3dbab338a871c0979aa15dfb734a22435d96e36e65cfa47d5abf",
@@ -35,7 +35,7 @@
     "engenho-sui-typescape/Cargo.toml": "30fde1a3a1db010241fa2d2c10c14a4953dcbb9979d760cf0843622f3b694207",
     "engenho-teia/Cargo.toml": "c0b840a05f7e1a944503ea3701d4f1f2a4e3656b3c334d9029e8ceb6ee8cbbcc",
     "engenho-types/Cargo.toml": "ed835cbe693033a0b05c49550da9b34545d51a477a28a053bd0a86878bc917c3",
-    "engenho-unit/Cargo.toml": "217104ea4d3291e03dd9bf80316fba80abf0a05a103813d2e63306f925320c67",
+    "engenho-unit/Cargo.toml": "c50c84e16c1c00b4114eb42306bd59b21ce535cb6d4c67237ba9ddb2c68be3e3",
     "engenho/Cargo.toml": "99f5aa512d4dbd227658b8abae14cd29e4526c6690fa28b563118d6c73754b6a"
   },
   "target_resolves": {
@@ -8311,6 +8311,16 @@
       },
       "engenho-unit-0.53.127": {
         "runtime_dependencies": [
+          {
+            "name": "engenho_substrate_core",
+            "package_key": "engenho-substrate-core-0.53.127",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
           {
             "name": "rustix",
             "package_key": "rustix-1.1.4",
