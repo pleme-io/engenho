@@ -58,6 +58,11 @@ substituter), never as a requirement.
 | **Identity and secrets** | node keys, the cluster CA, ServiceAccount tokens, Secret values | keys: the node; CA: sealed on the voters; Secret values: the external secret source | keys regenerate and re-enrol; the CA recovers from a quorum; Secrets re-sync from their source | strong, never gossiped |
 | **Ephemeral** | caches, backoff timers, in-flight RPCs | none | nothing to recover; losing it is harmless by construction | local |
 
+**Planned change to the Declared row** (2026-10-08): serialize each object at its
+owner and replicate committed history to every node eventually, keeping a quorum
+only for consensus metadata. The promise table, partition behaviour and build
+order are in [EVERY-NODE-ONE-CLUSTER.md](EVERY-NODE-ONE-CLUSTER.md).
+
 **The seal.** A `StateClass` enum, and a registry where every stored kind and
 every long-lived in-memory map declares its class. A parity gate fails the build
 when a stored kind, or a map that survives a request, has no class. Tier: **CI
