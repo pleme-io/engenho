@@ -448,6 +448,15 @@ pub struct PodIdentity {
     pub init: bool,
 }
 
+impl ContainerSpec {
+    #[must_use]
+    pub fn argv(&self) -> Vec<String> {
+        let mut argv = self.entrypoint.clone().unwrap_or_default();
+        argv.extend(self.command.iter().cloned());
+        argv
+    }
+}
+
 impl PodIdentity {
     /// Whether this carries a usable Pod identity. `false` for the default,
     /// which is what a non-Pod construction path produces.
@@ -465,7 +474,8 @@ pub struct ContainerSpec {
     pub image: String,
     /// Environment variables.
     pub env: BTreeMap<String, String>,
-    /// Command to run inside the container; empty = image default.
+    #[serde(default)]
+    pub entrypoint: Option<Vec<String>>,
     pub command: Vec<String>,
     /// This container's effective image-pull policy, resolved from its
     /// `imagePullPolicy` and image reference by [`PullPolicy::resolve`].
@@ -1894,6 +1904,10 @@ impl PodmanBackend {
             argv.push("-e".to_string());
             argv.push(format!("{k}={v}"));
         }
+        if let Some(ep) = &spec.entrypoint {
+            argv.push("--entrypoint".to_string());
+            argv.push(serde_json::to_string(ep).unwrap_or_default());
+        }
         argv.push(spec.image.clone());
         for arg in &spec.command {
             argv.push(arg.clone());
@@ -3064,6 +3078,7 @@ mod tests {
             name: name.into(),
             image: image.into(),
             env: BTreeMap::new(),
+            entrypoint: None,
             command: command.iter().map(|c| (*c).to_string()).collect(),
             // None = defer to the backend-wide policy, which is what these
             // argv tests are asserting on.

@@ -474,7 +474,8 @@ impl CriBackend {
                 user_specified_image: spec.image.clone(),
                 ..Default::default()
             }),
-            command: spec.command.clone(),
+            command: spec.entrypoint.clone().unwrap_or_default(),
+            args: spec.command.clone(),
             envs,
             // Relative to the sandbox's log_directory — the contract that makes
             // `logs()` able to find anything at all.

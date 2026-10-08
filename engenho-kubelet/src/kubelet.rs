@@ -1272,8 +1272,6 @@ impl Kubelet {
     /// status/stop/remove by-name is possible per container.
     ///
     /// Env + command + args are read per container: `command` →
-    /// `ContainerSpec.command` (the entrypoint override) followed by `args`
-    /// (appended, mirroring K8s where `args` are the entrypoint's arguments).
     ///
     /// `spec.containers` is REQUIRED (a pod with no app containers is invalid):
     /// a missing / empty array is a typed [`KubeletError::InvalidPod`].
@@ -1729,8 +1727,6 @@ impl Kubelet {
                 }
                 None => BTreeMap::new(),
             };
-            // command = entrypoint override; args = appended arguments
-            // (K8s semantics). The container's run argv is command ++ args.
             //
             // `$(VAR)` is expanded here too, against the container's FULLY
             // resolved environment — upstream applies the same substitution to
@@ -1749,8 +1745,8 @@ impl Kubelet {
                     })
                     .unwrap_or_default()
             };
-            let mut command = str_array("command");
-            command.extend(str_array("args"));
+            let entrypoint = Some(str_array("command")).filter(|c| !c.is_empty());
+            let command = str_array("args");
             // Backend (podman --name) handle. App containers: <ns>_<pod>_<cname>.
             // Init containers: <ns>_<pod>_init-<cname> (the disambiguating
             // prefix — see pod_to_init_container_specs).
@@ -1765,6 +1761,7 @@ impl Kubelet {
                     name: backend_name,
                     image,
                     env,
+                    entrypoint,
                     command,
                     pull_policy: Some(pull_policy),
                     // Service-name DNS aliases are computed once per pod in
@@ -6139,6 +6136,71 @@ mod env_resolution_tests {
 mod tests {
     use super::*;
 
+    fn discord_provider_pod(args: Option<Vec<&str>>) -> Value {
+        let mut c = json!({
+            "name": "run",
+            "image": "ghcr.io/pleme-io/lava-discord-provider:v2.7.0",
+            "command": ["/bin/terraform-provider-discord"]
+        });
+        if let Some(a) = args {
+            c["args"] = json!(a);
+        }
+        json!({"spec": {"containers": [c]}})
+    }
+
+    #[test]
+    fn a_k8s_command_replaces_the_image_entrypoint_on_the_libpod_wire() {
+        let specs = Kubelet::pod_to_container_specs(
+            "lava-operator",
+            "dprovtest-637ef1df01-0",
+            &discord_provider_pod(None),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let body =
+            serde_json::to_value(crate::podman_api::create_request(&specs[0].1, None)).unwrap();
+        assert_eq!(
+            body.get("entrypoint"),
+            Some(&json!(["/bin/terraform-provider-discord"])),
+            "{body}"
+        );
+        assert_eq!(body.get("command"), None, "{body}");
+    }
+
+    #[test]
+    fn a_k8s_command_replaces_the_image_entrypoint_on_the_podman_cli() {
+        let specs = Kubelet::pod_to_container_specs(
+            "lava-operator",
+            "dprovtest-637ef1df01-0",
+            &discord_provider_pod(Some(vec!["-debug"])),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let argv = crate::backend::PodmanBackend::new().run_argv(&specs[0].1);
+        let ep = argv
+            .iter()
+            .position(|a| a == "--entrypoint")
+            .expect("--entrypoint");
+        assert_eq!(argv[ep + 1], r#"["/bin/terraform-provider-discord"]"#);
+        let img = argv
+            .iter()
+            .position(|a| a == "ghcr.io/pleme-io/lava-discord-provider:v2.7.0")
+            .unwrap();
+        assert_eq!(&argv[img + 1..], ["-debug"]);
+    }
+
+    #[test]
+    fn k8s_args_alone_keep_the_image_entrypoint() {
+        let pod = json!({"spec": {"containers": [
+            {"name": "c", "image": "i", "args": ["--serve"]}
+        ]}});
+        let specs = Kubelet::pod_to_container_specs("ns", "p", &pod, &BTreeMap::new()).unwrap();
+        let body =
+            serde_json::to_value(crate::podman_api::create_request(&specs[0].1, None)).unwrap();
+        assert_eq!(body.get("entrypoint"), None, "{body}");
+        assert_eq!(body.get("command"), Some(&json!(["--serve"])), "{body}");
+    }
+
     #[test]
     fn pod_identity_survives_the_pod_path_unfused() {
         // A present-but-empty identity would be WORSE than none: a consumer
@@ -6223,8 +6285,9 @@ mod tests {
             }
         });
         let specs = Kubelet::pod_to_container_specs("ns", "x", &pod, &BTreeMap::new()).unwrap();
-        // command ++ args.
-        assert_eq!(specs[0].1.command, vec!["sh", "-c", "echo hi; sleep 3600"]);
+        assert_eq!(specs[0].1.entrypoint, Some(vec!["sh".into(), "-c".into()]));
+        assert_eq!(specs[0].1.command, vec!["echo hi; sleep 3600"]);
+        assert_eq!(specs[0].1.argv(), vec!["sh", "-c", "echo hi; sleep 3600"]);
     }
 
     #[test]
@@ -6244,7 +6307,8 @@ mod tests {
         assert_eq!(specs[0].1.name, "default_p_web");
         assert_eq!(specs[1].0, "sidecar");
         assert_eq!(specs[1].1.name, "default_p_sidecar");
-        assert_eq!(specs[1].1.command, vec!["sleep", "300"]);
+        assert_eq!(specs[1].1.argv(), vec!["sleep", "300"]);
+        assert!(specs[1].1.command.is_empty());
     }
 
     #[test]

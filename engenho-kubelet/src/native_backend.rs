@@ -830,7 +830,8 @@ impl ContainerRuntime for NativeBackend {
         let admission = self.admit(&spec.resources)?;
         let run_as = RunAs::of(&spec.confinement)?;
         let closure = Self::closure_of(spec)?;
-        let program = Self::resolve_program(&closure, &spec.command)?;
+        let argv = spec.argv();
+        let program = Self::resolve_program(&closure, &argv)?;
         Self::verify_mounts(spec)?;
 
         let id = Self::container_id(spec);
@@ -861,7 +862,7 @@ impl ContainerRuntime for NativeBackend {
             detail: e.to_string(),
         })?;
 
-        let mut cmd = workload_command(&program, spec.command.iter().skip(1), &spec.env);
+        let mut cmd = workload_command(&program, argv.iter().skip(1), &spec.env);
         cmd.stdout(std::process::Stdio::from(log));
         cmd.stderr(std::process::Stdio::from(log_err));
         run_as.apply(&mut cmd);

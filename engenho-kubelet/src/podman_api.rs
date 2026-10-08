@@ -181,7 +181,8 @@ pub struct CreateRequest {
     pub name: String,
     /// Image reference.
     pub image: String,
-    /// Entrypoint override — podman's `command`, the CLI's trailing args.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub command: Vec<String>,
     /// Environment, as a map (the CLI's repeated `-e k=v`).
@@ -559,6 +560,7 @@ pub fn create_request(spec: &ContainerSpec, network: Option<&str>) -> CreateRequ
     CreateRequest {
         name: spec.name.clone(),
         image: spec.image.clone(),
+        entrypoint: spec.entrypoint.clone(),
         command: spec.command.clone(),
         env: spec.env.clone(),
         networks,
@@ -1623,6 +1625,7 @@ mod tests {
             name: "operator-0".to_string(),
             image: "ghcr.io/pleme-io/pangea-operator:x".to_string(),
             env,
+            entrypoint: None,
             command: vec!["/bin/operator".to_string(), "--serve".to_string()],
             pull_policy: Some(PullPolicy::Never),
             network_aliases: vec!["operator".to_string()],
