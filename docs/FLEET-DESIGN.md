@@ -489,7 +489,11 @@ with a derive, never a hand-written schema.
   is lost, the fleet re-roots with a rotation, not a rebuild.
 - Secret values are never gossiped or content-synced (DISTRIBUTED.md open
   question 1). They travel through the resource log and are re-synced from their
-  external source on recovery.
+  external source on recovery. **Planned (2026-10-08):** they live in aldeia's
+  built-in KV, replicated to every node as ciphertext under a cluster keyring
+  sealed per node, and are decrypted only in the consuming process
+  ([EVERY-NODE-ONE-CLUSTER.md](EVERY-NODE-ONE-CLUSTER.md) §7). Gossip still
+  carries none of them.
 
 ## 12. Testing and proof
 

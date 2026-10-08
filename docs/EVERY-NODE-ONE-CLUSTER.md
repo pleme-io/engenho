@@ -1,6 +1,6 @@
 # aldeia: every node, one cluster, eventually consistent behind the Kubernetes face
 
-Status: **plan** (2026-10-08, revision 2). Nothing here is built. Companion docs:
+Status: **plan** (2026-10-08, revision 3). Nothing here is built. Companion docs:
 [FLEET-DESIGN.md](FLEET-DESIGN.md) (the whole-fleet design this adjusts),
 [RECOVERABLE-STATE.md](RECOVERABLE-STATE.md) (the guarantees and their seals),
 [CONSISTENCY-FABRIC.md](CONSISTENCY-FABRIC.md), [DISTRIBUTED.md](DISTRIBUTED.md),
@@ -156,7 +156,7 @@ and an MCP tool list every node's score, role, zone, version and the last
 ## 5. revoada changes, each locked by tests
 
 revoada becomes the consensus group's home. What it needs, from the recon and
-from its own open items (DISTRIBUTED.md §194, RECOVERABLE-STATE.md §6,
+from its own open items (DISTRIBUTED.md:194, RECOVERABLE-STATE.md §6,
 IMPROVEMENT-PLAN.md §5.3):
 
 | Change | Why |
@@ -164,7 +164,7 @@ IMPROVEMENT-PLAN.md §5.3):
 | `AutopilotPolicy` (§4), replacing `AutoReplacementPolicy`'s "any healthy member" choice with eligibility and scoring | today a replacement is the first healthy node without the role |
 | Fencing epochs on every role and ownership grant | a paused old holder must be refused, not trusted |
 | Quorum-seeded bootstrap | the first node forms `Solo`; no later node becomes a voter except through a committed decision |
-| A network `RaftNetwork` on the shared in-binary transport (§6) | revoada's Raft is in-process only |
+| A network `RaftNetwork` on the shared in-binary transport (§8) | revoada's Raft is in-process only |
 | RPC replies as `Result`; errors surfaced, never swallowed | edge 18; `engenho-store/src/mesh.rs:334-346` swallows them today |
 | Graceful leave as a gossip state distinct from failure | Serf's leave intent |
 | Zone, power source and churn history in the capability record | the autopilot's scoring inputs |
@@ -192,6 +192,10 @@ house rule: a test that cannot fail locks nothing). New seams go on
 | Policy evaluation is pure and idempotent | | same inputs, same proposals, any number of runs | |
 | Per-object linearizability | | | recorded histories under partitions checked per object |
 | Replicas converge | | any delivery order of the same writes → the same replica | |
+| No plaintext Secret on disk or on the wire | ✓ | random values: no stored or transported byte equals a plaintext | a scan of every node's fjall files and a capture of the transport find no plaintext |
+| A node decrypts offline | ✓ | | partition a node, restart it: its pods still get their Secrets |
+| Key rotation re-encrypts, and a removed node's key opens nothing new | ✓ | | remove a node, rotate: values written afterwards fail with its sealed key |
+| KV check-and-set and blocking queries behave like Consul's | ✓ | | differential against a Consul binary as the oracle, as `engenho-diff` does against Kubernetes |
 
 ## 6. Partitions and sleeping laptops
 
@@ -201,7 +205,48 @@ house rule: a test that cannot fail locks nothing). New seams go on
 | A node vanishes (unannounced) | every node | continue | objects it owned are re-leased after the lease ends, new epoch | it is demoted after `dead_threshold` if it voted; quorum kept |
 | Voters lose their majority | every node | continue | continue where the owner is reachable | blocked, and reported as blocked, never guessed |
 
-## 7. Pieces, and where each comes from
+## 7. The built-in KV: configuration and Secrets, Consul-style
+
+aldeia carries a key-value store the way Consul does, inside engenho: every
+node holds all of it, reads are local, and it is redistributed to every node
+by the same replication as everything else (§2). It is the global
+configuration cache, and **Secrets live in it**.
+
+| Consul KV behaviour | aldeia KV |
+|---|---|
+| hierarchical keys, prefix list and delete | the same, over the replicated store |
+| check-and-set on `ModifyIndex` | a write carries the version it read; the key's owner checks it (§3) |
+| blocking queries (`?index=&wait=`) | a watch on a key or prefix, served from the local replica |
+| `?stale` reads (any server) and `?consistent` reads (leader) | local reads by default; `consistent` forwards to the key's owner |
+| sessions and locks | leases from the consensus group (§4), fenced by epoch |
+| ACL tokens per path | one policy model: Kubernetes RBAC on the Kubernetes face, the same roles mapped onto key prefixes on the KV face |
+
+**One store, two faces.** ConfigMaps and Secrets are Kubernetes objects and
+KV entries at once (`config/<namespace>/<name>`, `secret/<namespace>/<name>`);
+the KV face adds keys that are not Kubernetes objects. Faces: the Kubernetes
+API, a Consul-shaped HTTP API, `engenho ctl kv`, and MCP tools.
+
+**Secrets, replicated everywhere and readable only where consumed:**
+
+- Values are envelope-encrypted with the cluster data key before they are
+  stored or sent; gossip never carries them (it carries replication
+  high-water marks only), so FLEET-DESIGN.md §11's rule holds in spirit:
+  ciphertext replicates, plaintext never travels.
+- The data-key ring is committed through the consensus group and rotated like
+  `consul keyring`; each node holds it sealed under its own identity in the OS
+  keystore (the macOS Keychain, backed by the Secure Enclave where present; a
+  TPM through systemd-creds on Linux), so a node decrypts offline.
+- Plaintext exists only in the consuming process: the kubelet decrypts into a
+  tmpfs volume for the pod, as kubelet secret volumes do.
+- A node removed for good triggers a key rotation and a re-encryption pass, so
+  its sealed copy of the old key opens nothing written after it left.
+- Where a Secret's source of truth is external (Akeyless, SOPS), cofre writes
+  it into the KV and refreshes it on rotation; the KV is the distribution
+  cache. A Secret authored in-cluster has the KV as its source and follows
+  RECOVERABLE-STATE.md's identity-and-secrets class for its way back. P5
+  updates engenho's CLAUDE.md cofre rows to this shape when it lands.
+
+## 8. Pieces, and where each comes from
 
 | Piece | Build or reuse |
 |---|---|
@@ -214,7 +259,7 @@ house rule: a test that cannot fail locks nothing). New seams go on
 | Kubelet on every node | unchanged in shape: it reads its local replica and runs its own pods |
 | Faces | the apiserver on every node serves the whole cluster; one kubeconfig context, `aldeia`, names every node |
 
-## 8. Build order
+## 9. Build order
 
 Edge 18 gates every step that adds a second node.
 
@@ -225,25 +270,55 @@ Edge 18 gates every step that adds a second node.
 | P2 | revoada §5 in pure form: `AutopilotPolicy`, fencing epochs, leave intent, scoring inputs, with every unit and property test of §5 red first | the §5 unit and property rows green; mutation gate clean on the new seams |
 | P3 | Transport and identity: QUIC, the FaultRouter, the shared `aldeia` cluster name, stable node ids, discovery, read fences | the FaultRouter partition test recorded red, then green (edge 18) |
 | P4 | Many nodes: anti-entropy, forwarded writes, owner leases, join as a learner, the autopilot live | §5's integration rows green over the FaultRouter, then over real sockets |
-| P5 | Workloads across nodes: `pods/binding` with CAS, role leases for scheduler and controllers, `generateName`, authenticated kubelet and etcd listeners (edge 26) | a pod scheduled anywhere runs on its node, and its logs read from any other |
-| P6 | The fleet: every engenho node in aldeia, rendered by the nix modules with no voter list anywhere | closing a laptop's lid costs nothing §6 says continues; the autopilot state shows who votes and why |
-| P7 | Faces: banken shows aldeia as one context with each node's lag and autopilot role; revoada's MCP tools | banken never blocks on a slow or sleeping node |
+| P5 | The KV (§7): the Consul-shaped face, envelope encryption for Secrets, the keyring through the consensus group, sealing in the OS keystore, cofre writing external Secrets in | the §7 rows of the test matrix green |
+| P6 | Workloads across nodes: `pods/binding` with CAS, role leases for scheduler and controllers, `generateName`, authenticated kubelet and etcd listeners (edge 26) | a pod scheduled anywhere runs on its node, and its logs read from any other |
+| P7 | The fleet: today's five clusters join aldeia one at a time (§10.2), rendered by the nix modules with no voter list anywhere | closing a laptop's lid costs nothing §6 says continues; the autopilot state shows who votes and why |
+| P8 | Faces: banken shows aldeia as one context with each node's lag and autopilot role; revoada's MCP tools | banken never blocks on a slow or sleeping node |
 
-## 9. Decisions for the operator
+## 10. Decisions (2026-10-08)
 
-1. **Where Secrets replicate.** Full replication puts every Secret on every
-   laptop; FLEET-DESIGN.md §11 says Secret values are never gossiped. Options:
-   replicate to voters plus the nodes running a consuming pod, or keep them on
-   voters and proxy reads.
-2. **Migrating today's five clusters.** Each node's store holds real state (ryn
-   runs pangea-operator and Postgres). Either each store becomes that node's
-   owned share when it joins aldeia, or aldeia starts empty and GitOps
-   re-declares everything.
-3. **Autopilot defaults**, if the ones above should differ: `max_voters` 5,
-   `stabilization` 10 minutes, `max_trailing_logs` 250, a `dead_threshold` and
-   `hysteresis` to be measured on the fleet.
+1. **Secrets live in the built-in KV**, replicated to every node (operator
+   decision). §7 is the design: envelope-encrypted everywhere, decrypted only in
+   the consuming process, the keyring sealed per node, cofre bridging external
+   sources.
 
-## 10. What stays only mitigated
+2. **Migration: a rolling join, one node at a time, with an explicit import of
+   what git does not hold.** Merging the five stores wholesale is unsafe: each
+   carries its own `default/kubernetes` Service, namespaces and system objects
+   under identical names. So for each node:
+   1. export what no GitOps source declares (in-cluster Secrets, objects with no
+      git owner, CR status that cannot be re-observed) as a typed snapshot;
+   2. join aldeia as a learner and let GitOps re-declare everything git owns;
+   3. import the snapshot; a name that already exists is refused and listed,
+      never overwritten;
+   4. workload volumes stay on the node's disk as local PersistentVolumes bound
+      to that node, so a stateful pod (ryn's Postgres) comes back on the same
+      disk;
+   5. switch the node's kubeconfig to the `aldeia` context; keep the old store
+      read-only until the node has run a day in aldeia.
+
+   Order, least state first and the control plane last: rio, cid, zek, plo,
+   ryn. The first node forms aldeia `Solo`; the autopilot moves the voters as
+   better nodes arrive. Every node in the fleet ends in aldeia, and so does
+   every new machine.
+
+3. **Autopilot and Raft defaults**, as typed config, re-measured in P4 over the
+   FaultRouter and in P7 on the fleet. The fleet spans intercontinental round
+   trips (rio in Bristol, the rest in Brazil), so Consul's datacentre defaults
+   would mark rio unhealthy.
+
+   | Setting | Default | Why |
+   |---|---|---|
+   | `max_voters` | 5 | Consul's ceiling; derived down to 3 when fewer nodes are eligible |
+   | `stabilization` | 10 min | a laptop that just woke is not promoted on its first minutes |
+   | `max_trailing_logs` | 250 | Consul's default |
+   | `last_contact_threshold` | 1 s | above the Bristol–Brazil round trip with margin |
+   | Raft heartbeat / election timeout | 500 ms / 3–6 s | the same round trip; openraft's LAN defaults would elect on every jitter |
+   | `dead_threshold` | 3 min | an unannounced loss outlives a tailnet blip before a voter is replaced; an announced leave is demoted at once |
+   | `hysteresis` | one shift per node per 10 min | no flapping |
+   | leadership-transfer margin | the leader's score 20% below the best voter's | moves leadership off a node that went on battery, not on noise |
+
+## 11. What stays only mitigated
 
 - Objects owned by different nodes are not ordered against each other. A client
   can see a later change to one before an earlier change to another; informer
