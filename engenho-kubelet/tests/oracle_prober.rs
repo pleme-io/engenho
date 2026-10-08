@@ -726,6 +726,9 @@ impl ContainerRuntime for CountedExec<'_> {
     fn readoption(&self) -> Readoption {
         self.inner.readoption()
     }
+    fn resource_enforcement(&self) -> engenho_kubelet::cgroup::ResourceEnforcement {
+        self.inner.resource_enforcement()
+    }
     async fn exec(&self, container_id: &str, argv: &[String]) -> Result<ExecOutcome, KubeletError> {
         self.execs.fetch_add(1, Ordering::SeqCst);
         self.inner.exec(container_id, argv).await

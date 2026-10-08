@@ -18,7 +18,11 @@
 //! [`Isolation`] has one variant, [`Isolation::HostProcess`], and the caller
 //! must name it. That is not ceremony — it is the honest tier. A workload
 //! started here runs with the **daemon's own privileges**: no Seatbelt profile,
-//! no container principal, no uid-scoped reaper. Confinement lives in
+//! no container principal, no uid-scoped reaper. On Linux two things do bind
+//! it: the pod's `runAsUser` / `runAsGroup`, and its declared `resources`,
+//! enforced in a cgroup v2 leaf under the daemon's delegated cgroup
+//! ([`crate::cgroup`]). On macOS neither does, and the kubelet says so with a
+//! `ResourcesNotEnforced` event. Confinement lives in
 //! `pleme-io/nawabari` (`shimenawa` renders the profile, `kakoi::enter` drops
 //! the principal and applies it) and arrives here as a second `Isolation`
 //! variant once that crate is a dependency.
@@ -42,11 +46,13 @@
 //! * **The daemon process stops, on Linux.** The engenho daemon runs as the
 //!   systemd unit `engenho-daemon`, rendered by substrate's `mkNixOSService`
 //!   with `KillMode=control-group`: stopping (or restarting) the unit kills
-//!   every process in its cgroup, and every native workload is in it, because
-//!   it is spawned as the daemon's child. That is what makes a daemon restart
-//!   safe, and it is load-bearing — so the NixOS arm in `flake.nix` ASSERTS
-//!   it, and an evaluation that sets `KillMode` to anything else (`process`,
-//!   `mixed`, `none`) fails instead of silently doubling every pod. A daemon
+//!   every process in its cgroup and the cgroups below it, and every native
+//!   workload is there: it is spawned as the daemon's child, into the
+//!   daemon's own cgroup or into a leaf under the unit's. That is what makes
+//!   a daemon restart safe, and it is load-bearing — so the NixOS arm in
+//!   `flake.nix` ASSERTS it, and an evaluation that sets `KillMode` to
+//!   anything else (`process`, `mixed`, `none`) fails instead of silently
+//!   doubling every pod. A daemon
 //!   that CRASHES is the same case: systemd stops the unit's remaining cgroup
 //!   before `Restart=on-failure` starts it again.
 //! * **The daemon process stops, on macOS.** The workload stays in the
@@ -68,7 +74,11 @@
 //! cgroup kill on Linux and by none of the others.
 
 use crate::backend::{
-    ContainerRuntime, ContainerSpec, ContainerStatus, ExecOutcome, LogOptions, Readoption,
+    Confinement, ContainerRuntime, ContainerSpec, ContainerStatus, ExecOutcome, LogOptions,
+    Readoption, Resources,
+};
+use crate::cgroup::{
+    CgroupPlan, CgroupTree, Cgroups, ResourceEnforcement, Unenforceable, UnparseableResources,
 };
 use crate::cri::{ExitDisposition, RunState};
 use crate::error::KubeletError;
@@ -155,6 +165,12 @@ pub enum NativeError {
         /// The container whose termination was lost.
         id: String,
     },
+    #[allow(missing_docs)]
+    ResourcesUnparseable(UnparseableResources),
+    #[allow(missing_docs)]
+    ResourcesUnenforceable(Unenforceable),
+    #[allow(missing_docs)]
+    RunAs { field: &'static str, value: i64 },
 }
 
 impl std::fmt::Display for NativeError {
@@ -242,6 +258,13 @@ impl std::fmt::Display for NativeError {
                 "the task terminating container {id} ended without reaping \
                  it; the process may still be running"
             ),
+            Self::ResourcesUnparseable(e) => write!(f, "{e}"),
+            Self::ResourcesUnenforceable(e) => write!(f, "{e}"),
+            Self::RunAs { field, value } => write!(
+                f,
+                "securityContext.{field} is {value}, which is not an id this \
+                 host can run a process as"
+            ),
         }
     }
 }
@@ -269,7 +292,8 @@ impl From<NativeError> for KubeletError {
 /// docs for why this is a type rather than a default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Isolation {
-    /// No confinement: the workload runs with the daemon's own privileges.
+    /// No confinement: the workload runs with the daemon's own privileges,
+    /// less the uid and gid its pod names (applied on Linux only).
     ///
     /// Honest about what it is. Appropriate for a single-operator node where
     /// the alternative is a whole Linux VM; NOT a substitute for a sandbox.
@@ -305,6 +329,72 @@ struct NativeContainer {
     grace: Duration,
     /// Where the process is in its life, and who holds it.
     process: Process,
+    leaf: Option<Leaf>,
+}
+
+#[derive(Debug)]
+struct Leaf {
+    tree: Arc<CgroupTree>,
+    name: String,
+}
+
+impl Leaf {
+    fn release(self) {
+        if let Err(e) = self.tree.release(&self.name) {
+            tracing::warn!(
+                leaf = %self.tree.leaf(&self.name).display(),
+                error = %e,
+                "a reaped container's cgroup leaf was not removed; the next adopt or start sweeps it"
+            );
+        }
+    }
+}
+
+#[derive(Debug)]
+enum Admission {
+    Unbounded,
+    Bounded(Arc<CgroupTree>, CgroupPlan),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RunAs {
+    uid: Option<u32>,
+    gid: Option<u32>,
+}
+
+impl RunAs {
+    fn of(confinement: &Confinement) -> Result<Self, NativeError> {
+        if !cfg!(target_os = "linux") {
+            return Ok(Self::default());
+        }
+        Ok(Self {
+            uid: host_id("runAsUser", confinement.run_as_user)?,
+            gid: host_id("runAsGroup", confinement.run_as_group)?,
+        })
+    }
+
+    fn apply(self, cmd: &mut tokio::process::Command) {
+        if let Some(uid) = self.uid {
+            cmd.uid(uid);
+        }
+        if let Some(gid) = self.gid {
+            cmd.gid(gid);
+        }
+    }
+}
+
+fn host_id(field: &'static str, value: Option<i64>) -> Result<Option<u32>, NativeError> {
+    value
+        .map(|v| u32::try_from(v).map_err(|_| NativeError::RunAs { field, value: v }))
+        .transpose()
+}
+
+fn join_on_exec(cmd: &mut tokio::process::Command, procs: std::fs::File) {
+    use std::io::Write as _;
+    #[allow(unsafe_code)]
+    unsafe {
+        cmd.pre_exec(move || (&procs).write_all(b"0"));
+    }
 }
 
 /// ★ WHO HOLDS THE PROCESS IS A VALUE, NOT A HOPE.
@@ -471,6 +561,9 @@ impl NativeContainer {
         };
         if let Some(reaped) = reaped {
             self.process = Process::Reaped(reaped);
+            if let Some(leaf) = self.leaf.take() {
+                leaf.release();
+            }
         }
         Ok(())
     }
@@ -503,6 +596,7 @@ impl NativeContainer {
 pub struct NativeBackend {
     isolation: Isolation,
     log_dir: PathBuf,
+    cgroups: Cgroups,
     state: Arc<Mutex<HashMap<String, NativeContainer>>>,
 }
 
@@ -540,10 +634,11 @@ const HOST_NETWORK_POD_IP: &str = "127.0.0.1";
 impl NativeBackend {
     /// Build a backend that writes container logs under `log_dir`.
     #[must_use]
-    pub fn new(isolation: Isolation, log_dir: impl Into<PathBuf>) -> Self {
+    pub fn new(isolation: Isolation, log_dir: impl Into<PathBuf>, cgroups: Cgroups) -> Self {
         Self {
             isolation,
             log_dir: log_dir.into(),
+            cgroups,
             state: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -553,6 +648,31 @@ impl NativeBackend {
     #[must_use]
     pub const fn isolation(&self) -> Isolation {
         self.isolation
+    }
+
+    #[allow(missing_docs)]
+    #[must_use]
+    pub const fn cgroups(&self) -> &Cgroups {
+        &self.cgroups
+    }
+
+    fn admit(&self, resources: &Resources) -> Result<Admission, NativeError> {
+        let (Cgroups::Delegated(_) | Cgroups::NotDelegated(_)) = &self.cgroups else {
+            return Ok(Admission::Unbounded);
+        };
+        let plan = CgroupPlan::try_from(resources).map_err(NativeError::ResourcesUnparseable)?;
+        if plan.is_empty() {
+            return Ok(Admission::Unbounded);
+        }
+        match &self.cgroups {
+            Cgroups::Delegated(tree) => Ok(Admission::Bounded(Arc::clone(tree), plan)),
+            Cgroups::NotDelegated(e) if plan.bounds() => Err(NativeError::ResourcesUnenforceable(
+                Unenforceable::NotDelegated(e.clone()),
+            )),
+            Cgroups::NotDelegated(_) | Cgroups::Off | Cgroups::Unsupported => {
+                Ok(Admission::Unbounded)
+            }
+        }
     }
 
     /// The deterministic container id, matching the scheme the podman backend
@@ -702,7 +822,13 @@ impl ContainerRuntime for NativeBackend {
         Readoption::Cannot
     }
 
+    fn resource_enforcement(&self) -> ResourceEnforcement {
+        self.cgroups.enforcement()
+    }
+
     async fn start(&self, spec: &ContainerSpec) -> Result<ContainerStatus, KubeletError> {
+        let admission = self.admit(&spec.resources)?;
+        let run_as = RunAs::of(&spec.confinement)?;
         let closure = Self::closure_of(spec)?;
         let program = Self::resolve_program(&closure, &spec.command)?;
         Self::verify_mounts(spec)?;
@@ -738,11 +864,37 @@ impl ContainerRuntime for NativeBackend {
         let mut cmd = workload_command(&program, spec.command.iter().skip(1), &spec.env);
         cmd.stdout(std::process::Stdio::from(log));
         cmd.stderr(std::process::Stdio::from(log_err));
+        run_as.apply(&mut cmd);
 
-        let child = cmd.spawn().map_err(|e| NativeError::Spawn {
-            program: program.clone(),
-            detail: e.to_string(),
-        })?;
+        let leaf = match admission {
+            Admission::Unbounded => None,
+            Admission::Bounded(tree, plan) => {
+                let prepared = tree
+                    .prepare(&id, &plan)
+                    .map_err(|e| NativeError::ResourcesUnenforceable(Unenforceable::Leaf(e)))?;
+                join_on_exec(&mut cmd, prepared.procs);
+                Some(Leaf {
+                    tree,
+                    name: prepared.name,
+                })
+            }
+        };
+
+        let spawned = cmd.spawn();
+        drop(cmd);
+        let child = match spawned {
+            Ok(child) => child,
+            Err(e) => {
+                if let Some(leaf) = leaf {
+                    leaf.release();
+                }
+                return Err(NativeError::Spawn {
+                    program,
+                    detail: e.to_string(),
+                }
+                .into());
+            }
+        };
         let pid = child.id();
 
         state.insert(
@@ -752,6 +904,7 @@ impl ContainerRuntime for NativeBackend {
                 program,
                 grace: spec.termination_grace.duration(),
                 process: Process::Live(child),
+                leaf,
             },
         );
         drop(state);
@@ -991,7 +1144,7 @@ mod tests {
     /// the pod and fail somewhere later.
     #[tokio::test]
     async fn an_oci_image_is_refused_with_the_reason_and_the_remedy() {
-        let b = NativeBackend::new(Isolation::HostProcess, "/tmp/nb-test-logs");
+        let b = NativeBackend::new(Isolation::HostProcess, "/tmp/nb-test-logs", Cgroups::Off);
         let err = b
             .start(&spec("docker.io/library/postgres:16-alpine", &["postgres"]))
             .await
@@ -1176,7 +1329,7 @@ mod tests {
     /// that reads as "the workload printed nothing".
     #[tokio::test]
     async fn logs_for_an_unknown_container_are_an_error_not_an_empty_success() {
-        let b = NativeBackend::new(Isolation::HostProcess, "/tmp/nb-test-logs");
+        let b = NativeBackend::new(Isolation::HostProcess, "/tmp/nb-test-logs", Cgroups::Off);
         let err = b
             .logs("nope", &LogOptions::default())
             .await
@@ -1286,7 +1439,7 @@ mod tests {
     #[test]
     #[ignore = "gap: docs/QUALIFICATION.md row 13 (native workloads are not re-adopted across a daemon restart)"]
     fn gap_the_next_backend_adopts_a_running_native_workload() {
-        let b = NativeBackend::new(Isolation::HostProcess, "/tmp/nb-test-logs");
+        let b = NativeBackend::new(Isolation::HostProcess, "/tmp/nb-test-logs", Cgroups::Off);
         assert_eq!(b.readoption(), Readoption::AdoptsRunning);
     }
 
@@ -1295,7 +1448,7 @@ mod tests {
     /// entrypoint.
     #[tokio::test]
     async fn a_missing_closure_is_named_not_mistaken_for_a_missing_entrypoint() {
-        let b = NativeBackend::new(Isolation::HostProcess, "/tmp/nb-test-logs");
+        let b = NativeBackend::new(Isolation::HostProcess, "/tmp/nb-test-logs", Cgroups::Off);
         let gone = "/nix/store/00000000000000000000000000000000-gone";
         let err = b
             .start(&spec(&format!("nix:{gone}"), &[]))
@@ -1369,6 +1522,144 @@ mod tests {
             "a SIGTERM-honouring process must not wait out its grace period"
         );
         assert!(!process_is_alive(pid), "reaped");
+    }
+
+    const GONE: &str = "nix:/nix/store/00000000000000000000000000000000-gone";
+
+    fn declaring(resources: &serde_json::Value) -> ContainerSpec {
+        let mut s = spec(GONE, &["x"]);
+        s.resources =
+            Resources::from_container_json(&serde_json::json!({ "resources": resources }));
+        s
+    }
+
+    fn undelegated() -> Cgroups {
+        Cgroups::NotDelegated(crate::cgroup::CgroupError::NotDelegated {
+            cgroup: PathBuf::from("/sys/fs/cgroup/system.slice/engenho-daemon.service"),
+            why: crate::cgroup::Undelegated::Unmarked,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_limit_on_an_undelegated_node_is_refused_with_the_typed_reason() {
+        let b = NativeBackend::new(Isolation::HostProcess, "/tmp/nb-test-logs", undelegated());
+        let limited = declaring(&serde_json::json!({ "limits": { "memory": "64Mi" } }));
+        let Err(NativeError::ResourcesUnenforceable(Unenforceable::NotDelegated(
+            crate::cgroup::CgroupError::NotDelegated { why, .. },
+        ))) = b.admit(&limited.resources)
+        else {
+            panic!("a limit this node cannot enforce is refused as NotDelegated");
+        };
+        assert_eq!(why, crate::cgroup::Undelegated::Unmarked);
+        let shown = b.start(&limited).await.expect_err("refused").to_string();
+        assert!(shown.contains("cannot enforce"), "{shown}");
+        assert!(shown.contains("Delegate=yes"), "names the remedy: {shown}");
+        assert!(
+            !shown.contains("ImageUnavailable"),
+            "refused before the image: {shown}"
+        );
+        assert!(!shown.contains("  "), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn requests_alone_on_an_undelegated_node_are_not_a_refusal() {
+        let b = NativeBackend::new(Isolation::HostProcess, "/tmp/nb-test-logs", undelegated());
+        let weighted =
+            declaring(&serde_json::json!({ "requests": { "cpu": "1", "memory": "1Mi" } }));
+        assert!(matches!(
+            b.admit(&weighted.resources),
+            Ok(Admission::Unbounded)
+        ));
+        let shown = b
+            .start(&weighted)
+            .await
+            .expect_err("the closure is gone")
+            .to_string();
+        assert!(shown.contains("ImageUnavailable"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_bound_is_refused_before_the_image_is_resolved() {
+        let b = NativeBackend::new(Isolation::HostProcess, "/tmp/nb-test-logs", undelegated());
+        let shown = b
+            .start(&declaring(
+                &serde_json::json!({ "limits": { "memory": "512Quatloos" } }),
+            ))
+            .await
+            .expect_err("refused")
+            .to_string();
+        assert!(shown.contains("limits.memory=\"512Quatloos\""), "{shown}");
+        assert!(!shown.contains("ImageUnavailable"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn off_and_unsupported_leave_declared_resources_exactly_as_before() {
+        for cgroups in [Cgroups::Off, Cgroups::Unsupported] {
+            let b = NativeBackend::new(Isolation::HostProcess, "/tmp/nb-test-logs", cgroups);
+            let declared = declaring(&serde_json::json!({
+                "limits": { "memory": "64Mi", "cpu": "512Quatloos" }
+            }));
+            assert!(matches!(
+                b.admit(&declared.resources),
+                Ok(Admission::Unbounded)
+            ));
+            let shown = b
+                .start(&declared)
+                .await
+                .expect_err("the closure is gone")
+                .to_string();
+            assert!(shown.contains("ImageUnavailable"), "{shown}");
+        }
+    }
+
+    #[test]
+    fn the_backend_reports_the_enforcement_of_its_cgroups() {
+        let b = NativeBackend::new(Isolation::HostProcess, "/tmp/nb-test-logs", Cgroups::Off);
+        assert_eq!(b.resource_enforcement(), Cgroups::Off.enforcement());
+        let b = NativeBackend::new(Isolation::HostProcess, "/tmp/nb-test-logs", undelegated());
+        assert_eq!(b.resource_enforcement(), undelegated().enforcement());
+    }
+
+    #[test]
+    fn a_run_as_id_outside_the_hosts_range_is_refused() {
+        assert_eq!(host_id("runAsUser", None), Ok(None));
+        assert_eq!(host_id("runAsUser", Some(65_534)), Ok(Some(65_534)));
+        assert_eq!(
+            host_id("runAsUser", Some(-1)),
+            Err(NativeError::RunAs {
+                field: "runAsUser",
+                value: -1
+            })
+        );
+        assert_eq!(
+            host_id("runAsGroup", Some(i64::from(u32::MAX) + 1)),
+            Err(NativeError::RunAs {
+                field: "runAsGroup",
+                value: i64::from(u32::MAX) + 1
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn the_join_hook_writes_zero_from_the_child_before_it_execs() {
+        let dir = tempfile::tempdir().unwrap();
+        let procs = dir.path().join("cgroup.procs");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&procs)
+            .unwrap();
+        let args = ["-c".to_string(), "exit 0".to_string()];
+        let mut cmd = workload_command(
+            Path::new("/bin/sh"),
+            args.iter(),
+            &std::collections::BTreeMap::new(),
+        );
+        join_on_exec(&mut cmd, file);
+        let status = cmd.spawn().unwrap().wait().await.unwrap();
+        assert!(status.success());
+        assert_eq!(std::fs::read_to_string(&procs).unwrap(), "0");
     }
 
     #[test]

@@ -39,6 +39,7 @@ http-body-util     = { workspace = true }
 # writing the materialized files. Same 0.22 line the apiserver + kube-client
 # already pin (single closure).
 base64             = "0.22"
+rustix             = { version = "1", features = ["fs", "param"] }
 
 engenho-types       = { workspace = true }
 engenho-store       = { workspace = true }

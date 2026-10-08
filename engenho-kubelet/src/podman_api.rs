@@ -279,10 +279,7 @@ pub struct MemoryLimits {
     pub reservation: Option<i64>,
 }
 
-/// The CFS period every Kubernetes kubelet uses. Not a tunable here: a
-/// different period would make the same `cpu.max` numerator mean a different
-/// fraction of a core than it does on every other cluster.
-pub const CFS_PERIOD_US: u64 = 100_000;
+pub use crate::backend::CFS_PERIOD_US;
 
 impl ResourceLimits {
     /// Lower a typed [`crate::backend::Resources`] onto podman's block.
@@ -291,11 +288,7 @@ impl ResourceLimits {
     /// entirely rather than as an empty object.
     #[must_use]
     pub fn from_resources(r: &crate::backend::Resources) -> Option<Self> {
-        let quota = r.cpu_limit_milli.value().map(|milli| {
-            // milli-cores → microseconds of CPU per 100ms period.
-            // 1000 milli (one core) → 100_000us == the full period.
-            (i128::from(milli) * i128::from(CFS_PERIOD_US) / 1000) as i64
-        });
+        let quota = r.cpu_quota_us();
         let shares = r.cpu_weight().map(|w| {
             // podman's `shares` is the cgroup-v1 number; convert back from the
             // v2 weight so the two backends cannot disagree by re-deriving.
@@ -1299,6 +1292,10 @@ impl crate::backend::ContainerRuntime for PodmanApiBackend {
     /// watched is not recovered (`pending-readopt-exited`).
     fn readoption(&self) -> crate::backend::Readoption {
         crate::backend::Readoption::AdoptsRunning
+    }
+
+    fn resource_enforcement(&self) -> crate::cgroup::ResourceEnforcement {
+        crate::cgroup::ResourceEnforcement::Enforced
     }
 
     async fn start(

@@ -42,6 +42,7 @@
 
 pub mod backend;
 pub mod backoff;
+pub mod cgroup;
 pub mod closure_store;
 pub mod config_bridge;
 pub mod cri;
@@ -85,7 +86,8 @@ pub use closure_store::{
     ClosureState, ClosureStore, NixClosureStore, RootName, UnmanagedClosures, pod_closures,
 };
 pub use config_bridge::{
-    BackendRefused, make_container_runtime, make_container_runtime_with_apiserver,
+    BackendRefused, make_container_runtime, make_container_runtime_on_node,
+    make_container_runtime_with_apiserver,
 };
 pub use csi_materializer::{
     CsiRegistrarController, CsiVolumeMaterializer, DriverCsiProvisioner, DriverTable,

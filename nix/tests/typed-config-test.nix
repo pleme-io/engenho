@@ -221,6 +221,20 @@ let
       ).success;
       got = "expected eval failure for kubeletBackend=cri"; }
 
+    { name = "native-cgroups-renders-at-its-wire-key";
+      ok = lib.all (mode: ((evalWith {
+             services.engenho.config.runtime = { kubeletBackend = "native"; nativeCgroups = mode; };
+           }).runtime or { }).native_cgroups or null == mode) [ "delegated" "off" ];
+      got = builtins.toJSON (evalWith {
+              services.engenho.config.runtime.nativeCgroups = "off";
+            }); }
+
+    { name = "native-cgroups-outside-its-enum-fails-eval";
+      ok = !(builtins.tryEval (builtins.toJSON (evalWith {
+             services.engenho.config.runtime.nativeCgroups = "on";
+           }))).success;
+      got = "nativeCgroups = on evaluated"; }
+
     { name = "bad-scheduler-strategy-is-rejected";
       ok = !(builtins.tryEval
         (evalWith { services.engenho.config.scheduler.strategy = "random"; })

@@ -513,11 +513,8 @@ pub fn linux_resources(r: &crate::backend::Resources) -> Option<v1::LinuxContain
     if r.is_unset() {
         return None;
     }
-    let period = i64::try_from(crate::podman_api::CFS_PERIOD_US).unwrap_or(100_000);
-    let quota = r
-        .cpu_limit_milli
-        .value()
-        .map(|milli| (i128::from(milli) * i128::from(period) / 1000) as i64);
+    let period = i64::try_from(crate::backend::CFS_PERIOD_US).unwrap_or(100_000);
+    let quota = r.cpu_quota_us();
     Some(v1::LinuxContainerResources {
         cpu_period: if quota.is_some() { period } else { 0 },
         cpu_quota: quota.unwrap_or(0),
@@ -541,6 +538,10 @@ impl ContainerRuntime for CriBackend {
     /// to find what a previous kubelet left (`pending-cri-readopt`).
     fn readoption(&self) -> crate::backend::Readoption {
         crate::backend::Readoption::Cannot
+    }
+
+    fn resource_enforcement(&self) -> crate::cgroup::ResourceEnforcement {
+        crate::cgroup::ResourceEnforcement::Enforced
     }
 
     async fn exec(&self, container_id: &str, argv: &[String]) -> Result<ExecOutcome, KubeletError> {

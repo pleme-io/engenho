@@ -254,10 +254,15 @@ in
         references rather than falling back, so a node set to `native` cannot
         silently end up running its pods in a VM.
 
-        Tier-honest: it confines nothing yet. A container runs with the
-        daemon's own privileges -- no Seatbelt profile, no container principal,
-        no uid-scoped reaper. Choose it where the alternative is a whole Linux
-        VM, not where you need a sandbox.
+        Tier-honest: it sandboxes nothing yet. A container runs with the
+        daemon's own privileges -- no Seatbelt profile, no mount or network
+        namespace, no uid-scoped reaper. Choose it where the alternative is a
+        whole Linux VM, not where you need a sandbox. What it does bound: on
+        Linux, each container's `resources` are enforced in a cgroup v2 leaf
+        under the daemon's delegated cgroup (see `nativeCgroups`), and
+        `runAsUser` / `runAsGroup` are applied. On macOS neither is: a
+        container that declares resources runs, and its pod gets a
+        `ResourcesNotEnforced` Warning event.
 
         `podman_api` (the DEFAULT) speaks podman's libpod REST API over its unix
         socket — no subprocess, typed JSON, status codes instead of parsed error
@@ -282,6 +287,25 @@ in
         ★ Both podman arms drive the SAME container store; the difference is
         entirely client-side. Switching between them does not migrate, restart
         or orphan anything.
+      '';
+      nativeCgroups = optional (types.enum [ "delegated" "off" ]) ''
+        How the `native` backend enforces a container's `resources` on Linux.
+
+        `delegated` (engenho's default): the daemon's systemd unit runs with
+        `Delegate=yes` (this module sets it and asserts it), the daemon moves
+        itself into `<unit>/supervisor`, and each container that declares
+        resources runs in `<unit>/workloads/<namespace>_<pod>_<container>`
+        with `memory.max`, `memory.swap.max = 0`, `memory.oom.group = 1`,
+        `cpu.max`, `cpu.weight` and `memory.min` written and read back. A pod
+        whose limits cannot be enforced (the cgroup is not delegated) is
+        refused with the reason; a pod that declares nothing runs exactly as
+        before.
+
+        `off`: no cgroup is touched and no pod is refused for its resources,
+        which is the behaviour before enforcement existed. Each pod that
+        declares resources still gets a `ResourcesNotEnforced` Warning event.
+
+        Has no effect on macOS, where nothing is enforced.
       '';
       podmanPackage = mkOption {
         type = types.nullOr types.package;
@@ -564,6 +588,7 @@ in
       advertise_address = cfg.runtime.advertiseAddress;
       remote_kubeconfig_publish_path = cfg.runtime.remoteKubeconfigPublishPath;
         kubelet_backend = cfg.runtime.kubeletBackend;
+        native_cgroups = cfg.runtime.nativeCgroups;
         host_path_allowlist = cfg.runtime.hostPathAllowlist;
         node_manifests_dir = cfg.runtime.nodeManifestsDir;
         # DERIVED, never a second hand-list: an explicit `podmanBinary` wins,

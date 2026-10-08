@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "f571e464217cebf16a3854b914339e056b0291586122d131dcd326c45a1bfc27",
+  "cargo_lock_sha256": "4788ed9e764099daa38801feb5f459a164f7978efba9de77d51c2e26d568b1ba",
   "manifest_sha256": {
     "Cargo.toml": "886a9b9ec7a7dbda4493fa24ec24cba60d956c78ee934d9e70bcadff53ffd5dc",
     "engenho-apiserver/Cargo.toml": "a42bf1f662ba3dbab338a871c0979aa15dfb734a22435d96e36e65cfa47d5abf",
@@ -20,7 +20,7 @@
     "engenho-kube-client/Cargo.toml": "91708a8a8ec2457678a3dcb977c6145d09b82a0930e609381cce93af4a1c7b3e",
     "engenho-kube-codegen/Cargo.toml": "2fd91bb5b562a4adbd5f8298595155bcdbb51c52070e49b2efc47cc805a070ea",
     "engenho-kube-proto/Cargo.toml": "7545b21650bdbf36fa4b0592ee3659069a39555f10174f42142bf337b1f1c00b",
-    "engenho-kubelet/Cargo.toml": "e6e0a52fade25343da69129b7ce04d396a15d930903084d09e564e0716fb2ee1",
+    "engenho-kubelet/Cargo.toml": "4db5724a5cc5604b0c8e5d0f12dc0d2e4cd6499be8a596a5c9963cd1c298c2b1",
     "engenho-mcp/Cargo.toml": "a73d0471a92fe4eeb98d75f5ca945aeafcf56c6034e36f47d06bbf980ed9e369",
     "engenho-oracle/Cargo.toml": "9b0da2a6c1d469c28eb0617b8d71df0b0bf6db7751596956e0bb74a6ac979984",
     "engenho-revoada/Cargo.toml": "08cfd6e45e8acfb75f3073e3a70a9a11a9c33575c43509d0199b1e73bb8012f9",
@@ -6478,6 +6478,19 @@
               "system-proxy"
             ],
             "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "rustix",
+            "package_key": "rustix-1.1.4",
+            "kind": "normal",
+            "features": [
+              "fs",
+              "param"
+            ],
+            "uses_default_features": true,
             "optional": false,
             "target": null,
             "tree": "target"
@@ -33280,6 +33293,7 @@
               "alloc",
               "default",
               "fs",
+              "param",
               "process",
               "std",
               "system",
@@ -34478,6 +34492,7 @@
               "alloc",
               "default",
               "fs",
+              "param",
               "process",
               "std",
               "system",
@@ -35524,6 +35539,7 @@
               "alloc",
               "default",
               "fs",
+              "param",
               "process",
               "std",
               "system",
@@ -36394,6 +36410,7 @@
               "alloc",
               "default",
               "fs",
+              "param",
               "process",
               "std",
               "system",
@@ -37603,6 +37620,7 @@
               "alloc",
               "default",
               "fs",
+              "param",
               "process",
               "std",
               "system",
@@ -38660,6 +38678,7 @@
               "alloc",
               "default",
               "fs",
+              "param",
               "process",
               "std",
               "system",

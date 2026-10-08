@@ -55,8 +55,9 @@ impl Severity {
 /// The two exceptions, [`Reason::ProbeBlind`] and [`Reason::WouldReject`],
 /// say on their variant which emitter they are waiting for.
 ///
-/// Three reasons are engenho's own, each for a state upstream does not
-/// have: [`Reason::NetworkPolicyNotEnforced`], [`Reason::ProbeBlind`] and
+/// Four reasons are engenho's own, each for a state upstream does not
+/// have: [`Reason::NetworkPolicyNotEnforced`],
+/// [`Reason::ResourcesNotEnforced`], [`Reason::ProbeBlind`] and
 /// [`Reason::WouldReject`]. Each is `Warning`. The last two share their
 /// word with what an operator searches for beside them — the kubelet's
 /// `ProbeBlind` pod condition, the `engenho_would_reject_total` metric — so
@@ -140,6 +141,7 @@ pub enum Reason {
     /// rather than a missing feature, which is why it is a `Warning` and
     /// why it is surfaced where `kubectl describe` shows it.
     NetworkPolicyNotEnforced,
+    ResourcesNotEnforced,
     // ── rollout gates ──
     /// A gate in Shadow allowed what Enforce would refuse. The string is
     /// [`engenho_substrate::WouldReject::EVENT_REASON`], owned by the
@@ -178,6 +180,7 @@ impl Reason {
             Self::ProvisioningFailed => "ProvisioningFailed",
             Self::VolumeFailedDelete => "VolumeFailedDelete",
             Self::NetworkPolicyNotEnforced => "NetworkPolicyNotEnforced",
+            Self::ResourcesNotEnforced => "ResourcesNotEnforced",
             Self::WouldReject => engenho_substrate::WouldReject::EVENT_REASON,
         }
     }
@@ -205,6 +208,7 @@ impl Reason {
             | Self::ReplicaSetCreateError
             | Self::FailedToUpdateEndpoint
             | Self::NetworkPolicyNotEnforced
+            | Self::ResourcesNotEnforced
             | Self::WouldReject => Severity::Warning,
             Self::Pulled
             | Self::Created
@@ -362,6 +366,7 @@ mod tests {
             Reason::ReplicaSetCreateError,
             Reason::FailedToUpdateEndpoint,
             Reason::NetworkPolicyNotEnforced,
+            Reason::ResourcesNotEnforced,
             Reason::ProbeBlind,
             Reason::WouldReject,
         ] {

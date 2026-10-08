@@ -15,6 +15,7 @@ use crate::cri_backend::CriGaps;
 /// [`make_container_runtime`] as-is. The path `config_bridge::KubeletBackendKind`
 /// still resolves.
 pub use engenho_config::KubeletBackendKind;
+pub use engenho_config::NativeCgroups;
 
 /// Why `kind` may not be constructed, or `None` when it may.
 ///
@@ -110,6 +111,16 @@ pub fn make_container_runtime_with_apiserver(
     kind: KubeletBackendKind,
     podman_binary: Option<&str>,
     apiserver: Option<(String, u16)>,
+) -> Result<Arc<dyn ContainerRuntime>, BackendRefused> {
+    make_container_runtime_on_node(kind, podman_binary, apiserver, NativeCgroups::default())
+}
+
+#[allow(missing_docs, clippy::missing_errors_doc)]
+pub fn make_container_runtime_on_node(
+    kind: KubeletBackendKind,
+    podman_binary: Option<&str>,
+    apiserver: Option<(String, u16)>,
+    native_cgroups: NativeCgroups,
 ) -> Result<Arc<dyn ContainerRuntime>, BackendRefused> {
     if let Some(refused) = construction_refusal(kind) {
         return Err(refused);
@@ -209,6 +220,7 @@ pub fn make_container_runtime_with_apiserver(
             // nothing yet. See native_backend's module docs.
             crate::native_backend::Isolation::HostProcess,
             native_log_dir(),
+            crate::cgroup::Cgroups::select(native_cgroups),
         )),
     };
     Ok(runtime)

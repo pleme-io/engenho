@@ -345,7 +345,20 @@ impl Resources {
         let weight = 1 + ((shares - 2) * 9999) / 262_142;
         Some(weight.clamp(1, 10_000) as u64)
     }
+
+    pub(crate) fn cpu_quota_us(&self) -> Option<i64> {
+        let milli = self.cpu_limit_milli.value().filter(|m| *m > 0)?;
+        let quota = i128::from(milli) * i128::from(CFS_PERIOD_US) / 1000;
+        Some(i64::try_from(quota.max(i128::from(MIN_CFS_QUOTA_US))).unwrap_or(i64::MAX))
+    }
 }
+
+/// The CFS period every Kubernetes kubelet uses. Not a tunable here: a
+/// different period would make the same `cpu.max` numerator mean a different
+/// fraction of a core than it does on every other cluster.
+pub const CFS_PERIOD_US: u64 = 100_000;
+
+pub(crate) const MIN_CFS_QUOTA_US: i64 = 1_000;
 
 /// How long a container gets between `SIGTERM` and `SIGKILL` when it is
 /// stopped — the pod's `spec.terminationGracePeriodSeconds`.
@@ -703,6 +716,9 @@ pub trait ContainerRuntime: Send + Sync {
     /// backend must say which it is.
     fn readoption(&self) -> Readoption;
 
+    #[allow(missing_docs)]
+    fn resource_enforcement(&self) -> crate::cgroup::ResourceEnforcement;
+
     /// Run `argv` inside a previously-started container (`podman exec <id>
     /// <argv...>`). The SOLE runtime capability the exec-probe path needs —
     /// exec MUST go through the runtime because it requires the container's
@@ -803,6 +819,7 @@ pub struct FakeBackend {
     /// restart carries the same id as the run the old kubelet lost. Set by
     /// [`FakeBackend::with_ids_from_names`].
     ids_from_names: bool,
+    resource_enforcement: crate::cgroup::ResourceEnforcement,
 }
 
 #[derive(Default)]
@@ -925,6 +942,16 @@ impl FakeBackend {
     #[must_use]
     pub fn with_ids_from_names(mut self) -> Self {
         self.ids_from_names = true;
+        self
+    }
+
+    #[allow(missing_docs)]
+    #[must_use]
+    pub fn with_resource_enforcement(
+        mut self,
+        enforcement: crate::cgroup::ResourceEnforcement,
+    ) -> Self {
+        self.resource_enforcement = enforcement;
         self
     }
 
@@ -1152,6 +1179,10 @@ impl ContainerRuntime for FakeBackend {
 
     fn readoption(&self) -> Readoption {
         self.readoption
+    }
+
+    fn resource_enforcement(&self) -> crate::cgroup::ResourceEnforcement {
+        self.resource_enforcement
     }
 
     async fn exec(
@@ -2095,6 +2126,10 @@ impl ContainerRuntime for PodmanBackend {
     /// (`pending-adopt-parity`, below).
     fn readoption(&self) -> Readoption {
         Readoption::Cannot
+    }
+
+    fn resource_enforcement(&self) -> crate::cgroup::ResourceEnforcement {
+        crate::cgroup::ResourceEnforcement::Enforced
     }
 
     async fn exec(&self, container_id: &str, argv: &[String]) -> Result<ExecOutcome, KubeletError> {
@@ -3153,6 +3188,22 @@ mod tests {
         let cpus = argv.iter().position(|a| a == "--cpus").unwrap();
         let image = argv.iter().position(|a| a == "img").unwrap();
         assert!(cpus < image, "resources must precede the image argument");
+    }
+
+    #[test]
+    fn cpu_quota_follows_upstreams_floor_and_zero_rule() {
+        let quota = |cpu: &str| {
+            Resources::from_container_json(&res_json(&format!(r#"{{"cpu":"{cpu}"}}"#), "{}"))
+                .cpu_quota_us()
+        };
+        assert_eq!(quota("500m"), Some(50_000));
+        assert_eq!(quota("2"), Some(200_000));
+        assert_eq!(quota("1m"), Some(1_000));
+        assert_eq!(quota("0"), None);
+        assert_eq!(
+            Resources::from_container_json(&res_json("{}", "{}")).cpu_quota_us(),
+            None
+        );
     }
 
     #[test]

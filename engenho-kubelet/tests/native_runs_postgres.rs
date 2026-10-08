@@ -87,7 +87,11 @@ async fn postgres_runs_natively_under_the_kubelet_from_a_nix_closure() {
     std::fs::create_dir_all(&sock).expect("socket dir");
     initdb(&pg, &data);
 
-    let backend = NativeBackend::new(Isolation::HostProcess, "/tmp/eng-pg-logs");
+    let backend = NativeBackend::new(
+        Isolation::HostProcess,
+        "/tmp/eng-pg-logs",
+        engenho_kubelet::cgroup::Cgroups::Off,
+    );
 
     let mut image = String::from("nix:");
     image.push_str(&pg.to_string_lossy());

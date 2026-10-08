@@ -411,6 +411,21 @@ impl std::fmt::Display for FailedToStart<'_> {
     }
 }
 
+struct ResourcesNotEnforced<'a> {
+    container: &'a str,
+    why: crate::cgroup::NotEnforced,
+}
+
+impl std::fmt::Display for ResourcesNotEnforced<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Resources declared by container {} are not enforced: {}",
+            self.container, self.why
+        )
+    }
+}
+
 /// The event text for a container held off before its next start.
 struct BackOffRestarting<'a> {
     container: &'a str,
@@ -4163,6 +4178,32 @@ impl Kubelet {
     /// # Errors
     ///
     /// [`LaunchFailed`]: the runtime's error and what it cost on the curve.
+    async fn report_unenforced_resources(&self, spec: &ContainerSpec) {
+        let crate::cgroup::ResourceEnforcement::NotEnforced(why) =
+            self.backend.resource_enforcement()
+        else {
+            return;
+        };
+        if spec.resources.is_unset() {
+            return;
+        }
+        engenho_controllers::event_recorder::record_pod_event(
+            self.events.as_ref(),
+            &spec.pod.namespace,
+            &spec.pod.name,
+            None,
+            engenho_controllers::event_recorder::Reason::ResourcesNotEnforced,
+            ResourcesNotEnforced {
+                container: &spec.pod.container_name,
+                why,
+            }
+            .to_string(),
+            KUBELET_COMPONENT,
+            &engenho_types::time::now_rfc3339_utc(),
+        )
+        .await;
+    }
+
     #[allow(
         clippy::disallowed_methods,
         reason = "the one sanctioned call: it holds a permit and records the outcome"
@@ -4175,6 +4216,7 @@ impl Kubelet {
         match self.backend.start(spec).await {
             Ok(status) => {
                 self.start_ledger.lock().await.succeeded(permit);
+                self.report_unenforced_resources(spec).await;
                 Ok(status)
             }
             Err(cause) => {

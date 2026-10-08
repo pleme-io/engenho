@@ -17,10 +17,14 @@
     reason = "drives the native runtime directly; no kubelet in the loop"
 )]
 
+use engenho_kubelet::backend::Resources;
 use engenho_kubelet::backend::{ContainerRuntime, ContainerSpec, LogOptions, PodIdentity};
+use engenho_kubelet::cgroup::{CgroupFs, Cgroups, HostFs};
 use engenho_kubelet::cri::{ExitDisposition, RunState};
 use engenho_kubelet::native_backend::{Isolation, NativeBackend};
+use engenho_substrate::HostRoot;
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 /// Realise a closure and return its store path.
 fn closure(attr: &str) -> String {
@@ -67,7 +71,7 @@ fn spec(image: &str, command: &[&str], env: &[(&str, &str)]) -> ContainerSpec {
 async fn a_nix_closure_runs_as_a_native_process_and_its_output_is_readable() {
     let coreutils = closure("nixpkgs#coreutils");
     let logs_dir = std::env::temp_dir().join("engenho-native-e2e");
-    let backend = NativeBackend::new(Isolation::HostProcess, &logs_dir);
+    let backend = NativeBackend::new(Isolation::HostProcess, &logs_dir, Cgroups::Off);
 
     let mut image = String::from("nix:");
     image.push_str(&coreutils);
@@ -157,6 +161,7 @@ async fn a_signalled_container_reports_its_signal_not_a_clean_exit() {
     let backend = NativeBackend::new(
         Isolation::HostProcess,
         std::env::temp_dir().join("engenho-native-e2e-signal"),
+        Cgroups::Off,
     );
     let mut image = String::from("nix:");
     image.push_str(&coreutils);
@@ -197,7 +202,7 @@ async fn a_signalled_container_reports_its_signal_not_a_clean_exit() {
 async fn a_container_sees_only_its_declared_environment() {
     let coreutils = closure("nixpkgs#coreutils");
     let logs_dir = std::env::temp_dir().join("engenho-native-e2e-env");
-    let backend = NativeBackend::new(Isolation::HostProcess, &logs_dir);
+    let backend = NativeBackend::new(Isolation::HostProcess, &logs_dir, Cgroups::Off);
 
     // Set a variable in the PARENT that the container must not see.
     unsafe { std::env::set_var("ENGENHO_MUST_NOT_LEAK", "leaked") };
@@ -242,6 +247,7 @@ async fn the_image_ryn_runs_today_is_refused_by_the_real_backend() {
     let backend = NativeBackend::new(
         Isolation::HostProcess,
         std::env::temp_dir().join("engenho-native-e2e-refuse"),
+        Cgroups::Off,
     );
     let err = backend
         .start(&spec(
@@ -306,6 +312,7 @@ async fn a_workload_ignoring_sigterm_is_sigkilled_after_the_pods_grace_and_reape
     let backend = NativeBackend::new(
         Isolation::HostProcess,
         std::env::temp_dir().join("engenho-native-e2e-grace"),
+        Cgroups::Off,
     );
     let mut image = String::from("nix:");
     image.push_str(&bash);
@@ -399,4 +406,162 @@ async fn a_workload_ignoring_sigterm_is_sigkilled_after_the_pods_grace_and_reape
         .await
         .expect("a reaped process's record may go");
     assert!(backend.status(&id).await.expect("status").is_none());
+}
+
+#[derive(Debug)]
+struct DirectoryCgroupfs {
+    host: HostFs,
+    root: HostRoot,
+}
+
+impl DirectoryCgroupfs {
+    fn at(root: &Path) -> Self {
+        Self {
+            host: HostFs::at(HostRoot::at(root)),
+            root: HostRoot::at(root),
+        }
+    }
+}
+
+impl CgroupFs for DirectoryCgroupfs {
+    fn read(&self, path: &Path) -> std::io::Result<String> {
+        self.host.read(path)
+    }
+    fn write(&self, path: &Path, value: &str) -> std::io::Result<()> {
+        self.host.write(path, value)
+    }
+    fn create_dir(&self, path: &Path) -> std::io::Result<()> {
+        self.host.create_dir(path)
+    }
+    fn remove_dir(&self, path: &Path) -> std::io::Result<()> {
+        std::fs::remove_dir_all(self.root.resolve(path))
+    }
+    fn subdirs(&self, path: &Path) -> std::io::Result<Vec<String>> {
+        self.host.subdirs(path)
+    }
+    fn writable(&self, path: &Path) -> bool {
+        self.host.writable(path)
+    }
+    fn delegation_marked(&self, path: &Path) -> std::io::Result<bool> {
+        self.host.delegation_marked(path)
+    }
+    fn open_procs(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        self.host.open_procs(path)
+    }
+}
+
+fn delegated_unit(root: &Path) -> PathBuf {
+    let unit = root.join("sys/fs/cgroup/test.slice/engenho.service");
+    std::fs::create_dir_all(&unit).unwrap();
+    std::fs::create_dir_all(root.join("proc/self")).unwrap();
+    std::fs::write(
+        root.join("proc/self/cgroup"),
+        "0::/test.slice/engenho.service\n",
+    )
+    .unwrap();
+    std::fs::write(unit.join("cgroup.controllers"), "cpu io memory pids").unwrap();
+    std::fs::write(unit.join("cgroup.subtree_control"), "").unwrap();
+    std::fs::write(unit.join("cgroup.procs"), std::process::id().to_string()).unwrap();
+    rustix::fs::setxattr(
+        unit.as_path(),
+        "user.delegate",
+        b"1",
+        rustix::fs::XattrFlags::empty(),
+    )
+    .unwrap();
+    unit
+}
+
+#[tokio::test]
+async fn a_limited_container_joins_its_leaf_before_it_runs_and_the_leaf_goes_when_it_is_reaped() {
+    let coreutils = closure("nixpkgs#coreutils");
+    let root = tempfile::tempdir().unwrap();
+    let unit = delegated_unit(root.path());
+    let cgroups = Cgroups::adopt(Box::new(DirectoryCgroupfs::at(root.path())));
+    assert!(matches!(cgroups, Cgroups::Delegated(_)), "{cgroups:?}");
+    let backend = NativeBackend::new(
+        Isolation::HostProcess,
+        std::env::temp_dir().join("engenho-native-e2e-cgroup"),
+        cgroups,
+    );
+    let mut image = String::from("nix:");
+    image.push_str(&coreutils);
+    let mut s = spec(&image, &["sleep", "2"], &[]);
+    s.resources = Resources::from_container_json(&serde_json::json!({
+        "resources": { "limits": { "memory": "64Mi", "cpu": "250m" } }
+    }));
+
+    let started = backend.start(&s).await.expect("a delegated node starts it");
+    let leaf = unit.join("workloads").join(&started.container_id);
+    let at = |knob: &str| std::fs::read_to_string(leaf.join(knob)).unwrap();
+    assert_eq!(at("memory.max"), "67108864");
+    assert_eq!(at("memory.swap.max"), "0");
+    assert_eq!(at("memory.oom.group"), "1");
+    assert_eq!(at("cpu.max"), "25000 100000");
+    let mut joined = String::new();
+    for _ in 0..100 {
+        joined = at("cgroup.procs");
+        if !joined.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(joined, "0", "the child joins its leaf itself, before exec");
+
+    for _ in 0..250 {
+        let st = backend
+            .status(&started.container_id)
+            .await
+            .expect("status")
+            .expect("tracked");
+        if !st.is_running() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(!leaf.exists(), "a reaped container's leaf is released");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_pods_run_as_user_is_the_workloads_uid_on_linux() {
+    use std::os::unix::fs::MetadataExt;
+    let coreutils = closure("nixpkgs#coreutils");
+    let backend = NativeBackend::new(
+        Isolation::HostProcess,
+        std::env::temp_dir().join("engenho-native-e2e-runas"),
+        Cgroups::Off,
+    );
+    let mut image = String::from("nix:");
+    image.push_str(&coreutils);
+    let mut s = spec(&image, &["id", "-u"], &[]);
+    s.confinement.run_as_user = Some(65_534);
+    let root = std::fs::metadata("/proc/self").expect("procfs").uid() == 0;
+    match backend.start(&s).await {
+        Ok(started) if root => {
+            for _ in 0..250 {
+                let st = backend
+                    .status(&started.container_id)
+                    .await
+                    .expect("status")
+                    .expect("tracked");
+                if !st.is_running() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            let out = backend
+                .logs(&started.container_id, &LogOptions::default())
+                .await
+                .expect("logs");
+            assert_eq!(out.trim(), "65534");
+        }
+        Err(e) if !root => {
+            assert!(
+                e.to_string().contains("cannot spawn"),
+                "an unprivileged daemon cannot become another uid, so the pod is refused: {e}"
+            );
+        }
+        other => panic!("root={root}: {other:?}"),
+    }
 }

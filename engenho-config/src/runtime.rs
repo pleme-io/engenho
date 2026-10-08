@@ -137,6 +137,15 @@ pub enum KubeletBackendRefusal {
     CriIncomplete,
 }
 
+#[allow(missing_docs)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeCgroups {
+    #[default]
+    Delegated,
+    Off,
+}
+
 /// Where a node's declared manifests live unless its config says otherwise
 /// (`runtime.node_manifests_dir`).
 pub const DEFAULT_NODE_MANIFESTS_DIR: &str = "/etc/engenho/manifests.d";
@@ -337,6 +346,9 @@ pub struct RuntimeConfig {
     /// socket, no subprocess. See that enum for why the shell-out backend is
     /// retained but no longer the default.
     pub kubelet_backend: KubeletBackendKind,
+    #[allow(missing_docs)]
+    #[serde(default)]
+    pub native_cgroups: NativeCgroups,
     /// Optional explicit podman binary path.
     ///
     /// Used by the shell-out backend, and by the `PodmanApi` backend ONLY on
@@ -398,6 +410,7 @@ impl TieredConfig for RuntimeConfig {
             kubelet_listen_addr: String::new(),
             etcd_listen_addr: String::new(),
             kubelet_backend: KubeletBackendKind::Fake,
+            native_cgroups: NativeCgroups::Off,
             podman_binary: None,
             host_path_allowlist: Vec::new(),
             node_manifests_dir: PathBuf::new(),
@@ -460,6 +473,7 @@ impl TieredConfig for RuntimeConfig {
             // violates the fleet's NO SHELL law is a default that has to be
             // overridden on every node to be correct.
             kubelet_backend: KubeletBackendKind::PodmanApi,
+            native_cgroups: NativeCgroups::Delegated,
             podman_binary: None,
             host_path_allowlist: Vec::new(),
             node_manifests_dir: PathBuf::from(DEFAULT_NODE_MANIFESTS_DIR),
@@ -520,6 +534,7 @@ impl TieredConfig for RuntimeConfig {
                 self.etcd_listen_addr
             },
             kubelet_backend: self.kubelet_backend,
+            native_cgroups: self.native_cgroups,
             // No "unset" sentinel on an enum whose safe arm is also a
             // meaningful value, so the overlay's value wins — same rule as
             // `durable` and `kubelet_backend` above. A node asking for
@@ -812,6 +827,7 @@ mod tests {
             kubelet_listen_addr: String::new(),
             etcd_listen_addr: String::new(),
             kubelet_backend: KubeletBackendKind::Fake,
+            native_cgroups: NativeCgroups::Off,
             podman_binary: None,
             host_path_allowlist: Vec::new(),
             node_manifests_dir: PathBuf::new(),
@@ -1195,6 +1211,50 @@ mod backend_refusal {
         assert!(
             shown.contains("podman_api"),
             "names a backend that works: {shown}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod native_cgroups_tests {
+    use super::NativeCgroups;
+    use crate::EngenhoConfig;
+    use shikumi::TieredConfig;
+
+    #[test]
+    fn a_config_that_does_not_name_it_delegates() {
+        let cfg = EngenhoConfig::from_yaml_with_defaults("runtime:\n  kubelet_backend: native\n")
+            .expect("parses");
+        assert_eq!(cfg.runtime.native_cgroups, NativeCgroups::Delegated);
+        assert_eq!(
+            super::RuntimeConfig::prescribed_default().native_cgroups,
+            NativeCgroups::Delegated
+        );
+    }
+
+    #[test]
+    fn each_wire_name_reads_back_as_its_variant() {
+        for (wire, want) in [
+            ("delegated", NativeCgroups::Delegated),
+            ("off", NativeCgroups::Off),
+        ] {
+            let yaml = format!("runtime:\n  kubelet_backend: native\n  native_cgroups: {wire}\n");
+            let cfg = EngenhoConfig::from_yaml_with_defaults(&yaml)
+                .unwrap_or_else(|e| panic!("`{wire}` must parse: {e}"));
+            assert_eq!(cfg.runtime.native_cgroups, want);
+            assert_eq!(
+                serde_json::to_string(&want).unwrap(),
+                format!("\"{wire}\""),
+                "nix/typed-config.nix renders exactly these names"
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_outside_the_two_is_refused_at_parse() {
+        assert!(
+            EngenhoConfig::from_yaml_with_defaults("runtime:\n  native_cgroups: on\n").is_err(),
+            "an unknown arm must not fall back to a default"
         );
     }
 }

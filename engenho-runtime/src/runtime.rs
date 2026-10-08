@@ -30,9 +30,7 @@ use engenho_controllers::{
 };
 use engenho_kube_client::{emit_kubeconfig, emit_kubeconfig_with_admin};
 use engenho_kubelet::config_bridge::KubeletBackendKind;
-use engenho_kubelet::{
-    ContainerRuntime, Kubelet, LogOptions, make_container_runtime_with_apiserver,
-};
+use engenho_kubelet::{ContainerRuntime, Kubelet, LogOptions, make_container_runtime_on_node};
 use engenho_scheduler::{
     ConfiguredScheduler, NodeCapabilities, Runtime as SchedRuntime, Scheduler,
 };
@@ -1809,10 +1807,11 @@ fn build_backend(boot: &BootConfig) -> Result<Arc<dyn ContainerRuntime>, Runtime
             );
         }
     }
-    Ok(make_container_runtime_with_apiserver(
+    Ok(make_container_runtime_on_node(
         kind,
         boot.podman_binary.as_deref(),
         reachability.injectable(),
+        boot.native_cgroups,
     )?)
 }
 

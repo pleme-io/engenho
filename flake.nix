@@ -56,6 +56,8 @@
         "a_signalled_container_reports_its_signal_not_a_clean_exit"
         "a_container_sees_only_its_declared_environment"
         "a_workload_ignoring_sigterm_is_sigkilled_after_the_pods_grace_and_reaped"
+        "a_limited_container_joins_its_leaf_before_it_runs_and_the_leaf_goes_when_it_is_reaped"
+        "the_pods_run_as_user_is_the_workloads_uid_on_linux"
         # engenho-kubelet/tests/native_runs_postgres.rs
         "postgres_runs_natively_under_the_kubelet_from_a_nix_closure"
       ];
@@ -258,18 +260,34 @@
         # `mkForce "process"` anywhere in the fleet would change it silently,
         # so evaluation refuses it.
         extraNixosConfigFn = { cfg, lib, config, ... }:
+          let
+            runtime = cfg.config.runtime;
+            nativeDelegated = runtime.kubeletBackend == "native" && runtime.nativeCgroups != "off";
+            serviceConfig = config.systemd.services.engenho-daemon.serviceConfig;
+          in
           lib.mkIf (cfg.daemon.enable or false) {
-            assertions = [{
-              assertion =
-                (config.systemd.services.engenho-daemon.serviceConfig.KillMode or null)
-                == "control-group";
-              message = ''
-                services.engenho: systemd.services.engenho-daemon must keep
-                KillMode=control-group. engenho's native backend cannot re-adopt
-                the workloads a previous daemon spawned, so only the cgroup kill
-                on stop keeps a restart from running every native pod twice.
-              '';
-            }];
+            systemd.services.engenho-daemon.serviceConfig.Delegate = lib.mkIf nativeDelegated "yes";
+            assertions = [
+              {
+                assertion = (serviceConfig.KillMode or null) == "control-group";
+                message = ''
+                  services.engenho: systemd.services.engenho-daemon must keep
+                  KillMode=control-group. engenho's native backend cannot re-adopt
+                  the workloads a previous daemon spawned, so only the cgroup kill
+                  on stop keeps a restart from running every native pod twice.
+                '';
+              }
+              {
+                assertion = !nativeDelegated || builtins.elem (serviceConfig.Delegate or null) [ "yes" true ];
+                message = ''
+                  services.engenho: the native backend with nativeCgroups = "delegated"
+                  needs systemd.services.engenho-daemon.serviceConfig.Delegate=yes.
+                  Without it the daemon refuses every pod that declares a resource
+                  limit. Set services.engenho.config.runtime.nativeCgroups = "off"
+                  to run limits unenforced instead.
+                '';
+              }
+            ];
           };
       };
       # The typed surface rides with every arm, so a consumer gets one
@@ -360,6 +378,18 @@
             pkgs = pkgsFor system;
           };
           flake-surface = flakeSurface system;
+        } // lib.optionalAttrs (lib.hasSuffix "-linux" system) {
+          native-delegation = import ./nix/tests/native-delegation-test.nix {
+            inherit nixpkgs system;
+            module = self.nixosModules.engenho;
+            package = self.packages.${system}.default;
+          };
+        } // lib.optionalAttrs (system == "x86_64-linux") {
+          native-cgroups-vm = import ./nix/tests/native-cgroups-vm.nix {
+            pkgs = pkgsFor system;
+            module = self.nixosModules.engenho;
+            package = self.packages.${system}.default;
+          };
         });
       }
 
