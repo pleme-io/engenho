@@ -45,6 +45,7 @@ impl ShikumiWatcher {
 
         // Push the initial-read change.
         let initial = read_change(&path, &source, &revision, ChangeKind::Initial)?;
+        let initial_text = initial.source_text.clone();
         let _ = tx.try_send(initial);
 
         // Notify callback: classify event kind, re-read, push.
@@ -53,8 +54,7 @@ impl ShikumiWatcher {
         let cb_tx = tx.clone();
         let cb_revision = revision.clone();
         let watcher_path = path.clone();
-        let last_seen: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
-        let cb_last = last_seen.clone();
+        let cb_last: Mutex<Arc<str>> = Mutex::new(initial_text);
         let watcher = ConfigWatcher::watch(&watcher_path, move |event: notify::Event| {
             use notify::EventKind;
             let kind = match event.kind {
@@ -63,30 +63,15 @@ impl ShikumiWatcher {
                 EventKind::Remove(_) => ChangeKind::Removed,
                 _ => return,
             };
-            // Coalesce identical revisions if notify fires twice (some
-            // OSes emit Modify(Metadata) + Modify(Data) per save).
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            {
-                let mut last = cb_last.lock().expect("shikumi-watcher poisoned");
-                if let Some(prev) = *last
-                    && now.saturating_sub(prev) < 50
-                {
-                    return;
-                }
-                *last = Some(now);
+            let mut last = cb_last.lock().expect("shikumi-watcher poisoned");
+            let Ok(text) = read_text(&cb_path, kind) else {
+                return;
+            };
+            if kind == ChangeKind::Modified && *text == **last {
+                return;
             }
-            match read_change(&cb_path, &cb_source, &cb_revision, kind) {
-                Ok(change) => {
-                    let _ = cb_tx.try_send(change);
-                }
-                Err(_) => {
-                    // File transiently absent — caller's next read
-                    // will re-emit when the file reappears.
-                }
-            }
+            *last = text.clone();
+            let _ = cb_tx.try_send(build_change(&cb_source, &cb_revision, kind, text));
         })
         .map_err(|e| FonteError::Watch(format!("shikumi watch: {e}")))?;
 
@@ -103,23 +88,33 @@ fn read_change(
     revision: &Arc<AtomicU64>,
     kind: ChangeKind,
 ) -> FonteResult<Change> {
-    let source_text = match kind {
+    let source_text = read_text(path, kind)?;
+    Ok(build_change(source, revision, kind, source_text))
+}
+
+fn read_text(path: &PathBuf, kind: ChangeKind) -> FonteResult<Arc<str>> {
+    match kind {
         // On Remove, we synthesize an empty body so downstream sees
         // a deletion event.
-        ChangeKind::Removed => Arc::from(""),
-        _ => {
-            let body = std::fs::read_to_string(path)
-                .map_err(|e| FonteError::Watch(format!("read {}: {e}", path.display())))?;
-            Arc::from(body)
-        }
-    };
-    let rev = revision.fetch_add(1, Ordering::SeqCst);
-    Ok(Change {
+        ChangeKind::Removed => Ok(Arc::from("")),
+        _ => std::fs::read_to_string(path)
+            .map(Arc::from)
+            .map_err(|e| FonteError::Watch(format!("read {}: {e}", path.display()))),
+    }
+}
+
+fn build_change(
+    source: &Arc<str>,
+    revision: &Arc<AtomicU64>,
+    kind: ChangeKind,
+    source_text: Arc<str>,
+) -> Change {
+    Change {
         source: source.clone(),
         kind,
         source_text,
-        revision: rev,
-    })
+        revision: revision.fetch_add(1, Ordering::SeqCst),
+    }
 }
 
 #[async_trait]

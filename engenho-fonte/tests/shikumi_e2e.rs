@@ -67,7 +67,6 @@ async fn modifying_a_file_emits_modified_change() {
     assert_eq!(initial.revision, 0);
 
     // Modify the file (write a Sistema with 2 apps).
-    sleep(Duration::from_millis(100)).await;
     std::fs::write(
         &path,
         r#"{"name":"a","apps":[{"name":"x","version":null},{"name":"y","version":null}],"infra":[],"promises":[],"topology":{"strategy":"solo","nodes":1}}"#,
@@ -90,6 +89,32 @@ async fn modifying_a_file_emits_modified_change() {
     .await
     .expect("modify notify within 30s");
     assert!(modified.revision > initial.revision);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_landing_right_after_a_truncate_is_never_lost() {
+    use engenho_fonte::Watcher;
+    let final_text = r#"{"name":"b","apps":[],"infra":[],"promises":[],"topology":{"strategy":"solo","nodes":1}}"#;
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+    std::fs::write(&path, "{}").unwrap();
+    let watcher = ShikumiWatcher::new(&path).unwrap();
+    let initial = watcher.next().await.unwrap().expect("initial");
+    assert_eq!(initial.kind, ChangeKind::Initial);
+
+    std::fs::write(&path, "").unwrap();
+    std::fs::write(&path, final_text).unwrap();
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let change = watcher.next().await.unwrap().expect("channel open");
+            if &*change.source_text == final_text {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the final contents must be emitted");
 }
 
 #[test]
