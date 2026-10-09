@@ -9,6 +9,7 @@ use engenho_store::{
 use tracing::debug;
 
 use crate::controller::ReconcileReport;
+use crate::effect::Effect;
 use crate::error::ControllerError;
 
 pub const DEFAULT_EVENT_TTL: Duration = Duration::from_secs(60 * 60);
@@ -108,7 +109,7 @@ pub(crate) async fn expire_events(
                 deletion_timestamp: Some(stamp.clone()),
             })
             .collect();
-        store
+        let applied = store
             .propose(ResourceCommand::Txn {
                 compares: Vec::new(),
                 success,
@@ -116,7 +117,7 @@ pub(crate) async fn expire_events(
                 reason: Reason::GarbageCollector,
             })
             .await?;
-        report.objects_changed += chunk.len();
+        report.record(Effect::of(applied.op));
     }
     debug!(expired = doomed.len(), "events past retention deleted");
     Ok(())
