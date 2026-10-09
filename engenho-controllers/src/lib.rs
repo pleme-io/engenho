@@ -62,6 +62,7 @@ pub mod endpoints;
 pub mod error;
 pub mod event_driven;
 pub mod event_recorder;
+pub mod event_retention;
 pub mod gc;
 pub mod heartbeat;
 pub mod hpa;

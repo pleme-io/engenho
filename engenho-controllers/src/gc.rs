@@ -81,6 +81,7 @@ pub use served::{ServedKind, ServedKinds, Unresolvable};
 use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
 use crate::effect::Effect;
 use crate::error::ControllerError;
+use crate::event_retention::{EventRetention, expire_events};
 use crate::reads::{DeclaresReads, Reads};
 
 /// The dependent kinds gc scans. Owners are resolved from each reference
@@ -182,6 +183,7 @@ impl Controller for GcController {
         let ns = self.namespace.as_deref();
         let served = self.served().await;
         let env = StoreEnv { store: &self.store };
+        expire_events(&self.store, ns, EventRetention::default(), &mut report).await?;
 
         for (group, version, kind) in DEPENDENT_KINDS {
             let dependents = self.store.list(group, version, kind, ns).await;
