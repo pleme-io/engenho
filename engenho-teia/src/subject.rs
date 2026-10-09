@@ -44,7 +44,7 @@ impl ClusterScope {
         format!("engenho.{}", self.cluster)
     }
 
-    /// Subject for an AppendEntries RPC to `target_node`.
+    /// Subject for an `AppendEntries` RPC to `target_node`.
     #[must_use]
     pub fn raft_append(&self, group: RaftGroup, target_node: NodeId) -> String {
         format!(
@@ -55,7 +55,7 @@ impl ClusterScope {
         )
     }
 
-    /// Subject for a RequestVote RPC to `target_node`.
+    /// Subject for a `RequestVote` RPC to `target_node`.
     #[must_use]
     pub fn raft_vote(&self, group: RaftGroup, target_node: NodeId) -> String {
         format!(
@@ -66,7 +66,7 @@ impl ClusterScope {
         )
     }
 
-    /// Subject for an InstallSnapshot RPC to `target_node`.
+    /// Subject for an `InstallSnapshot` RPC to `target_node`.
     #[must_use]
     pub fn raft_snapshot(&self, group: RaftGroup, target_node: NodeId) -> String {
         format!(
@@ -172,7 +172,7 @@ impl RaftGroup {
     }
 }
 
-/// Typed NodeId — the 32-byte ed25519 public key, wire-encoded
+/// Typed `NodeId` — the 32-byte ed25519 public key, wire-encoded
 /// as hex on the subject (so subject tokens stay alphanumeric).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

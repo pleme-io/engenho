@@ -53,7 +53,7 @@ pub struct Confinement {
     /// Set `no_new_privs`, so `execve` cannot gain privileges via setuid.
     ///
     /// The POLARITY IS INVERTED relative to Kubernetes, deliberately.
-    /// `allowPrivilegeEscalation: false` means "set no_new_privs", and carrying
+    /// `allowPrivilegeEscalation: false` means "set `no_new_privs`", and carrying
     /// the negative through two layers is how a double negative eventually gets
     /// read backwards. Converted once, at the boundary, in
     /// [`Self::from_security_context`].
@@ -414,7 +414,7 @@ impl ResourceBound {
 pub enum QuantityUnit {
     /// Milli-cores: `"1"` → 1000, `"100m"` → 100.
     MilliCores,
-    /// Whole bytes: `"1Gi"` → 1_073_741_824.
+    /// Whole bytes: `"1Gi"` → `1_073_741_824`.
     Bytes,
 }
 
@@ -510,7 +510,7 @@ impl Resources {
     #[must_use]
     pub fn cpu_weight(&self) -> Option<u64> {
         let milli = self.cpu_request_milli.value()?;
-        let shares = ((milli as i128) * 1024 / 1000).max(2);
+        let shares = (i128::from(milli) * 1024 / 1000).max(2);
         let weight = 1 + ((shares - 2) * 9999) / 262_142;
         Some(weight.clamp(1, 10_000) as u64)
     }
@@ -661,7 +661,7 @@ pub struct ContainerSpec {
     /// cluster-DNS brick). Each alias is a Service-name form — `<svc>`,
     /// `<svc>.<ns>`, `<svc>.<ns>.svc.<cluster_domain>` — fed to podman's
     /// aardvark-dns so a pod on the shared user-defined network resolves
-    /// Service names to backend pod IPs (headless multi-A, no ClusterIP).
+    /// Service names to backend pod IPs (headless multi-A, no `ClusterIP`).
     ///
     /// Empty = the Pod matched no Service (or the backend is on the
     /// ambient network, where aliases are meaningless). Carried on
@@ -675,10 +675,10 @@ pub struct ContainerSpec {
     /// is a `podman run` flag that cannot be added to a running container
     /// without recreate. A Service created AFTER a pod starts does NOT
     /// retroactively alias that pod until it is recreated. The
-    /// EndpointsController (reconciled) keeps Service→Endpoints current
+    /// `EndpointsController` (reconciled) keeps Service→Endpoints current
     /// for any consumer reading Endpoints; this alias path is the
     /// convenience DNS layer. The M0.4 `engenho-dns` authority (hickory +
-    /// KubernetesAuthority owning ClusterIP A-records + SRV) removes the
+    /// `KubernetesAuthority` owning `ClusterIP` A-records + SRV) removes the
     /// limitation entirely — named here so this interim is a conscious
     /// shortest-correct step toward that destination, not the easy path.
     pub network_aliases: Vec<String>,
@@ -1164,7 +1164,7 @@ pub trait ContainerRuntime: Send + Sync {
     }
 
     /// Start a container matching `spec`. Returns the new
-    /// container's status (post-start; pod_ip may take a moment
+    /// container's status (post-start; `pod_ip` may take a moment
     /// to materialize, callers should poll via `status` if None).
     ///
     /// # Errors
@@ -1287,11 +1287,11 @@ pub struct FakeBackend {
 struct FakeState {
     next_id: u64,
     containers: BTreeMap<String, ContainerStatus>,
-    /// Last seen spec per container_id, kept for assertions.
+    /// Last seen spec per `container_id`, kept for assertions.
     specs: BTreeMap<String, ContainerSpec>,
     /// Operations log so tests can assert backend invocations.
     pub events: Vec<FakeEvent>,
-    /// Per-container stdout buffer keyed by container_id. Seeded at `start`
+    /// Per-container stdout buffer keyed by `container_id`. Seeded at `start`
     /// from the spec name (deterministic) so [`ContainerRuntime::logs`]
     /// returns a known string a test can assert exactly; overridable per
     /// container name via [`FakeBackend::seed_log`].
@@ -1569,7 +1569,7 @@ impl FakeBackend {
             .insert(container_name.to_string(), content.into());
     }
 
-    /// The current log buffer for a container_id (test inspection helper).
+    /// The current log buffer for a `container_id` (test inspection helper).
     pub async fn log_of(&self, container_id: &str) -> Option<String> {
         self.inner.lock().await.logs.get(container_id).cloned()
     }
@@ -1849,7 +1849,7 @@ impl ContainerRuntime for FakeBackend {
 /// operator points a workload at a different API server.
 ///
 /// NOT SUFFICIENT ON ITS OWN. `Config::incluster()` also needs the
-/// projected ServiceAccount token and CA at
+/// projected `ServiceAccount` token and CA at
 /// `/var/run/secrets/kubernetes.io/serviceaccount/`, which is the
 /// separate SA-token brick. This closes the half that is cheap and
 /// leaves the half that is not.
@@ -2095,7 +2095,7 @@ impl PodmanNetwork {
 ///     `NetworkSettings.Networks.<net>.IPAddress` (ranged over all
 ///     networks), NOT the empty legacy top-level `NetworkSettings.IPAddress`
 ///     field, so the kubelet records a real `status.podIP` → the
-///     EndpointsController populates Service Endpoints with real IPs.
+///     `EndpointsController` populates Service Endpoints with real IPs.
 ///   * **Prompt IP surfacing** — after a successful `run`, `start`
 ///     re-inspects so it can return `pod_ip: Some(..)` immediately,
 ///     closing the one-tick empty-Endpoints window.
@@ -2330,7 +2330,7 @@ impl PodmanBackend {
                 // v2 weight is what the kernel finally stores, so convert back
                 // rather than re-deriving shares from milli a second time and
                 // risking the two paths disagreeing.
-                let shares = 2 + ((weight as i128 - 1) * 262_142) / 9999;
+                let shares = 2 + ((i128::from(weight) - 1) * 262_142) / 9999;
                 argv.push("--cpu-shares".to_string());
                 argv.push(shares.to_string());
             }
@@ -4730,7 +4730,7 @@ mod name_conflict_tests {
     fn unrelated_failures_do_not_trigger_a_reclaim() {
         for msg in [
             "Error: short-name resolution enforced but cannot prompt without a TTY",
-            r#"Error: unable to copy from source docker://ghcr.io/x:1: manifest unknown"#,
+            r"Error: unable to copy from source docker://ghcr.io/x:1: manifest unknown",
             "Error: OCI runtime error: crun: cannot set memory limit",
         ] {
             assert!(!is_name_conflict(msg), "must NOT reclaim on: {msg}");

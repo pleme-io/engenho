@@ -5,7 +5,7 @@
 //! below, and the banner on `docs/FABRIC.md`, which is the draft
 //! this crate types. The design there was a third-site extraction
 //! of the messaging pattern that lives twice (engenho-revoada's
-//! InProcessRouter + engenho-store's InProcessRouter); both still
+//! `InProcessRouter` + engenho-store's `InProcessRouter`); both still
 //! run, and the in-process router is what carries Raft traffic.
 //!
 //! ## Surface
@@ -36,8 +36,8 @@
 //! ## Phase
 //!
 //! F1 — typed surface + client connection (this crate).
-//! F2-F5 — real impls (RaftTransport, WatchPub/Sub, ContentStore,
-//! AttestationPub) ratchet on top.
+//! F2-F5 — real impls (`RaftTransport`, WatchPub/Sub, `ContentStore`,
+//! `AttestationPub`) ratchet on top.
 
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]

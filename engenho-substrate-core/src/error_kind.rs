@@ -2,7 +2,7 @@
 //!
 //! Closes the 25+-site duplication of `fn kind(&self) -> &'static
 //! str` across every typed error in the substrate. Per the PRIME
-//! DIRECTIVE — "any pattern that appears ≥2 times → macro_rules!
+//! DIRECTIVE — "any pattern that appears ≥2 times → `macro_rules`!
 //! or proc-macro". This module operationalizes that for error
 //! kinds.
 //!
@@ -67,7 +67,7 @@
 ///
 /// Implemented automatically by [`impl_error_kind!`].
 pub trait ErrorKind {
-    /// Stable identifier — snake_case, stable across substrate
+    /// Stable identifier — `snake_case`, stable across substrate
     /// releases. Operators use this for log filtering + metric
     /// dimensions + SDK-side error dispatch.
     fn kind(&self) -> &'static str;

@@ -1,12 +1,12 @@
-//! R17 — NetworkPolicy enforcement.
+//! R17 — `NetworkPolicy` enforcement.
 //!
 //! Typed pluggable backend for installing L3/L4 firewall rules
-//! that implement K8s NetworkPolicy semantics. Backends:
-//!   * [`FakeNetworkPolicyEnforcer`] (tests; tracks rules in BTreeMap)
+//! that implement K8s `NetworkPolicy` semantics. Backends:
+//!   * [`FakeNetworkPolicyEnforcer`] (tests; tracks rules in `BTreeMap`)
 //!   * [`ComputedNetworkPolicyEnforcer`] (computes and records the rules,
 //!     and says it installs nothing: for a host with no packet filter to
 //!     install into)
-//!   * [`CiliumNetworkPolicyAdapter`] (renders CiliumNetworkPolicy CRD YAML
+//!   * [`CiliumNetworkPolicyAdapter`] (renders `CiliumNetworkPolicy` CRD YAML
 //!     into a directory, for a cilium-operator to pick up)
 //!
 //! No backend installs kernel rules itself; an iptables backend is not
@@ -20,11 +20,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-/// One NetworkPolicy rule — a flat representation of the K8s
-/// NetworkPolicy spec.
+/// One `NetworkPolicy` rule — a flat representation of the K8s
+/// `NetworkPolicy` spec.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkPolicyRule {
-    /// `namespace/name` of the source NetworkPolicy object.
+    /// `namespace/name` of the source `NetworkPolicy` object.
     pub policy_id: String,
     /// Pod selector (matchLabels) — pods this rule applies to.
     pub pod_selector: BTreeMap<String, String>,
@@ -82,13 +82,13 @@ pub struct PortSpec {
     pub protocol: String,
 }
 
-/// NetworkPolicy backend errors.
+/// `NetworkPolicy` backend errors.
 #[derive(Debug, Clone, Error)]
 pub enum NetworkPolicyError {
     /// Backend (Cilium, iptables, ebpf) returned an error.
     #[error("backend: {0}")]
     Backend(String),
-    /// Invalid policy (e.g. empty policy_id).
+    /// Invalid policy (e.g. empty `policy_id`).
     #[error("invalid policy: {0}")]
     InvalidPolicy(String),
 }
@@ -104,7 +104,7 @@ engenho_substrate::impl_error_kind! {
 /// computes it.
 ///
 /// ★ THE SAME SPLIT `DatapathInstall` MAKES FOR kube-proxy, AND FOR THE
-/// SAME REASON. A NetworkPolicy that is parsed, selected and tracked but
+/// SAME REASON. A `NetworkPolicy` that is parsed, selected and tracked but
 /// never installed in a kernel allows every packet it claims to deny. That
 /// is not a partial implementation, it is the opposite of the stated
 /// semantics — and it is the one failure shape where silence is a security
@@ -162,7 +162,7 @@ pub trait NetworkPolicyEnforcer: Send + Sync {
 // FakeNetworkPolicyEnforcer — deterministic backend for tests
 // =================================================================
 
-/// In-memory backend. Tracks rules in a BTreeMap + records events.
+/// In-memory backend. Tracks rules in a `BTreeMap` + records events.
 #[derive(Default, Clone)]
 pub struct FakeNetworkPolicyEnforcer {
     inner: Arc<Mutex<FakeNpState>>,
@@ -243,11 +243,11 @@ impl NetworkPolicyEnforcer for FakeNetworkPolicyEnforcer {
 // CiliumNetworkPolicyAdapter — renders Cilium CRD YAML
 // =================================================================
 
-/// Renders [`NetworkPolicyRule`] as CiliumNetworkPolicy CRD YAML +
+/// Renders [`NetworkPolicyRule`] as `CiliumNetworkPolicy` CRD YAML +
 /// writes to a configured directory. Cilium operator watches the
 /// directory + hot-reloads.
 ///
-/// No shell-out; pure Rust + std::fs.
+/// No shell-out; pure Rust + `std::fs`.
 #[derive(Clone)]
 pub struct CiliumNetworkPolicyAdapter {
     output_dir: std::path::PathBuf,
@@ -269,7 +269,7 @@ impl CiliumNetworkPolicyAdapter {
         }
     }
 
-    /// Render the CiliumNetworkPolicy CRD YAML for one rule. Pure.
+    /// Render the `CiliumNetworkPolicy` CRD YAML for one rule. Pure.
     ///
     /// Builds a typed [`engenho_types::egress::CiliumNetworkPolicy`]
     /// + renders it through `serde_yaml` (per the ★★ TYPED EMISSION
@@ -445,7 +445,7 @@ mod tests {
         let r = sample_rule();
         b.upsert(&r).await.unwrap();
         b.remove(&r.policy_id).await.unwrap();
-        let count = std::fs::read_dir(&dir).map(|i| i.count()).unwrap_or(0);
+        let count = std::fs::read_dir(&dir).map_or(0, std::iter::Iterator::count);
         assert_eq!(count, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }

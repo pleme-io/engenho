@@ -153,8 +153,8 @@ pub struct NamedContext {
 /// credential-less user, so an all-`None` `AuthInfo` would make every
 /// `kubectl get`/`apply` hang. The token is a complete auth method, so
 /// kubectl sends it and proceeds; engenho has no authn yet (the apiserver
-/// runs a FailOpen admission chain and serves anonymous-root) so the value is
-/// ignored. A later brick replaces the placeholder with a real ServiceAccount
+/// runs a `FailOpen` admission chain and serves anonymous-root) so the value is
+/// ignored. A later brick replaces the placeholder with a real `ServiceAccount`
 /// / client-cert credential. TLS is load-bearing throughout: kubectl verifies
 /// the server's presented cert against `ca_pem`.
 ///
@@ -166,7 +166,7 @@ pub struct NamedContext {
 ///
 /// # Errors
 ///
-/// [`KubeError::Encode`] if serde_yaml can't serialize the value (does not
+/// [`KubeError::Encode`] if `serde_yaml` can't serialize the value (does not
 /// happen for the fixed shape built here, but the typed surface keeps the
 /// fallible contract).
 /// Placeholder bearer token emitted into the kubeconfig so real `kubectl`
@@ -246,7 +246,7 @@ const ADMIN_USER: &str = "engenho-admin";
 ///
 /// # Errors
 ///
-/// [`KubeError::Encode`] if serde_yaml can't serialize the value.
+/// [`KubeError::Encode`] if `serde_yaml` can't serialize the value.
 pub fn emit_kubeconfig_with_admin(
     cluster_name: &str,
     server_url: &str,
@@ -434,7 +434,7 @@ mod tests {
 
     #[test]
     fn parses_minimal_kubeconfig() {
-        let yaml = r#"
+        let yaml = r"
 apiVersion: v1
 kind: Config
 current-context: foo
@@ -453,7 +453,7 @@ contexts:
       cluster: c1
       user: u1
       namespace: default
-"#;
+";
         let kc = Kubeconfig::from_yaml(yaml).unwrap();
         assert_eq!(kc.current_context, "foo");
         assert_eq!(kc.clusters.len(), 1);
@@ -462,7 +462,7 @@ contexts:
 
     #[test]
     fn resolves_bearer_token() {
-        let yaml = r#"
+        let yaml = r"
 apiVersion: v1
 kind: Config
 current-context: foo
@@ -479,7 +479,7 @@ contexts:
     context:
       cluster: c1
       user: u1
-"#;
+";
         let kc = Kubeconfig::from_yaml(yaml).unwrap();
         let conn = kc.resolve_connection().unwrap();
         assert_eq!(conn.server(), "https://api.example.com");
@@ -493,14 +493,14 @@ contexts:
 
     #[test]
     fn missing_current_context_errors() {
-        let yaml = r#"
+        let yaml = r"
 apiVersion: v1
 kind: Config
 current-context: nonexistent
 clusters: []
 users: []
 contexts: []
-"#;
+";
         let kc = Kubeconfig::from_yaml(yaml).unwrap();
         let r = kc.resolve_connection();
         assert!(matches!(r, Err(KubeError::Auth(_))));

@@ -1,16 +1,16 @@
 //! M0.6 — namespaced reconcile-chain regression suite.
 //!
 //! The end-to-end regression for the namespace-propagation bug (commit
-//! 7e09b84): the DeploymentController created child ReplicaSets, and the
-//! ReplicaSetController created Pods, in the controller's SCOPE namespace
+//! 7e09b84): the `DeploymentController` created child `ReplicaSets`, and the
+//! `ReplicaSetController` created Pods, in the controller's SCOPE namespace
 //! ("default") instead of the PARENT object's namespace. A Deployment in
 //! ns `team-x` produced RS+Pods in `default` (wrong ns + a
 //! recreate-every-tick hot loop because the owned-children query, scoped
 //! to `team-x` by owner-ref, never saw the children it created).
 //!
-//! This suite boots the SAME in-process apiserver + StoreMesh + the
+//! This suite boots the SAME in-process apiserver + `StoreMesh` + the
 //! deployment/replicaset/scheduler/endpoints controllers `m0_1` wires
-//! (FakeBackend — no real container runtime, runs in CI), then proves the
+//! (`FakeBackend` — no real container runtime, runs in CI), then proves the
 //! chain converges in the PARENT namespace and NOTHING lands in `default`:
 //!
 //!   1. `namespaced_chain_lands_in_parent_namespace` — POST a Namespace

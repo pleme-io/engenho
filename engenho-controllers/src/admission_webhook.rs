@@ -6,7 +6,7 @@
 //! the mesh's sidecar injector (`lareira-enxerto`) is a
 //! `MutatingWebhookConfiguration` that intercepts Pod creation and injects the
 //! `aresta` proxy sidecar + a SPIRE-agent init container as a base64
-//! RFC6902 JSONPatch. This module dispatches that call-out and applies the
+//! RFC6902 `JSONPatch`. This module dispatches that call-out and applies the
 //! returned patch to the object BEFORE it is persisted — and the kubelet's
 //! init-container driver (commit a7810a6) then runs the injected init
 //! container. The loop closes.
@@ -26,7 +26,7 @@
 //!
 //! The wire `AdmissionReview` request/response objects are built + read as
 //! typed `serde_json::Value` trees (NO `format!()` of JSON — ★★ TYPED
-//! EMISSION). The returned base64 JSONPatch is decoded + applied through
+//! EMISSION). The returned base64 `JSONPatch` is decoded + applied through
 //! [`engenho_store::patch_apply`]'s RFC6902 engine — the SAME engine the
 //! apiserver's `kubectl patch --type=json` path uses (solve-once: no second
 //! patch implementation).
@@ -35,10 +35,10 @@
 //!
 //!   * `clientConfig.url` is supported. `clientConfig.service` is ALSO
 //!     supported now: the plugin resolves `{namespace, name, port, path}`
-//!     to the Service's allocated ClusterIP via the [`ServiceResolver`]
+//!     to the Service's allocated `ClusterIP` via the [`ServiceResolver`]
 //!     seam and synthesizes `https://<clusterIP>:<port><path>`, which the
-//!     [`WebhookCaller`] then calls (this is the brick the ClusterIP
-//!     allocator unblocks). A Service that has NO ClusterIP yet (headless,
+//!     [`WebhookCaller`] then calls (this is the brick the `ClusterIP`
+//!     allocator unblocks). A Service that has NO `ClusterIP` yet (headless,
 //!     or not-yet-allocated) yields a typed
 //!     [`WebhookError::ServiceUnresolvable`] the `failurePolicy` governs —
 //!     never a silent skip.
@@ -107,7 +107,7 @@ pub struct WebhookClientConfig {
     /// `clientConfig.url` — a fully-qualified `https://…/path` endpoint.
     pub url: Option<String>,
     /// `clientConfig.service` — an in-cluster Service ref. Resolved to the
-    /// Service's allocated ClusterIP via a [`ServiceResolver`] when one is
+    /// Service's allocated `ClusterIP` via a [`ServiceResolver`] when one is
     /// wired (→ `https://<clusterIP>:<port><path>`); a Service with no VIP
     /// yields a typed [`WebhookError::ServiceUnresolvable`]. A `url`, when
     /// also set, takes precedence.
@@ -229,7 +229,7 @@ pub enum WebhookError {
     },
     /// The `clientConfig.service` ref could not be resolved to a callable
     /// `https://<clusterIP>:<port><path>` endpoint — the Service has no
-    /// allocated ClusterIP (it doesn't exist, is headless, or hasn't been
+    /// allocated `ClusterIP` (it doesn't exist, is headless, or hasn't been
     /// allocated yet). A typed deferral the `failurePolicy` governs — NOT a
     /// silent skip.
     #[error(
@@ -310,20 +310,20 @@ pub trait WebhookCaller: Send + Sync {
 }
 
 /// Resolves a `clientConfig.service` ref to the Service's allocated
-/// ClusterIP. Production reads the store (the ClusterIP allocator stamps
+/// `ClusterIP`. Production reads the store (the `ClusterIP` allocator stamps
 /// `spec.clusterIP`); tests pass a static map. The seam keeps the plugin
 /// unit-testable with ZERO store: a Service ref resolves to a VIP through
 /// a mock.
 #[async_trait]
 pub trait ServiceResolver: Send + Sync {
-    /// The allocated ClusterIP (`spec.clusterIP`) for the Service
+    /// The allocated `ClusterIP` (`spec.clusterIP`) for the Service
     /// `namespace/name`, or `None` when it has no VIP (absent, headless,
     /// or not-yet-allocated).
     async fn cluster_ip(&self, namespace: &str, name: &str) -> Option<String>;
 }
 
 /// Production [`ServiceResolver`] — reads `spec.clusterIP` off the live
-/// Service object in the store. A `"None"` (headless) ClusterIP resolves
+/// Service object in the store. A `"None"` (headless) `ClusterIP` resolves
 /// to `None` (a headless Service has no VIP to call).
 pub struct StoreServiceResolver {
     store: Arc<engenho_store::StoreMesh>,
@@ -677,14 +677,14 @@ pub type Pluralizer = Box<dyn Fn(&str, &str, &str) -> Option<String> + Send + Sy
 /// On every Put/Patch (CREATE/UPDATE) it lists the live
 /// `MutatingWebhookConfiguration`s, finds the webhooks whose `rules` match the
 /// request, builds an `AdmissionReview`, calls each in config+webhook order,
-/// and applies each returned JSONPatch to the object — feeding the mutated
+/// and applies each returned `JSONPatch` to the object — feeding the mutated
 /// object forward to the next webhook. A `Deny` (`allowed: false`) short
 /// circuits with [`AdmissionDecision::Deny`]. Errors are governed per-webhook
 /// by `failurePolicy` (`Fail` ⇒ deny; `Ignore` ⇒ skip that webhook).
 pub struct MutatingWebhookPlugin {
     source: Arc<dyn WebhookConfigSource>,
     caller: Arc<dyn WebhookCaller>,
-    /// Resolves a `clientConfig.service` ref to the Service's ClusterIP.
+    /// Resolves a `clientConfig.service` ref to the Service's `ClusterIP`.
     /// `None` ⇒ no resolver wired: a service ref yields a typed
     /// [`WebhookError::ServiceUnresolvable`] (preserving the typed-deferral
     /// for plugins constructed without store access).
@@ -700,7 +700,7 @@ impl MutatingWebhookPlugin {
     /// `(group, version, kind) -> plural`. No [`ServiceResolver`] — a
     /// `clientConfig.service` ref is a typed
     /// [`WebhookError::ServiceUnresolvable`]. Use [`Self::with_resolver`] to
-    /// enable service-ref resolution against the allocated ClusterIPs.
+    /// enable service-ref resolution against the allocated `ClusterIPs`.
     #[must_use]
     pub fn new(
         source: Arc<dyn WebhookConfigSource>,
@@ -892,7 +892,7 @@ impl MutatingWebhookPlugin {
     /// Resolve a `clientConfig.service` ref to a callable
     /// `https://<clusterIP>:<port><path>` endpoint. Requires a wired
     /// [`ServiceResolver`]; without one (or when the Service has no
-    /// allocated ClusterIP) returns a typed
+    /// allocated `ClusterIP`) returns a typed
     /// [`WebhookError::ServiceUnresolvable`] the `failurePolicy` governs.
     async fn resolve_service_endpoint(
         &self,
@@ -1061,7 +1061,7 @@ impl WebhookConfigSource for StaticConfigSource {
 }
 
 /// A [`WebhookCaller`] that returns a canned `AdmissionReview` keyed by
-/// endpoint, and records every call. Lets a test inject a JSONPatch (or a
+/// endpoint, and records every call. Lets a test inject a `JSONPatch` (or a
 /// deny, or a backend error) WITHOUT a real webhook server.
 #[derive(Clone, Default)]
 pub struct MockWebhookCaller {
@@ -1248,9 +1248,9 @@ mod tests {
         }
     }
 
-    /// A config whose webhook injects a sidecar container via a JSONPatch and
+    /// A config whose webhook injects a sidecar container via a `JSONPatch` and
     /// matches Pod CREATE.
-    /// A ValidatingWebhookConfiguration over the same rule shape.
+    /// A `ValidatingWebhookConfiguration` over the same rule shape.
     ///
     /// Same webhook body as the mutating one on purpose: the tests below
     /// must show that the DIFFERENCE in behaviour comes from WHICH LIST the

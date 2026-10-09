@@ -1,7 +1,7 @@
-//! PlantioPipeline — builder that assembles the full production
+//! `PlantioPipeline` — builder that assembles the full production
 //! roça stack from a typed config.
 //!
-//! The composition story today requires 8+ Arc::new calls to wire
+//! The composition story today requires 8+ `Arc::new` calls to wire
 //! the full pipeline. This builder collapses that to one call:
 //!
 //! ```no_run
@@ -19,12 +19,12 @@
 //! ## What the builder does
 //!
 //! - Picks the right `Roceiro` (Fake or BuildBackend-composed)
-//! - Picks the right `MaterializationLedger` (Memory or StoreBacked,
+//! - Picks the right `MaterializationLedger` (Memory or `StoreBacked`,
 //!   optionally wrapped with Broadcast + Gossip)
-//! - Picks the right `NodeResolver` (Static or StoreBacked)
+//! - Picks the right `NodeResolver` (Static or `StoreBacked`)
 //! - Assembles a `PlantioController` ready to tick
 //!
-//! ## The PipelineConfig
+//! ## The `PipelineConfig`
 //!
 //! Single typed value the operator constructs. The materializer is
 //! always named: `RoceiroChoice` has no default, so a pipeline that
@@ -62,9 +62,9 @@ use crate::store_resolver::StoreBackedNodeResolver;
 pub enum RoceiroChoice {
     /// Deterministic fake — for tests + bootstrap.
     Fake,
-    /// Production — composed from BuildBackend + Cache + Verifier.
+    /// Production — composed from `BuildBackend` + Cache + Verifier.
     /// Operator supplies all three; the builder wires them through
-    /// BuildBackendRoceiro.
+    /// `BuildBackendRoceiro`.
     BuildBackend {
         /// Build backend (single or Tiered).
         build: Arc<dyn BuildBackend>,
@@ -78,8 +78,10 @@ pub enum RoceiroChoice {
 }
 
 /// Which ledger backend + wrappers to apply.
+#[derive(Default)]
 pub enum LedgerChoice {
     /// Memory-only — tests + single-node bootstrap.
+    #[default]
     Memory,
     /// Store-backed — receipts commit via Raft for cross-process
     /// durability.
@@ -88,29 +90,23 @@ pub enum LedgerChoice {
     Custom(Arc<dyn MaterializationLedger>),
 }
 
-impl Default for LedgerChoice {
-    fn default() -> Self {
-        Self::Memory
-    }
-}
-
 /// Wrappers applied to whichever ledger is chosen.
 #[derive(Default, Clone)]
 pub struct LedgerWrappers {
-    /// Wrap with BroadcastLedger so subscribers receive typed events.
+    /// Wrap with `BroadcastLedger` so subscribers receive typed events.
     pub broadcast: bool,
-    /// Wrap with GossipLedger via the given GossipBroadcaster.
+    /// Wrap with `GossipLedger` via the given `GossipBroadcaster`.
     /// Ignored when None.
     pub gossip: Option<Arc<dyn GossipBroadcaster>>,
 }
 
-/// Which NodeResolver to wire.
+/// Which `NodeResolver` to wire.
 pub enum NodeResolverChoice {
     /// Static list — tests + bootstrap.
     Static(Vec<NodeId>),
-    /// StoreBacked cluster-wide (no namespace).
+    /// `StoreBacked` cluster-wide (no namespace).
     StoreBackedClusterWide,
-    /// StoreBacked scoped to a namespace.
+    /// `StoreBacked` scoped to a namespace.
     StoreBackedNamespace(String),
     /// Operator-supplied custom resolver.
     Custom(Arc<dyn NodeResolver>),
@@ -124,7 +120,7 @@ impl Default for NodeResolverChoice {
 
 /// Typed pipeline config — one value, three choices.
 pub struct PipelineConfig {
-    /// Store the pipeline reads PlantioCRs from.
+    /// Store the pipeline reads `PlantioCRs` from.
     pub store: Arc<StoreMesh>,
     /// Which materializer.
     pub roceiro: RoceiroChoice,
@@ -163,9 +159,9 @@ pub struct PlantioPipeline {
     pub ledger: Arc<dyn MaterializationLedger>,
     /// The wired Roceiro.
     pub roceiro: Arc<dyn Roceiro>,
-    /// The wired NodeResolver.
+    /// The wired `NodeResolver`.
     pub resolver: Arc<dyn NodeResolver>,
-    /// If the ledger was wrapped in BroadcastLedger, this is the
+    /// If the ledger was wrapped in `BroadcastLedger`, this is the
     /// underlying broadcaster (subscribe for events). None when
     /// `broadcast` wasn't set.
     pub broadcast_ledger: Option<Arc<BroadcastLedger>>,
@@ -173,6 +169,7 @@ pub struct PlantioPipeline {
 
 impl PlantioPipeline {
     /// Build the pipeline from typed config.
+    #[must_use]
     pub fn build(config: PipelineConfig) -> Self {
         // Every field, and every wrapper flag, is bound by name with no
         // `..`: a field added to either struct does not compile here

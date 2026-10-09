@@ -1,12 +1,12 @@
-//! TieredBuildBackend — composes N `BuildBackend`s; tries each in
+//! `TieredBuildBackend` — composes N `BuildBackend`s; tries each in
 //! order, first success wins. Analog to `TieredCache` but for the
 //! build path.
 //!
 //! ## Use-cases
 //!
-//!   * Try a fast local builder first (FakeBuildBackend for tests,
-//!     SuiBuildBackend on-node for production), fall back to a
-//!     remote queue (NatsBuildBackend) for unsupported systems
+//!   * Try a fast local builder first (`FakeBuildBackend` for tests,
+//!     `SuiBuildBackend` on-node for production), fall back to a
+//!     remote queue (`NatsBuildBackend`) for unsupported systems
 //!     or oversized workloads.
 //!   * Try multiple cache mirrors (each backed by a different
 //!     content tier) — first hit wins, others not queried.

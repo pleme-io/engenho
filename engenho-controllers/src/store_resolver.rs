@@ -1,9 +1,9 @@
-//! StoreBackedNodeResolver — `NodeResolver` impl that reads
+//! `StoreBackedNodeResolver` — `NodeResolver` impl that reads
 //! cluster nodes from engenho-store.
 //!
 //! Resolves abstract `JobTarget`s (AnyOne/AnyK/AllNodes) into
 //! concrete `NodeId`s by listing `Node` resources from a configured
-//! namespace. Each Node resource's name carries a hex NodeId.
+//! namespace. Each Node resource's name carries a hex `NodeId`.
 //!
 //! ## Wire shape
 //!
@@ -12,7 +12,7 @@
 //!   group: ""
 //!   version: v1
 //!   kind: Node
-//!   name: {64-char hex NodeId}
+//!   name: {64-char hex `NodeId`}
 //!   namespace: configurable (default: engenho-system) — or
 //!     None for cluster-scoped lookups
 //!
@@ -56,7 +56,7 @@ impl StoreBackedNodeResolver {
         }
     }
 
-    /// Parse a NodeId from a Node resource's name (64-char lowercase hex).
+    /// Parse a `NodeId` from a Node resource's name (64-char lowercase hex).
     /// Returns None for any other format — those resources are skipped.
     #[must_use]
     pub fn parse_node_name(name: &str) -> Option<NodeId> {
@@ -70,7 +70,7 @@ impl StoreBackedNodeResolver {
         Some(NodeId::new(bytes))
     }
 
-    /// Load every available NodeId from the store. Pure helper —
+    /// Load every available `NodeId` from the store. Pure helper —
     /// exposed for tests that want to inspect the resolver's view.
     pub async fn load_all(&self) -> Result<Vec<NodeId>, ControllerError> {
         let resources = self

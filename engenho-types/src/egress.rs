@@ -1,5 +1,5 @@
 //! Typed egress AST — every wire/config artifact engenho's controllers
-//! + kubelet emit is built as a typed value and rendered through a
+//! and kubelet emit is built as a typed value and rendered through a
 //! single typed serializer, never `format!()`-of-syntax.
 //!
 //! Per the org-level ★★ TYPED EMISSION rule: `std::format!()` of YAML /
@@ -18,7 +18,7 @@
 //!    `Vec<String>` from typed fields — never a `format!()` command
 //!    string that a shell would have to re-tokenize.
 //!
-//! Output is byte-equivalent (modulo serde_yaml's canonical list
+//! Output is byte-equivalent (modulo `serde_yaml`'s canonical list
 //! indentation, which parses identically) to the hand-rolled
 //! `format!()` renderers these types replace; round-trip / snapshot
 //! tests pin the shape.
@@ -44,8 +44,8 @@ pub enum CiliumDirection {
 /// A `cilium.io/v2` `CiliumNetworkPolicy` resource.
 ///
 /// Mirrors the minimal allow-all-in-direction shape the engenho
-/// NetworkPolicy controller emits: an `endpointSelector.matchLabels`
-/// + a single `{}` entry under the chosen direction key. Rendered via
+/// `NetworkPolicy` controller emits: an `endpointSelector.matchLabels`
+/// and a single `{}` entry under the chosen direction key. Rendered via
 /// [`CiliumNetworkPolicy::to_yaml`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CiliumNetworkPolicy {
@@ -126,7 +126,7 @@ impl CiliumNetworkPolicy {
     /// # Panics
     ///
     /// Never — the fixed struct shape always serializes; `expect` only
-    /// guards an unreachable serde_yaml failure.
+    /// guards an unreachable `serde_yaml` failure.
     #[must_use]
     pub fn to_yaml(&self) -> String {
         serde_yaml::to_string(self).expect("CiliumNetworkPolicy serializes")
@@ -214,13 +214,8 @@ impl TraefikIngressRoute {
         port: u16,
         tls_secret: Option<String>,
     ) -> Self {
-        let (entry_point, tls) = match &tls_secret {
-            Some(secret) => (
-                "websecure".to_string(),
-                Some(TraefikTls {
-                    secret_name: secret.clone(),
-                }),
-            ),
+        let (entry_point, tls) = match tls_secret {
+            Some(secret_name) => ("websecure".to_string(), Some(TraefikTls { secret_name })),
             None => ("web".to_string(), None),
         };
         Self {

@@ -473,7 +473,7 @@ fn hex_decode(s: &str) -> Vec<u8> {
         b'a'..=b'f' => c - b'a' + 10,
         _ => panic!("non-hex in test fixture"),
     };
-    for pair in b.chunks_exact(2) {
+    for pair in b.as_chunks::<2>().0 {
         out.push((nib(pair[0]) << 4) | nib(pair[1]));
     }
     out

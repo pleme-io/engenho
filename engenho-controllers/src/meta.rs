@@ -1,6 +1,6 @@
 //! `ObjectMeta` accessor extension trait.
 //!
-//! Every workload controller (ReplicaSet / Deployment / StatefulSet /
+//! Every workload controller (`ReplicaSet` / Deployment / `StatefulSet` /
 //! Endpoints / Job / GC) reads the same handful of fields off the
 //! opaque `serde_json::Value` it lists from the store:
 //!

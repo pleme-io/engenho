@@ -74,7 +74,7 @@ pub fn selector_is_supported(selector: &Value) -> bool {
     selector
         .get("matchExpressions")
         .and_then(Value::as_array)
-        .is_none_or(|e| e.is_empty())
+        .is_none_or(std::vec::Vec::is_empty)
 }
 
 /// One required affinity or anti-affinity term.

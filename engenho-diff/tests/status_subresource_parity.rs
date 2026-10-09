@@ -1,13 +1,13 @@
 //! `/status` subresource parity.
 //!
-//! Two axes, against a Pod (declares a `/status` subresource) and a ConfigMap
+//! Two axes, against a Pod (declares a `/status` subresource) and a `ConfigMap`
 //! (declares NONE — the negative case that matters):
 //!
-//!   1. **Routing.** `/status` GET+PUT on a ConfigMap MUST 404 on both sides
+//!   1. **Routing.** `/status` GET+PUT on a `ConfigMap` MUST 404 on both sides
 //!      (no status subresource); `/status` GET on a Pod MUST 200 on both.
 //!   2. **The spec/status write-split.** A `/status` PUT MUST NOT change
 //!      `spec` (spec edits on the status endpoint are dropped) — proven
-//!      FIELD-FOCUSED on `spec.containers[0].image`, immune to PodSpec
+//!      FIELD-FOCUSED on `spec.containers[0].image`, immune to `PodSpec`
 //!      defaulting.
 //!
 //! ── The other half of the write-split (a MAIN-object PUT drops status) ──
@@ -36,7 +36,7 @@ use serde_json::json;
 ///     returns 422 `Forbidden: pod updates may not change fields other than
 ///     spec.containers[*].image,…`. This is engenho's MISSING Pod-spec
 ///     IMMUTABILITY admission validation (a client can mutate an immutable
-///     PodSpec field), NOT a status-subresource bug — the status-drop half of
+///     `PodSpec` field), NOT a status-subresource bug — the status-drop half of
 ///     the write-split is separately enforced + unit-tested (see the module
 ///     doc). Gated on the engenho-apiserver admission/validation milestone
 ///     (per-kind immutable-field enforcement).

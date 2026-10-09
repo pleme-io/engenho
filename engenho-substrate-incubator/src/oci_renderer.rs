@@ -1,4 +1,4 @@
-//! OciImageRenderer — `ShapeRenderer` impl that wraps a typed
+//! `OciImageRenderer` — `ShapeRenderer` impl that wraps a typed
 //! `CommandRunner` to invoke `skopeo` for OCI image materialization.
 //!
 //! ## Wire shape
@@ -22,7 +22,7 @@
 //!
 //! When the operator provides no destination-bytes accessor, the
 //! renderer falls back to a synthetic artifact whose bytes are
-//! BLAKE3(drv_hash + skopeo_invocation_bytes). Tests don't need
+//! `BLAKE3(drv_hash` + `skopeo_invocation_bytes`). Tests don't need
 //! real OCI bytes to verify the dispatch path.
 
 use std::path::PathBuf;
@@ -55,7 +55,7 @@ engenho_substrate::async_closure_type! {
     pub type OciDestReader = sync (&Drv) -> Option<Vec<u8>>;
 }
 
-/// Renderer parameterized by a CommandRunner + the three ref/reader
+/// Renderer parameterized by a `CommandRunner` + the three ref/reader
 /// closures.
 pub struct OciImageRenderer {
     name: &'static str,
@@ -120,7 +120,7 @@ impl OciImageRenderer {
         self
     }
 
-    /// Pure helper: compose the typed CommandRequest for a Drv.
+    /// Pure helper: compose the typed `CommandRequest` for a Drv.
     /// Exposed so tests can assert what would be invoked without
     /// driving the full async path.
     #[must_use]

@@ -48,7 +48,7 @@ fn admin_token(data_dir: &std::path::Path) -> String {
         .to_string()
 }
 
-/// Create a ConfigMap through the apiserver, as any client would.
+/// Create a `ConfigMap` through the apiserver, as any client would.
 async fn create_configmap(rt: &Runtime, data_dir: &std::path::Path, name: &str) {
     let resp = reqwest::Client::new()
         .post(format!(
@@ -72,7 +72,7 @@ async fn create_configmap(rt: &Runtime, data_dir: &std::path::Path, name: &str) 
     );
 }
 
-/// Read a ConfigMap's `data.boot` through the apiserver.
+/// Read a `ConfigMap`'s `data.boot` through the apiserver.
 async fn read_configmap(rt: &Runtime, data_dir: &std::path::Path, name: &str) -> Option<String> {
     let resp = reqwest::Client::new()
         .get(format!(

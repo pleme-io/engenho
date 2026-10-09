@@ -1,4 +1,4 @@
-//! Vendored OpenAPI v3 BLAKE3 manifest verification.
+//! Vendored `OpenAPI` v3 BLAKE3 manifest verification.
 //!
 //! Every byte the forge-gen → engenho-types
 //! pipeline consumes is BLAKE3-attested. This test reads the manifest

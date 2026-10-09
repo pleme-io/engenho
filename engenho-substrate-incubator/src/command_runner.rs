@@ -1,4 +1,4 @@
-//! CommandRunner — typed shell-out boundary.
+//! `CommandRunner` — typed shell-out boundary.
 //!
 //! Per the org's NO SHELL rule, every "shell out to a CLI"
 //! integration must go through ONE typed boundary. Renderers that
@@ -91,7 +91,7 @@ impl CommandResponse {
     }
 }
 
-/// CommandRunner errors.
+/// `CommandRunner` errors.
 #[derive(Debug, Clone, Error)]
 pub enum CommandError {
     /// Process couldn't be spawned (binary not found / permission denied).
@@ -224,7 +224,10 @@ mod tests {
     use super::*;
 
     fn req(program: &str, args: &[&str]) -> CommandRequest {
-        CommandRequest::new(program, args.iter().map(|s| s.to_string()).collect())
+        CommandRequest::new(
+            program,
+            args.iter().map(std::string::ToString::to_string).collect(),
+        )
     }
 
     #[tokio::test]

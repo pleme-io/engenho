@@ -457,9 +457,7 @@ impl pb::node_server::Node for LocalPathDriver {
         // A runtime retrying after a timeout must not get an error for
         // work that already happened.
         if target.exists() {
-            let already = std::fs::read_link(&target)
-                .map(|dest| dest == record.data_path)
-                .unwrap_or(false);
+            let already = std::fs::read_link(&target).is_ok_and(|dest| dest == record.data_path);
             if already {
                 return Ok(Response::new(pb::NodePublishVolumeResponse {}));
             }

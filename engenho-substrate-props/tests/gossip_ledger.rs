@@ -86,7 +86,7 @@ proptest_with_env! {
                 ledger.ingest(&StageId::new("s"), NonZeroUsize::MIN, &r).await.unwrap();
             }
             let mut count = 0;
-            while let Ok(_) = rx.try_recv() {
+            while rx.try_recv().is_ok() {
                 count += 1;
             }
             assert_eq!(count, subjects.len());

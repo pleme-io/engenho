@@ -170,7 +170,7 @@ async fn driver_coalesces_burst_events_into_one_tick() {
     for i in 0..5 {
         store
             .propose(ResourceCommand::Put {
-                key: ResourceKey::namespaced("", "v1", "Pod", "default", &format!("p{i}")),
+                key: ResourceKey::namespaced("", "v1", "Pod", "default", format!("p{i}")),
                 value: json!({"spec": {}}),
                 expected: None,
                 reason: Reason::Operator,

@@ -27,8 +27,8 @@
 //!
 //! - **Within a cluster:** Face is one renderer over the typed
 //!   fabric vocabulary. Five face impls cover the renderer axis.
-//! - **Across clusters:** FederatedFabric is one router over N
-//!   clusters. RoutingPolicy variants cover the routing axis.
+//! - **Across clusters:** `FederatedFabric` is one router over N
+//!   clusters. `RoutingPolicy` variants cover the routing axis.
 //!
 //! The same engenho-types vocabulary speaks at both levels —
 //! operators write the same `apply`/`get`/`list`/`delete`/`watch`
@@ -70,7 +70,7 @@ pub enum RoutingPolicy {
     /// for testing + single-active multi-standby deployments.
     First,
 
-    /// Map resource namespace → member index. The HashMap key is
+    /// Map resource namespace → member index. The `HashMap` key is
     /// the namespace string; missing entries fall through to
     /// `default_member`. This is the "federation by namespace"
     /// pattern (each cluster owns its namespaces).
@@ -192,7 +192,7 @@ impl FederatedFabric {
             return Err(FederationError::BadDefaultIndex(*idx, members.len()));
         }
         if let RoutingPolicy::NamespacePrefix { map, .. } = &routing {
-            for (_ns, idx) in map.iter() {
+            for idx in map.values() {
                 if *idx >= members.len() {
                     return Err(FederationError::BadDefaultIndex(*idx, members.len()));
                 }

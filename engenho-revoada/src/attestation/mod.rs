@@ -138,6 +138,7 @@ pub struct AttestationChain {
 }
 
 impl AttestationChain {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -156,8 +157,7 @@ impl AttestationChain {
         let mut guard = self.inner.lock().unwrap();
         let prev_hash = guard
             .last()
-            .map(RoleAttestationBlock::blake3_hash)
-            .unwrap_or([0; 32]);
+            .map_or([0; 32], RoleAttestationBlock::blake3_hash);
         let mut block = RoleAttestationBlock {
             prev_hash,
             assignment,
@@ -181,10 +181,12 @@ impl AttestationChain {
         self.inner.lock().unwrap().push(block);
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.inner.lock().unwrap().len()
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.inner.lock().unwrap().is_empty()
     }
@@ -199,6 +201,7 @@ impl AttestationChain {
 
     /// Snapshot of the chain — clones the blocks for read-only
     /// export.
+    #[must_use]
     pub fn snapshot(&self) -> Vec<RoleAttestationBlock> {
         self.inner.lock().unwrap().clone()
     }
@@ -502,7 +505,7 @@ mod tests {
             let id = NodeIdentity::from_seed([seed; 32]);
             let chain = AttestationChain::new();
             for i in 0..3 {
-                chain.append(&id, promote_cmd(i as u8), 100 + i, 1, i as u64 + 1);
+                chain.append(&id, promote_cmd(i as u8), 100 + i, 1, i + 1);
             }
             let mut blocks = chain.snapshot();
             // Tamper with one block's chosen field.

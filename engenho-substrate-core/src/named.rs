@@ -53,7 +53,7 @@
 ///
 /// Implemented automatically by [`define_named!`].
 pub trait Named {
-    /// Stable identifier — snake_case (or kebab-case for things
+    /// Stable identifier — `snake_case` (or kebab-case for things
     /// the operator may type), stable across substrate releases.
     /// Used for log filtering + metric dimensions + SDK dispatch.
     fn name(&self) -> &'static str;

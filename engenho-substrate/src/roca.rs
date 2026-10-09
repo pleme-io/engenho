@@ -144,8 +144,10 @@ impl Placement {
 /// How the DAG decides a stage is confirmed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ConfirmacaoPolicy {
     /// Local-only — this node's own receipt suffices.
+    #[default]
     Local,
     /// K receipts gossiped via chitchat must reach this node.
     Quorum {
@@ -158,12 +160,6 @@ pub enum ConfirmacaoPolicy {
     All,
     /// Strong consistency — Raft commit required.
     RaftCommitted,
-}
-
-impl Default for ConfirmacaoPolicy {
-    fn default() -> Self {
-        Self::Local
-    }
 }
 
 /// One stage of the materialization DAG.
@@ -204,7 +200,7 @@ impl Stage {
 /// Validation errors for a Plantio.
 #[derive(Debug, Clone, Error)]
 pub enum PlantioError {
-    /// A `depends_on` reference points at an unknown StageId.
+    /// A `depends_on` reference points at an unknown `StageId`.
     #[error("unknown dependency: stage {stage} depends on {dependency}")]
     UnknownDependency {
         /// Stage that has the dangling reference.
@@ -236,7 +232,7 @@ crate::impl_fingerprint!(Plantio);
 /// Typed materialization DAG. Pure value — no runtime state.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Plantio {
-    /// Stages keyed by ID. BTreeMap preserves deterministic ordering.
+    /// Stages keyed by ID. `BTreeMap` preserves deterministic ordering.
     pub stages: BTreeMap<StageId, Stage>,
 }
 
@@ -274,7 +270,7 @@ impl Plantio {
 
     /// BLAKE3 fingerprint over canonical JSON. Operators commit
     /// this to attest a particular Plantio was deployed.
-    /// Same Plantio (down to stage insertion order via BTreeMap)
+    /// Same Plantio (down to stage insertion order via `BTreeMap`)
     /// always produces the same fingerprint.
     ///
     /// Generated via [`crate::Fingerprint`].
@@ -284,8 +280,8 @@ impl Plantio {
     }
 
     /// Observable snapshot — name + stage count. Pattern #2 SSC v0.96:
-    /// `Plantio` joins TieredCache + CompositeShapeRenderer +
-    /// ChainedVerifier as a 4th `ChildCountSnapshot` consumer.
+    /// `Plantio` joins `TieredCache` + `CompositeShapeRenderer` +
+    /// `ChainedVerifier` as a 4th `ChildCountSnapshot` consumer.
     /// Dashboards can show "this Plantio has N stages."
     #[must_use]
     pub fn snapshot(&self) -> crate::mirante::ChildCountSnapshot {
@@ -295,7 +291,7 @@ impl Plantio {
         }
     }
 
-    /// Validate topology: every depends_on resolves + the DAG is
+    /// Validate topology: every `depends_on` resolves + the DAG is
     /// acyclic. Empty Plantio is trivially valid.
     ///
     /// # Errors
@@ -318,7 +314,7 @@ impl Plantio {
     }
 
     /// Topological sort. Returns stages in dependency order;
-    /// each stage appears AFTER everything it depends_on.
+    /// each stage appears AFTER everything it `depends_on`.
     ///
     /// # Errors
     /// [`PlantioError::Cycle`] if the DAG is cyclic;
@@ -359,12 +355,12 @@ impl Plantio {
             sorted.push(next.clone());
             // Decrement in-degree of stages that depend on `next`.
             for stage in self.stages.values() {
-                if stage.depends_on.contains(&next) {
-                    if let Some(d) = in_degree.get_mut(&stage.id) {
-                        *d = d.saturating_sub(1);
-                        if *d == 0 {
-                            queue.push_back(stage.id.clone());
-                        }
+                if stage.depends_on.contains(&next)
+                    && let Some(d) = in_degree.get_mut(&stage.id)
+                {
+                    *d = d.saturating_sub(1);
+                    if *d == 0 {
+                        queue.push_back(stage.id.clone());
                     }
                 }
             }
@@ -382,7 +378,7 @@ impl Plantio {
 
     /// "Compile" the Plantio into a flat list of materialization
     /// jobs ready for a downstream scheduler. Each job is a
-    /// (stage_id, target_node) pair; placement fan-out happens
+    /// (`stage_id`, `target_node`) pair; placement fan-out happens
     /// here — `AllNodes` requires the caller to supply the live
     /// cluster size.
     ///

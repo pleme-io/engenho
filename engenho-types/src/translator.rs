@@ -49,7 +49,7 @@ pub struct WorkloadIntent {
     pub image: String,
     /// Number of replicas.
     pub replicas: u32,
-    /// Environment variables in deterministic order (BTreeMap).
+    /// Environment variables in deterministic order (`BTreeMap`).
     pub env: BTreeMap<String, String>,
     /// Resource requests (CPU + memory). Coupled because Nomad's
     /// Resources struct requires both fields, so we must either
@@ -63,7 +63,7 @@ pub struct WorkloadIntent {
 }
 
 /// Coupled CPU + memory request. Either both are present or both
-/// are absent (across the WorkloadIntent's `resources` Option).
+/// are absent (across the `WorkloadIntent`'s `resources` Option).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceIntent {
     /// CPU in millicores (matches K8s convention; 1 core = 1000m).
@@ -72,7 +72,7 @@ pub struct ResourceIntent {
     pub memory_mib: u32,
 }
 
-/// Port intent — matches both K8s containerPort + Nomad dynamic_ports.
+/// Port intent — matches both K8s containerPort + Nomad `dynamic_ports`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortIntent {
     /// Port label (e.g. "http", "metrics").
@@ -153,7 +153,11 @@ impl WorkloadTranslator for K8sDeploymentTranslator {
         let spec = manifest
             .get("spec")
             .ok_or_else(|| TranslateError::MissingField("spec".into()))?;
-        let replicas = spec.get("replicas").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+        let replicas = spec
+            .get("replicas")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(1);
         let containers = spec
             .get("template")
             .and_then(|t| t.get("spec"))
@@ -209,8 +213,10 @@ impl WorkloadTranslator for K8sDeploymentTranslator {
                             .and_then(|n| n.as_str())
                             .unwrap_or("default")
                             .to_string();
-                        let container_port =
-                            p.get("containerPort").and_then(|p| p.as_u64())? as u16;
+                        let container_port = u16::try_from(
+                            p.get("containerPort").and_then(serde_json::Value::as_u64)?,
+                        )
+                        .ok()?;
                         Some(PortIntent {
                             label,
                             container_port,
@@ -329,7 +335,11 @@ impl WorkloadTranslator for NomadJobTranslator {
             .and_then(|tg| tg.as_array())
             .and_then(|arr| arr.first())
             .ok_or_else(|| TranslateError::MissingField("Job.TaskGroups[0]".into()))?;
-        let replicas = group.get("Count").and_then(|c| c.as_u64()).unwrap_or(1) as u32;
+        let replicas = group
+            .get("Count")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(1);
         let task = group
             .get("Tasks")
             .and_then(|t| t.as_array())
@@ -354,12 +364,12 @@ impl WorkloadTranslator for NomadJobTranslator {
         let resources = match (
             res_block
                 .and_then(|r| r.get("CPU"))
-                .and_then(|c| c.as_u64())
-                .map(|n| n as u32),
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok()),
             res_block
                 .and_then(|r| r.get("MemoryMB"))
-                .and_then(|m| m.as_u64())
-                .map(|n| n as u32),
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok()),
         ) {
             (Some(cpu_millicores), Some(memory_mib)) => Some(ResourceIntent {
                 cpu_millicores,
@@ -377,7 +387,8 @@ impl WorkloadTranslator for NomadJobTranslator {
                 arr.iter()
                     .filter_map(|port| {
                         let label = port.get("Label").and_then(|l| l.as_str())?.to_string();
-                        let to = port.get("To").and_then(|t| t.as_u64())? as u16;
+                        let to = u16::try_from(port.get("To").and_then(serde_json::Value::as_u64)?)
+                            .ok()?;
                         Some(PortIntent {
                             label,
                             container_port: to,
@@ -486,6 +497,7 @@ impl WorkloadTranslator for NomadJobTranslator {
 // Helpers
 // =================================================================
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn parse_k8s_cpu(s: &str) -> Option<u32> {
     if let Some(stripped) = s.strip_suffix('m') {
         stripped.parse().ok()
@@ -502,7 +514,9 @@ fn parse_k8s_memory_mib(s: &str) -> Option<u32> {
     } else if let Some(stripped) = s.strip_suffix("Ki") {
         stripped.parse::<u32>().ok().map(|n| n / 1024)
     } else {
-        s.parse::<u64>().ok().map(|b| (b / (1024 * 1024)) as u32)
+        s.parse::<u64>()
+            .ok()
+            .and_then(|b| u32::try_from(b / (1024 * 1024)).ok())
     }
 }
 

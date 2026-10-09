@@ -155,15 +155,15 @@ fn status_divergence(op: &Operation, eng: u16, k3s: u16) -> Vec<Divergence> {
     let eng_ok = (200..300).contains(&eng);
     let k3s_ok = (200..300).contains(&k3s);
     // A verb probe whose two sides disagree on success ⇒ a refused verb.
-    if let Some((gvr, verb)) = &op.verb_probe {
-        if eng_ok != k3s_ok {
-            let present_on = if k3s_ok { Side::K3s } else { Side::Engenho };
-            return vec![Divergence::MissingVerb {
-                gvr: gvr.clone(),
-                verb: *verb,
-                present_on,
-            }];
-        }
+    if let Some((gvr, verb)) = &op.verb_probe
+        && eng_ok != k3s_ok
+    {
+        let present_on = if k3s_ok { Side::K3s } else { Side::Engenho };
+        return vec![Divergence::MissingVerb {
+            gvr: gvr.clone(),
+            verb: *verb,
+            present_on,
+        }];
     }
     // A 404-vs-success (no verb probe) ⇒ a missing resource.
     if eng == 404 && k3s_ok {
@@ -195,6 +195,7 @@ fn status_divergence(op: &Operation, eng: u16, k3s: u16) -> Vec<Divergence> {
 /// `state` documents with exactly these semantics and must not grow a second
 /// recursive JSON differ that can disagree with this one about what counts as
 /// a difference.
+#[must_use]
 pub fn diff_object(eng: &Value, k3s: &Value, sev: Severity) -> Vec<Divergence> {
     let mut out = Vec::new();
     walk(JsonPath::root(), eng, k3s, sev, &mut out);

@@ -2,7 +2,7 @@
 //!
 //! HTTP/HTTPS routing from public hostnames to in-cluster services.
 //! Pluggable [`IngressBackend`] trait — [`FakeIngressBackend`] for
-//! tests, [`TraefikIngressBackend`] renders Traefik IngressRoute CRDs,
+//! tests, [`TraefikIngressBackend`] renders Traefik `IngressRoute` CRDs,
 //! [`NginxIngressBackend`] renders nginx server-block files. Whether the
 //! daemon runs this controller, and why not, is recorded once, in
 //! engenho-runtime's dormant-controller catalog (`Dormant::Ingress`).
@@ -51,19 +51,15 @@ pub struct IngressRoute {
 /// K8s Ingress pathType enum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
+#[derive(Default)]
 pub enum PathType {
     /// Match the path exactly.
     Exact,
     /// Match the path as a prefix (default).
+    #[default]
     Prefix,
     /// Implementation-specific.
     ImplementationSpecific,
-}
-
-impl Default for PathType {
-    fn default() -> Self {
-        Self::Prefix
-    }
 }
 
 /// Ingress backend errors.
@@ -97,7 +93,7 @@ pub trait IngressBackend: Send + Sync {
     /// [`IngressError::InvalidRoute`] for malformed input.
     async fn upsert(&self, route: &IngressRoute) -> Result<(), IngressError>;
 
-    /// Remove a route by (ingress_id, host, path) triple — the
+    /// Remove a route by (`ingress_id`, host, path) triple — the
     /// unique key. The backend identifies the route by this key.
     ///
     /// # Errors
@@ -115,8 +111,8 @@ pub trait IngressBackend: Send + Sync {
 // FakeIngressBackend — deterministic in-memory backend
 // =================================================================
 
-/// In-memory backend. Tracks routes in a BTreeMap keyed by
-/// (ingress_id, host, path). Records every call for test assertion.
+/// In-memory backend. Tracks routes in a `BTreeMap` keyed by
+/// (`ingress_id`, host, path). Records every call for test assertion.
 #[derive(Default, Clone)]
 pub struct FakeIngressBackend {
     inner: Arc<Mutex<FakeIngressState>>,
@@ -200,13 +196,13 @@ impl IngressBackend for FakeIngressBackend {
 // TraefikIngressBackend — renders typed IngressRoute CRD YAML
 // =================================================================
 
-/// Renders the [`IngressRoute`] catalog as Traefik IngressRoute
+/// Renders the [`IngressRoute`] catalog as Traefik `IngressRoute`
 /// CRD YAML documents + writes them to a configured directory
 /// (Traefik's file-provider watches the directory + hot-reloads).
 ///
 /// No shell-out — Traefik consumes the YAML directly via its
 /// file provider. The renderer is pure; the I/O boundary is
-/// std::fs::write through engenho-substrate's atomic_write.
+/// `std::fs::write` through engenho-substrate's `atomic_write`.
 #[derive(Clone)]
 pub struct TraefikIngressBackend {
     /// Directory Traefik watches (e.g. `/etc/traefik/dynamic/`).
@@ -229,7 +225,7 @@ impl TraefikIngressBackend {
         }
     }
 
-    /// Render the Traefik IngressRoute CRD YAML for one route.
+    /// Render the Traefik `IngressRoute` CRD YAML for one route.
     /// Pure — no I/O. Test helper.
     ///
     /// The Traefik match expression is domain logic (path-type →
@@ -335,7 +331,7 @@ impl IngressBackend for TraefikIngressBackend {
 /// reloads via `nginx -s reload` (out-of-band — operator
 /// configures inotify or systemd path-watch to trigger).
 ///
-/// No shell-out — pure Rust + std::fs.
+/// No shell-out — pure Rust + `std::fs`.
 #[derive(Clone)]
 pub struct NginxIngressBackend {
     output_dir: std::path::PathBuf,
@@ -550,7 +546,7 @@ impl IngressController {
                 let service_port = backend
                     .get("port")
                     .and_then(|p| p.get("number"))
-                    .and_then(|n| n.as_u64())
+                    .and_then(serde_json::Value::as_u64)
                     .unwrap_or(80) as u16;
                 let tls = tls_secrets.get(&host).cloned();
                 routes.push(IngressRoute {
@@ -751,7 +747,7 @@ mod tests {
             .filter_map(|e| e.ok().map(|e| e.path()))
             .collect();
         assert_eq!(files.len(), 1);
-        assert!(files[0].extension().unwrap() == "conf");
+        assert_eq!(files[0].extension().unwrap(), "conf");
         let content = std::fs::read_to_string(&files[0]).unwrap();
         assert!(content.contains("server {"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -819,7 +815,7 @@ mod tests {
         let r = sample_route();
         b.upsert(&r).await.unwrap();
         b.remove(&r.ingress_id, &r.host, &r.path).await.unwrap();
-        let count = std::fs::read_dir(&dir).map(|i| i.count()).unwrap_or(0);
+        let count = std::fs::read_dir(&dir).map_or(0, std::iter::Iterator::count);
         assert_eq!(count, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }

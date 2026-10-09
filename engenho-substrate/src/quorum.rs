@@ -1,4 +1,4 @@
-//! QuorumTracker — the one quorum fold.
+//! `QuorumTracker` — the one quorum fold.
 //!
 //! Every place engenho asks "have enough distinct voters agreed?"
 //! answers through [`Tally::verdict`]. There is no second copy of the

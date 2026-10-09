@@ -4,7 +4,7 @@
 //! This module composes that into whole `struct`s: it emits a kind (or a
 //! referenced sub-struct) as typed Rust fields, then recursively emits every
 //! `$ref`'d sub-struct it pulls in — the transitive closure — from a merged
-//! OpenAPI schema map. apimachinery types engenho-types hand-provides
+//! `OpenAPI` schema map. apimachinery types engenho-types hand-provides
 //! (`ObjectMeta`, …) are REFERENCED, never re-emitted. Anything the mapper
 //! can't model bottoms out at `serde_json::Value`, so output always compiles.
 //!
@@ -13,19 +13,20 @@
 //! so the generated tree + `--check` are untouched here.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 
 use crate::types::{RustType, map_schema, type_name_from_ref};
 
 /// apimachinery / engenho-types-provided types: referenced by generated
 /// code, never emitted (they are hand-authored in engenho-types). Keyed by
-/// the BARE Rust name (last dotted segment of the OpenAPI key).
+/// the BARE Rust name (last dotted segment of the `OpenAPI` key).
 const PROVIDED: &[&str] = &["ObjectMeta", "ListMeta", "TypeMeta"];
 
 /// Field-type overrides for prose-only enums: upstream types these as a plain
 /// `string` but the value set is closed (described only in prose, no `enum`
 /// array). The generator can't derive the enum, so it REFERENCES a curated
 /// hand-authored enum from `engenho_types::curated_enums`. Tuple:
-/// (owning OpenAPI schema key, wire field name, Rust type to emit verbatim).
+/// (owning `OpenAPI` schema key, wire field name, Rust type to emit verbatim).
 /// The override suppresses `$ref` collection for that field.
 const FIELD_OVERRIDES: &[(&str, &str, &str)] = &[
     (
@@ -42,7 +43,7 @@ const FIELD_OVERRIDES: &[(&str, &str, &str)] = &[
 
 /// Kubernetes types that marshal as a SCALAR, not as an object.
 ///
-/// Their OpenAPI schemas carry no `properties` — the wire form is defined by
+/// Their `OpenAPI` schemas carry no `properties` — the wire form is defined by
 /// hand-written Go `MarshalJSON`/`UnmarshalJSON`, which the schema cannot
 /// express. A generic emitter therefore produces `pub struct Quantity {}`,
 /// which is syntactically fine and **rejects every real value**:
@@ -133,7 +134,7 @@ fn field_override(owner_key: &str, wire_field: &str) -> Option<&'static str> {
 }
 
 /// Field-name shapes a TOP-LEVEL KIND handles structurally rather than as
-/// data fields: `apiVersion`/`kind` are TypeMeta (carried separately by the
+/// data fields: `apiVersion`/`kind` are `TypeMeta` (carried separately by the
 /// wire envelope, not stored), and `metadata` is the provided `ObjectMeta`.
 ///
 /// ★ ONLY TRUE FOR A TOP-LEVEL KIND. On a nested struct these are ordinary
@@ -150,7 +151,7 @@ fn is_envelope_field(name: &str) -> bool {
     matches!(name, "apiVersion" | "kind")
 }
 
-/// Emit fields for a TOP-LEVEL KIND (TypeMeta stripped).
+/// Emit fields for a TOP-LEVEL KIND (`TypeMeta` stripped).
 ///
 /// Kept as the name every existing kind-emitter call site already uses, so
 /// the policy is opt-in at the two places that actually needed it rather
@@ -175,7 +176,7 @@ pub fn emit_fields(
 /// nested struct).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnvelopePolicy {
-    /// Top-level kind: strip TypeMeta, it is carried by the wire envelope.
+    /// Top-level kind: strip `TypeMeta`, it is carried by the wire envelope.
     StripTypeMeta,
     /// Nested struct: `apiVersion`/`kind` are ordinary data fields.
     KeepAllFields,
@@ -196,7 +197,7 @@ const RAW_KEYWORDS: &[&str] = &[
 const NON_RAW_KEYWORDS: &[&str] = &["self", "Self", "super", "crate"];
 
 /// Map a wire field name to (Rust identifier, Some(wire-name) if a serde
-/// `rename` is needed). Handles camelCase→snake_case AND Rust-keyword
+/// `rename` is needed). Handles `camelCase→snake_case` AND Rust-keyword
 /// collisions (raw `r#kw` where legal, `kw_` otherwise) — the generated
 /// struct always parses, the wire name is always preserved.
 #[must_use]
@@ -213,7 +214,7 @@ pub fn field_ident(wire: &str) -> (String, Option<String>) {
     }
 }
 
-/// camelCase → snake_case for Rust field names (serde `rename` preserves the
+/// camelCase → `snake_case` for Rust field names (serde `rename` preserves the
 /// wire name). `automountServiceAccountToken` → `automount_service_account_token`.
 #[must_use]
 pub fn snake_case(camel: &str) -> String {
@@ -258,7 +259,7 @@ pub fn snake_case(camel: &str) -> String {
     out
 }
 
-/// First paragraph of an OpenAPI description, line-trimmed into `///` rustdoc
+/// First paragraph of an `OpenAPI` description, line-trimmed into `///` rustdoc
 /// (no 4-space indent that rustdoc would treat as a code block).
 fn rustdoc(desc: &str, indent: &str) -> String {
     if desc.is_empty() {
@@ -279,7 +280,7 @@ fn rustdoc(desc: &str, indent: &str) -> String {
         .join("\n")
 }
 
-/// Emit the field lines of a struct body from an OpenAPI schema's
+/// Emit the field lines of a struct body from an `OpenAPI` schema's
 /// `properties` + `required`, collecting referenced schema KEYS into `refs`.
 /// `metadata` → the provided `ObjectMeta`; `apiVersion`/`kind` are skipped.
 #[must_use]
@@ -309,10 +310,11 @@ pub fn emit_fields_with(
                 .map(|w| format!(", rename = \"{w}\""))
                 .unwrap_or_default();
             out.push_str(&doc);
-            out.push_str(&format!(
-                "    #[serde(default{rename}, skip_serializing_if = \"Option::is_none\")]\n"
-            ));
-            out.push_str(&format!("    pub {field}: {ovr},\n"));
+            let _ = writeln!(
+                out,
+                "    #[serde(default{rename}, skip_serializing_if = \"Option::is_none\")]"
+            );
+            let _ = writeln!(out, "    pub {field}: {ovr},");
             continue;
         }
 
@@ -345,8 +347,8 @@ pub fn emit_fields_with(
             ),
         };
         out.push_str(&doc);
-        out.push_str(&format!("    #[serde(default{rename}{skip})]\n"));
-        out.push_str(&format!("    pub {field}: {decl_ty},\n"));
+        let _ = writeln!(out, "    #[serde(default{rename}{skip})]");
+        let _ = writeln!(out, "    pub {field}: {decl_ty},");
     }
     out
 }
@@ -425,7 +427,7 @@ pub fn transitive_structs(
 }
 
 /// Collect the global, deduplicated sub-struct closure across every catalog
-/// kind (`kind_keys` = their OpenAPI keys), excluding the kinds themselves
+/// kind (`kind_keys` = their `OpenAPI` keys), excluding the kinds themselves
 /// (`kind_names`). Shared sub-structs (`PodSpec`, `LabelSelector`,
 /// `PodTemplateSpec`, …) are emitted ONCE into a shared module rather than
 /// duplicated per kind — so a single canonical type is referenced everywhere
@@ -451,13 +453,16 @@ pub fn shared_substructs(
         .collect()
 }
 
-/// A view of an OpenAPI schema body — the subset the emitter needs. Mirrors
+/// A view of an `OpenAPI` schema body — the subset the emitter needs. Mirrors
 /// `openapi::KindShape` but lives here so the engine is unit-testable without
 /// the full parser.
 #[derive(Debug, Clone, Default)]
 pub struct SchemaView {
+    /// The schema's `description`.
     pub description: String,
+    /// The schema's `properties`, keyed by wire name.
     pub properties: BTreeMap<String, serde_json::Value>,
+    /// The schema's `required` property names.
     pub required: Vec<String>,
 }
 
@@ -554,7 +559,7 @@ mod scalar_override_tests {
         assert!(body.contains("#[serde(transparent)]"));
     }
 
-    /// IntOrString must accept BOTH forms — `targetPort: 8080` and
+    /// `IntOrString` must accept BOTH forms — `targetPort: 8080` and
     /// `targetPort: http` are each legal in the same field.
     #[test]
     fn int_or_string_is_an_untagged_enum_over_both_forms() {
@@ -564,7 +569,7 @@ mod scalar_override_tests {
         assert!(body.contains("Str(String)"));
     }
 
-    /// The override fires from emit_struct, and takes precedence over the
+    /// The override fires from `emit_struct`, and takes precedence over the
     /// generic property-driven path.
     #[test]
     fn emit_struct_routes_through_the_override() {
@@ -589,6 +594,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[allow(clippy::needless_pass_by_value)]
     fn view(props: serde_json::Value, required: &[&str]) -> SchemaView {
         let properties = props
             .as_object()

@@ -49,14 +49,14 @@ pub struct UserInfo {
 /// The group every authenticated principal carries (upstream convention).
 ///
 /// ★ PUBLIC because "every authenticated principal" has to mean every one, and
-/// while this was private it did not. The ServiceAccount authenticator builds
+/// while this was private it did not. The `ServiceAccount` authenticator builds
 /// its own group list in `engenho-apiserver::sa_token::groups_for` and could
 /// not reference this constant, so it enumerated the groups its author thought
 /// of and omitted this one. The result: every in-cluster client authenticated
 /// successfully and then took **403 on `/api` and `/apis`**, because the
-/// default `system:discovery` ClusterRoleBinding is keyed on this group.
+/// default `system:discovery` `ClusterRoleBinding` is keyed on this group.
 /// Admin and client-cert identities were unaffected, so `kubectl` worked and
-/// only the controllers failed — measured on rio 2026-09-15 as FluxCD's
+/// only the controllers failed — measured on rio 2026-09-15 as `FluxCD`'s
 /// source-controller and notification-controller crash-looping on
 /// `failed to get server groups`.
 ///
@@ -125,7 +125,7 @@ pub enum KubeAuth {
 
     /// Bearer-token in the `Authorization: Bearer …` header. The
     /// token may be inline (`Inline`) or loaded from a file at every
-    /// request (`File` — for ServiceAccount tokens that rotate).
+    /// request (`File` — for `ServiceAccount` tokens that rotate).
     BearerToken(TokenSource),
 
     /// Mutual TLS — client cert + private key. The apiserver's serving
@@ -163,7 +163,7 @@ pub enum TokenSource {
         token: String,
     },
     /// Path to a file containing the token. Re-read per request so
-    /// rotated ServiceAccount tokens pick up automatically (matches
+    /// rotated `ServiceAccount` tokens pick up automatically (matches
     /// upstream client-go behavior).
     File {
         /// Filesystem path holding the token (one line, no trailing newline).

@@ -94,6 +94,7 @@ pub mod server;
 /// request/response. Generated at build time by protox + prost — no
 /// `protoc` on the build host, the same route `engenho-kube-proto` takes.
 pub mod pb {
+    #![allow(clippy::pedantic, clippy::all)]
     /// `mvccpb` — `KeyValue`, `Event`.
     pub mod mvccpb {
         include!(concat!(env!("OUT_DIR"), "/mvccpb.rs"));

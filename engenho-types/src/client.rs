@@ -94,7 +94,7 @@ pub trait KubeClient: Send + Sync {
     /// # Errors
     ///
     /// Same shape as [`Self::get`]; SSA can also fail with
-    /// `Conflict` carrying a typed FieldManagerConflict body.
+    /// `Conflict` carrying a typed `FieldManagerConflict` body.
     async fn patch<R: KubeResource + Send + Sync + 'static>(
         &self,
         namespace: Option<&str>,
@@ -110,7 +110,7 @@ pub trait KubeClient: Send + Sync {
     ///
     /// [`KubeError::NotFound`] is intentionally exposed — many
     /// controllers reconcile by attempting to delete + treating
-    /// NotFound as success ("already gone").
+    /// `NotFound` as success ("already gone").
     async fn delete<R: KubeResource + Send + Sync + 'static>(
         &self,
         namespace: Option<&str>,

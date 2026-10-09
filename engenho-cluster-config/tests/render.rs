@@ -10,9 +10,8 @@ use std::net::Ipv4Addr;
 
 use engenho_cluster_config::{
     ArgocdBootstrap, BootstrapConfig, ClusterConfig, CniChoice, DnsChoice, FlannelBackend,
-    FluxcdBootstrap, GitopsSource, IngressChoice, Ipv6Config, K3sComponent, KubeProxyConfig,
-    KubeProxyMode, LoadBalancerChoice, NetworkConfig, NetworkPolicyConfig, NetworkPolicyEnforce,
-    PortRange, SecretRef,
+    FluxcdBootstrap, GitopsSource, IngressChoice, Ipv6Config, K3sComponent, KubeProxyMode,
+    LoadBalancerChoice, NetworkConfig, NetworkPolicyEnforce, PortRange, SecretRef,
 };
 
 fn base() -> ClusterConfig {
@@ -136,8 +135,8 @@ fn kubeproxy_disabled_with_cilium_accepted() {
 }
 
 /// Install-only mode: enable=true with no source is now valid —
-/// the NixOS image bakes the flux2 HelmChart (controllers + CRDs)
-/// but no GitRepository / Kustomization CR. A downstream operator
+/// the NixOS image bakes the flux2 `HelmChart` (controllers + CRDs)
+/// but no `GitRepository` / Kustomization CR. A downstream operator
 /// primitive (kikai's `gitops::bootstrap`) owns the source-CR
 /// lifecycle from the fleet registry, avoiding the rio.cattle.io
 /// vs operator patch fight over spec.url.
@@ -273,7 +272,7 @@ fn render_yaml_advertise_address() {
 #[test]
 fn render_yaml_bind_address() {
     let mut c = base();
-    c.network.bind_address = Some(Ipv4Addr::new(0, 0, 0, 0));
+    c.network.bind_address = Some(Ipv4Addr::UNSPECIFIED);
     let yaml = c.render_k3s_config_yaml();
     assert!(yaml.contains("bind-address: 0.0.0.0"));
 }

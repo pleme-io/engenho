@@ -158,6 +158,7 @@ impl RaftStore {
     /// Construct with this node's identity + a fresh attestation chain.
     /// Production clock — uses `engenho_substrate::WallClock`. Tests
     /// pinning timestamps should use [`Self::with_clock`].
+    #[must_use]
     pub fn new(identity: NodeIdentity) -> Self {
         Self::volatile(identity)
     }
@@ -225,13 +226,14 @@ impl RaftStore {
         Ok(())
     }
 
-    /// Read-only snapshot of the typed MeshShape (the application
+    /// Read-only snapshot of the typed `MeshShape` (the application
     /// state). Used by the wrapper layer's `RaftMesh::current_shape`.
     pub async fn current_shape(&self) -> MeshShape {
         self.inner.lock().await.shape.clone()
     }
 
     /// Reference to this node's local attestation chain.
+    #[must_use]
     pub fn attestation_chain(&self) -> &AttestationChain {
         &self.chain
     }
@@ -377,7 +379,7 @@ impl RaftSnapshotBuilder<TypeConfig> for RaftSnapshotBuilderHandle {
     }
 }
 
-/// We need a way to clone Snapshot — since SnapshotData is
+/// We need a way to clone Snapshot — since `SnapshotData` is
 /// `Cursor<Vec<u8>>` we can deep-clone it ourselves.
 trait SnapshotClone {
     fn clone_snapshot_data_or_skip(&self) -> Snapshot<TypeConfig>;

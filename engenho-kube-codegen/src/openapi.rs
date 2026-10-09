@@ -1,4 +1,4 @@
-//! OpenAPI v3 parser — sufficient surface to extract a "kind shape"
+//! `OpenAPI` v3 parser — sufficient surface to extract a "kind shape"
 //! per [`crate::catalog::KindEntry`].
 //!
 //! Intentionally minimal — full $ref-walking lives in M0.0.4. For
@@ -11,7 +11,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
-/// Top-level OpenAPI v3 document. We only deserialize the components
+/// Top-level `OpenAPI` v3 document. We only deserialize the components
 /// section we use — the rest is left as raw JSON.
 #[derive(Debug, Deserialize)]
 pub struct OpenApiDoc {
@@ -19,7 +19,7 @@ pub struct OpenApiDoc {
     pub components: Components,
 }
 
-/// `components.schemas` from the OpenAPI doc.
+/// `components.schemas` from the `OpenAPI` doc.
 #[derive(Debug, Deserialize)]
 pub struct Components {
     /// Definition map: key is the full openapi-key
@@ -60,7 +60,7 @@ pub struct XGvk {
 }
 
 impl OpenApiDoc {
-    /// Load + parse an OpenAPI v3 JSON file.
+    /// Load + parse an `OpenAPI` v3 JSON file.
     ///
     /// # Errors
     ///
@@ -109,7 +109,7 @@ mod tests {
         assert_eq!(
             pod.gvks[0],
             XGvk {
-                group: "".into(),
+                group: String::new(),
                 version: "v1".into(),
                 kind: "Pod".into(),
             }

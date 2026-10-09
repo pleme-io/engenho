@@ -1,8 +1,8 @@
-//! Curated enums for fields the upstream OpenAPI types as a plain `string`
+//! Curated enums for fields the upstream `OpenAPI` types as a plain `string`
 //! but whose value set is closed in prose (no `enum` array in the schema).
 //!
 //! The generator (`engenho-kube-codegen`) cannot mechanically derive these —
-//! the OpenAPI gives only a description listing the values. They live here,
+//! the `OpenAPI` gives only a description listing the values. They live here,
 //! hand-authored, and the generator REFERENCES them via its field-type
 //! override table (`emit_typed::FIELD_OVERRIDES`) so a regenerate keeps the
 //! typed surface. Everything else in `generated_v1_34/` is machine-emitted;

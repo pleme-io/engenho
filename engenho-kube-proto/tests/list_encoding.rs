@@ -87,7 +87,7 @@ fn encoding_a_list_against_the_item_descriptor_does_not_preserve_items() {
             Ok(back) => back
                 .get("items")
                 .and_then(|i| i.as_array())
-                .is_none_or(|a| a.is_empty()),
+                .is_none_or(std::vec::Vec::is_empty),
         },
     };
     assert!(

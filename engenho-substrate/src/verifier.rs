@@ -13,7 +13,7 @@
 //!
 //! `VerificationReceipt` IS a `MaterializationReceipt` — the
 //! verification subject is the materialized artifact's
-//! evidence_hash; the receipt's evidence_hash is the verifier's
+//! `evidence_hash`; the receipt's `evidence_hash` is the verifier's
 //! proof (re-derived BLAKE3 / tameshi chain head / signature
 //! bytes). Verification receipts gossip + accumulate in
 //! `QuorumTracker` exactly like materialization receipts.
@@ -127,8 +127,8 @@ pub type VerifierId = String;
 pub struct VerificationReceipt {
     /// Predicate this receipt is proof of.
     pub verificacao: Verificacao,
-    /// Underlying MaterializationReceipt — kind+subject+emitter+
-    /// timestamp+evidence_hash semantics inherited.
+    /// Underlying `MaterializationReceipt` — kind+subject+emitter+
+    /// `timestamp+evidence_hash` semantics inherited.
     pub receipt: MaterializationReceipt,
     /// Verifier that produced this receipt.
     pub verifier: VerifierId,

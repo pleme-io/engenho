@@ -326,6 +326,6 @@ async fn boot_store() -> Arc<StoreMesh> {
 /// dropped — the SSR/anonymous tests don't read it back.
 async fn boot_store_handlers() -> Vec<Arc<dyn ResourceHandler>> {
     let store = boot_store().await;
-    let handlers = handlers_from_catalog(store);
-    handlers
+
+    handlers_from_catalog(store)
 }

@@ -1,4 +1,4 @@
-//! # FormatAdapter — operator formats ↔ Native CBOR envelope
+//! # `FormatAdapter` — operator formats ↔ Native CBOR envelope
 //!
 //! Operators send manifests in their preferred format: Kubernetes
 //! YAML, JSON, Nomad HCL, etc. The fabric's internal store speaks
@@ -29,7 +29,7 @@
 //!   `apiVersion`/`kind`/`metadata.name`/`metadata.namespace`.
 //! - [`K8sJsonAdapter`] — same shape, JSON instead of YAML.
 //! - [`NativePassthroughAdapter`] — no-op; expects the body to
-//!   already be a CBOR `NativeEnvelope`. Used by PureRaftFace.
+//!   already be a CBOR `NativeEnvelope`. Used by `PureRaftFace`.
 //!
 //! New format families (Nomad HCL, Terraform HCL, Cap'n Proto…)
 //! land as additional `FormatAdapter` impls. The trait stays
@@ -169,7 +169,7 @@ pub fn encode_envelope(reference: &ResourceRef, payload: &[u8]) -> Result<Vec<u8
 // ─────────────────────────────────────────────────────────────────
 
 /// Expects the body to already be a CBOR `NativeEnvelope` (the
-/// shape PureRaftFace stores). The "adapter" here is a contract
+/// shape `PureRaftFace` stores). The "adapter" here is a contract
 /// shim — the body bytes pass through unchanged on both sides.
 pub struct NativePassthroughAdapter;
 
@@ -261,15 +261,15 @@ impl FormatAdapter for K8sJsonAdapter {
 // HclAdapter — Nomad-style HCL job manifests
 // ─────────────────────────────────────────────────────────────────
 
-/// Adapter for HashiCorp HCL job manifests (Nomad's authoring
+/// Adapter for `HashiCorp` HCL job manifests (Nomad's authoring
 /// format). Parses the top-level `job "<name>" {}` block to extract
 /// the resource reference; stores the HCL body verbatim in a
 /// `NativeEnvelope`.
 ///
 /// **What this proves about the trait abstraction:** YAML + JSON
 /// are sibling formats (both serde-driven, both K8s-style). HCL is
-/// a genuinely different family (HashiCorp's, block-oriented). The
-/// fact that it fits the FormatAdapter trait with the same shape
+/// a genuinely different family (`HashiCorp`'s, block-oriented). The
+/// fact that it fits the `FormatAdapter` trait with the same shape
 /// is the structural proof that the trait abstracts over arbitrary
 /// authoring formats, not just YAML-shaped ones.
 ///
@@ -326,7 +326,7 @@ impl FormatAdapter for HclAdapter {
 /// `ResourceRef`.
 fn extract_nomad_job_ref(body: &hcl::Body) -> Result<ResourceRef, AdapterError> {
     use hcl::Structure;
-    for structure in body.iter() {
+    for structure in body {
         let Structure::Block(block) = structure else {
             continue;
         };

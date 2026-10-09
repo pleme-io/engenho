@@ -2,10 +2,10 @@
 //! <...> + Send + Sync>` alias generator.
 //!
 //! Closes the 7+-site duplication of typed async-closure aliases
-//! across the substrate (BytesAccessor, SmokeBuilder,
-//! IndependentRebuild, SignerCheck, OciSourceRef, OciDestRef,
-//! OciDestReader, …). Per the PRIME DIRECTIVE — "any pattern that
-//! appears ≥2 times → macro_rules! or proc-macro" — extracted.
+//! across the substrate (`BytesAccessor`, `SmokeBuilder`,
+//! `IndependentRebuild`, `SignerCheck`, `OciSourceRef`, `OciDestRef`,
+//! `OciDestReader`, …). Per the PRIME DIRECTIVE — "any pattern that
+//! appears ≥2 times → `macro_rules`! or proc-macro" — extracted.
 //!
 //! ## Authoring shape
 //!
@@ -104,7 +104,9 @@ mod tests {
     }
 
     fn make_arity_two() -> TestArity2 {
-        Arc::new(|name: String, n: u32| async move { Ok(name.len() as u32 == n) }.boxed())
+        Arc::new(|name: String, n: u32| {
+            async move { Ok(u32::try_from(name.len()) == Ok(n)) }.boxed()
+        })
     }
 
     fn make_arity_zero() -> TestArity0 {

@@ -150,7 +150,7 @@ impl Patch {
     ///
     /// # Errors
     ///
-    /// Returns the underlying serde_json error if serialization fails
+    /// Returns the underlying `serde_json` error if serialization fails
     /// (effectively unreachable — all our variants are owned-data).
     pub fn body_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
         match self {

@@ -1,4 +1,4 @@
-//! The CSI provisioning seam — dynamic `CreateVolume` from a StorageClass.
+//! The CSI provisioning seam — dynamic `CreateVolume` from a `StorageClass`.
 //!
 //! ★ WHY A NARROW TRAIT HERE RATHER THAN A DEPENDENCY ON `engenho-csi`.
 //! `engenho-kubelet` depends on `engenho-controllers`, so the arrow cannot
@@ -88,7 +88,7 @@ pub trait CsiProvisioner: Send + Sync {
 /// A provisioner that serves nothing.
 ///
 /// The honest default for a binder with no CSI plane wired: every CSI
-/// StorageClass stays Pending, which is exactly what happens today and
+/// `StorageClass` stays Pending, which is exactly what happens today and
 /// what an external provisioner would eventually handle.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoCsiProvisioner;

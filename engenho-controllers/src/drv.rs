@@ -1,4 +1,4 @@
-//! DrvController — reconciles `DerivationCR` objects through a
+//! `DrvController` — reconciles `DerivationCR` objects through a
 //! `DerivationCacheBackend` (typically a `TieredCache`).
 //!
 //! Each `DerivationCR` in the store names a `drv_hash` the cluster
@@ -9,7 +9,7 @@
 //!
 //! ## Reconcile rule
 //!
-//! For each DerivationCR:
+//! For each `DerivationCR`:
 //!   1. Read `spec.drvHash` (hex string).
 //!   2. Look up the drv in the cache. If absent → mark CR
 //!      `status.phase = "DrvUnknown"`, skip.
@@ -58,7 +58,7 @@ impl DrvController {
         }
     }
 
-    /// Parse a DrvHash from a hex string. Pure helper.
+    /// Parse a `DrvHash` from a hex string. Pure helper.
     ///
     /// # Errors
     /// Returns None if the string isn't 64 lowercase hex characters.

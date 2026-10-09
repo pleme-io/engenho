@@ -1,11 +1,11 @@
 //! Label-selector typed helpers.
 //!
 //! K8s controllers match parents to children via label selectors:
-//!   * EndpointsController: Service.spec.selector → matching Pods
-//!   * ReplicaSetController: rs.spec.selector → matching Pods
-//!   * Deployment: d.spec.selector → matching ReplicaSets
+//!   * `EndpointsController`: Service.spec.selector → matching Pods
+//!   * `ReplicaSetController`: rs.spec.selector → matching Pods
+//!   * Deployment: d.spec.selector → matching `ReplicaSets`
 //!   * Job: job.spec.selector → matching Pods
-//!   * NetworkPolicy: np.spec.podSelector → matching Pods
+//!   * `NetworkPolicy`: np.spec.podSelector → matching Pods
 //!
 //! Six sites + counting — extract once, reuse forever.
 
@@ -33,11 +33,11 @@ pub fn matches_labels(resource: &Value, match_labels: &Value) -> bool {
         return false;
     };
     want.iter()
-        .all(|(k, v)| have.get(k).map(|h| h == v).unwrap_or(false))
+        .all(|(k, v)| have.get(k).is_some_and(|h| h == v))
 }
 
 /// Extract `spec.selector.matchLabels` from a parent (Service /
-/// ReplicaSet / Deployment / etc.). Returns `None` if missing.
+/// `ReplicaSet` / Deployment / etc.). Returns `None` if missing.
 #[must_use]
 pub fn selector_match_labels(parent: &Value) -> Option<&Value> {
     parent

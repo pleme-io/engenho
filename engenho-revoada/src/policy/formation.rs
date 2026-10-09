@@ -3,29 +3,29 @@
 //!
 //! Wraps a [`TopologyReactor`] + implements the [`Policy`] trait.
 //! Translates `topology::Transition` (Admit/Promote/Demote/Reassign/Evict)
-//! into `consensus::RoleAssignment` (Demote/Promote with NodeRole sets)
+//! into `consensus::RoleAssignment` (Demote/Promote with `NodeRole` sets)
 //! so the formation-shift logic flows through the same commit path
 //! every other policy uses.
 //!
 //! ## Translation rules
 //!
-//! | topology::Transition | consensus::RoleAssignment |
+//! | `topology::Transition` | `consensus::RoleAssignment` |
 //! |---|---|
 //! | Admit(n) | (none — gossip already discovered the node) |
-//! | Promote(n, Master) | Promote(n, {ApiServer, Etcd, Scheduler, ControllerManager}) |
+//! | Promote(n, Master) | Promote(n, {`ApiServer`, Etcd, Scheduler, `ControllerManager`}) |
 //! | Promote(n, Worker) | (none — workers are non-control-plane; no consensus op) |
 //! | Promote(n, Observer) | (none — non-voting; pending future support) |
-//! | Demote(n) | Demote(n, current_roles, Voluntary) |
+//! | Demote(n) | Demote(n, `current_roles`, Voluntary) |
 //! | Reassign(n, Master) | Promote(n, {control-plane set}) |
-//! | Reassign(n, Worker) | Demote(n, control-plane_roles, OperatorRebalance) |
-//! | Evict(n) | Demote(n, current_roles, ReplacingFailed) |
+//! | Reassign(n, Worker) | Demote(n, control-plane_roles, `OperatorRebalance`) |
+//! | Evict(n) | Demote(n, `current_roles`, `ReplacingFailed`) |
 //!
 //! ## Why both policies in one engine
 //!
 //! `FormationPolicy` and `AutoReplacementPolicy` are NOT mutually
 //! exclusive — operators run BOTH:
-//!   * FormationPolicy decides cluster-shape (how many masters at all)
-//!   * AutoReplacementPolicy fills the per-component role gaps
+//!   * `FormationPolicy` decides cluster-shape (how many masters at all)
+//!   * `AutoReplacementPolicy` fills the per-component role gaps
 //! Together they form the two-tier shape declaration the user's
 //! formation directive asks for.
 
@@ -42,7 +42,7 @@ use crate::topology::{NodeId as TopologyNodeId, Role, TopologyReactor, Transitio
 
 /// Policy that drives cluster shape via a [`TopologyReactor`].
 ///
-/// Construct with a reactor + the engine's NodeId vocabulary
+/// Construct with a reactor + the engine's `NodeId` vocabulary
 /// translator. Register on the [`crate::policy::PolicyEngine`] like
 /// any other policy.
 pub struct FormationPolicy {

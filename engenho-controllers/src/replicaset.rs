@@ -1,5 +1,5 @@
 //! `ReplicaSetController` — keeps the observed pod count matching
-//! `spec.replicas` per ReplicaSet.
+//! `spec.replicas` per `ReplicaSet`.
 //!
 //! The reconciliation rule:
 //!   * count the LIVE Pods owned by the `ReplicaSet` (controller-owned,
@@ -105,10 +105,10 @@ fn used_indices(
     };
     let prefix = format!("{rs_name}-");
     for (key, _) in owned_pods {
-        if let Some(suffix) = key.name.strip_prefix(&prefix) {
-            if let Ok(n) = suffix.parse::<usize>() {
-                used.insert(n);
-            }
+        if let Some(suffix) = key.name.strip_prefix(&prefix)
+            && let Ok(n) = suffix.parse::<usize>()
+        {
+            used.insert(n);
         }
     }
     used

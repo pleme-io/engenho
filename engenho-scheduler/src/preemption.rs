@@ -170,7 +170,7 @@ mod tests {
         p
     }
 
-    fn victim<'a>(p: &'a Value) -> Victim<'a> {
+    fn victim(p: &Value) -> Victim<'_> {
         Victim {
             pod: p,
             priority: priority_of(p),

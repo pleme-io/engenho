@@ -194,7 +194,7 @@ impl ContinueToken {
         if raw[0] != CONTINUE_TOKEN_VERSION {
             return Err(ContinueInvalid::of("bad_version"));
         }
-        let digest_prefix = &raw[1..1 + DIGEST_PREFIX_LEN];
+        let digest_prefix = &raw[1..=DIGEST_PREFIX_LEN];
         let json = &raw[1 + DIGEST_PREFIX_LEN..];
         let expect = blake3::hash(json);
         if expect.as_bytes()[..DIGEST_PREFIX_LEN] != *digest_prefix {
@@ -220,7 +220,7 @@ fn to_hex(bytes: &[u8]) -> String {
 /// nibble (surfaced as `ContinueInvalid::bad_hex` by the caller).
 fn from_hex(s: &str) -> Option<Vec<u8>> {
     let bytes = s.as_bytes();
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);
@@ -232,7 +232,7 @@ fn from_hex(s: &str) -> Option<Vec<u8>> {
             _ => None,
         }
     };
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         let hi = nibble(pair[0])?;
         let lo = nibble(pair[1])?;
         out.push((hi << 4) | lo);
