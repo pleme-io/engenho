@@ -179,10 +179,9 @@ pub fn tolerates(pod: &Value, taint: &Taint) -> bool {
             .get("effect")
             .and_then(Value::as_str)
             .filter(|e| !e.is_empty())
+            && TaintEffect::parse(e) != Some(taint.effect)
         {
-            if TaintEffect::parse(e) != Some(taint.effect) {
-                return false;
-            }
+            return false;
         }
         match op {
             "Exists" => key.is_empty() || key == taint.key,

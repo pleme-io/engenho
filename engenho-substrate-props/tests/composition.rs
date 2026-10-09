@@ -750,7 +750,7 @@ proptest_with_env! {
             // a 1-token consume.
             let _outcome: Result<u64, BudgetCallFault> = match injector.maybe_fault(clk) {
                 Some(_) => Err(BudgetCallFault::Upstream),
-                None => Ok(budget.try_consume(1).map_or(0, |remaining| remaining)),
+                None => Ok(budget.try_consume(1).unwrap_or(0)),
             };
         }
         // Invariant: available is always in [0, cap] no matter what

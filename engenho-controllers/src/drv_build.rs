@@ -1,8 +1,8 @@
-//! DrvBuildController — the consumer that watches `DerivationCR`
+//! `DrvBuildController` — the consumer that watches `DerivationCR`
 //! phase=Pending + drives a pluggable build backend.
 //!
 //! Pairs with [`crate::drv::DrvController`] (which sets the phase
-//! from cache state). DrvBuildController acts on the missing-output
+//! from cache state). `DrvBuildController` acts on the missing-output
 //! case: take the drv, run it through a `BuildBackend`, capture
 //! realisations + NAR blob, push back into the cache.
 //!
@@ -106,7 +106,7 @@ impl FakeBuildBackend {
         self.inner.lock().await.builds.clone()
     }
 
-    /// Make the next build call return BuildError::Backend.
+    /// Make the next build call return `BuildError::Backend`.
     pub async fn fail_next(&self, msg: impl Into<String>) {
         self.inner.lock().await.fail_with = Some(msg.into());
     }
@@ -154,7 +154,7 @@ impl BuildBackend for FakeBuildBackend {
 // DrvBuildController
 // =================================================================
 
-/// Controller that drives Pending derivations through a BuildBackend.
+/// Controller that drives Pending derivations through a `BuildBackend`.
 pub struct DrvBuildController {
     store: Arc<StoreMesh>,
     cache: Arc<dyn DerivationCacheBackend>,
@@ -241,17 +241,16 @@ impl Controller for DrvBuildController {
             };
 
             // Read the drv itself from the cache.
-            let drv = match self
+            let drv = if let Some(d) = self
                 .cache
                 .get_drv(&hash)
                 .await
                 .map_err(|e| ControllerError::Internal(e.to_string()))?
             {
-                Some(d) => d,
-                None => {
-                    debug!(drv_hash = %hash_str, "DrvBuild: drv not in cache");
-                    continue;
-                }
+                d
+            } else {
+                debug!(drv_hash = %hash_str, "DrvBuild: drv not in cache");
+                continue;
             };
 
             // Build.

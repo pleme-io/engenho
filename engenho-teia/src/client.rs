@@ -2,8 +2,8 @@
 //! subject construction + JSON payload encoding.
 //!
 //! F1 ships connect + publish + subscribe + request-reply. F2-F5
-//! layer on this with concrete primitives (RaftTransport,
-//! WatchPub/Sub, ContentStore, AttestationPub).
+//! layer on this with concrete primitives (`RaftTransport`,
+//! WatchPub/Sub, `ContentStore`, `AttestationPub`).
 
 use std::time::Duration;
 
@@ -84,7 +84,7 @@ impl TeiaClient {
         &self.scope
     }
 
-    /// Underlying NATS client for advanced use cases (JetStream,
+    /// Underlying NATS client for advanced use cases (`JetStream`,
     /// Object Store, KV) at F3-F5.
     #[must_use]
     pub fn nats(&self) -> &async_nats::Client {
@@ -95,7 +95,7 @@ impl TeiaClient {
     ///
     /// # Errors
     ///
-    /// - [`TeiaError::Encode`] if serde_json fails
+    /// - [`TeiaError::Encode`] if `serde_json` fails
     /// - [`TeiaError::PublishFailed`] if NATS publish fails
     pub async fn publish_json<T: Serialize>(
         &self,

@@ -20,7 +20,7 @@ proptest_with_env! {
     ) {
         let s = hex_encode(&bytes);
         for c in s.chars() {
-            prop_assert!(c.is_ascii_digit() || (c >= 'a' && c <= 'f'));
+            prop_assert!(c.is_ascii_digit() || ('a'..='f').contains(&c));
         }
     }
 

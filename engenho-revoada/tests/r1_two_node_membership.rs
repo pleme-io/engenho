@@ -174,10 +174,10 @@ async fn local_state_update_propagates_to_peer() {
     let observed = timeout(Duration::from_secs(5), async {
         loop {
             let view = rx_b.borrow().clone();
-            if let Some(a_view) = view.members.iter().find(|m| m.node_id == id_a) {
-                if a_view.state.roles.contains(&NodeRole::Etcd) {
-                    return a_view.state.clone();
-                }
+            if let Some(a_view) = view.members.iter().find(|m| m.node_id == id_a)
+                && a_view.state.roles.contains(&NodeRole::Etcd)
+            {
+                return a_view.state.clone();
             }
             if rx_b.changed().await.is_err() {
                 panic!("watch closed");

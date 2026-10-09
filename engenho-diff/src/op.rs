@@ -74,7 +74,7 @@ pub struct Operation {
     /// isolates a targeted invariant (e.g. "a `/status` PUT left
     /// `spec.containers[0].image` unchanged") from a kind's unrelated
     /// server-side-defaulting divergence, so a Pod field-diff need not carry
-    /// the whole (heavily-defaulted) PodSpec into the ratchet.
+    /// the whole (heavily-defaulted) `PodSpec` into the ratchet.
     pub focus: Option<JsonPath>,
 }
 
@@ -190,7 +190,7 @@ impl Operation {
         )
     }
 
-    /// POST a new ConfigMap with the given `data`.
+    /// POST a new `ConfigMap` with the given `data`.
     #[must_use]
     pub fn create_configmap(ns: &str, name: &str, data: Value) -> Self {
         Self::object(
@@ -209,7 +209,7 @@ impl Operation {
         )
     }
 
-    /// GET a ConfigMap.
+    /// GET a `ConfigMap`.
     #[must_use]
     pub fn get_configmap(ns: &str, name: &str) -> Self {
         Self::object(
@@ -219,7 +219,7 @@ impl Operation {
         )
     }
 
-    /// POST a ConfigMap carrying `labels` (the selector-test vehicle). The
+    /// POST a `ConfigMap` carrying `labels` (the selector-test vehicle). The
     /// labels drive `labelSelector` matching; the trivial `data` keeps the
     /// object valid.
     #[must_use]
@@ -244,7 +244,7 @@ impl Operation {
         )
     }
 
-    /// LIST ConfigMaps filtered to a single name via `fieldSelector`
+    /// LIST `ConfigMaps` filtered to a single name via `fieldSelector`
     /// (isolates the diff from cluster-auto-created objects like
     /// `kube-root-ca.crt`). The `=` in the selector is percent-encoded.
     #[must_use]
@@ -260,7 +260,7 @@ impl Operation {
         .with_kind(OpKind::List)
     }
 
-    /// PATCH a ConfigMap (JSON merge patch).
+    /// PATCH a `ConfigMap` (JSON merge patch).
     #[must_use]
     pub fn merge_patch_configmap(ns: &str, name: &str, patch: Value) -> Self {
         Self::object(
@@ -271,7 +271,7 @@ impl Operation {
         .with_body(patch, "application/merge-patch+json")
     }
 
-    /// PUT (replace) a ConfigMap — the sharp verb probe. engenho's router
+    /// PUT (replace) a `ConfigMap` — the sharp verb probe. engenho's router
     /// refuses PUT on the main object (400); k3s returns 200. A status
     /// mismatch here becomes `MissingVerb{Update, present_on: K3s}`.
     #[must_use]
@@ -285,7 +285,7 @@ impl Operation {
         .with_verb_probe(configmaps_gvr(), Verb::Update)
     }
 
-    /// DELETE a ConfigMap.
+    /// DELETE a `ConfigMap`.
     #[must_use]
     pub fn delete_configmap(ns: &str, name: &str) -> Self {
         Self::object(

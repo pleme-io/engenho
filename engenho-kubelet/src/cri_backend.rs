@@ -29,7 +29,6 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::sync::{Mutex, OnceCell};
@@ -382,7 +381,7 @@ impl CriBackend {
     /// ★ `IfNotPresent` IS OURS TO DECIDE, NOT THE RUNTIME'S. Unlike podman's
     /// create endpoint, CRI's `CreateContainer` takes no pull policy —
     /// `PullImage` is an unconditional registry contact on a separate service.
-    /// So "just call PullImage and let it decide" silently turns every
+    /// So "just call `PullImage` and let it decide" silently turns every
     /// `IfNotPresent` container into `Always`: no error, no manifest diff.
     async fn ensure_image(&self, spec: &ContainerSpec) -> Result<String, KubeletError> {
         use crate::backend::PullPolicy;
@@ -410,12 +409,10 @@ impl CriBackend {
                 "ErrImageNeverPull: {} is absent and imagePullPolicy is Never",
                 spec.image
             ))),
-            (PullPolicy::Never, Some(img))
-            | (PullPolicy::IfNotPresent, Some(img))
-            | (PullPolicy::Missing, Some(img)) => Ok(img.id),
-            (PullPolicy::Always, _)
-            | (PullPolicy::IfNotPresent, None)
-            | (PullPolicy::Missing, None) => {
+            (PullPolicy::Never | PullPolicy::IfNotPresent | PullPolicy::Missing, Some(img)) => {
+                Ok(img.id)
+            }
+            (PullPolicy::Always, _) | (PullPolicy::IfNotPresent | PullPolicy::Missing, None) => {
                 let resp = ic
                     .pull_image(v1::PullImageRequest {
                         image: Some(image_spec),
@@ -521,8 +518,7 @@ pub fn linux_resources(r: &crate::backend::Resources) -> Option<v1::LinuxContain
         cpu_quota: quota.unwrap_or(0),
         cpu_shares: r
             .cpu_weight()
-            .map(|w| (2 + ((i128::from(w) - 1) * 262_142) / 9999) as i64)
-            .unwrap_or(0),
+            .map_or(0, |w| (2 + ((i128::from(w) - 1) * 262_142) / 9999) as i64),
         memory_limit_in_bytes: r.memory_limit_bytes.value().unwrap_or(0),
         ..Default::default()
     })

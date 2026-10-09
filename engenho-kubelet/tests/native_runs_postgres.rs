@@ -147,11 +147,11 @@ async fn postgres_runs_natively_under_the_kubelet_from_a_nix_closure() {
                 "select version()",
             ])
             .output();
-        if let Ok(o) = out {
-            if o.status.success() {
-                answered = Some(String::from_utf8_lossy(&o.stdout).trim().to_string());
-                break;
-            }
+        if let Ok(o) = out
+            && o.status.success()
+        {
+            answered = Some(String::from_utf8_lossy(&o.stdout).trim().to_string());
+            break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }

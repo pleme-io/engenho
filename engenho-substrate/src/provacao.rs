@@ -196,8 +196,8 @@ crate::impl_named_field_generic!(Provacao, F: ErrorKind + Clone);
 
 /// Provacao impl Observable (v1.00 SSC) — exposes
 /// `ChildCountSnapshot { name, child_count: policy_count }`. Joins
-/// TieredCache + CompositeShapeRenderer + ChainedVerifier + Plantio
-/// as the 5th ChildCountSnapshot consumer. The Send + Sync + 'static
+/// `TieredCache` + `CompositeShapeRenderer` + `ChainedVerifier` + Plantio
+/// as the 5th `ChildCountSnapshot` consumer. The Send + Sync + 'static
 /// supertraits on `F` come from `Observable: Named + Send + Sync`
 /// (pattern #11 check #6, codified v0.99).
 impl<F: ErrorKind + Clone + Send + Sync + 'static> crate::mirante::Observable for Provacao<F> {

@@ -77,6 +77,10 @@ impl K3sServerConfig {
 
     /// Serialize to k3s-compatible YAML. Replaces the previous
     /// `formatdoc!` block. **Typed emission.**
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: every field serializes to YAML.
     #[must_use]
     pub fn to_yaml(&self) -> String {
         // serde_yaml emits keys without quotes when possible; the
@@ -152,7 +156,7 @@ mod tests {
     }
 
     /// Round-trip property: parsing emit produces the input
-    /// (modulo the header comment which serde_yaml strips on read).
+    /// (modulo the header comment which `serde_yaml` strips on read).
     #[test]
     fn round_trip_through_yaml() {
         let original = sample();

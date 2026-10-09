@@ -81,14 +81,14 @@ impl<T> Default for LineageGraph<T> {
     }
 }
 
-/// LineageGraph impl Named + Observable (v1.01 SSC) — exposes
+/// `LineageGraph` impl Named + Observable (v1.01 SSC) — exposes
 /// `ChildCountSnapshot { name: "lineage-graph", child_count: node count }`.
-/// Joins TieredCache + CompositeShapeRenderer + ChainedVerifier +
-/// Plantio + Provacao as the 6th ChildCountSnapshot consumer.
+/// Joins `TieredCache` + `CompositeShapeRenderer` + `ChainedVerifier` +
+/// Plantio + Provacao as the 6th `ChildCountSnapshot` consumer.
 ///
-/// Hand-rolled (not via define_named! macro) because the existing
+/// Hand-rolled (not via `define_named`! macro) because the existing
 /// `define_named!(Type<T: Bound>, "lit")` form only supports single-token
-/// bounds (`T: Send`); LineageGraph's `T: Fingerprint + Clone + ...`
+/// bounds (`T: Send`); `LineageGraph`'s `T: Fingerprint + Clone + ...`
 /// multi-bound shape doesn't fit. If a 3rd literal-name multi-bound
 /// generic appears, extract `define_named_multi!` (mirrors v0.94's
 /// `impl_named_field_generic!`).
@@ -374,6 +374,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::many_single_char_names)]
     fn ancestors_diamond_pattern() {
         // a → {b, c} → d
         let mut g = LineageGraph::new();

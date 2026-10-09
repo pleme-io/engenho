@@ -53,6 +53,7 @@ pub struct InProcessRouter {
 }
 
 impl InProcessRouter {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }

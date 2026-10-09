@@ -1,4 +1,4 @@
-//! RetryingCacheBackend — pluggable backoff wrapper around any
+//! `RetryingCacheBackend` — pluggable backoff wrapper around any
 //! `DerivationCacheBackend`. Transient `CacheError::Backend`
 //! failures are retried with typed backoff; structural errors
 //! (`HashMismatch`, `NotFound`) pass through unchanged.
@@ -8,7 +8,7 @@
 //!   * Wrap remote-tier backends (iroh / NATS Object / federation)
 //!     where network blips are recoverable.
 //!   * Add resilience to a single backend before composing it into
-//!     a TieredCache without rewriting the underlying impl.
+//!     a `TieredCache` without rewriting the underlying impl.
 //!
 //! ## When NOT to use
 //!
@@ -68,7 +68,7 @@ impl BackoffConfig {
         if attempt <= 1 {
             return Duration::ZERO;
         }
-        let exp = (attempt - 2) as i32;
+        let exp = i32::try_from(attempt - 2).unwrap_or(i32::MAX);
         let multiplied = self.initial_delay.as_secs_f64() * self.multiplier.powi(exp);
         let capped = multiplied.min(self.max_delay.as_secs_f64());
         Duration::from_secs_f64(capped)

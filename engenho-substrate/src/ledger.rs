@@ -1,6 +1,6 @@
-//! MaterializationLedger — cluster-wide receipt accumulator.
+//! `MaterializationLedger` — cluster-wide receipt accumulator.
 //!
-//! Holds one [`QuorumTracker`] per (stage_id, kind, subject) tuple
+//! Holds one [`QuorumTracker`] per (`stage_id`, kind, subject) tuple
 //! and routes incoming receipts to the right tracker. The roça
 //! runtime consults the ledger to decide whether each stage's
 //! `ConfirmacaoPolicy` is satisfied.
@@ -14,7 +14,7 @@
 //! ## Composition with prior primitives
 //!
 //! - Ingests [`MaterializationReceipt`] / [`VerificationReceipt`]
-//! - Routes to [`QuorumTracker`] keyed by (stage_id, kind, subject)
+//! - Routes to [`QuorumTracker`] keyed by (`stage_id`, kind, subject)
 //! - Returns the tracker's own [`QuorumVerdict`] per query. A backend
 //!   never folds receipts itself: the verdict is sealed, so the only way
 //!   to answer is to ask the tracker.
@@ -36,7 +36,7 @@ use crate::roca::StageId;
 pub struct LedgerKey {
     /// Stage this receipt belongs to.
     pub stage_id: StageId,
-    /// What kind of receipt (drv / nar / build_result / shape).
+    /// What kind of receipt (drv / nar / `build_result` / shape).
     pub kind: ReceiptKind,
     /// Subject hash the receipt is attesting.
     pub subject: [u8; 32],
@@ -96,7 +96,7 @@ pub trait MaterializationLedger: Send + Sync {
 // MemoryLedger — deterministic backend for tests + bootstrap
 // =================================================================
 
-/// In-memory backend. Per-key QuorumTracker; thread-safe via
+/// In-memory backend. Per-key `QuorumTracker`; thread-safe via
 /// `RwLock` so the apiserver + controllers share one instance.
 #[derive(Default, Clone)]
 pub struct MemoryLedger {
@@ -123,6 +123,11 @@ impl MemoryLedger {
     /// Count of distinct tracked slots.
     pub async fn len(&self) -> usize {
         self.inner.read().await.trackers.len()
+    }
+
+    /// Whether no slot is tracked.
+    pub async fn is_empty(&self) -> bool {
+        self.inner.read().await.trackers.is_empty()
     }
 }
 

@@ -3,14 +3,14 @@
 //! Three primitives this module:
 //!
 //!   * [`FakeShapeRenderer`] — deterministic per-shape renderer
-//!     for tests. Produces synthetic bytes tied to (shape, drv_hash).
+//!     for tests. Produces synthetic bytes tied to (shape, `drv_hash`).
 //!
 //!   * [`CompositeShapeRenderer`] — composes N renderers + dispatches
 //!     by shape match. Operator wires one composite per node;
 //!     the composite picks the right backend per Stage.shape.
 //!
-//!   * Future per-shape impls (OciImageRenderer, Qcow2Renderer,
-//!     WasmRenderer) plug into the composite without changing
+//!   * Future per-shape impls (`OciImageRenderer`, `Qcow2Renderer`,
+//!     `WasmRenderer`) plug into the composite without changing
 //!     call sites.
 
 use std::sync::Arc;
@@ -98,7 +98,7 @@ impl ShapeRenderer for FakeShapeRenderer {
 // CompositeShapeRenderer — dispatches by shape match
 // =================================================================
 
-/// Composes N ShapeRenderer impls + dispatches by shape match.
+/// Composes N `ShapeRenderer` impls + dispatches by shape match.
 ///
 /// Operator constructs once per node:
 ///
@@ -114,7 +114,7 @@ impl ShapeRenderer for FakeShapeRenderer {
 /// it finds one matching the request; first hit wins. No match
 /// returns `ShapeError::UnsupportedShape`.
 ///
-/// ## Pluggable shape() comparison
+/// ## Pluggable `shape()` comparison
 ///
 /// `WorkloadShape::eq` is structural — `OciImage` matches
 /// `OciImage`, `StaticBinary { triple }` matches only when triples
@@ -205,15 +205,15 @@ impl ShapeRenderer for CompositeShapeRenderer {
     }
 
     /// Composite's own shape is the FIRST child's shape — operators
-    /// using a composite as a drop-in ShapeRenderer typically wire
+    /// using a composite as a drop-in `ShapeRenderer` typically wire
     /// it where the shape is known statically.
     fn shape(&self) -> WorkloadShape {
-        self.renderers
-            .first()
-            .map(|r| r.shape())
-            .unwrap_or(WorkloadShape::Custom {
+        self.renderers.first().map_or(
+            WorkloadShape::Custom {
                 name: "empty-composite".into(),
-            })
+            },
+            |r| r.shape(),
+        )
     }
 
     async fn render(&self, drv: &Drv) -> Result<RenderedArtifact, ShapeError> {

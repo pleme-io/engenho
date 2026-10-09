@@ -26,7 +26,7 @@
 //!
 //! ## Composition with the substrate
 //!
-//! Any existing ShapeRenderer / ComposeStack / future QEMU runner
+//! Any existing `ShapeRenderer` / `ComposeStack` / future QEMU runner
 //! / future kind runner becomes Disposable via a thin newtype.
 //! `Transient` then makes them scope-bound + receipt-attested for
 //! free.
@@ -87,13 +87,13 @@ impl From<LedgerError> for DisposableError {
 }
 
 /// Scope-bound runtime instance. Implementers materialize + dispose
-/// + emit typed receipts; consumers ALWAYS go through Transient::scope.
+/// + emit typed receipts; consumers ALWAYS go through `Transient::scope`.
 #[async_trait]
 pub trait Disposable: Send + Sync {
     /// Telemetry name.
     fn name(&self) -> &'static str;
 
-    /// Input type the disposable materializes from (e.g. ComposeIr).
+    /// Input type the disposable materializes from (e.g. `ComposeIr`).
     type Input: Send + Sync;
 
     /// Handle type the body sees while the instance lives.
@@ -101,7 +101,7 @@ pub trait Disposable: Send + Sync {
 
     /// Stable subject hash for receipt routing — usually a
     /// fingerprint of the input (BLAKE3 of canonical bytes). The
-    /// substrate uses this as the QuorumTracker subject so K
+    /// substrate uses this as the `QuorumTracker` subject so K
     /// independent nodes can attest the same materialization.
     fn subject_for(&self, input: &Self::Input) -> [u8; 32];
 
@@ -133,7 +133,7 @@ pub struct Transient<D: Disposable> {
 
 impl<D: Disposable> Transient<D> {
     /// New Transient with `WallClock` (production). For tests under
-    /// FrozenClock use [`Self::with_clock`].
+    /// `FrozenClock` use [`Self::with_clock`].
     ///
     /// `stage_id` is what the receipts route to in the ledger
     /// (typically the test name or a stable identifier for the
@@ -179,7 +179,7 @@ impl<D: Disposable> Transient<D> {
     ///
     /// Disposal ALWAYS runs after the body — even when the body errors,
     /// even when the body's future is dropped mid-execution. (We don't
-    /// model panics here; operators using catch_unwind layer it above.)
+    /// model panics here; operators using `catch_unwind` layer it above.)
     ///
     /// ## Receipt shape
     /// - Materialize receipt: `ReceiptKind::Shape("transient:materialize:{disposable_name}")`,

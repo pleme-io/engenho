@@ -44,7 +44,7 @@ use std::str::FromStr;
 ///
 /// `Quantity` is the engenho equivalent of upstream's
 /// `resource.Quantity`. Where upstream uses an inf-prec decimal
-/// + a scale, engenho-types ships a `i128` "milli-value" — enough
+/// and a scale, engenho-types ships a `i128` "milli-value" — enough
 /// for every reasonable cluster (max ~170 exabytes of memory in
 /// a single value, ~170 trillion cores). M0.0.4 codegen can swap
 /// in inf-prec if a conformance test demands it; until then this
@@ -56,7 +56,7 @@ pub enum Quantity {
     /// and 100 all have distinct typed representations.
     Parsed {
         /// Numeric value × 1000 (so "1" → 1000, "100m" → 100,
-        /// "1Ki" → 1_024_000, "2.5" → 2500).
+        /// "1Ki" → `1_024_000`, "2.5" → 2500).
         milli: i128,
         /// Original suffix so we can round-trip back to the
         /// exact string form. Empty for integer/decimal,
@@ -130,8 +130,7 @@ impl FromStr for Quantity {
         let suffix_start = s
             .char_indices()
             .find(|(_, c)| !c.is_ascii_digit() && *c != '.' && *c != '-' && *c != '+')
-            .map(|(i, _)| i)
-            .unwrap_or(s.len());
+            .map_or(s.len(), |(i, _)| i);
         let (num_part, suffix_part) = s.split_at(suffix_start);
         if num_part.is_empty() {
             return Err(QuantityParseError::NoNumeric);
@@ -168,7 +167,7 @@ impl fmt::Display for Quantity {
                     } else if frac_part % 10 == 0 {
                         write!(f, "{}.{:02}{}", int_part, frac_part / 10, suffix_str)
                     } else {
-                        write!(f, "{}.{:03}{}", int_part, frac_part, suffix_str)
+                        write!(f, "{int_part}.{frac_part:03}{suffix_str}")
                     }
                 }
             }
@@ -245,7 +244,7 @@ impl Suffix {
 }
 
 /// Parse a decimal string into milli-units. `"2"` → 2000,
-/// `"2.5"` → 2500, `"0.001"` → 1, `"100"` → 100_000.
+/// `"2.5"` → 2500, `"0.001"` → 1, `"100"` → `100_000`.
 fn parse_decimal_to_milli(s: &str) -> Result<i128, QuantityParseError> {
     let (int_part, frac_part) = match s.split_once('.') {
         Some((i, f)) => (i, f),
@@ -301,7 +300,7 @@ impl<'de> Deserialize<'de> for Quantity {
         // Soft-fail to `Other(s)` for unrecognized inputs — keeps
         // the wire shape lossless. M0.0.4 codegen can decide
         // whether to harden this.
-        Ok(Self::from_str(&s).unwrap_or_else(|_| Self::Other(s)))
+        Ok(Self::from_str(&s).unwrap_or(Self::Other(s)))
     }
 }
 
@@ -404,9 +403,9 @@ mod tests {
         assert_eq!(parse("1k").milli_value(), parse("1000").milli_value());
     }
 
-    /// Property-based: any sane "integer + recognized suffix"
-    /// input parses + serializes back to the SAME string.
     proptest! {
+        /// Property-based: any sane "integer + recognized suffix"
+        /// input parses + serializes back to the SAME string.
         #[test]
         fn arb_int_plus_suffix_round_trips(
             int_val in 0i64..1_000_000,

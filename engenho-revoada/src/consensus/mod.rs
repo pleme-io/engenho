@@ -15,9 +15,9 @@
 //!
 //! Modules:
 //!   * `role_assignment` — the typed command set (R0)
-//!   * `type_config` — openraft TypeConfig declaration
-//!   * `store` — RaftStore (RaftLogStorage + RaftStateMachine)
-//!   * `network` — InProcessRouter / InProcessNetwork
+//!   * `type_config` — openraft `TypeConfig` declaration
+//!   * `store` — `RaftStore` (`RaftLogStorage` + `RaftStateMachine`)
+//!   * `network` — `InProcessRouter` / `InProcessNetwork`
 
 pub mod mesh;
 pub mod network;

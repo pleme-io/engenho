@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 /// `meta/v1.ObjectMeta` — the metadata every namespaced/cluster-scoped
 /// resource carries.
 ///
-/// Fields are ordered to match upstream OpenAPI's required-then-optional
+/// Fields are ordered to match upstream `OpenAPI`'s required-then-optional
 /// shape. `BTreeMap` is intentional (not `HashMap`) for byte-reproducible
 /// serialization (theory/ENGENHO.md §VI.4 — determinism in SSA merge).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

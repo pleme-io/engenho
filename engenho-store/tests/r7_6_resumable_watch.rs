@@ -248,7 +248,7 @@ async fn nonempty_replay_boundary_iteration(mesh: &Arc<StoreMesh>, backlog: u64,
     // a resume point `from` partway through so the replay is non-empty.
     let base = mesh.current_revision().await.get();
     for i in 1..=backlog {
-        put(&mesh, &format!("bk{base}_{i}"), i).await;
+        put(mesh, &format!("bk{base}_{i}"), i).await;
     }
     // Resume from the MIDPOINT of the backlog → replay covers the upper
     // half (non-empty), and `from` < current tip.

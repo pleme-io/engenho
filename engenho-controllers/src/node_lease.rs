@@ -217,6 +217,55 @@ pub fn find_ready_condition(node: &ResourceValue) -> Option<&ResourceValue> {
         .find(|c| c.get("type").and_then(|t| t.as_str()) == Some("Ready"))
 }
 
+// =================================================================
+// The one derivation of Ready from a Lease
+// =================================================================
+
+/// Project the `Ready` condition a Node's Lease implies onto that Node.
+///
+/// The one derivation of `Ready`. Its callers WRITE what it returns
+/// ([`crate::node_readiness`], from the kubelet and from
+/// [`crate::node_lifecycle`]) or judge with it in memory (the scheduler's
+/// filter). The apiserver no longer applies it to what it serves: it did
+/// until 2026-10-15, and a value that changed with the passage of time under
+/// one `resourceVersion` reached no watch and was content no revision
+/// identified (QUALIFICATION row 32). A wedged kubelet beside a live process,
+/// and a peer whose process died, are now moved to `Unknown` by the
+/// node-lifecycle controller's write.
+///
+/// `lease` is that node's Lease, `None` when it has none. Conditions the
+/// kubelet does not own are preserved; only `Ready` is replaced.
+pub fn project_ready_condition(node: &mut ResourceValue, lease: Option<&ResourceValue>, now: &str) {
+    let since_renew = lease
+        .and_then(|l| l.get("spec"))
+        .and_then(|s| s.get("renewTime"))
+        .and_then(|t| t.as_str())
+        .and_then(engenho_types::time::age_since_rfc3339);
+    let state = readiness(since_renew);
+
+    // Carry `lastTransitionTime` from whatever is stored, so the derived value
+    // still answers "how long has it been like this" when the status agrees.
+    let previous = find_ready_condition(node).cloned();
+    let condition = ready_condition(state, now, previous.as_ref());
+
+    let mut conditions: Vec<ResourceValue> = node
+        .get("status")
+        .and_then(|s| s.get("conditions"))
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|c| c.get("type").and_then(|t| t.as_str()) != Some("Ready"))
+        .collect();
+    conditions.push(condition);
+
+    if let Some(obj) = node.as_object_mut() {
+        let status = obj.entry("status").or_insert_with(|| json!({}));
+        if let Some(status_obj) = status.as_object_mut() {
+            status_obj.insert("conditions".to_string(), json!(conditions));
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,55 +459,5 @@ mod tests {
         assert_eq!(k.kind, "Lease");
         assert_eq!(k.namespace.as_deref(), Some("kube-node-lease"));
         assert_eq!(k.name, "cid");
-    }
-}
-
-// =================================================================
-// The one derivation of Ready from a Lease
-// =================================================================
-
-/// Project the `Ready` condition a Node's Lease implies onto that Node.
-///
-/// The one derivation of `Ready`. Its callers WRITE what it returns
-/// ([`crate::node_readiness`], from the kubelet and from
-/// [`crate::node_lifecycle`]) or judge with it in memory (the scheduler's
-/// filter). The apiserver no longer applies it to what it serves: it did
-/// until 2026-10-15, and a value that changed with the passage of time under
-/// one `resourceVersion` reached no watch and was content no revision
-/// identified (QUALIFICATION row 32). A wedged kubelet beside a live process,
-/// and a peer whose process died, are now moved to `Unknown` by the
-/// node-lifecycle controller's write.
-///
-/// `lease` is that node's Lease, `None` when it has none. Conditions the
-/// kubelet does not own are preserved; only `Ready` is replaced.
-pub fn project_ready_condition(node: &mut ResourceValue, lease: Option<&ResourceValue>, now: &str) {
-    let since_renew = lease
-        .and_then(|l| l.get("spec"))
-        .and_then(|s| s.get("renewTime"))
-        .and_then(|t| t.as_str())
-        .and_then(engenho_types::time::age_since_rfc3339);
-    let state = readiness(since_renew);
-
-    // Carry `lastTransitionTime` from whatever is stored, so the derived value
-    // still answers "how long has it been like this" when the status agrees.
-    let previous = find_ready_condition(node).cloned();
-    let condition = ready_condition(state, now, previous.as_ref());
-
-    let mut conditions: Vec<ResourceValue> = node
-        .get("status")
-        .and_then(|s| s.get("conditions"))
-        .and_then(|c| c.as_array())
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|c| c.get("type").and_then(|t| t.as_str()) != Some("Ready"))
-        .collect();
-    conditions.push(condition);
-
-    if let Some(obj) = node.as_object_mut() {
-        let status = obj.entry("status").or_insert_with(|| json!({}));
-        if let Some(status_obj) = status.as_object_mut() {
-            status_obj.insert("conditions".to_string(), json!(conditions));
-        }
     }
 }

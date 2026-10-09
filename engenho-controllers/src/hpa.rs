@@ -1,4 +1,4 @@
-//! R18 — HorizontalPodAutoscaler controller.
+//! R18 — `HorizontalPodAutoscaler` controller.
 //!
 //! Watches HPA objects + adjusts the target's `spec.replicas`
 //! based on observed metrics. Same trait shape as every other
@@ -418,7 +418,7 @@ impl Recommendations {
     }
 }
 
-/// Controller — scales targets based on metric vs target_value.
+/// Controller — scales targets based on metric vs `target_value`.
 pub struct HorizontalPodAutoscalerController {
     store: Arc<StoreMesh>,
     metrics: Arc<dyn MetricsProvider>,

@@ -1,8 +1,8 @@
-//! WatchedCache — wraps any `DerivationCacheBackend` + broadcasts
+//! `WatchedCache` — wraps any `DerivationCacheBackend` + broadcasts
 //! typed change events to all subscribers.
 //!
-//! Same pattern as engenho-store's WatchEvent — gives consumers an
-//! event-driven path so DrvController / DrvBuildController can
+//! Same pattern as engenho-store's `WatchEvent` — gives consumers an
+//! event-driven path so `DrvController` / `DrvBuildController` can
 //! react immediately to cache changes instead of polling.
 //!
 //! Subscribers receive [`CacheEvent`]s on a tokio broadcast channel.
@@ -71,6 +71,7 @@ impl WatchedCache {
     /// Subscribe to cache events. `capacity` parameter is the
     /// per-subscriber receive backlog — not the channel capacity
     /// (set at construction).
+    #[must_use]
     pub fn subscribe(&self, _capacity: usize) -> broadcast::Receiver<CacheEvent> {
         self.sender.subscribe()
     }

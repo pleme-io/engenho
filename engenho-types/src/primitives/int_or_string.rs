@@ -1,6 +1,6 @@
 //! Typed `IntOrString` — K8s's polyglot type for fields that
 //! accept either an integer or a string (e.g. `targetPort`,
-//! `maxSurge`/`maxUnavailable` in RollingUpdate, intstr.IntOrString).
+//! `maxSurge`/`maxUnavailable` in `RollingUpdate`, intstr.IntOrString).
 //!
 //! Wire shape is a JSON int OR a JSON string; the typed enum
 //! `IntOrString::Int(i32)` / `IntOrString::String(String)` carries

@@ -1,6 +1,6 @@
 //! # engenho-kube-codegen
 //!
-//! Reads vendored Kubernetes OpenAPI v3 JSON + emits typed Rust source
+//! Reads vendored Kubernetes `OpenAPI` v3 JSON + emits typed Rust source
 //! into `engenho-types/src/generated_v1_34/`. Per theory/ENGENHO.md
 //! §IV the load-bearing invariant: no hand-authored K8s resource
 //! types — every kind is generated bit-reproducibly from upstream.
@@ -17,15 +17,15 @@
 //!
 //! ## Future (M0.0.4)
 //!
-//! Recursive `$ref` expansion through the OpenAPI spec produces
+//! Recursive `$ref` expansion through the `OpenAPI` spec produces
 //! fully-typed `PodSpec`, `Container`, `Volume`, etc. Hand-rolled
-//! ObjectMeta also becomes generator output at that point.
+//! `ObjectMeta` also becomes generator output at that point.
 //!
 //! ## Determinism contract
 //!
 //! `kube-codegen --check` (callable from CI) must regenerate
 //! byte-identical source from the same input. Implementation:
-//!   * Sort iteration deterministic (BTreeMap, never HashMap).
+//!   * Sort iteration deterministic (`BTreeMap`, never `HashMap`).
 //!   * Emitted source has a fixed header comment.
 //!   * Field ordering: required-then-optional, then alphabetical.
 

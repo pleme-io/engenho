@@ -8,7 +8,7 @@ use engenho_fonte::{
     ComplianceController, ComplianceDrift, ComplianceSnapshot, ComplianceSpec,
     CostBudgetController, CostBudgetDrift, CostBudgetSnapshot, CostBudgetSpec,
     CustomerKpiController, CustomerKpiDrift, CustomerKpiSnapshot, CustomerKpiSpec,
-    SecurityController, SecurityDrift, SecuritySnapshot, SecuritySpec,
+    SecurityController, SecuritySnapshot, SecuritySpec,
 };
 use promessa_types::{Decision, PromessaTargetKind, Severity, TargetController, TypedAction};
 

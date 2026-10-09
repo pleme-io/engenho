@@ -11,7 +11,7 @@
 //! ## What ships
 //!
 //!   - `Instant` value (48-bit physical ms + 16-bit logical counter)
-//!     with total ordering + causally_after + serde + Fingerprint
+//!     with total ordering + `causally_after` + serde + Fingerprint
 //!   - `Clock` trait — universal time surface, supertraits `Named`
 //!   - `WallClock` — production: `SystemTime::now()` based
 //!   - `FrozenClock` — tests: returns a fixed Instant; `advance()` mutates
@@ -22,7 +22,7 @@
 //!
 //!   - `Named` supertrait → every clock has telemetry name
 //!   - `Fingerprint` over `Instant` → deterministic bytes
-//!   - `Hex` over Instant.to_bytes() for log display
+//!   - `Hex` over `Instant.to_bytes()` for log display
 //!   - Future: `MaterializationReceipt.emitted_at: Instant` (next round)
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,7 +39,7 @@ use crate::named::Named;
 ///   - `physical_ms < 2^48` (~8908 years from epoch — plenty)
 ///   - `logical < 2^16` (65k ticks per ms in worst-case bursts)
 ///
-/// Tie-breaking: lexicographic on (physical_ms, logical).
+/// Tie-breaking: lexicographic on (`physical_ms`, logical).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Instant {
     /// Physical milliseconds since UNIX epoch.
@@ -104,7 +104,7 @@ impl Instant {
     }
 
     /// Total order: returns true if `self` is strictly after `other`
-    /// in the (physical_ms, logical) lexicographic order.
+    /// in the (`physical_ms`, logical) lexicographic order.
     #[must_use]
     pub fn causally_after(&self, other: &Self) -> bool {
         (self.physical_ms, self.logical) > (other.physical_ms, other.logical)
@@ -203,8 +203,7 @@ impl Clock for WallClock {
     fn now(&self) -> Instant {
         let physical_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
         Instant {
             physical_ms,
             logical: 0,
@@ -264,7 +263,7 @@ impl Clock for FrozenClock {
     fn now(&self) -> Instant {
         Instant {
             physical_ms: self.physical_ms.load(Ordering::SeqCst),
-            logical: self.logical.load(Ordering::SeqCst) as u16,
+            logical: u16::try_from(self.logical.load(Ordering::SeqCst)).unwrap_or(u16::MAX),
         }
     }
 }

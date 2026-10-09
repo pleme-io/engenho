@@ -1,4 +1,4 @@
-//! GossipLedger — `MaterializationLedger` impl built on top of a
+//! `GossipLedger` — `MaterializationLedger` impl built on top of a
 //! pluggable `GossipTransport`.
 //!
 //! Sits between the substrate's typed receipts and any
@@ -10,9 +10,9 @@
 //! ## Receive path
 //!
 //! The transport delivers receipts via a tokio broadcast channel
-//! the operator subscribes to. The GossipLedger's `receiver_task`
+//! the operator subscribes to. The `GossipLedger`'s `receiver_task`
 //! drains the channel + ingests each receipt into the inner
-//! ledger so reads against the GossipLedger see the cluster-wide
+//! ledger so reads against the `GossipLedger` see the cluster-wide
 //! aggregated state.
 //!
 //! ## Composition
@@ -145,12 +145,13 @@ impl FakeGossipTransport {
 
     /// Subscribe to the outbound side. Tests can assert what was
     /// broadcast + drive the wire end-to-end.
+    #[must_use]
     pub fn subscribe_outbound(&self) -> broadcast::Receiver<GossipBroadcast> {
         self.outbound_sender.subscribe()
     }
 
-    /// Currently-active outbound subscribers (for the SubscriberSnapshot
-    /// observable). Sync — reads broadcast::Sender::receiver_count.
+    /// Currently-active outbound subscribers (for the `SubscriberSnapshot`
+    /// observable). Sync — reads `broadcast::Sender::receiver_count`.
     #[must_use]
     pub fn subscriber_count(&self) -> usize {
         self.outbound_sender.receiver_count()

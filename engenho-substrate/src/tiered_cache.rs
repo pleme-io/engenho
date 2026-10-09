@@ -20,7 +20,7 @@
 //! ## Why "promote on read" + "write to local only"
 //!
 //! Symmetric with how every other tiered system (CPU caches, CDNs,
-//! ZFS L2ARC, S3 + CloudFront) works. Higher tiers are eventually-
+//! ZFS L2ARC, S3 + `CloudFront`) works. Higher tiers are eventually-
 //! consistent reflections of authoritative lower tiers; writes are
 //! cheap locally; reads pull data closer to the consumer.
 //!
@@ -84,9 +84,9 @@ impl TieredCache {
         self.tiers.len()
     }
 
-    /// Observable snapshot of the tier stack — name + tier_count.
-    /// Pattern #2 (SSC v0.91) — TieredCache + CompositeShapeRenderer +
-    /// ChainedVerifier all return canonical
+    /// Observable snapshot of the tier stack — name + `tier_count`.
+    /// Pattern #2 (SSC v0.91) — `TieredCache` + `CompositeShapeRenderer` +
+    /// `ChainedVerifier` all return canonical
     /// [`crate::mirante::ChildCountSnapshot`].
     #[must_use]
     pub fn snapshot(&self) -> crate::mirante::ChildCountSnapshot {

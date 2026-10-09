@@ -1,4 +1,4 @@
-//! StoreBackedLedger — `MaterializationLedger` impl backed by
+//! `StoreBackedLedger` — `MaterializationLedger` impl backed by
 //! `engenho-store`. Receipts commit through the store's existing
 //! Raft path; reads aggregate the committed receipts back into a
 //! `QuorumTracker`.
@@ -14,11 +14,11 @@
 //!
 //!   group: engenho.io
 //!   version: v1
-//!   kind: MaterializationReceipt
+//!   kind: `MaterializationReceipt`
 //!   namespace: configurable (default: engenho-system)
 //!   name: {stage_id}-{kind}-{subject_hex_short}-{emitter_hex_short}
 //!   spec.receipt: <serialized MaterializationReceipt>
-//!   spec.stage_id: {stage_id}
+//!   `spec.stage_id`: {`stage_id`}
 //!   spec.threshold: {usize}
 //!
 //! ## Aggregation
@@ -49,7 +49,7 @@ use serde_json::json;
 /// Default namespace for receipt resources.
 pub const DEFAULT_RECEIPT_NAMESPACE: &str = "engenho-system";
 
-/// MaterializationLedger backed by engenho-store.
+/// `MaterializationLedger` backed by engenho-store.
 pub struct StoreBackedLedger {
     store: Arc<StoreMesh>,
     namespace: String,
@@ -102,7 +102,7 @@ impl StoreBackedLedger {
             "v1",
             "MaterializationReceipt",
             &self.namespace,
-            &Self::receipt_name(stage_id, receipt),
+            Self::receipt_name(stage_id, receipt),
         )
     }
 }

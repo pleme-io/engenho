@@ -992,12 +992,11 @@ impl ResourceCatalog {
         // Finalizer release (same rule as apply_put/apply_patch): an apply
         // that empties finalizers on a Terminating object converts to a
         // removal. Only meaningful for an UPDATE (prior present).
-        if prior_value.is_some() {
-            if let Some(out) =
+        if prior_value.is_some()
+            && let Some(out) =
                 self.finalizer_release_removal(key, &merged, prior_value.as_ref(), rev)
-            {
-                return out;
-            }
+        {
+            return out;
         }
 
         self.resources
@@ -1051,8 +1050,7 @@ impl ResourceCatalog {
         let removed_meta = self
             .resources
             .remove(key)
-            .map(|(_, m)| m)
-            .unwrap_or_else(|| VersionMeta::created_at(rev));
+            .map_or_else(|| VersionMeta::created_at(rev), |(_, m)| m);
         Some(ApplyOutcome::with_change(
             ResourceOp::Deleted,
             Change {

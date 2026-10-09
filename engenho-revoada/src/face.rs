@@ -20,7 +20,7 @@
 //!   compat). Delegates the actual reader/writer work to
 //!   `engenho-kube-client` + the in-tree kube-apiserver bridge.
 //!
-//! Future faces (Nomad / Systemd / BareMetalSupervisor) land as
+//! Future faces (Nomad / Systemd / `BareMetalSupervisor`) land as
 //! additional impls. The trait stays stable; each face is a Reader+
 //! Writer pair against the same engenho-types vocabulary.
 
@@ -267,9 +267,9 @@ pub enum ResourceFormat {
     Yaml,
     /// JSON — universal.
     Json,
-    /// HashiCorp Nomad HCL.
+    /// `HashiCorp` Nomad HCL.
     Hcl,
-    /// engenho-types native (CBOR-encoded TypedResource — internal).
+    /// engenho-types native (CBOR-encoded `TypedResource` — internal).
     Native,
 }
 
@@ -277,7 +277,7 @@ pub enum ResourceFormat {
 /// their native addressing scheme:
 ///   * K8s: `/api/v1/namespaces/{ns}/{kind}/{name}`
 ///   * Nomad: `/v1/job/{name}` (namespace mapped to job namespace)
-///   * PureRaft: raft key `{kind}/{ns}/{name}`
+///   * `PureRaft`: raft key `{kind}/{ns}/{name}`
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ResourceRef {
     /// Kind name (e.g. "Pod", "Service", "Job"). Face-specific
@@ -287,13 +287,13 @@ pub struct ResourceRef {
     pub name: String,
     /// Namespace (e.g. "default" for K8s, "" for cluster-scoped,
     /// `None` for faces that don't model namespaces — Nomad uses
-    /// `namespace` for region, PureRaft uses it as a prefix).
+    /// `namespace` for region, `PureRaft` uses it as a prefix).
     pub namespace: Option<String>,
 }
 
 impl ResourceRef {
     /// Convenience constructor for cluster-scoped resources (no
-    /// namespace, e.g. K8s Namespace / Node / ClusterRole).
+    /// namespace, e.g. K8s Namespace / Node / `ClusterRole`).
     #[must_use]
     pub fn cluster_scoped(kind: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
@@ -378,7 +378,7 @@ pub enum FaceWatchEventKind {
     Deleted,
     /// The watch was reset — the consumer should re-fetch state
     /// from scratch. K8s emits this on bookmark gap; Nomad on
-    /// index reset; PureRaft on raft snapshot install.
+    /// index reset; `PureRaft` on raft snapshot install.
     Reset,
 }
 
@@ -402,7 +402,7 @@ pub struct PureRaftFace {
     name: String,
     state: Mutex<FaceState>,
     /// Shared verb-impl backend. R5+ replaces this with a raft-
-    /// backed store; today it's an in-memory HashMap. The verb
+    /// backed store; today it's an in-memory `HashMap`. The verb
     /// signatures stay byte-identical — the swap is internal.
     store: crate::face_store::InMemoryStore,
 }
@@ -541,7 +541,7 @@ impl Face for PureRaftFace {
 
 /// CBOR-encoded envelope used by `PureRaftFace::apply_resource` —
 /// carries the reference + payload in one wire shape. This is the
-/// `ResourceFormat::Native` for PureRaftFace; other faces define
+/// `ResourceFormat::Native` for `PureRaftFace`; other faces define
 /// their own native shape.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct NativeEnvelope {
@@ -781,12 +781,12 @@ impl Face for KubernetesFace {
 // NomadFace — the third impl (Nomad jobs)
 // ─────────────────────────────────────────────────────────────────
 
-/// HashiCorp Nomad face — renders the fabric vocabulary to Nomad
+/// `HashiCorp` Nomad face — renders the fabric vocabulary to Nomad
 /// job specifications.
 ///
 /// **Why this face matters for the abstraction:** with two impls
-/// (PureRaft + Kubernetes) the [`Face`] trait could still be
-/// secretly K8s-shaped — PureRaft is the "no-rendering" degenerate
+/// (`PureRaft` + Kubernetes) the [`Face`] trait could still be
+/// secretly K8s-shaped — `PureRaft` is the "no-rendering" degenerate
 /// case. A genuine *third* renderer that translates to a different
 /// non-Kubernetes external API (Nomad jobs, allocations, deployments,
 /// task groups — a wholly different resource ontology) is the
@@ -928,8 +928,8 @@ impl Face for NomadFace {
 /// files for non-clustered single-node or supervised-VM deployments.
 ///
 /// **Why this face matters for the abstraction:** with three impls
-/// already proving generalization (PureRaft / Kubernetes / Nomad),
-/// SystemdFace strengthens the proof in a fourth dimension —
+/// already proving generalization (`PureRaft` / Kubernetes / Nomad),
+/// `SystemdFace` strengthens the proof in a fourth dimension —
 /// generating *files* (unit files on disk) instead of issuing *API
 /// calls* (kube-apiserver / nomad-http / raft RPC). The Face trait
 /// abstracts equally over both interaction shapes; if it had hidden
@@ -1071,9 +1071,9 @@ impl Face for SystemdFace {
 /// without a Kubernetes apiserver.
 ///
 /// **Why this face matters for the abstraction:** with four impls
-/// already (PureRaft / Kubernetes / Nomad / Systemd) the Face
+/// already (`PureRaft` / Kubernetes / Nomad / Systemd) the Face
 /// trait generalizes across interaction shapes + ontology. The
-/// fifth impl completes the FaceKind enumeration so
+/// fifth impl completes the `FaceKind` enumeration so
 /// `instantiate()` has no `Unsupported` arm — every typed face
 /// declaration is now constructible. The "what if someone declares
 /// X?" question is gone; the type system has answers for the full
@@ -1199,13 +1199,13 @@ impl Face for BareMetalSupervisorFace {
 // ─────────────────────────────────────────────────────────────────
 
 /// Build a concrete [`Face`] from a typed [`FabricFace`] declaration.
-/// Future faces (Nomad / Systemd / BareMetalSupervisor) add arms
+/// Future faces (Nomad / Systemd / `BareMetalSupervisor`) add arms
 /// here as they ship.
 ///
 /// # Errors
 ///
 /// Returns `Err(FaceError::Unsupported)` for face kinds that don't
-/// have a concrete impl yet (Nomad / Systemd / BareMetalSupervisor
+/// have a concrete impl yet (Nomad / Systemd / `BareMetalSupervisor`
 /// at present).
 pub fn instantiate(decl: &FabricFace) -> Result<Box<dyn Face>, FaceError> {
     match &decl.kind {

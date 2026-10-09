@@ -42,7 +42,7 @@ pub enum Scope {
 /// The contract every Kubernetes resource type satisfies.
 ///
 /// Implementors are emitted by `forge-gen --backend kube-resource` from
-/// upstream OpenAPI v3. Hand-authoring an `impl KubeResource for X` for
+/// upstream `OpenAPI` v3. Hand-authoring an `impl KubeResource for X` for
 /// any K8s upstream kind is a CI-rejected anti-pattern — see
 /// `theory/ENGENHO.md` §IV (the non-negotiable rule).
 pub trait KubeResource: serde::Serialize + serde::de::DeserializeOwned + Clone {

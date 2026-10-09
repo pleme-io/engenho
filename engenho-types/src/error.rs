@@ -109,17 +109,17 @@ pub enum ApiStatusKind {
     NotFound,
     /// 409 Conflict — resourceVersion mismatch (optimistic concurrency).
     Conflict,
-    /// 409 AlreadyExists — create on existing resource.
+    /// 409 `AlreadyExists` — create on existing resource.
     AlreadyExists,
     /// 410 Gone — resourceVersion expired or stale.
     Gone,
     /// 422 Invalid — admission validation rejected the object.
     Invalid,
-    /// 429 TooManyRequests — apiserver rate-limited us.
+    /// 429 `TooManyRequests` — apiserver rate-limited us.
     TooManyRequests,
-    /// 500 InternalError — apiserver fault.
+    /// 500 `InternalError` — apiserver fault.
     InternalError,
-    /// 503 ServiceUnavailable — apiserver overloaded / electing.
+    /// 503 `ServiceUnavailable` — apiserver overloaded / electing.
     ServiceUnavailable,
     /// 504 Timeout — apiserver took too long.
     Timeout,
@@ -186,7 +186,7 @@ impl KubeError {
     }
 
     /// Suggested retry delay, if [`Transient`](FailureKind::Transient). `None` for declarative
-    /// errors. Default: 1s for network, 5s for TooManyRequests, 0
+    /// errors. Default: 1s for network, 5s for `TooManyRequests`, 0
     /// (immediate) for the `Conflict` retry-loop. Callers MAY override
     /// (e.g., exponential backoff).
     #[must_use]

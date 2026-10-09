@@ -4,7 +4,7 @@
 
 use engenho_revoada::face::{Face, ResourceFormat, ResourceRef};
 use engenho_revoada::topology::{
-    Cluster3MNW, MeshAllPeers, Pair, Phalanx, Quorum3M, Solo, TopologyStrategy,
+    Cluster3MNW, MeshAllPeers, Pair, Quorum3M, Solo, TopologyStrategy,
 };
 use engenho_revoada::{Cluster, ClusterDeclaration, FabricFace, FabricStrategy, FaceKind};
 

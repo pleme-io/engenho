@@ -2,7 +2,7 @@
 //!
 //! Boots engenho IN-PROCESS and diffs it against the LIVE reference oracle
 //! (`ENGENHO_ORACLE_KUBECONFIG`; see [`common`]) across a full object
-//! lifecycle (create Namespace → create/get/list/patch ConfigMap → the sharp
+//! lifecycle (create Namespace → create/get/list/patch `ConfigMap` → the sharp
 //! PUT/replace verb probe → delete) plus a core/v1 discovery diff.
 //!
 //! **Fail loud, never silent-skip.** If the oracle is unreachable the test

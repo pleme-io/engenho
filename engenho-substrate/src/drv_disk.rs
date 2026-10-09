@@ -1,4 +1,4 @@
-//! Disk persistence for derivations + realisations via MagicBlob.
+//! Disk persistence for derivations + realisations via `MagicBlob`.
 //!
 //! Wires the typed `Drv` value through the substrate's existing
 //! `MagicBlob` + `write_atomic` primitives. Disk format:

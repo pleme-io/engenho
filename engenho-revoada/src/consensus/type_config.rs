@@ -12,7 +12,7 @@ use openraft::BasicNode;
 
 use crate::consensus::RoleAssignment;
 
-/// Openraft NodeId — `u64`. Distinct from [`crate::NodeId`] (the
+/// Openraft `NodeId` — `u64`. Distinct from [`crate::NodeId`] (the
 /// ed25519 pubkey we gossip); the mapping is owned by `RaftMesh`.
 pub type RaftNodeId = u64;
 

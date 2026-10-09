@@ -1,26 +1,26 @@
 //! `DaemonSetController` — ensures exactly ONE Pod per schedulable
-//! node, owned by the DaemonSet.
+//! node, owned by the `DaemonSet`.
 //!
-//! ## The DaemonSet contract (distinct from ReplicaSet)
+//! ## The `DaemonSet` contract (distinct from `ReplicaSet`)
 //!
-//! A DaemonSet does NOT have a `spec.replicas` knob. Its desired pod
+//! A `DaemonSet` does NOT have a `spec.replicas` knob. Its desired pod
 //! set is "one pod on every schedulable node" — node-pinned, scheduler-
 //! bypassing. So unlike ReplicaSet/StatefulSet (which clone N pods the
-//! scheduler then binds), the DaemonSet controller:
+//! scheduler then binds), the `DaemonSet` controller:
 //!
 //!   1. enumerates schedulable Nodes (cluster-scoped `Node` objects,
 //!      skipping those with `spec.unschedulable == true`),
 //!   2. for each node WITHOUT an owned pod, creates one pod from
 //!      `spec.template` with `spec.nodeName` PRE-SET to that node (the
-//!      scheduler never touches it — DaemonSet pods are node-pinned),
+//!      scheduler never touches it — `DaemonSet` pods are node-pinned),
 //!   3. for each owned pod on a node that no longer exists / is now
 //!      unschedulable, deletes it (node removed → pod GC'd; owner-ref
-//!      GC also covers DaemonSet deletion).
+//!      GC also covers `DaemonSet` deletion).
 //!
 //! Pod name: `{ds}-{node}` — deterministic (one pod per node, so the
 //! node name is a natural unique key). Production K8s uses a hash
 //! suffix; we keep it deterministic + readable for tests + operators,
-//! the same way ReplicaSet uses `{rs}-{index}`.
+//! the same way `ReplicaSet` uses `{rs}-{index}`.
 //!
 //! Self-heal: a deleted pod is recreated on its node on the next tick
 //! (the node still exists + has no owned pod → step 2 fires).
@@ -43,7 +43,7 @@
 //! ## Why node enumeration lives in `reconcile_one`
 //!
 //! The shared [`OwnedChildrenReconciler`] blanket hands each parent its
-//! owned children, but a DaemonSet's desired set is a function of the
+//! owned children, but a `DaemonSet`'s desired set is a function of the
 //! NODE list (not the child count). The controller reads the cluster's
 //! Nodes from `self.store()` inside `reconcile_one` — the one place the
 //! per-parent delta is computed. Nodes are cluster-scoped, so the read
@@ -75,7 +75,7 @@ use crate::sweep::{Sweep, impl_sweep_event_sink};
 use engenho_substrate::Clock;
 use engenho_types::kind::GroupVersionKind;
 
-/// DaemonSet controller — one node-pinned Pod per schedulable node.
+/// `DaemonSet` controller — one node-pinned Pod per schedulable node.
 pub struct DaemonSetController {
     store: Arc<StoreMesh>,
     namespace: Option<String>,
@@ -125,11 +125,11 @@ impl DaemonSetController {
             .unwrap_or(false)
     }
 
-    /// Build a node-pinned Pod from the DaemonSet template for `node`.
+    /// Build a node-pinned Pod from the `DaemonSet` template for `node`.
     /// The name is `{ds_name}-{node}`; `spec.nodeName` is PRE-SET to the
-    /// node (the scheduler is bypassed — DaemonSet pods are node-pinned).
+    /// node (the scheduler is bypassed — `DaemonSet` pods are node-pinned).
     ///
-    /// The Pod lives in the SAME namespace as its parent DaemonSet — the
+    /// The Pod lives in the SAME namespace as its parent `DaemonSet` — the
     /// namespace the blanket gathers owned pods from. Never the
     /// controller's scope namespace (an all-namespace controller has
     /// none). Mirrors `ReplicaSetController::build_pod_from_template`.
@@ -279,7 +279,7 @@ impl OwnedChildrenReconciler for DaemonSetController {
         // looks), not the controller scope ns.
         let pod_ns = ds_value.namespace().map_or_else(
             || self.namespace.as_deref().unwrap_or("default").to_string(),
-            |c| c.to_owned(),
+            std::borrow::ToOwned::to_owned,
         );
 
         // The nodes already covered by an owned pod. A Terminating pod
@@ -539,7 +539,7 @@ mod tests {
             .unwrap();
     }
 
-    /// Seed a DaemonSet into the store (so it gets a uid the controller
+    /// Seed a `DaemonSet` into the store (so it gets a uid the controller
     /// can owner-ref against).
     async fn seed_ds(store: &StoreMesh, ns: &str, name: &str) -> String {
         let key = ResourceKey::namespaced("apps", "v1", "DaemonSet", ns, name);

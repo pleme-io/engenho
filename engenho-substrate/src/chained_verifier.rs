@@ -1,4 +1,4 @@
-//! ChainedVerifier — composes N `Verifier` impls AND-style.
+//! `ChainedVerifier` — composes N `Verifier` impls AND-style.
 //!
 //! Stage.verify is `Vec<Verificacao>` evaluated with AND semantics
 //! (all predicates must pass). This wrapper does the same on the
@@ -8,8 +8,8 @@
 //! ## When to use
 //!
 //!   * Stage requires multiple verifications (e.g.
-//!     HashEquality + TameshiSigned + SmokeTest) — wire one
-//!     ChainedVerifier holding three specialized backends.
+//!     `HashEquality` + `TameshiSigned` + `SmokeTest`) — wire one
+//!     `ChainedVerifier` holding three specialized backends.
 //!   * Production deployments combining cosign + reproducer +
 //!     attestation chain into one dispatchable surface.
 //!

@@ -1,8 +1,8 @@
 //! `define_hash_newtype!` — the canonical `[u8; 32]` hash-newtype macro.
 //!
 //! Closes the 7-site duplication of the hand-written
-//! "`pub struct Name(pub [u8; 32])` + `new` + `from_bytes` + `to_hex`
-//! + `from_hex` + `impl Display`" quartet that grew independently
+//! "`pub struct Name(pub [u8; 32])` + `new` + `from_bytes` + `to_hex` +
+//! `from_hex` + `impl Display`" quartet that grew independently
 //! across the substrate + revoada:
 //!
 //!   * `DrvHash`  / `NarHash`   — `derivation.rs`
@@ -215,6 +215,7 @@ macro_rules! define_hash_newtype {
 
             /// Lowercase hex representation (64 chars).
             #[must_use]
+            #[allow(clippy::wrong_self_convention)]
             pub fn to_hex(&self) -> String {
                 $crate::hex::hex_encode(&self.0)
             }

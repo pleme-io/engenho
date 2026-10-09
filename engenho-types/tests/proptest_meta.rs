@@ -1,5 +1,5 @@
-//! Property tests pinning the determinism contract on ObjectMeta /
-//! TypeMeta / ListMeta + the GVK path-construction injectivity rule.
+//! Property tests pinning the determinism contract on `ObjectMeta` /
+//! `TypeMeta` / `ListMeta` + the GVK path-construction injectivity rule.
 //!
 //! These are the L1 (proptest) layer of theory/ENGENHO.md §V.2 — every
 //! load-bearing data shape carries a property test that an example

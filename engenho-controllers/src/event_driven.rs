@@ -1,14 +1,14 @@
-//! EventDrivenController — generic adapter that ticks a wrapped
+//! `EventDrivenController` — generic adapter that ticks a wrapped
 //! Controller on every received event.
 //!
-//! Bridges any tokio broadcast channel (engenho-store WatchEvent,
-//! engenho-substrate CacheEvent, custom event sources) into the
+//! Bridges any tokio broadcast channel (engenho-store `WatchEvent`,
+//! engenho-substrate `CacheEvent`, custom event sources) into the
 //! Controller trait surface — controllers no longer need to poll
 //! when the upstream can notify.
 //!
 //! ## Reconcile semantics
 //!
-//!   * `tick()` on EventDrivenController = drain pending events +
+//!   * `tick()` on `EventDrivenController` = drain pending events +
 //!     issue ONE downstream `tick()` per event (or one per batch
 //!     when `coalesce: true`).
 //!   * Lagged subscribers (broadcast capacity overflow) → ignored;
@@ -19,13 +19,13 @@
 //!
 //! ## When to use
 //!
-//!   * Wrap DrvController so it ticks on CacheEvent::RealisationUpserted
+//!   * Wrap `DrvController` so it ticks on `CacheEvent::RealisationUpserted`
 //!     instead of running on every interval.
 //!   * Wrap any Controller whose upstream emits typed events.
 //!
 //! ## When NOT to use
 //!
-//!   * Controllers whose state isn't event-derived (TickEvery is
+//!   * Controllers whose state isn't event-derived (`TickEvery` is
 //!     fine for those).
 //!   * Cross-cluster federation paths where event order isn't
 //!     guaranteed (use a reconcile loop with full-list reads).

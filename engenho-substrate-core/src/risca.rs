@@ -51,7 +51,7 @@ pub const RISCA_FRAMING: &str = "RISCA";
 /// Assert at test time that a value's `Debug` output does NOT leak
 /// the given secret + DOES carry the `Risca` framing. Extracted per
 /// the third-site rule (substrate's own risca tests + kube-client
-/// bearer_token + revoada NodeIdentity signing_key_bytes).
+/// `bearer_token` + revoada `NodeIdentity` `signing_key_bytes`).
 ///
 /// ## Usage
 ///
