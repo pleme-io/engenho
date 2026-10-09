@@ -153,10 +153,10 @@ fn count_starts_named(events: &[FakeEvent], name: &str) -> usize {
 /// the live containers' specs.
 async fn id_for_spec_name(backend: &FakeBackend, spec_name: &str) -> Option<String> {
     for (id, _status) in backend.containers().await {
-        if let Some(spec) = backend.spec_of(&id).await {
-            if spec.name == spec_name {
-                return Some(id);
-            }
+        if let Some(spec) = backend.spec_of(&id).await
+            && spec.name == spec_name
+        {
+            return Some(id);
         }
     }
     None

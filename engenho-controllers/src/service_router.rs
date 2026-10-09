@@ -2,7 +2,7 @@
 //!
 //! The substrate has Service + Endpoints objects + matching Pods
 //! since R9.6; before R11 nothing actually routed traffic from a
-//! Service's ClusterIP to the backing Pods. R11 ships the typed
+//! Service's `ClusterIP` to the backing Pods. R11 ships the typed
 //! routing surface + a backend trait.
 //!
 //! ## Architecture
@@ -21,7 +21,7 @@
 //!
 //! 1. List Services + Endpoints from the store.
 //! 2. For each pair (service, endpoints), compute the typed
-//!    [`ServiceRoute`]: ClusterIP + per-port (proto, port, target_port)
+//!    [`ServiceRoute`]: `ClusterIP` + per-port (proto, port, `target_port`)
 //!    + the set of healthy Pod IPs from Endpoints.subsets.
 //! 3. Diff against the backend's current table. Add/remove routes
 //!    to converge.
@@ -34,7 +34,7 @@
 //! different maturities and is explicit about which:
 //!
 //!   1. **VIP allocation** — DONE (`crate::cluster_ip`): a Service gets a
-//!      real ClusterIP, so a route HAS a VIP to key on (before this the
+//!      real `ClusterIP`, so a route HAS a VIP to key on (before this the
 //!      VIP was `None` and every route degenerate).
 //!   2. **Desired-rule computation** — DONE (this module): the controller
 //!      resolves Service+Endpoints → typed [`ServiceRoute`]s, and the
@@ -53,7 +53,7 @@
 //!      iptables/ipvs backend applies the rules). A `Computed` install is
 //!      NOT a silent skip: it is the named, fail-safe state the same way
 //!      the webhook caBundle deferral is — real progress (correct allocator
-//!      + correct computed rules + EndpointSlice) awaiting a Linux node for
+//!      + correct computed rules + `EndpointSlice`) awaiting a Linux node for
 //!      the final kernel apply.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -88,7 +88,7 @@ pub struct ServiceRoute {
 pub struct PortMap {
     /// Operator-facing port name (e.g. "http").
     pub name: String,
-    /// Service-side port (the ClusterIP listens here).
+    /// Service-side port (the `ClusterIP` listens here).
     pub service_port: u16,
     /// Pod-side port (Endpoints subsets each have this).
     pub target_port: u16,
@@ -96,13 +96,13 @@ pub struct PortMap {
     pub protocol: String,
 }
 
-/// Errors a ServiceRouter backend may return.
+/// Errors a `ServiceRouter` backend may return.
 #[derive(Debug, Clone, Error)]
 pub enum RouterError {
     /// Backend (iptables / ipvs) returned a non-zero exit.
     #[error("backend: {0}")]
     Backend(String),
-    /// Invalid route shape (e.g. empty service_id).
+    /// Invalid route shape (e.g. empty `service_id`).
     #[error("invalid route: {0}")]
     InvalidRoute(String),
 }
@@ -139,7 +139,7 @@ pub trait ServiceRouter: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// The datapath-install maturity this backend provides. `Computed`
-    /// (FakeRouter / off-Linux topology) ⇒ routes are computed + tracked
+    /// (`FakeRouter` / off-Linux topology) ⇒ routes are computed + tracked
     /// but no kernel rule is installed; `Installed` (iptables / ipvs on a
     /// Linux node) ⇒ the VIP datapath is applied. Defaults to `Installed`
     /// (the kernel backends); the `FakeRouter` overrides to `Computed`.
@@ -174,7 +174,7 @@ pub trait ServiceRouter: Send + Sync {
 // FakeRouter — deterministic in-memory backend for tests
 // =================================================================
 
-/// Test backend. Tracks routes in a BTreeMap + records every
+/// Test backend. Tracks routes in a `BTreeMap` + records every
 /// upsert/remove call for assertion in tests.
 #[derive(Default, Clone)]
 pub struct FakeRouter {
@@ -258,11 +258,11 @@ impl ServiceRouter for FakeRouter {
 // IptablesRouter — Linux production backend (R11b)
 // =================================================================
 
-/// Production ServiceRouter for Linux nodes. Renders the desired
+/// Production `ServiceRouter` for Linux nodes. Renders the desired
 /// state as iptables rules + applies them via `iptables-restore`.
 ///
 /// Per the org's NO SHELL rule, this is the ONE acceptable
-/// shell-out site for ServiceRouter — the integration boundary
+/// shell-out site for `ServiceRouter` — the integration boundary
 /// itself, not orchestration glue.
 ///
 /// ## Approach
@@ -573,7 +573,7 @@ const MAX_DUPLICATE_JUMPS: usize = 64;
 fn chain_name(prefix: &str, key: &str) -> String {
     let hash = blake3::hash(key.as_bytes());
     let hex = hash.to_hex();
-    format!("{prefix}-{}", &hex.as_str()[..12].to_uppercase())
+    format!("{prefix}-{}", hex.as_str()[..12].to_uppercase())
 }
 
 /// Map a K8s protocol string to the ipvsadm transport flag.
@@ -842,7 +842,8 @@ impl ServiceRoutingController {
                             .and_then(|n| n.as_str())
                             .unwrap_or("default")
                             .to_string();
-                        let service_port = p.get("port").and_then(|n| n.as_u64())? as u16;
+                        let service_port =
+                            p.get("port").and_then(serde_json::Value::as_u64)? as u16;
                         let target_port = Self::target_port(p, &name, endpoints, service_port)?;
                         let protocol = p
                             .get("protocol")
@@ -888,10 +889,10 @@ impl ServiceRoutingController {
     /// The Endpoints controller has already resolved a NAMED `targetPort`
     /// against the backing containers, so a port published there under the
     /// same name is authoritative. Reading only a numeric `targetPort` here
-    /// silently treated `targetPort: "http"` as absent and DNATed to the
+    /// silently treated `targetPort: "http"` as absent and `DNATed` to the
     /// SERVICE port — measured on rio 2026-09-15, where Flux's
     /// source-controller (`port: 80`, `targetPort: http` → 9090) refused every
-    /// ClusterIP connection while the Endpoints object correctly said 9090.
+    /// `ClusterIP` connection while the Endpoints object correctly said 9090.
     ///
     /// A named port with no resolved Endpoints port yields `None`: no rule
     /// beats a rule to a port nothing listens on.
@@ -909,7 +910,7 @@ impl ServiceRoutingController {
             .filter_map(|subset| subset.get("ports").and_then(|p| p.as_array()))
             .flatten()
             .find(|ep| ep.get("name").and_then(|n| n.as_str()).unwrap_or("default") == name)
-            .and_then(|ep| ep.get("port").and_then(|n| n.as_u64()))
+            .and_then(|ep| ep.get("port").and_then(serde_json::Value::as_u64))
             .and_then(|n| u16::try_from(n).ok());
         match port.get("targetPort") {
             None | Some(serde_json::Value::Null) => Some(published.unwrap_or(service_port)),
@@ -1420,7 +1421,7 @@ mod tests {
     /// reconciles a Service + Endpoints into a computed route WITHOUT any
     /// kernel call (no iptables/ipvs binary touched), and its datapath
     /// maturity is the typed `DatapathInstall::Computed`. This is exactly
-    /// the backend the runtime selects on a Darwin host (Auto → ComputeOnly),
+    /// the backend the runtime selects on a Darwin host (Auto → `ComputeOnly`),
     /// so the local daemon keeps running fine.
     #[tokio::test]
     async fn compute_only_backend_reconciles_route_without_kernel_call() {

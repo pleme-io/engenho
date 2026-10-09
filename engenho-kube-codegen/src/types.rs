@@ -1,7 +1,7 @@
-//! OpenAPI v3 schema → Rust type mapping (the M0.0.4 typed-emission core).
+//! `OpenAPI` v3 schema → Rust type mapping (the M0.0.4 typed-emission core).
 //!
 //! This is brick 1 of the typed-emission engine: a pure function that maps a
-//! single OpenAPI property schema to the Rust type a generated field should
+//! single `OpenAPI` property schema to the Rust type a generated field should
 //! carry, and collects every `$ref`'d schema key it encounters so the emitter
 //! can later emit those referenced kinds as transitive typed sub-structs.
 //!
@@ -14,7 +14,7 @@
 use serde_json::Value;
 use std::collections::BTreeSet;
 
-/// The Rust type an OpenAPI property maps to.
+/// The Rust type an `OpenAPI` property maps to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RustType {
     /// A primitive: `String`, `i64`, `i32`, `bool`, `f64`.
@@ -22,9 +22,9 @@ pub enum RustType {
     /// A reference to another generated kind/sub-struct (e.g. `PodSpec`,
     /// `ObjectReference`). The String is the bare Rust type name.
     Ref(String),
-    /// `Vec<inner>` — an OpenAPI `array`.
+    /// `Vec<inner>` — an `OpenAPI` `array`.
     Vec(Box<RustType>),
-    /// `std::collections::BTreeMap<String, inner>` — an OpenAPI `object`
+    /// `std::collections::BTreeMap<String, inner>` — an `OpenAPI` `object`
     /// with `additionalProperties`.
     Map(Box<RustType>),
     /// `serde_json::Value` — the safe fallback for shapes the typed mapper
@@ -63,7 +63,7 @@ impl RustType {
 }
 
 /// `io.k8s.api.core.v1.PodSpec` → `PodSpec`. The Rust type name is the last
-/// dotted segment of the OpenAPI schema key.
+/// dotted segment of the `OpenAPI` schema key.
 #[must_use]
 pub fn type_name_from_ref(ref_str: &str) -> String {
     // `$ref` values are `#/components/schemas/<key>`; the key is dotted.
@@ -71,7 +71,7 @@ pub fn type_name_from_ref(ref_str: &str) -> String {
     key.rsplit('.').next().unwrap_or(key).to_string()
 }
 
-/// Map an OpenAPI property schema to a [`RustType`], inserting every
+/// Map an `OpenAPI` property schema to a [`RustType`], inserting every
 /// referenced schema KEY (the full dotted `io.k8s.…` key, not the bare name)
 /// into `refs` so the caller can transitively emit those sub-structs.
 ///
@@ -89,13 +89,12 @@ pub fn map_schema(schema: &Value, refs: &mut BTreeSet<String>) -> RustType {
     }
     // 2. allOf: [{ $ref }] — K8s wraps a typed object that also carries a
     //    description/default. Take the first $ref'd member.
-    if let Some(all_of) = schema.get("allOf").and_then(Value::as_array) {
-        if let Some(r) = all_of
+    if let Some(all_of) = schema.get("allOf").and_then(Value::as_array)
+        && let Some(r) = all_of
             .iter()
             .find_map(|m| m.get("$ref").and_then(Value::as_str))
-        {
-            return ref_type(r, refs);
-        }
+    {
+        return ref_type(r, refs);
     }
     // 3. Typed scalars / arrays / maps.
     match schema.get("type").and_then(Value::as_str) {
@@ -138,6 +137,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[allow(clippy::needless_pass_by_value)]
     fn map(v: Value) -> (RustType, BTreeSet<String>) {
         let mut refs = BTreeSet::new();
         let t = map_schema(&v, &mut refs);

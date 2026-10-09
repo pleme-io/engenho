@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-/// Top-level k3s HelmChart resource. Drops into
+/// Top-level k3s `HelmChart` resource. Drops into
 /// `/var/lib/rancher/k3s/server/manifests/` and is reconciled by
 /// k3s' built-in helm-controller.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,13 +25,13 @@ pub struct HelmChart {
     pub spec: HelmChartSpec,
 }
 
-/// HelmChart resource metadata.
+/// `HelmChart` resource metadata.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HelmChartMetadata {
-    /// Resource name (the HelmChart's identifier in the source namespace).
+    /// Resource name (the `HelmChart`'s identifier in the source namespace).
     pub name: String,
-    /// Source namespace where the HelmChart resource lives.
+    /// Source namespace where the `HelmChart` resource lives.
     pub namespace: String,
 }
 
@@ -65,7 +65,7 @@ pub struct HelmChartSpec {
 }
 
 impl HelmChart {
-    /// Construct a minimal HelmChart manifest with the canonical
+    /// Construct a minimal `HelmChart` manifest with the canonical
     /// k3s API version + kind.
     #[must_use]
     pub fn new(name: impl Into<String>, namespace: impl Into<String>, spec: HelmChartSpec) -> Self {
@@ -83,12 +83,16 @@ impl HelmChart {
     /// Serialize to k3s-compatible YAML. Replaces `formatdoc!`
     /// blocks across the 22 helm-wrapper sites in `render.rs`.
     /// **Typed emission.**
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: every field serializes to YAML.
     #[must_use]
     pub fn to_yaml(&self) -> String {
         serde_yaml::to_string(self).expect("HelmChart serializes")
     }
 
-    /// Parse a HelmChart manifest. Tolerant of extra spec fields
+    /// Parse a `HelmChart` manifest. Tolerant of extra spec fields
     /// via [`HelmChartSpec::extra`].
     ///
     /// # Errors

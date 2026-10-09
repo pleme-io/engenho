@@ -262,7 +262,7 @@ pub struct CpuLimits {
     /// Hard ceiling numerator, microseconds per `period`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota: Option<i64>,
-    /// Hard ceiling denominator, microseconds. Fixed at 100_000 — the value
+    /// Hard ceiling denominator, microseconds. Fixed at `100_000` — the value
     /// upstream Kubernetes uses, so a quota computed here means the same
     /// fraction of a core it would mean on any other kubelet.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -851,11 +851,11 @@ impl PodmanApi {
     /// a policy that looks right produced `HTTP 404 … "image not known"` for
     /// every image not already in the local store.
     ///
-    /// Measured on rio 2026-09-15: all four FluxCD controllers sat Pending in
-    /// ContainerCreating with exactly that error, while `podman pull` of the
+    /// Measured on rio 2026-09-15: all four `FluxCD` controllers sat Pending in
+    /// `ContainerCreating` with exactly that error, while `podman pull` of the
     /// very same reference succeeded by hand — so the images were reachable
     /// and the registry was fine. This is the same shape the CRI backend
-    /// already solved with its `ensure_image` (ImageStatus → PullImage); the
+    /// already solved with its `ensure_image` (`ImageStatus` → `PullImage`); the
     /// libpod backend simply never grew one.
     ///
     /// `Never` is honoured: it must not reach out, so an absent image stays a

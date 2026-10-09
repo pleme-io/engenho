@@ -99,11 +99,11 @@ pub enum Reason {
     /// No node satisfied the pod's requirements.
     FailedScheduling,
     // ── workload controllers ──
-    /// A ReplicaSet was scaled up or down.
+    /// A `ReplicaSet` was scaled up or down.
     ScalingReplicaSet,
-    /// A ReplicaSet created a pod.
+    /// A `ReplicaSet` created a pod.
     SuccessfulCreate,
-    /// A ReplicaSet deleted a pod.
+    /// A `ReplicaSet` deleted a pod.
     SuccessfulDelete,
     /// A workload controller could not create a child from its parent's
     /// template (`ReplicaSet`, `StatefulSet`, `DaemonSet` and `Job` pods;
@@ -122,7 +122,7 @@ pub enum Reason {
     /// The Endpoints controller could not write a Service's `Endpoints` or
     /// `EndpointSlice`. Upstream's `FailedToUpdateEndpoint`.
     FailedToUpdateEndpoint,
-    /// A PersistentVolumeClaim was bound.
+    /// A `PersistentVolumeClaim` was bound.
     ProvisioningSucceeded,
     /// A `PersistentVolumeClaim` could not be provisioned, for a reason that
     /// retrying will not clear (its declaration is unusable). Emitted by the
@@ -135,7 +135,7 @@ pub enum Reason {
     /// pv-binder's volume sweep on the volume, once, as it goes `Failed`.
     VolumeFailedDelete,
     // ── networking ──
-    /// A NetworkPolicy was accepted and its rules computed, but no packet
+    /// A `NetworkPolicy` was accepted and its rules computed, but no packet
     /// filter was installed — so the traffic it claims to restrict is
     /// unrestricted. The one case where silence would be a SECURITY claim
     /// rather than a missing feature, which is why it is a `Warning` and
@@ -269,7 +269,7 @@ impl EventRecord {
     #[must_use]
     pub fn key(&self) -> ResourceKey {
         let ns = self.involved.namespace.as_deref().unwrap_or("default");
-        ResourceKey::namespaced("", "v1", "Event", ns, &self.event_name())
+        ResourceKey::namespaced("", "v1", "Event", ns, self.event_name())
     }
 
     /// The `v1.Event` object.

@@ -1,4 +1,4 @@
-//! # StoreBackend — pluggable verb backend trait
+//! # `StoreBackend` — pluggable verb backend trait
 //!
 //! Every face's 5-verb contract dispatches through a
 //! [`StoreBackend`] trait object. The substrate ships one default
@@ -131,7 +131,7 @@ pub trait StoreBackend: Send + Sync + 'static {
 /// Blanket impl: an in-memory store implements the trait without
 /// any glue — its method signatures align.
 impl StoreBackend for crate::face_store::InMemoryStore {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "in-memory"
     }
 
@@ -270,7 +270,7 @@ impl StoreBackend for StubBackend {
 /// underway.
 
 /// Stub for the openraft-replicated store landing in R5
-/// (engenho-store / engenho-revoada::consensus).
+/// (engenho-store / `engenho-revoada::consensus`).
 #[must_use]
 pub fn raft_stub() -> Box<dyn StoreBackend> {
     Box::new(StubBackend::new("openraft-coming-in-R5"))

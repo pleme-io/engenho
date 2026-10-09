@@ -7,7 +7,7 @@
 //!
 //! This trait is the substrate every controller's reconcile loop
 //! reads from. Concrete impls live in `engenho-kube-client`
-//! (SharedInformerImpl using ReqwestWatcher) and the future
+//! (`SharedInformerImpl` using `ReqwestWatcher`) and the future
 //! `engenho-controller-runtime`.
 
 use crate::error::KubeError;

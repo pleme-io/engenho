@@ -120,8 +120,8 @@ impl<E: Clone> ReplayCursor<E> {
 crate::impl_named_field_generic!(ReplayCursor, E: Clone);
 
 /// Observable snapshot of a `ReplayCursor<E>` — cursor progress
-/// metadata (name + position + len + remaining + is_done). Pattern
-/// #2 (SSC v0.99): ReplayCursor's progress becomes plottable on
+/// metadata (name + position + len + remaining + `is_done`). Pattern
+/// #2 (SSC v0.99): `ReplayCursor`'s progress becomes plottable on
 /// any mirante dashboard without per-consumer adapter.
 ///
 /// Note: the snapshot does NOT include the cursor's E-typed events

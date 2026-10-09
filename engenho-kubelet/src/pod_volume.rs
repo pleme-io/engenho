@@ -296,10 +296,10 @@ pub enum PodVolumeSource {
     /// single directory. configMap and secret arms are served; the remaining
     /// arms stay typed-deferred and say which one they are.
     ///
-    /// This is the shape a secret-bearing config arrives in: a ConfigMap
+    /// This is the shape a secret-bearing config arrives in: a `ConfigMap`
     /// carrying the plain conf plus a Secret carrying the encrypted half,
     /// projected together so the consumer sees one directory. Serving only
-    /// the ConfigMap half — which is what refusing the whole volume forces a
+    /// the `ConfigMap` half — which is what refusing the whole volume forces a
     /// caller to do — silently drops the secret file.
     Projected {
         /// `projected.sources[]`, in declaration order.
@@ -567,7 +567,7 @@ engenho_substrate::impl_error_kind! {
 ///   * [`ensure_empty_dir`](VolumeMaterializer::ensure_empty_dir) —
 ///     idempotently create a per-pod-volume named volume, return the
 ///     [`MountSource::NamedVolume`]. Shared across the pod's containers.
-/// The standard path upstream mounts a pod's ServiceAccount credentials at.
+/// The standard path upstream mounts a pod's `ServiceAccount` credentials at.
 ///
 /// `kube-rs`, client-go and every other in-cluster client look here and
 /// nowhere else. `Config::incluster()` reads `namespace` first, then `token`,
@@ -576,14 +576,14 @@ engenho_substrate::impl_error_kind! {
 /// error.
 pub const SA_MOUNT_PATH: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
 
-/// Supplies the files for a pod's projected ServiceAccount volume.
+/// Supplies the files for a pod's projected `ServiceAccount` volume.
 ///
 /// A SEAM, not a concrete type, because issuing a token needs the cluster's
 /// ed25519 signing key which lives in `engenho-apiserver` — and
 /// `engenho-kubelet` does not depend on it, deliberately. The runtime holds
 /// both and implements this; tests inject a fake.
 ///
-/// Returning `None` means this pod gets NO ServiceAccount projection, the
+/// Returning `None` means this pod gets NO `ServiceAccount` projection, the
 /// honest state for a runtime with no signing key. It must never mean
 /// "project an empty token": a zero-byte token file is WORSE than an absent
 /// one, because the client stops looking for a kubeconfig and then fails
@@ -950,7 +950,7 @@ impl HostPathPolicy {
 /// same key read through a plain volume cannot disagree.
 ///
 /// Every other arm is typed-deferred and NAMES ITSELF in the reason, because
-/// "ProjectedUnsupported" sent a reader to the wrong place: the volume was
+/// "`ProjectedUnsupported`" sent a reader to the wrong place: the volume was
 /// refused wholesale when only one of its sources was actually unserved.
 ///
 /// `serviceAccountToken` is deferred here deliberately rather than
@@ -1352,7 +1352,7 @@ pub enum PvcBacking {
 /// # Errors
 ///
 ///   * [`VolumeResolveError::PvcNotBound`] — the PVC is absent, not `Bound`,
-///     or has no `spec.volumeName` (the pod waits, like ConfigMapNotFound).
+///     or has no `spec.volumeName` (the pod waits, like `ConfigMapNotFound`).
 ///   * [`VolumeResolveError::PvcNotBound`] — the bound PV named by the PVC is
 ///     itself absent from the store (binder hasn't created/written it yet).
 ///   * [`VolumeResolveError::PvcSourceUnsupported`] — the bound PV carries a
@@ -1824,7 +1824,7 @@ impl PodmanVolumeMaterializer {
     /// an errno the kubelet never sees. Measured 2026-09-15 on rio: Flux's
     /// source-controller (`runAsUser: 65534`) reported
     /// `failed to create temporary working directory: mkdir /tmp/...:
-    /// permission denied` and the GitRepository never synced, while the pod
+    /// permission denied` and the `GitRepository` never synced, while the pod
     /// itself stayed `Running` and the kubelet reported success.
     ///
     /// Not a security regression relative to Kubernetes: the directory is a
@@ -2873,7 +2873,7 @@ mod tests {
     }
 
     /// The guest chmod goes through the runtime, with the same mode the host
-    /// arm uses — not a hand-typed 777 that could drift from EMPTY_DIR_MODE.
+    /// arm uses — not a hand-typed 777 that could drift from `EMPTY_DIR_MODE`.
     #[test]
     fn guest_chmod_argv_is_the_runtime_path_not_a_host_syscall() {
         let argv = PodmanVolumeMaterializer::guest_chmod_argv(&GuestPath::new("/var/home/core/x"));
@@ -2904,11 +2904,11 @@ mod projected_volumes {
     use super::{PodVolumeSource, VolumeResolveError, resolve_pod_volumes};
     use serde_json::{Value, json};
 
-    /// The real shape: a ConfigMap carrying the plain conf plus a Secret
+    /// The real shape: a `ConfigMap` carrying the plain conf plus a Secret
     /// carrying the encrypted half, projected into ONE directory. This is how
     /// an akeyless `secretsManager` service receives `<svc>.conf` +
     /// `<svc>-secret.conf`, and refusing the volume forces a caller to mount
-    /// only the ConfigMap — which silently drops the secret file and the
+    /// only the `ConfigMap` — which silently drops the secret file and the
     /// service starts with its secret config ABSENT.
     fn pod_with_projection() -> Value {
         json!({
@@ -3020,7 +3020,7 @@ mod projected_volumes {
         assert!(format!("{err}").contains("more than one"));
     }
 
-    /// The deferred arms must NAME themselves — "ProjectedUnsupported" sent a
+    /// The deferred arms must NAME themselves — "`ProjectedUnsupported`" sent a
     /// reader to the wrong place by condemning the whole volume.
     #[tokio::test]
     async fn an_unserved_arm_says_which_arm_it_is() {

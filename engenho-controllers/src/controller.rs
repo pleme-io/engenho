@@ -138,10 +138,11 @@ impl<C: Controller + ?Sized> Controller for std::sync::Arc<C> {
 /// duplicate) so it becomes the LIVE requeue vocabulary the loop
 /// propagates. `Done` is the default — every controller that doesn't
 /// schedule a follow-up keeps the pre-unification behavior.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReconcileResult {
     /// Reconciliation succeeded; no follow-up scheduled. The next
     /// invocation comes from the next watch event or the fallback timer.
+    #[default]
     Done,
 
     /// Schedule another reconcile after `delay`. Useful for polling
@@ -154,12 +155,6 @@ pub enum ReconcileResult {
     /// over idle ones. The drivers treat it the same as `Requeue` for
     /// now (the driver's one requeue slot, armed for `delay`).
     RequeueWithProgress(Duration),
-}
-
-impl Default for ReconcileResult {
-    fn default() -> Self {
-        Self::Done
-    }
 }
 
 impl ReconcileResult {

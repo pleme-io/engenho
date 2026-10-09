@@ -1,4 +1,4 @@
-//! GitOps bootstrap — FluxCD + ArgoCD, both opt-in, both pointing at
+//! `GitOps` bootstrap — `FluxCD` + `ArgoCD`, both opt-in, both pointing at
 //! typed sources. The bootstrap path emits manifests dropped into
 //! `/var/lib/rancher/k3s/server/manifests/` which k3s auto-applies at
 //! startup. Per Operating Principle #1, both controllers share the same
@@ -6,14 +6,14 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Top-level GitOps bootstrap config.
+/// Top-level `GitOps` bootstrap config.
 ///
 /// Both [`Self::fluxcd`] and [`Self::argocd`] default to disabled.
 /// Enabling either causes the renderer to emit:
 ///
-/// 1. The controller install manifest (FluxCD or ArgoCD CRDs +
+/// 1. The controller install manifest (`FluxCD` or `ArgoCD` CRDs +
 ///    controllers + RBAC) into `/var/lib/rancher/k3s/server/manifests/`.
-/// 2. A source-of-truth CR (GitRepository for Flux; Application for
+/// 2. A source-of-truth CR (`GitRepository` for Flux; Application for
 ///    Argo) pointing at the typed [`GitopsSource`].
 /// 3. Optional secret-population manifests if [`GitopsSource::auth`]
 ///    is set — the secret content itself comes from sops-nix, but the
@@ -21,28 +21,28 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case", default)]
 pub struct BootstrapConfig {
-    /// FluxCD bootstrap. Disabled by default. Enabling installs
-    /// flux-system controllers + a GitRepository pointing at the
+    /// `FluxCD` bootstrap. Disabled by default. Enabling installs
+    /// flux-system controllers + a `GitRepository` pointing at the
     /// configured source.
     pub fluxcd: FluxcdBootstrap,
 
-    /// ArgoCD bootstrap. Disabled by default. Enabling installs
+    /// `ArgoCD` bootstrap. Disabled by default. Enabling installs
     /// argocd controllers + an Application pointing at the source.
     pub argocd: ArgocdBootstrap,
 }
 
-/// FluxCD bootstrap config.
+/// `FluxCD` bootstrap config.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case", default)]
 pub struct FluxcdBootstrap {
     /// `true` ⇒ render the flux-system install manifest + the
-    /// GitRepository + initial Kustomization.
+    /// `GitRepository` + initial Kustomization.
     pub enable: bool,
 
     /// The Git source this cluster reconciles from.
     pub source: Option<GitopsSource>,
 
-    /// Reconciliation interval for the GitSource (e.g. `1m`, `10m`).
+    /// Reconciliation interval for the `GitSource` (e.g. `1m`, `10m`).
     /// Default `1m` — k3s clusters typically iterate fast in dev.
     #[serde(default = "default_interval")]
     pub interval: String,
@@ -52,13 +52,13 @@ pub struct FluxcdBootstrap {
     #[serde(default = "default_flux_path")]
     pub path: String,
 
-    /// FluxCD version to install. `latest` pulls upstream's most recent
+    /// `FluxCD` version to install. `latest` pulls upstream's most recent
     /// stable; a pinned version like `v2.3.0` is recommended for prod.
     #[serde(default = "default_flux_version")]
     pub version: String,
 }
 
-/// ArgoCD bootstrap config.
+/// `ArgoCD` bootstrap config.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case", default)]
 pub struct ArgocdBootstrap {
@@ -83,9 +83,9 @@ pub struct ArgocdBootstrap {
     pub version: String,
 }
 
-/// Git source for either GitOps controller.
+/// Git source for either `GitOps` controller.
 ///
-/// Shared by FluxCD's `GitRepository` and ArgoCD's `Application.spec.source`.
+/// Shared by `FluxCD`'s `GitRepository` and `ArgoCD`'s `Application.spec.source`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct GitopsSource {

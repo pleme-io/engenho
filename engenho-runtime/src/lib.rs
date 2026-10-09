@@ -2,7 +2,7 @@
 //!
 //! The single-node assembly layer. [`Runtime`] is the ONE struct that
 //! boots the entire single-node engenho control + data plane in ONE
-//! process over a durable [`engenho_store::StoreMesh`], so a POSTed
+//! process over a durable [`engenho_store::StoreMesh`], so a `POSTed`
 //! `apps/v1` Deployment converges to a running container. The `engenho`
 //! binary is a thin launcher over [`Runtime::start`].
 //!
@@ -113,7 +113,7 @@
 //! ## Boot order (strict)
 //!
 //! 1. `config.validate()`
-//! 2. StoreMesh start (durable `start_or_resume`, or ephemeral) +
+//! 2. `StoreMesh` start (durable `start_or_resume`, or ephemeral) +
 //!    `wait_for_leadership` — leadership MUST precede any `propose`
 //! 3. register `Node/<node_name>` (the missing brick; no other code
 //!    does this, and the scheduler hard-requires a schedulable Node)

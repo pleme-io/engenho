@@ -141,7 +141,7 @@ pub async fn run_one(
 
 /// Fire `op` at BOTH targets WITHOUT diffing — for setup/mutation steps whose
 /// full-object response would otherwise flood the ratchet with unrelated
-/// defaulting divergence (e.g. a Pod create's PodSpec defaulting). The object
+/// defaulting divergence (e.g. a Pod create's `PodSpec` defaulting). The object
 /// must exist on both sides for the subsequent focused probes; its shape is
 /// diffed elsewhere (m0 covers create parity for the parity kinds).
 pub async fn exec_only(op: &Operation, engenho: &EngenhoTarget, k3s: &K3sTarget) {

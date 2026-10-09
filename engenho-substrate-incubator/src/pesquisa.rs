@@ -14,7 +14,7 @@
 //! is a typed DAG of search trials. Every `Ensaio` (trial) can be
 //! lowered to a `Plantio` (the brief's "per-trial Plantio"
 //! pattern); every generation can be lowered to a Plantio whose
-//! stages depend_on parents.
+//! stages `depend_on` parents.
 //!
 //! ## This commit
 //!
@@ -26,7 +26,7 @@
 //!   `FakeSelector`, `FakeSearchEngine`
 //! - Determinism anchors: BLAKE3 ids + seeded `SearchRng` + linhagem
 //!   chain hash
-//! - Replay-verifiable: same seed + same SearchSpace produces
+//! - Replay-verifiable: same seed + same `SearchSpace` produces
 //!   byte-identical Ensaios
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -147,7 +147,7 @@ pub struct Aptidao<F> {
     pub fitness: F,
     /// BLAKE3 over the canonical evidence the Fitness emitted.
     /// Cross-node disagreement on the same Ensaio = Dissent at the
-    /// QuorumTracker layer.
+    /// `QuorumTracker` layer.
     pub evidence_hash: [u8; 32],
 }
 
@@ -158,7 +158,7 @@ pub struct Geracao<F> {
     pub id: GeracaoId,
     /// Index in the search.
     pub generation_idx: u64,
-    /// Trials keyed by id. BTreeMap preserves deterministic ordering.
+    /// Trials keyed by id. `BTreeMap` preserves deterministic ordering.
     pub trials: BTreeMap<EnsaioId, Aptidao<F>>,
 }
 
@@ -224,7 +224,7 @@ impl Linhagem {
     /// commit this to attest a search was reproducible.
     ///
     /// COMPOSITE form (not serde-JSON) — the chain semantics are
-    /// hash-of-(search_id || generation_ids), which is more compact
+    /// hash-of-(search_id || `generation_ids`), which is more compact
     /// than full serde encoding and matches what a future
     /// cross-cluster federation would gossip.
     #[must_use]
@@ -238,7 +238,7 @@ impl Linhagem {
     }
 }
 
-/// MAP-Elites archive — typed BTreeMap from niche key to the best
+/// MAP-Elites archive — typed `BTreeMap` from niche key to the best
 /// trial that fell into that niche. Niche keys are operator-chosen
 /// behavior descriptors.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -301,7 +301,7 @@ impl<F: Clone> Arquivo<F> {
 }
 
 /// Opaque niche descriptor — operator-chosen bytes encoding
-/// behavior dimensions (e.g. "compression_ratio + circuit_depth").
+/// behavior dimensions (e.g. "`compression_ratio` + `circuit_depth`").
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct NicheKey(pub Vec<u8>);
 
@@ -319,8 +319,8 @@ impl NicheKey {
 
 /// Tiny deterministic RNG (Wyhash). Seeded from a 32-byte seed +
 /// stream identifier; same seed + same identifier produces
-/// byte-identical output. Used by every SearchSpace.mutate() +
-/// every Selector.select() call so the search is replayable.
+/// byte-identical output. Used by every `SearchSpace.mutate()` +
+/// every `Selector.select()` call so the search is replayable.
 ///
 /// Not cryptographic; good enough for search.
 #[derive(Clone, Debug)]
@@ -369,7 +369,7 @@ impl SearchRng {
 // Trait surface
 // =================================================================
 
-/// SearchSpace describes the search space + its mutation operators.
+/// `SearchSpace` describes the search space + its mutation operators.
 pub trait SearchSpace<G>: Send + Sync
 where
     G: Send + Sync,
@@ -384,13 +384,13 @@ where
     fn mutate(&self, parent: &G, rng: &mut SearchRng) -> G;
 
     /// Canonical bytes for a genotype — substrate hashes these to
-    /// derive EnsaioId. Same genotype always produces same bytes.
+    /// derive `EnsaioId`. Same genotype always produces same bytes.
     fn canonical_bytes(&self, g: &G) -> Vec<u8>;
 }
 
 /// Evidence bytes — whatever the Fitness produces alongside its
 /// scalar/vector score. The substrate hashes this with BLAKE3 to
-/// derive the receipt's evidence_hash.
+/// derive the receipt's `evidence_hash`.
 pub type Evidence = Vec<u8>;
 
 /// Fitness errors.
@@ -422,7 +422,7 @@ where
     fn name(&self) -> &'static str;
 
     /// Score a genotype + emit evidence bytes the substrate hashes
-    /// into a MaterializationReceipt's `evidence_hash`.
+    /// into a `MaterializationReceipt`'s `evidence_hash`.
     ///
     /// # Errors
     /// [`FitnessError::Backend`] / [`FitnessError::InvalidGenotype`].
@@ -449,7 +449,7 @@ pub enum PesquisaError {
     /// Fitness backend errored.
     #[error("fitness: {0}")]
     Fitness(String),
-    /// SearchEngine refused to step (out of budget / invalid prior).
+    /// `SearchEngine` refused to step (out of budget / invalid prior).
     #[error("engine: {0}")]
     Engine(String),
     /// Lineage replay diverged from the original chain.
@@ -474,7 +474,7 @@ impl engenho_substrate::fingerprint::Fingerprint for Linhagem {
     }
 }
 
-/// SearchEngine — runs one search step. The loop lives in operator
+/// `SearchEngine` — runs one search step. The loop lives in operator
 /// code; the trait gives one typed call per generation.
 #[async_trait]
 pub trait SearchEngine<F>: Send + Sync
@@ -499,7 +499,7 @@ where
 // Fake impls for tests
 // =================================================================
 
-/// In-memory SearchSpace<u32>. Sample = next_u64() as u32; mutate
+/// In-memory `SearchSpace`<u32>. Sample = `next_u64()` as u32; mutate
 /// = parent + small random delta. Deterministic.
 #[derive(Default, Clone)]
 pub struct FakeSearchSpace;
@@ -510,14 +510,15 @@ impl SearchSpace<u32> for FakeSearchSpace {
     }
 
     fn sample(&self, rng: &mut SearchRng) -> u32 {
-        rng.next_u64() as u32
+        let b = rng.next_u64().to_le_bytes();
+        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
     }
 
     fn mutate(&self, parent: &u32, rng: &mut SearchRng) -> u32 {
         // Small additive perturbation in [-16, 16).
-        let delta = (rng.next_u64() % 32) as i64 - 16;
-        let v = (*parent as i64).saturating_add(delta);
-        v.clamp(0, i64::from(u32::MAX)) as u32
+        let delta = i64::try_from(rng.next_u64() % 32).unwrap_or(0) - 16;
+        let v = i64::from(*parent).saturating_add(delta);
+        u32::try_from(v.clamp(0, i64::from(u32::MAX))).unwrap_or(u32::MAX)
     }
 
     fn canonical_bytes(&self, g: &u32) -> Vec<u8> {
@@ -548,7 +549,7 @@ impl Fitness<u32, f64> for FakeFitness {
     }
 
     async fn evaluate(&self, genotype: &u32) -> Result<(f64, Evidence), FitnessError> {
-        let distance = (*genotype as i64 - self.target as i64).unsigned_abs() as f64;
+        let distance = f64::from(genotype.abs_diff(self.target));
         let fitness = -distance; // higher = better
         let mut evidence = self.target.to_le_bytes().to_vec();
         evidence.extend_from_slice(&genotype.to_le_bytes());
@@ -590,7 +591,7 @@ where
             // Sample k random candidates; pick the highest-fitness one.
             let mut champion: Option<&Aptidao<F>> = None;
             for _ in 0..self.k {
-                let idx = rng.next_below(population.len() as u64) as usize;
+                let idx = usize::try_from(rng.next_below(population.len() as u64)).unwrap_or(0);
                 let candidate = &population[idx];
                 match champion {
                     None => champion = Some(candidate),
@@ -616,12 +617,12 @@ where
 // Conversion helpers — turn fitness evidence into receipts
 // =================================================================
 
-/// Map an Aptidao into a MaterializationReceipt the existing ledger
-/// can ingest. Subject is the EnsaioId; evidence_hash is the
-/// Aptidao's evidence_hash; emitter is operator-supplied.
+/// Map an Aptidao into a `MaterializationReceipt` the existing ledger
+/// can ingest. Subject is the `EnsaioId`; `evidence_hash` is the
+/// Aptidao's `evidence_hash`; emitter is operator-supplied.
 ///
-/// Cross-node disagreement on the same ensaio's evidence_hash =
-/// QuorumTracker reports Dissent (same byzantine-detection path).
+/// Cross-node disagreement on the same ensaio's `evidence_hash` =
+/// `QuorumTracker` reports Dissent (same byzantine-detection path).
 #[must_use]
 pub fn aptidao_to_receipt<F>(
     aptidao: &Aptidao<F>,
@@ -665,6 +666,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
 

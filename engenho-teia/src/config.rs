@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::TeiaError;
 
-/// Wire engenho-config's top-level TeiaConfig into this runtime
-/// TeiaConfig. Operators set one yaml file; this conversion gives
+/// Wire engenho-config's top-level `TeiaConfig` into this runtime
+/// `TeiaConfig`. Operators set one yaml file; this conversion gives
 /// the teia runtime its exact slice. Server-name list and cluster
 /// name are passed through verbatim; the runtime applies per-attempt
 /// + total timeouts derived from the single `connect_timeout_seconds`

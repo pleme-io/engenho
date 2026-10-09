@@ -13,7 +13,7 @@
 //!   1. `StoreMesh` is a usable foundation for K8s controllers.
 //!   2. The reconcile-loop pattern (poll → decide → patch) works
 //!      cleanly on top of typed resource commands.
-//!   3. Future controllers (Deployment, ReplicaSet, Service,
+//!   3. Future controllers (Deployment, `ReplicaSet`, Service,
 //!      Endpoints, GC, etc.) follow this exact shape.
 //!
 //! ## Architecture

@@ -1,4 +1,4 @@
-//! WorkloadShape — typed catalog of representations the substrate
+//! `WorkloadShape` — typed catalog of representations the substrate
 //! can render `Drv` outputs into.
 //!
 //! Every shape carries a deterministic "shape hash" the
@@ -8,8 +8,8 @@
 //! shape identifier).
 //!
 //! This module ships only the typed enum + naming + hashing. The
-//! actual renderers ship per-shape as they're built (OciImage
-//! first, NixClosure next, etc.).
+//! actual renderers ship per-shape as they're built (`OciImage`
+//! first, `NixClosure` next, etc.).
 
 use serde::{Deserialize, Serialize};
 
@@ -44,7 +44,7 @@ pub enum WorkloadShape {
 
 impl WorkloadShape {
     /// Project a [`Realisation`] into its native shape. Every
-    /// Realisation IS a NixClosure by definition (it's the output
+    /// Realisation IS a `NixClosure` by definition (it's the output
     /// of a Drv); upper layers re-render via [`ShapeRenderer`] for
     /// other shapes.
     ///
@@ -55,8 +55,8 @@ impl WorkloadShape {
         WorkloadShape::NixClosure
     }
 
-    /// Stable identifier (snake_case) used as a tag in receipts
-    /// + cache keys. Mirrors the serde rename — keeps consistency
+    /// Stable identifier (`snake_case`) used as a tag in receipts
+    /// and cache keys. Mirrors the serde rename — keeps consistency
     /// between in-process matching + on-wire receipts.
     #[must_use]
     pub fn tag(&self) -> String {
@@ -86,12 +86,10 @@ impl WorkloadShape {
     pub fn file_extension(&self) -> Option<&'static str> {
         match self {
             Self::OciImage => Some("tar"),
-            Self::NixClosure => None, // a directory, not a file
+            Self::NixClosure | Self::StaticBinary { .. } | Self::Custom { .. } => None,
             Self::Qcow2 => Some("qcow2"),
             Self::Wasm => Some("wasm"),
-            Self::StaticBinary { .. } => None, // no canonical extension
             Self::HelmChart => Some("tgz"),
-            Self::Custom { .. } => None,
         }
     }
 
@@ -146,7 +144,7 @@ pub struct RenderedArtifact {
 }
 
 impl RenderedArtifact {
-    /// Build from bytes; computes evidence_hash.
+    /// Build from bytes; computes `evidence_hash`.
     #[must_use]
     pub fn from_bytes(shape: WorkloadShape, bytes: Vec<u8>) -> Self {
         let evidence_hash = *blake3::hash(&bytes).as_bytes();

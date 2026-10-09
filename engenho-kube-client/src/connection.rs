@@ -7,7 +7,7 @@
 //! [`ReqwestWatcher`](crate::ReqwestWatcher) instances. It carries:
 //!
 //!   * the API server URL,
-//!   * the (cached) reqwest::Client with TLS + client-cert preloaded,
+//!   * the (cached) `reqwest::Client` with TLS + client-cert preloaded,
 //!   * the resolved [`KubeAuth`] (re-read every request when it's a
 //!     file-backed bearer token so SA-token rotation just works).
 
@@ -91,7 +91,7 @@ impl Connection {
         &self.server
     }
 
-    /// reqwest client clone (cheap; reqwest::Client is internally Arc).
+    /// reqwest client clone (cheap; `reqwest::Client` is internally Arc).
     #[must_use]
     pub fn http(&self) -> Client {
         self.http.clone()
@@ -144,12 +144,11 @@ impl Connection {
         env: &[engenho_types::auth::ExecEnv],
         api_version: &str,
     ) -> Result<Risca<String>, KubeError> {
-        if let Ok(guard) = self.exec_cache.lock() {
-            if let Some((tok, minted)) = guard.as_ref() {
-                if minted.elapsed() < EXEC_CREDENTIAL_TTL {
-                    return Ok(Risca::new(tok.clone()));
-                }
-            }
+        if let Ok(guard) = self.exec_cache.lock()
+            && let Some((tok, minted)) = guard.as_ref()
+            && minted.elapsed() < EXEC_CREDENTIAL_TTL
+        {
+            return Ok(Risca::new(tok.clone()));
         }
 
         let mut cmd = std::process::Command::new(command);

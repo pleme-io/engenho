@@ -1,7 +1,7 @@
-//! Layer C — content-addressed workload sync via iroh / BitTorrent
+//! Layer C — content-addressed workload sync via iroh / `BitTorrent`
 //! mainline DHT.
 //!
-//! Pod manifests, ConfigMaps, image layers are addressed by their
+//! Pod manifests, `ConfigMaps`, image layers are addressed by their
 //! BLAKE3 hash + served peer-to-peer. Any node that has the content
 //! can serve it; workers fetch from nearest peer instead of always
 //! through the central apiserver.
@@ -24,7 +24,7 @@ engenho_substrate::define_hash_newtype! {
 }
 
 /// Per-content advertisement gossiped to the mainline DHT.
-/// "I have content X; reach me at this NodeId."
+/// "I have content X; reach me at this `NodeId`."
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentAdvertisement {
     pub hash: ContentHash,
@@ -42,7 +42,7 @@ pub struct ContentAdvertisement {
 pub enum ContentKind {
     /// Pod manifest.
     PodSpec,
-    /// ConfigMap data blob.
+    /// `ConfigMap` data blob.
     ConfigMapData,
     /// Helm chart tarball.
     HelmChart,

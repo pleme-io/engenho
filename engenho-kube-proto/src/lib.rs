@@ -67,7 +67,7 @@ static DESCRIPTOR_SET_BYTES: &[u8] =
 
 /// Typed codec errors. Every error is a typed value — no panic, no
 /// `unimplemented!()`. The apiserver maps these to a proper K8s `Status`
-/// body (a 400 BadRequest for malformed / unknown input).
+/// body (a 400 `BadRequest` for malformed / unknown input).
 #[derive(Debug, thiserror::Error)]
 pub enum CodecError {
     /// The 4-byte magic prefix was missing or wrong.
@@ -373,15 +373,15 @@ fn normalize_metadata_times_in_place(value: &mut serde_json::Value) {
         .and_then(|m| m.as_object_mut())
     {
         for field in TIME_METADATA_FIELDS {
-            if let Some(serde_json::Value::String(s)) = metadata.get(field) {
-                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-                    let seconds = dt.timestamp();
-                    let nanos = i64::from(dt.timestamp_subsec_nanos());
-                    metadata.insert(
-                        field.to_string(),
-                        serde_json::json!({ "seconds": seconds, "nanos": nanos }),
-                    );
-                }
+            if let Some(serde_json::Value::String(s)) = metadata.get(field)
+                && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s)
+            {
+                let seconds = dt.timestamp();
+                let nanos = i64::from(dt.timestamp_subsec_nanos());
+                metadata.insert(
+                    field.to_string(),
+                    serde_json::json!({ "seconds": seconds, "nanos": nanos }),
+                );
             }
         }
     }

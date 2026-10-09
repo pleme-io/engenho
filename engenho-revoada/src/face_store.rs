@@ -1,18 +1,18 @@
-//! # InMemoryStore — the shared verb-impl backend
+//! # `InMemoryStore` — the shared verb-impl backend
 //!
 //! Every face needs the same shape of in-memory state to back its
-//! 5-verb contract: a HashMap of stored envelopes, a Vec of watch
-//! subscribers, and an AdapterRegistry for format conversion. This
+//! 5-verb contract: a `HashMap` of stored envelopes, a Vec of watch
+//! subscribers, and an `AdapterRegistry` for format conversion. This
 //! module ships that shape as one shared helper so all five faces
 //! compose with it.
 //!
-//! Per the prime-directive third-site rule: PureRaftFace shipped
-//! verbs first; KubernetesFace + NomadFace + SystemdFace +
-//! BareMetalSupervisorFace would have each re-implemented the same
+//! Per the prime-directive third-site rule: `PureRaftFace` shipped
+//! verbs first; `KubernetesFace` + `NomadFace` + `SystemdFace` +
+//! `BareMetalSupervisorFace` would have each re-implemented the same
 //! ~70-line pattern. Lifting to one helper means each face is
 //! 5 lines of delegation + its own lifecycle hooks. Future R6
 //! per-face backends (kube-apiserver / nomad HTTP / dbus / etc.)
-//! REPLACE the InMemoryStore in their face; the operator-facing
+//! REPLACE the `InMemoryStore` in their face; the operator-facing
 //! contract stays identical.
 
 use std::collections::HashMap;
@@ -30,7 +30,7 @@ use crate::format::AdapterRegistry;
 pub struct InMemoryStore {
     /// Face name (used for diagnostic messages in adapter errors).
     face_name: String,
-    /// Resource → envelope bytes (CBOR-encoded NativeEnvelope when
+    /// Resource → envelope bytes (CBOR-encoded `NativeEnvelope` when
     /// applied via Native; raw operator bytes when applied via
     /// Yaml/Json/Hcl — the adapter wraps either case to match
     /// `Native` round-tripping).
@@ -134,7 +134,7 @@ impl InMemoryStore {
         Ok(())
     }
 
-    /// Get: lookup + adapter.from_native rendering.
+    /// Get: lookup + `adapter.from_native` rendering.
     pub fn get(
         &self,
         reference: &ResourceRef,
@@ -210,7 +210,7 @@ impl InMemoryStore {
     // Pure-data primitive — no I/O. Operators wire to disk / object
     // store / network via the bytes the snapshot returns.
 
-    /// Serialize every (ResourceRef, envelope) pair the store
+    /// Serialize every (`ResourceRef`, envelope) pair the store
     /// currently holds into a CBOR-encoded byte buffer. Stable
     /// ordering: entries are sorted by (kind, namespace, name) so
     /// two snapshots of the same logical state produce byte-
@@ -260,10 +260,10 @@ impl InMemoryStore {
         Ok(())
     }
 
-    /// Number of resources currently stored. Used by ClusterHealth.
+    /// Number of resources currently stored. Used by `ClusterHealth`.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.store.lock().map(|s| s.len()).unwrap_or(0)
+        self.store.lock().map_or(0, |s| s.len())
     }
 
     /// True iff the store has no resources.
@@ -272,10 +272,10 @@ impl InMemoryStore {
         self.len() == 0
     }
 
-    /// Number of active watch subscribers. Used by ClusterHealth.
+    /// Number of active watch subscribers. Used by `ClusterHealth`.
     #[must_use]
     pub fn subscriber_count(&self) -> usize {
-        self.subscribers.lock().map(|s| s.len()).unwrap_or(0)
+        self.subscribers.lock().map_or(0, |s| s.len())
     }
 
     /// Watch: register subscriber, replay current state as Added.
@@ -320,13 +320,10 @@ impl std::fmt::Debug for InMemoryStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InMemoryStore")
             .field("face_name", &self.face_name)
-            .field(
-                "store_len",
-                &self.store.lock().map(|s| s.len()).unwrap_or(0),
-            )
+            .field("store_len", &self.store.lock().map_or(0, |s| s.len()))
             .field(
                 "subscriber_count",
-                &self.subscribers.lock().map(|s| s.len()).unwrap_or(0),
+                &self.subscribers.lock().map_or(0, |s| s.len()),
             )
             .finish()
     }

@@ -98,7 +98,7 @@ pub enum KeyShape {
     GrouplessClusterScoped,
     /// `/registry/<group>/<plural>/<ns>/<name>` — custom resources.
     GroupedNamespaced,
-    /// `/registry/<group>/<plural>/<name>` — CRDs, APIServices.
+    /// `/registry/<group>/<plural>/<name>` — CRDs, `APIServices`.
     GroupedClusterScoped,
     /// `/registry/services/<discriminator>/<ns>/<name>` — the Service split.
     ServiceSubtree(&'static str),
@@ -125,7 +125,7 @@ pub enum SingletonKey {
     /// `/registry/masterleases/<ip>` — apiserver endpoint leases.
     MasterLease,
     /// `/registry/ranges/serviceips` and `/registry/ranges/servicenodeports`
-    /// — the Service VIP and NodePort allocator bitmaps.
+    /// — the Service VIP and `NodePort` allocator bitmaps.
     Range,
 }
 
@@ -862,8 +862,8 @@ mod parse_tests {
 
     /// Registry segments present in the oracle that engenho does NOT serve.
     ///
-    /// These are real Kubernetes kinds (`networking.k8s.io` IPAddress and
-    /// ServiceCIDR) that a v1.34 apiserver writes and engenho's catalog has
+    /// These are real Kubernetes kinds (`networking.k8s.io` `IPAddress` and
+    /// `ServiceCIDR`) that a v1.34 apiserver writes and engenho's catalog has
     /// no descriptor for. A key for an unserved kind CANNOT resolve to a
     /// GVK, and inventing one would be worse than refusing.
     ///

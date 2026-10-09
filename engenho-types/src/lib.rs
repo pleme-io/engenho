@@ -4,7 +4,7 @@
 //!
 //! Per `pleme-io/theory/ENGENHO.md` §II.1, every Kubernetes kind is a
 //! `#[derive(KubeResource, TataraDomain)]` struct mechanically emitted by
-//! `forge-gen` from upstream OpenAPI v3 (Pillar 12 — generation over
+//! `forge-gen` from upstream `OpenAPI` v3 (Pillar 12 — generation over
 //! composition). The non-negotiable rule of this crate: **no hand-authored
 //! resource types**. If you reach for a hand-written struct, you are
 //! violating the prime directive — extend the generator instead.
@@ -47,7 +47,7 @@
 //!
 //! Engenho ships ONLY when Sonobuoy `--mode=certified-conformance`
 //! passes on Kubernetes 1.34 with zero skips. Until M4 lands, the kasou
-//! + kikai bridge runs k3s v1.34 in production locally and supplies the
+//! and kikai bridge runs k3s v1.34 in production locally and supplies the
 //! operator kubectl experience while engenho catches up.
 
 // A doc link to an item that does not exist is a comment naming code that
@@ -67,6 +67,11 @@ pub mod egress;
 pub mod error;
 #[allow(
     rustdoc::broken_intra_doc_links,
+    clippy::doc_lazy_continuation,
+    clippy::doc_link_with_quotes,
+    clippy::doc_markdown,
+    rustdoc::bare_urls,
+    clippy::wildcard_imports,
     reason = "generated from upstream OpenAPI descriptions, whose `[x]`-style text is prose, not links"
 )]
 pub mod generated_v1_34;
@@ -94,7 +99,7 @@ pub use spec_int::SpecInt;
 /// EVERY surface that reports a Kubernetes version (the apiserver's
 /// `/version` endpoint, the kubelet's probe `User-Agent`, conformance
 /// gating) reads it from an [`ApiFace`] so they can never drift from the
-/// vendored OpenAPI schemas under `vendor/openapi/v1.34.0/` or the
+/// vendored `OpenAPI` schemas under `vendor/openapi/v1.34.0/` or the
 /// generated kinds in [`generated_v1_34`].
 ///
 /// Per `theory/ENGENHO.md` §XIII the ship gate is Kubernetes 1.34

@@ -4,7 +4,7 @@
 //! GET/POST/PUT/PATCH/DELETE. Watch lives in [`crate::watcher`] because
 //! the trait returns a streaming object.
 //!
-//! Error mapping: every reqwest::Error → [`KubeError::Network`];
+//! Error mapping: every `reqwest::Error` → [`KubeError::Network`];
 //! every apiserver 4xx/5xx → [`KubeError::ApiStatus`] with the typed
 //! `ApiStatusKind` from the status code (+ Status body's reason
 //! when available).
@@ -64,8 +64,7 @@ impl ReqwestKubeClient {
         let kind = if let Ok(s) = serde_json::from_str::<serde_json::Value>(&text) {
             s.get("reason")
                 .and_then(|r| r.as_str())
-                .map(reason_to_kind)
-                .unwrap_or_else(|| ApiStatusKind::from_code(code))
+                .map_or_else(|| ApiStatusKind::from_code(code), reason_to_kind)
         } else {
             ApiStatusKind::from_code(code)
         };

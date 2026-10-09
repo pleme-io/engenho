@@ -8,12 +8,12 @@
 //! ## The owner is resolved from the ownerReference, never from a list
 //!
 //! This controller used to build a set of live UIDs by listing TWO
-//! hardcoded kinds — Deployment and ReplicaSet — and delete any Pod whose
-//! controller UID was not in it. A StatefulSet's Pod is therefore an
+//! hardcoded kinds — Deployment and `ReplicaSet` — and delete any Pod whose
+//! controller UID was not in it. A `StatefulSet`'s Pod is therefore an
 //! "orphan" on every single tick.
 //!
 //! Measured on ryn 2026-09-18: `pitr-lab/mysql-0` (owned by the
-//! StatefulSet `pitr-lab/mysql`) was deleted ~10 times per SECOND for
+//! `StatefulSet` `pitr-lab/mysql`) was deleted ~10 times per SECOND for
 //! days. The statefulset controller recreated it, the scheduler bound it,
 //! gc deleted it, forever — three controllers at full tilt, `changed=1`
 //! on every tick of each, and 14,306 log lines about one pod. The churn
@@ -23,7 +23,7 @@
 //! The old doc comment called the fix "more entries in the scan list".
 //! That is the wrong destination: the next owner kind would have re-armed
 //! the same trap. Upstream does not keep a list — `garbagecollector`
-//! resolves an ownerReference through the RESTMapper and does a live GET
+//! resolves an ownerReference through the `RESTMapper` and does a live GET
 //! of THAT owner, and it deletes only against a confirmed-absent owner
 //! (`absentOwnerCache`). So do we, and the hardcoded enumeration is gone
 //! rather than extended.

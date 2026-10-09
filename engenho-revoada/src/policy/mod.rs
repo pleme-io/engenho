@@ -90,6 +90,7 @@ impl TargetTopology {
         }
     }
 
+    #[must_use]
     pub fn target_for(&self, role: NodeRole) -> u32 {
         match role {
             NodeRole::ApiServer => self.api_servers,
@@ -130,7 +131,7 @@ pub trait Policy: Send + Sync {
 ///      healthy gossip-member without the role + emit `Promote`.
 ///
 /// Workers are NOT auto-promoted — they accumulate naturally as
-/// new nodes join + the min_workers floor is informational only
+/// new nodes join + the `min_workers` floor is informational only
 /// at R3 (R4 may auto-quarantine excess workers).
 pub struct AutoReplacementPolicy;
 
@@ -186,7 +187,7 @@ impl Policy for AutoReplacementPolicy {
             }
 
             // (2) Promote replacements if alive count < target.
-            let needed = target.target_for(role) as i64 - alive_holders.len() as i64;
+            let needed = i64::from(target.target_for(role)) - alive_holders.len() as i64;
             if needed > 0 {
                 // Find healthy gossip members not already holding the role.
                 let candidates: Vec<NodeId> = membership
@@ -199,8 +200,7 @@ impl Policy for AutoReplacementPolicy {
                         consensus
                             .assignments
                             .get(n)
-                            .map(|roles| !roles.contains(&NodeRole::Quarantined))
-                            .unwrap_or(true)
+                            .is_none_or(|roles| !roles.contains(&NodeRole::Quarantined))
                     })
                     .collect();
 
@@ -312,6 +312,7 @@ impl PolicyEngine {
     /// Spawn a long-running task that ticks on either a gossip
     /// change or the audit interval. Returns a handle the caller
     /// can abort to stop the engine.
+    #[must_use]
     pub fn spawn(self) -> JoinHandle<()> {
         tokio::spawn(async move {
             let mut gossip_rx = self.gossip.subscribe();

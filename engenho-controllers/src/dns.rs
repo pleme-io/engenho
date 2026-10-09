@@ -27,7 +27,7 @@ use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
 use crate::effect::Effect;
 use crate::error::ControllerError;
 
-/// Default cluster DNS suffix (matches CoreDNS convention).
+/// Default cluster DNS suffix (matches `CoreDNS` convention).
 pub const DEFAULT_CLUSTER_DOMAIN: &str = "cluster.local";
 
 /// One A-record in the cluster DNS zone.
@@ -37,7 +37,7 @@ pub struct DnsRecord {
     pub fqdn: String,
     /// IPv4 address it resolves to.
     pub ip: String,
-    /// TTL in seconds (default 30 — match CoreDNS).
+    /// TTL in seconds (default 30 — match `CoreDNS`).
     pub ttl: u32,
 }
 
@@ -85,7 +85,7 @@ pub fn srv_fqdn(
 ///
 /// ★ WHY SRV MATTERS AND A-RECORDS ARE NOT ENOUGH. An A record answers
 /// "where is this service"; SRV answers "on WHICH PORT". Every client that
-/// discovers a port rather than hardcoding it — StatefulSet peers finding
+/// discovers a port rather than hardcoding it — `StatefulSet` peers finding
 /// each other, Kafka and etcd clients, anything using
 /// `_port._proto.service` — reads SRV. Without it those clients fall back
 /// to a default port that is usually wrong, and the failure looks like a
@@ -225,7 +225,7 @@ pub trait DnsBackend: Send + Sync {
 // InMemoryDnsZone — deterministic backend for tests + small clusters
 // =================================================================
 
-/// In-memory DNS zone. Tracks records in a BTreeMap; records every
+/// In-memory DNS zone. Tracks records in a `BTreeMap`; records every
 /// upsert/remove call for test assertions.
 #[derive(Default, Clone)]
 pub struct InMemoryDnsZone {

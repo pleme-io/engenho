@@ -22,7 +22,7 @@
 //! 1. List all Pods whose `spec.nodeName == self.node_name`.
 //! 2. For each Pod:
 //!    - If not already running locally, start a container via the
-//!      backend and capture container_id.
+//!      backend and capture `container_id`.
 //!    - If running, ensure backend reports healthy + update
 //!      `status.podIP` + `status.conditions[Ready]=True` via patch.
 //!    - If Pod is missing from the store (cleanup), kill the
@@ -31,7 +31,7 @@
 //! ## Container intent translation
 //!
 //! Reuses `engenho_types::translator::WorkloadIntent` so an
-//! operator can express a Pod, ReplicaSet, or full Deployment
+//! operator can express a Pod, `ReplicaSet`, or full Deployment
 //! through any face and the kubelet's container spec is derived
 //! consistently. Per-pod the kubelet reads `spec.containers[0]`
 //! directly (Pod is the lowest-level unit; no further translation).

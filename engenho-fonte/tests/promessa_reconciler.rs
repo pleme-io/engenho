@@ -5,7 +5,7 @@
 #![cfg(feature = "with-promessa")]
 
 use engenho_fonte::{
-    PromessaIntent, PromessaKind, PromessaReconciler, PromessaRef, PromessaTargetReconciler,
+    PromessaKind, PromessaReconciler, PromessaRef, PromessaTargetReconciler,
     promessa_kind_to_target,
 };
 use promessa_types::PromessaTargetKind;

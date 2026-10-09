@@ -103,7 +103,7 @@ pub fn controlling_owner(child: &Value) -> Option<OwnerReference> {
             arr.iter().find_map(|r| {
                 let is_ctrl = r
                     .get("controller")
-                    .and_then(|c| c.as_bool())
+                    .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
                 if is_ctrl {
                     serde_json::from_value::<OwnerReference>(r.clone()).ok()
@@ -117,9 +117,7 @@ pub fn controlling_owner(child: &Value) -> Option<OwnerReference> {
 /// Returns true if `child` has `owner_uid` as its controlling owner.
 #[must_use]
 pub fn is_owned_by(child: &Value, owner_uid: &str) -> bool {
-    controlling_owner(child)
-        .map(|o| o.uid == owner_uid)
-        .unwrap_or(false)
+    controlling_owner(child).is_some_and(|o| o.uid == owner_uid)
 }
 
 /// Build a controller-style [`OwnerReference`] pointing at `parent`

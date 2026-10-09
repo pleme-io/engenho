@@ -1,4 +1,4 @@
-//! `EndpointsController` — materializes Endpoints **and** EndpointSlice
+//! `EndpointsController` — materializes Endpoints **and** `EndpointSlice`
 //! objects from Service selectors + matching Pod IPs.
 //!
 //! K8s rule: for each Service, find Pods in the same namespace
@@ -7,10 +7,10 @@
 //! (same name + namespace as the Service) with the Pod IPs in
 //! `subsets[].addresses`.
 //!
-//! ## EndpointSlice (discovery.k8s.io/v1)
+//! ## `EndpointSlice` (discovery.k8s.io/v1)
 //!
 //! In addition to the legacy Endpoints object, the controller emits ONE
-//! `discovery.k8s.io/v1` EndpointSlice per Service — the modern endpoint-
+//! `discovery.k8s.io/v1` `EndpointSlice` per Service — the modern endpoint-
 //! publishing kind kube-proxy + many controllers consume. Both objects
 //! are derived from the SAME selector→pod resolution (no fork): the slice
 //! is a parallel projection of the identical `(ip, pod_name)` set. The
@@ -101,7 +101,7 @@ impl EndpointsController {
     /// faithfully DNATs to a port nothing listens on. Measured on rio
     /// 2026-09-15 — Flux's source-controller Service is
     /// `port: 80, targetPort: "http"` and the container serves 9090.
-    /// engenho published `port: 80`, so every connection to the ClusterIP
+    /// engenho published `port: 80`, so every connection to the `ClusterIP`
     /// was refused while the pod answered 200 on its real port, and
     /// kustomize-controller could never fetch an artifact.
     ///
@@ -152,7 +152,7 @@ impl EndpointsController {
     }
 
     /// Build the Endpoints object body. `addresses` is a typed
-    /// list of (ip, target_pod_name) pairs.
+    /// list of (ip, `target_pod_name`) pairs.
     fn build_endpoints(svc: &Value, addresses: Vec<(String, String)>, pods: &[&Value]) -> Value {
         let name = svc.name().unwrap_or("");
         // The pod-side ports, NOT the Service's spec.ports verbatim.
@@ -184,7 +184,7 @@ impl EndpointsController {
         })
     }
 
-    /// Build the `discovery.k8s.io/v1` EndpointSlice body from the SAME
+    /// Build the `discovery.k8s.io/v1` `EndpointSlice` body from the SAME
     /// `(ip, pod_name)` set the Endpoints object uses. Parallel projection,
     /// not a fork: the caller resolves the selector once and feeds both.
     ///
@@ -229,7 +229,7 @@ impl EndpointsController {
         })
     }
 
-    /// Reconcile the EndpointSlice for a Service: owner-ref it, stamp the
+    /// Reconcile the `EndpointSlice` for a Service: owner-ref it, stamp the
     /// creationTimestamp on create, and write it only when the slice body
     /// changed (idempotent). Mirrors the Endpoints reconcile shape so both
     /// projections share one convergence discipline. Returns what the
@@ -416,7 +416,7 @@ fn subsets_equivalent(a: &Value, b: &Value) -> bool {
     a.get("subsets") == b.get("subsets")
 }
 
-/// Compare two EndpointSlice values for body equivalence — the
+/// Compare two `EndpointSlice` values for body equivalence — the
 /// `endpoints` + `ports` + `addressType` carry the load-bearing state;
 /// metadata.resourceVersion/uid (store-filled) is ignored so a re-tick
 /// with the same pods is a no-op.

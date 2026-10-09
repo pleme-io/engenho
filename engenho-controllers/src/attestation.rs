@@ -6,13 +6,13 @@
 //! tameshi / cosign / sigstore verifier; the substrate ships a
 //! `FakeSignatureVerifier` for tests + a typed
 //! `TameshiAttestationWebhook` that holds the verifier reference
-//! + opts in to specific kinds (Pods, Jobs, CronJobs — anything
+//! + opts in to specific kinds (Pods, Jobs, `CronJobs` — anything
 //! that names an image).
 //!
 //! ## Decision rules
 //!
-//! For Put / Patch on a kind that names images (Pod / Job / CronJob
-//! / Deployment / StatefulSet / DaemonSet / ReplicaSet via their
+//! For Put / Patch on a kind that names images (Pod / Job / `CronJob`
+//! / Deployment / `StatefulSet` / `DaemonSet` / `ReplicaSet` via their
 //! `spec.template.spec.containers[].image`), extract every image
 //! reference + ask the verifier. First unsigned image denies with
 //! a typed reason.
@@ -154,7 +154,7 @@ pub struct TameshiAttestationWebhook {
 
 impl TameshiAttestationWebhook {
     /// New webhook gating workload kinds (Pod / Deployment /
-    /// StatefulSet / Job / CronJob / DaemonSet / ReplicaSet).
+    /// `StatefulSet` / Job / `CronJob` / `DaemonSet` / `ReplicaSet`).
     #[must_use]
     pub fn new(verifier: Arc<dyn SignatureVerifier>) -> Self {
         Self {
@@ -167,7 +167,7 @@ impl TameshiAttestationWebhook {
     /// manifest. Walks `spec.containers[].image` and (for owner-
     /// resources) `spec.template.spec.containers[].image`. Also
     /// walks `spec.jobTemplate.spec.template.spec.containers[].image`
-    /// for CronJob.
+    /// for `CronJob`.
     #[must_use]
     pub fn extract_image_refs(value: &Value) -> Vec<String> {
         let mut refs = Vec::new();

@@ -7,7 +7,7 @@
 //!     `Scheduler`, which implements it too). Every controller here
 //!     implements it.
 //!   * [`replicaset::ReplicaSetController`] — first concrete
-//!     impl. Watches ReplicaSets, creates/deletes Pods so the
+//!     impl. Watches `ReplicaSets`, creates/deletes Pods so the
 //!     observed replica count matches `spec.replicas`.
 //!   * [`WatchDriver`] — the event loop that drives one controller from
 //!     store events, a requeue slot and a fallback timer. The daemon runs

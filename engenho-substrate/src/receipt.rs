@@ -1,4 +1,4 @@
-//! MaterializationReceipt — typed proof that one node successfully
+//! `MaterializationReceipt` — typed proof that one node successfully
 //! materialized one artifact at a specific moment.
 //!
 //! The substrate's confirmation primitive. Any controller, build
@@ -35,7 +35,7 @@ pub enum ReceiptKind {
     Nar,
     /// A Realisation entry was recorded.
     Realisation,
-    /// A BuildBackend completed a build.
+    /// A `BuildBackend` completed a build.
     BuildResult,
     /// A higher-level Shape materialization (OCI image / NixOS
     /// closure / qcow2 / wasm bundle) — payload identifies which
@@ -92,6 +92,10 @@ impl MaterializationReceipt {
     /// Content-address of the receipt itself — BLAKE3 over the
     /// canonical-bytes serialization. Idempotent: two receipts
     /// with identical fields produce identical ids.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: every field serializes to JSON.
     #[must_use]
     pub fn id(&self) -> [u8; 32] {
         let bytes = serde_json::to_vec(self).expect("receipt serializes");

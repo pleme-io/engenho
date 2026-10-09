@@ -1,14 +1,14 @@
 //! Selector parity — `?labelSelector=` (the FULL grammar) + `?fieldSelector=`
-//! against a seeded set of ConfigMaps, diffing the RETURNED ITEM SETS.
+//! against a seeded set of `ConfigMaps`, diffing the RETURNED ITEM SETS.
 //!
-//! Four ConfigMaps are seeded in a fresh namespace, each carrying a shared
+//! Four `ConfigMaps` are seeded in a fresh namespace, each carrying a shared
 //! `probe=cmset` label (so the oracle's auto-created `kube-root-ca.crt` — which
 //! engenho's namespace lacks — is scoped OUT of every list) plus test labels:
 //!
 //!   cmA {tier=web, env=prod}   cmB {tier=api, env=prod}
 //!   cmC {tier=web, env=dev}    cmD {}            (no tier / no env)
 //!
-//! Every label list is ANDed with `probe=cmset`. The grammar exercised:
+//! Every label list is `ANDed` with `probe=cmset`. The grammar exercised:
 //!   equality `k=v` · set `k in (a,b)` / `k notin (a)` · exists `k` /
 //!   not-exists `!k` · inequality `k!=v` · a multi-clause AND · the two core
 //!   field selectors `metadata.name=` / `metadata.namespace=`.
@@ -25,8 +25,8 @@ use engenho_diff::{Operation, volatile_meta};
 /// item sets match). The ONE recorded divergence is an EXOTIC field selector:
 ///
 ///   * `StatusCodeDiff:list_selector/exotic-field:GET` — `?fieldSelector=
-///     status.phase=Running` on ConfigMaps. k3s returns 400 `field label not
-///     supported: status.phase` (a ConfigMap has no such field); engenho
+///     status.phase=Running` on `ConfigMaps`. k3s returns 400 `field label not
+///     supported: status.phase` (a `ConfigMap` has no such field); engenho
 ///     returns 200 with an empty list (it filters unsupported field keys out
 ///     rather than rejecting them). Closing this needs per-kind field-selector
 ///     REGISTRATION (the set of selectable fields per kind) engenho does not

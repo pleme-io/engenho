@@ -38,7 +38,7 @@
 //!
 //! Cascade covers core + built-in namespaced kinds from
 //! [`RESOURCE_CATALOG`]. Dynamic CRD-served namespaced CR kinds are the
-//! next extension (fold the CrdController's registered served set into the
+//! next extension (fold the `CrdController`'s registered served set into the
 //! enumeration); documented as TYPED-DEFERRED, not silently dropped.
 
 use std::sync::Arc;
@@ -259,8 +259,8 @@ mod tests {
     use serde_json::json;
     use std::time::Duration;
 
-    /// Build a single-node in-memory StoreMesh (the controller-test rig the
-    /// other reconciler tests use — see tests/r9_replicaset_controller.rs).
+    /// Build a single-node in-memory `StoreMesh` (the controller-test rig the
+    /// other reconciler tests use — see `tests/r9_replicaset_controller.rs`).
     async fn test_store() -> Arc<StoreMesh> {
         let router = InProcessRouter::new();
         let cfg = default_config("controllers-namespace").unwrap();

@@ -16,7 +16,7 @@ use engenho_types::meta::ObjectMeta;
 use proptest::collection::btree_map;
 use proptest::prelude::*;
 
-/// Arbitrary ObjectMeta strategy — generates valid instances over the
+/// Arbitrary `ObjectMeta` strategy — generates valid instances over the
 /// shape every K8s namespaced resource carries.
 fn arb_object_meta() -> impl Strategy<Value = ObjectMeta> {
     (

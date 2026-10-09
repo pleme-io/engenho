@@ -59,7 +59,7 @@ impl RawWatchEvent {
     /// # Errors
     ///
     /// Returns [`KubeError::Decode`] if the `object` field can't be
-    /// deserialized into `R` for object events, or if the event_type
+    /// deserialized into `R` for object events, or if the `event_type`
     /// is unrecognized.
     pub fn into_typed<R: KubeResource>(self) -> Result<WatchEvent<R>, KubeError> {
         match self.event_type.as_str() {
@@ -96,8 +96,9 @@ impl RawWatchEvent {
                 let code = self
                     .object
                     .get("code")
-                    .and_then(|c| c.as_u64())
-                    .unwrap_or(0) as u16;
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|n| u16::try_from(n).ok())
+                    .unwrap_or(0);
                 let message = self
                     .object
                     .get("message")
@@ -154,6 +155,35 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+    struct Stub {
+        #[serde(default)]
+        metadata: serde_json::Value,
+    }
+
+    impl crate::kind::KubeResource for Stub {
+        const GVK: crate::kind::GroupVersionKind = crate::kind::GroupVersionKind {
+            group: "",
+            version: "v1",
+            kind: "Stub",
+        };
+        const GVR: crate::kind::GroupVersionResource = crate::kind::GroupVersionResource {
+            group: "",
+            version: "v1",
+            resource: "stubs",
+        };
+        const SCOPE: crate::kind::Scope = crate::kind::Scope::Namespaced;
+        fn name(&self) -> std::borrow::Cow<'_, str> {
+            "".into()
+        }
+        fn namespace(&self) -> Option<std::borrow::Cow<'_, str>> {
+            None
+        }
+        fn resource_version(&self) -> Option<std::borrow::Cow<'_, str>> {
+            None
+        }
+    }
+
     #[test]
     fn raw_added_decodes_to_typed() {
         // Minimal Pod-like shape: we just need ANY KubeResource
@@ -171,36 +201,6 @@ mod tests {
             event_type: "BOOKMARK".into(),
             object: json!({"metadata": {"resourceVersion": "12345"}}),
         };
-        // Using `()` as a stand-in is unsound but exercising the
-        // bookmark branch which never touches the payload-as-R is fine.
-        // We use a wrapper test type instead:
-        #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
-        struct Stub {
-            #[serde(default)]
-            metadata: serde_json::Value,
-        }
-        impl crate::kind::KubeResource for Stub {
-            const GVK: crate::kind::GroupVersionKind = crate::kind::GroupVersionKind {
-                group: "",
-                version: "v1",
-                kind: "Stub",
-            };
-            const GVR: crate::kind::GroupVersionResource = crate::kind::GroupVersionResource {
-                group: "",
-                version: "v1",
-                resource: "stubs",
-            };
-            const SCOPE: crate::kind::Scope = crate::kind::Scope::Namespaced;
-            fn name(&self) -> std::borrow::Cow<'_, str> {
-                "".into()
-            }
-            fn namespace(&self) -> Option<std::borrow::Cow<'_, str>> {
-                None
-            }
-            fn resource_version(&self) -> Option<std::borrow::Cow<'_, str>> {
-                None
-            }
-        }
         let typed: WatchEvent<Stub> = raw.into_typed().unwrap();
         assert!(matches!(typed, WatchEvent::Added(_)));
         let typed: WatchEvent<Stub> = bookmark.into_typed().unwrap();
@@ -213,30 +213,6 @@ mod tests {
             event_type: "GARBAGE".into(),
             object: json!({}),
         };
-        #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
-        struct Stub;
-        impl crate::kind::KubeResource for Stub {
-            const GVK: crate::kind::GroupVersionKind = crate::kind::GroupVersionKind {
-                group: "",
-                version: "v1",
-                kind: "Stub",
-            };
-            const GVR: crate::kind::GroupVersionResource = crate::kind::GroupVersionResource {
-                group: "",
-                version: "v1",
-                resource: "stubs",
-            };
-            const SCOPE: crate::kind::Scope = crate::kind::Scope::Namespaced;
-            fn name(&self) -> std::borrow::Cow<'_, str> {
-                "".into()
-            }
-            fn namespace(&self) -> Option<std::borrow::Cow<'_, str>> {
-                None
-            }
-            fn resource_version(&self) -> Option<std::borrow::Cow<'_, str>> {
-                None
-            }
-        }
         let r: Result<WatchEvent<Stub>, _> = raw.into_typed();
         assert!(r.is_err());
         assert!(matches!(r.unwrap_err(), KubeError::Decode(_)));
@@ -248,30 +224,6 @@ mod tests {
             event_type: "ERROR".into(),
             object: json!({"code": 410, "message": "too old resource version"}),
         };
-        #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
-        struct Stub;
-        impl crate::kind::KubeResource for Stub {
-            const GVK: crate::kind::GroupVersionKind = crate::kind::GroupVersionKind {
-                group: "",
-                version: "v1",
-                kind: "Stub",
-            };
-            const GVR: crate::kind::GroupVersionResource = crate::kind::GroupVersionResource {
-                group: "",
-                version: "v1",
-                resource: "stubs",
-            };
-            const SCOPE: crate::kind::Scope = crate::kind::Scope::Namespaced;
-            fn name(&self) -> std::borrow::Cow<'_, str> {
-                "".into()
-            }
-            fn namespace(&self) -> Option<std::borrow::Cow<'_, str>> {
-                None
-            }
-            fn resource_version(&self) -> Option<std::borrow::Cow<'_, str>> {
-                None
-            }
-        }
         let typed: WatchEvent<Stub> = raw.into_typed().unwrap();
         match typed {
             WatchEvent::Error(KubeError::ApiStatus { code, kind, .. }) => {

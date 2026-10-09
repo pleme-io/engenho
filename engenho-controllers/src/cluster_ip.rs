@@ -1,4 +1,4 @@
-//! Service ClusterIP (VIP) allocator + the defaulting admission webhook
+//! Service `ClusterIP` (VIP) allocator + the defaulting admission webhook
 //! that stamps an allocated VIP onto a Service at create time.
 //!
 //! ## The gap this closes
@@ -7,10 +7,10 @@
 //! `spec.clusterIP` the operator supplied — and `kubectl get svc`
 //! reported `clusterIP: None` for the common case (operator supplies no
 //! IP). Nothing ALLOCATED a virtual IP. `ServiceRoutingController`
-//! (service_router.rs) already computes VIP→pod routing rules, the DNS
+//! (`service_router.rs`) already computes VIP→pod routing rules, the DNS
 //! controller already answers `*.svc → clusterIP`, and the
 //! `EndpointsController` already resolves selectors → pod IPs — every
-//! one of them keyed on a ClusterIP that nothing produced. This module
+//! one of them keyed on a `ClusterIP` that nothing produced. This module
 //! is the producer.
 //!
 //! ## Shape (★★ TYPED-SPEC + INTERPRETER TRIPLET — Environment trait)
@@ -88,7 +88,7 @@ engenho_substrate::impl_error_kind! {
 //  The pure allocator core.
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// A typed ClusterIP allocator over one IPv4 service CIDR.
+/// A typed `ClusterIP` allocator over one IPv4 service CIDR.
 ///
 /// PURE — holds the parsed CIDR bounds + an in-use VIP set. Construct it,
 /// seed the in-use set from the live Service VIPs ([`Self::reserve`]),
@@ -335,14 +335,14 @@ impl ServiceIpSource for StoreServiceIpSource {
 //  The defaulting admission webhook.
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// A defaulting [`AdmissionWebhook`] that allocates a ClusterIP for a
+/// A defaulting [`AdmissionWebhook`] that allocates a `ClusterIP` for a
 /// Service on create.
 ///
 /// Fires on Put of a `v1/Service` (CREATE). It (1) reseeds a fresh
 /// [`ClusterIpAllocator`] from the live Service VIPs, (2) classifies the
 /// proposed Service, (3) for `NeedsAllocation` allocates a free VIP and
 /// returns [`AdmissionDecision::Mutate`] with `spec.clusterIP` +
-/// `spec.clusterIPs` set. Headless / ExternalName / already-assigned
+/// `spec.clusterIPs` set. Headless / `ExternalName` / already-assigned
 /// Services + every non-Service kind pass through unchanged
 /// ([`AdmissionDecision::Allow`]). Pool exhaustion is a typed
 /// [`AdmissionDecision::Deny`].

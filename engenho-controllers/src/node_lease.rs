@@ -217,6 +217,80 @@ pub fn find_ready_condition(node: &ResourceValue) -> Option<&ResourceValue> {
         .find(|c| c.get("type").and_then(|t| t.as_str()) == Some("Ready"))
 }
 
+// =================================================================
+// Read-time projection
+// =================================================================
+
+/// Project the `Ready` condition a Node's Lease implies onto that Node.
+///
+/// ── ★ WHY A DERIVATION AND NOT JUST A STORED FIELD ────────────────────────
+/// Upstream stores `Ready` as a fact because the writer (the
+/// node-lifecycle-controller) and the reader (scheduler, kubectl) live on
+/// different machines and communicate through etcd. That separation is also
+/// what lets a dead kubelet be *judged*: something else is still running.
+///
+/// engenho is one binary. Removing the distribution removes the observer, not
+/// the problem — so reproducing upstream's shape faithfully would reproduce a
+/// stored condition with nobody to correct it. A kubelet task that wedges
+/// (measured on rio: three days, 2,050 failed reconciles) leaves `Ready=True`
+/// standing while the apiserver happily serves it.
+///
+/// So the condition is DERIVED when a Node is read. There is no stored copy to
+/// go stale, which makes the bad state unrepresentable rather than reconciled
+/// — the `invariant-by-consistency-and-controller` third case: re-derive the
+/// value from live inputs instead of storing one that can drift.
+///
+/// The API contract is unchanged. A client `GETting` a Node sees a conformant
+/// `Ready` condition with status, reason, message and both timestamps. Only
+/// the mechanism differs, which is the naturalize posture: speak the API, own
+/// the implementation.
+///
+/// ── ★ WHAT THIS DOES NOT FIX, SO NOBODY READS IT AS MORE ──────────────────
+/// A derived value changes by the PASSAGE OF TIME, so no write happens, so no
+/// WATCH event fires. `kubectl get` is correct; `kubectl get --watch` stays
+/// silent until something writes. That is why the kubelet still publishes the
+/// condition on transition — the two halves are not alternatives:
+/// derivation makes the answer correct, the write makes it observable.
+///
+/// And if the WHOLE process is dead nothing serves reads either, so there is
+/// no one to lie to. This covers exactly the set where a reader outlives the
+/// writer — a wedged kubelet beside a live apiserver, or a peer serving a read
+/// of another node's object from the replicated store.
+///
+/// `lease` is that node's Lease, `None` when it has none. Conditions the
+/// kubelet does not own are preserved; only `Ready` is replaced.
+pub fn project_ready_condition(node: &mut ResourceValue, lease: Option<&ResourceValue>, now: &str) {
+    let since_renew = lease
+        .and_then(|l| l.get("spec"))
+        .and_then(|s| s.get("renewTime"))
+        .and_then(|t| t.as_str())
+        .and_then(engenho_types::time::age_since_rfc3339);
+    let state = readiness(since_renew);
+
+    // Carry `lastTransitionTime` from whatever is stored, so the derived value
+    // still answers "how long has it been like this" when the status agrees.
+    let previous = find_ready_condition(node).cloned();
+    let condition = ready_condition(state, now, previous.as_ref());
+
+    let mut conditions: Vec<ResourceValue> = node
+        .get("status")
+        .and_then(|s| s.get("conditions"))
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|c| c.get("type").and_then(|t| t.as_str()) != Some("Ready"))
+        .collect();
+    conditions.push(condition);
+
+    if let Some(obj) = node.as_object_mut() {
+        let status = obj.entry("status").or_insert_with(|| json!({}));
+        if let Some(status_obj) = status.as_object_mut() {
+            status_obj.insert("conditions".to_string(), json!(conditions));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,79 +484,5 @@ mod tests {
         assert_eq!(k.kind, "Lease");
         assert_eq!(k.namespace.as_deref(), Some("kube-node-lease"));
         assert_eq!(k.name, "cid");
-    }
-}
-
-// =================================================================
-// Read-time projection
-// =================================================================
-
-/// Project the `Ready` condition a Node's Lease implies onto that Node.
-///
-/// ── ★ WHY A DERIVATION AND NOT JUST A STORED FIELD ────────────────────────
-/// Upstream stores `Ready` as a fact because the writer (the
-/// node-lifecycle-controller) and the reader (scheduler, kubectl) live on
-/// different machines and communicate through etcd. That separation is also
-/// what lets a dead kubelet be *judged*: something else is still running.
-///
-/// engenho is one binary. Removing the distribution removes the observer, not
-/// the problem — so reproducing upstream's shape faithfully would reproduce a
-/// stored condition with nobody to correct it. A kubelet task that wedges
-/// (measured on rio: three days, 2,050 failed reconciles) leaves `Ready=True`
-/// standing while the apiserver happily serves it.
-///
-/// So the condition is DERIVED when a Node is read. There is no stored copy to
-/// go stale, which makes the bad state unrepresentable rather than reconciled
-/// — the `invariant-by-consistency-and-controller` third case: re-derive the
-/// value from live inputs instead of storing one that can drift.
-///
-/// The API contract is unchanged. A client GETting a Node sees a conformant
-/// `Ready` condition with status, reason, message and both timestamps. Only
-/// the mechanism differs, which is the naturalize posture: speak the API, own
-/// the implementation.
-///
-/// ── ★ WHAT THIS DOES NOT FIX, SO NOBODY READS IT AS MORE ──────────────────
-/// A derived value changes by the PASSAGE OF TIME, so no write happens, so no
-/// WATCH event fires. `kubectl get` is correct; `kubectl get --watch` stays
-/// silent until something writes. That is why the kubelet still publishes the
-/// condition on transition — the two halves are not alternatives:
-/// derivation makes the answer correct, the write makes it observable.
-///
-/// And if the WHOLE process is dead nothing serves reads either, so there is
-/// no one to lie to. This covers exactly the set where a reader outlives the
-/// writer — a wedged kubelet beside a live apiserver, or a peer serving a read
-/// of another node's object from the replicated store.
-///
-/// `lease` is that node's Lease, `None` when it has none. Conditions the
-/// kubelet does not own are preserved; only `Ready` is replaced.
-pub fn project_ready_condition(node: &mut ResourceValue, lease: Option<&ResourceValue>, now: &str) {
-    let since_renew = lease
-        .and_then(|l| l.get("spec"))
-        .and_then(|s| s.get("renewTime"))
-        .and_then(|t| t.as_str())
-        .and_then(engenho_types::time::age_since_rfc3339);
-    let state = readiness(since_renew);
-
-    // Carry `lastTransitionTime` from whatever is stored, so the derived value
-    // still answers "how long has it been like this" when the status agrees.
-    let previous = find_ready_condition(node).cloned();
-    let condition = ready_condition(state, now, previous.as_ref());
-
-    let mut conditions: Vec<ResourceValue> = node
-        .get("status")
-        .and_then(|s| s.get("conditions"))
-        .and_then(|c| c.as_array())
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|c| c.get("type").and_then(|t| t.as_str()) != Some("Ready"))
-        .collect();
-    conditions.push(condition);
-
-    if let Some(obj) = node.as_object_mut() {
-        let status = obj.entry("status").or_insert_with(|| json!({}));
-        if let Some(status_obj) = status.as_object_mut() {
-            status_obj.insert("conditions".to_string(), json!(conditions));
-        }
     }
 }

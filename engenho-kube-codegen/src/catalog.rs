@@ -1,11 +1,11 @@
 //! Curated catalog of K8s kinds to generate in the M0.0.1 first pass.
 //!
 //! Hardcoded because:
-//!   1. OpenAPI v3 doesn't carry the plural-resource name (`Pod` → `pods`,
+//!   1. `OpenAPI` v3 doesn't carry the plural-resource name (`Pod` → `pods`,
 //!      `PodSecurityPolicy` → `podsecuritypolicies`); those live in the
 //!      apiserver's discovery doc, not the schema. Hardcoding here is
 //!      the simplest path until M0.0.4 wires a fleet-aware lookup.
-//!   2. Scope (Namespaced vs Cluster) is similarly not in OpenAPI v3.
+//!   2. Scope (Namespaced vs Cluster) is similarly not in `OpenAPI` v3.
 //!   3. Curating a known-good subset lets us SHIP the typed surface
 //!      while expanding coverage incrementally. Adding a new kind is
 //!      one row in this table.
@@ -33,7 +33,7 @@ pub enum Subresource {
     /// (GET; no put/patch/delete). Pod-only; the router dispatches it to the
     /// kubelet (single-node: in-process) which reads `backend.logs`.
     Log,
-    /// `/token` — POST a `TokenRequest`, receive a signed ServiceAccount JWT
+    /// `/token` — POST a `TokenRequest`, receive a signed `ServiceAccount` JWT
     /// (`kubectl create token`, and every in-cluster client's identity).
     ///
     /// The ONLY create-shaped subresource: status/scale/log are read or
@@ -49,7 +49,7 @@ pub enum Subresource {
 pub struct KindEntry {
     /// `Kind` field of the resource (e.g. `Pod`).
     pub kind: &'static str,
-    /// OpenAPI definition key (e.g. `io.k8s.api.core.v1.Pod`).
+    /// `OpenAPI` definition key (e.g. `io.k8s.api.core.v1.Pod`).
     pub openapi_key: &'static str,
     /// API group (`""` for core/v1, `apps` for apps/v1, …).
     pub group: &'static str,
@@ -63,7 +63,7 @@ pub struct KindEntry {
     /// (e.g. `core_v1` for core/v1 kinds).
     pub module: &'static str,
     /// kubectl short-name aliases (e.g. `["deploy"]` for `Deployment`).
-    /// PURE registration metadata — NOT in OpenAPI; sourced verbatim from
+    /// PURE registration metadata — NOT in `OpenAPI`; sourced verbatim from
     /// upstream kube-apiserver Go REST storage. Empty for kinds with no
     /// upstream short name (e.g. `Secret`, every RBAC kind).
     pub short_names: &'static [&'static str],
@@ -75,7 +75,7 @@ pub struct KindEntry {
     /// the workload + networking core kinds). Empty for kinds in no
     /// category. PURE registration metadata, like `short_names`.
     pub categories: &'static [&'static str],
-    /// `true` ⇒ this kind has NO vendored OpenAPI schema and NO typed
+    /// `true` ⇒ this kind has NO vendored `OpenAPI` schema and NO typed
     /// struct — it is served as opaque JSON via the generic
     /// `StoreBackedHandler` and appears ONLY as a `RESOURCE_CATALOG` row
     /// (no `<module>/<kind>.rs`, no `$ref` closure, no schema lookup).
@@ -84,7 +84,7 @@ pub struct KindEntry {
     /// (e.g. `apiextensions.k8s.io/v1.CustomResourceDefinition` — the
     /// apiserver stores the CRD body as plain JSON, never decoding it into
     /// a typed struct). The generator SKIPS such kinds in the per-kind
-    /// struct/module emission (no OpenAPI schema is required, so
+    /// struct/module emission (no `OpenAPI` schema is required, so
     /// `openapi_key` / `module` may be empty) while STILL emitting the
     /// catalog descriptor row, so routing + discovery light up exactly as
     /// for a schema-backed kind. Non-opaque kinds set this `false`.

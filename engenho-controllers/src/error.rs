@@ -198,7 +198,7 @@ mod tests {
     /// A `StoreError::Persist`, built the way `FjallStore` builds one.
     fn persist() -> StoreError {
         StoreError::Persist(Box::new(openraft::StorageError::IO {
-            source: openraft::StorageIOError::write(&openraft::AnyError::error("disk full")),
+            source: openraft::StorageIOError::write(openraft::AnyError::error("disk full")),
         }))
     }
 

@@ -34,7 +34,7 @@ pub enum Vector {
     RbacResourceMatches,
     /// Probe worker and prober results (T1.1).
     ProberResults,
-    /// Container exit, restart and CrashLoopBackOff (T1.2, T2.4).
+    /// Container exit, restart and `CrashLoopBackOff` (T1.2, T2.4).
     ContainerRestart,
     /// Watch-cache 410, bookmarks and watch end forms (T3.9a, T3.7).
     Watch410Bookmark,

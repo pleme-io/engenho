@@ -1,18 +1,18 @@
-//! R15 — StatefulSet controller.
+//! R15 — `StatefulSet` controller.
 //!
-//! Like ReplicaSetController but with **ordered, persistent
+//! Like `ReplicaSetController` but with **ordered, persistent
 //! identity**: pods get names `{sts}-0`, `{sts}-1`, ...
 //! Replacement keeps the same name + PVC mapping.
 //!
 //! ## Reconcile rule
 //!
-//! For each StatefulSet:
-//!   1. desired_replicas = spec.replicas (default 1)
+//! For each `StatefulSet`:
+//!   1. `desired_replicas` = spec.replicas (default 1)
 //!   2. owned pods = pods with controller-ref UID matching
-//!   3. for i in 0..desired_replicas:
-//!         expected_name = "{sts}-{i}"
+//!   3. for i in `0..desired_replicas`:
+//!         `expected_name` = "{sts}-{i}"
 //!         if no pod with that name exists → create from template
-//!   4. for each owned pod with ordinal >= desired_replicas:
+//!   4. for each owned pod with ordinal >= `desired_replicas`:
 //!         delete (scale-down evicts highest-ordinal first)
 //!
 //! Identity is preserved across restart: pod `web-2` always has
@@ -55,7 +55,7 @@ use engenho_types::kind::GroupVersionKind;
 /// Where a pod's volumes live.
 const POD_VOLUMES: &[&str] = &["spec", "volumes"];
 
-/// StatefulSet controller — peer to ReplicaSetController with
+/// `StatefulSet` controller — peer to `ReplicaSetController` with
 /// ordered identity semantics.
 pub struct StatefulSetController {
     store: Arc<StoreMesh>,
@@ -77,10 +77,10 @@ impl StatefulSetController {
         }
     }
 
-    /// Build a Pod from the StatefulSet template at ordinal `i`.
+    /// Build a Pod from the `StatefulSet` template at ordinal `i`.
     /// The name is `{sts_name}-{i}` — ordered + persistent.
     ///
-    /// The Pod inherits the parent StatefulSet's namespace — the
+    /// The Pod inherits the parent `StatefulSet`'s namespace — the
     /// namespace the blanket gathers owned pods from. Never the
     /// controller's scope namespace (an all-namespace controller has
     /// none). Mirrors `ReplicaSetController::build_pod_from_template`;
@@ -90,7 +90,7 @@ impl StatefulSetController {
     ///
     /// `volumeClaimTemplates` (PVC provisioning) is scoped OUT at M0 —
     /// the PVC/storage subsystem is a separate engenho gap. BUT when the
-    /// StatefulSet declares `spec.volumeClaimTemplates`, the pod's
+    /// `StatefulSet` declares `spec.volumeClaimTemplates`, the pod's
     /// matching `spec.volumes[].persistentVolumeClaim.claimName` is set
     /// to the deterministic per-pod PVC name `{template}-{sts}-{ordinal}`
     /// (the K8s naming contract) so the wiring is CORRECT the moment PVCs
@@ -127,24 +127,24 @@ impl StatefulSetController {
     ///
     /// ── ★ WHY THIS EXISTS ──────────────────────────────────────────────
     /// The naming contract and the pod-side wiring shipped at M0; only the
-    /// CLAIM was missing, so a StatefulSet with storage produced a pod
+    /// CLAIM was missing, so a `StatefulSet` with storage produced a pod
     /// referencing `{template}-{sts}-{ordinal}` that nothing ever created.
     /// The pod then waits on a volume forever, which presents as a slow
     /// scheduler rather than as a missing subsystem.
     ///
-    /// Measured 2026-09-14 on ryn: a MySQL StatefulSet reached `mysql-0`
+    /// Measured 2026-09-14 on ryn: a MySQL `StatefulSet` reached `mysql-0`
     /// with `persistentVolumeClaim.claimName: data-mysql-0` and
     /// `kubectl get pvc` returned nothing at all.
     ///
     /// Each claim is the template's own `spec` verbatim — accessModes,
     /// resources, storageClassName, and `dataSource` — so a claim whose
-    /// template names a VolumeSnapshot restores from it through the same
+    /// template names a `VolumeSnapshot` restores from it through the same
     /// binder path an explicit PVC uses. That is what lets a restore vector
     /// be expressed as `VolumeSnapshot -> StatefulSet` with no hand-written
     /// PVC in between.
     ///
     /// Returns `(name, object)` pairs; empty when the set declares no
-    /// templates, so a storage-less StatefulSet is untouched.
+    /// templates, so a storage-less `StatefulSet` is untouched.
     fn build_pvcs(
         sts: &Value,
         sts_name: &str,
@@ -244,7 +244,7 @@ impl StatefulSetController {
     }
 
     /// The deterministic per-pod PVC name for a volumeClaimTemplate:
-    /// `{template}-{sts}-{ordinal}` (the K8s StatefulSet PVC naming
+    /// `{template}-{sts}-{ordinal}` (the K8s `StatefulSet` PVC naming
     /// contract). Pure + total — the name is correct the moment PVC
     /// provisioning lands.
     #[must_use]
@@ -396,7 +396,7 @@ impl OwnedChildrenReconciler for StatefulSetController {
         // → recreate-every-tick hot loop for namespaced StatefulSets.
         let pod_ns = sts_value.namespace().map_or_else(
             || self.namespace.as_deref().unwrap_or("default").to_string(),
-            |c| c.to_owned(),
+            std::borrow::ToOwned::to_owned,
         );
 
         // Every owned pod, Terminating ones included: an ordinal is an
@@ -477,11 +477,11 @@ impl OwnedChildrenReconciler for StatefulSetController {
 
         // Scale-down: remove pods with ordinal >= desired.
         for (pod_key, _) in owned {
-            if let Some(ord) = Self::ordinal_of(&pod_key.name, sts_name) {
-                if ord >= desired {
-                    debug!(sts = sts_name, pod = %pod_key.label(), "scaling down ordered pod");
-                    commands.push(ResourceCommand::delete(pod_key.clone(), Reason::Controller));
-                }
+            if let Some(ord) = Self::ordinal_of(&pod_key.name, sts_name)
+                && ord >= desired
+            {
+                debug!(sts = sts_name, pod = %pod_key.label(), "scaling down ordered pod");
+                commands.push(ResourceCommand::delete(pod_key.clone(), Reason::Controller));
             }
         }
 
@@ -878,7 +878,7 @@ mod volume_claim_templates {
 
     /// The K8s naming contract. `wire_pvc_volumes` already puts this exact
     /// string on the pod, so a claim named anything else is a volume the pod
-    /// can never bind — the pod waits in ContainerCreating forever.
+    /// can never bind — the pod waits in `ContainerCreating` forever.
     #[test]
     fn claim_name_follows_the_kubernetes_contract() {
         let sts = sts_with(json!([{"metadata": {"name": "data"}, "spec": {}}]));
@@ -895,7 +895,7 @@ mod volume_claim_templates {
         assert_ne!(a[0].0, b[0].0, "two ordinals sharing a claim is data loss");
     }
 
-    /// ★ THE RESTORE PATH. A volumeClaimTemplate naming a VolumeSnapshot is
+    /// ★ THE RESTORE PATH. A volumeClaimTemplate naming a `VolumeSnapshot` is
     /// how `VolumeSnapshot -> StatefulSet` is expressed with no hand-written
     /// PVC in between — which is the shape a PITR restore vector needs. If the
     /// template's spec were rebuilt field-by-field instead of carried
@@ -926,7 +926,7 @@ mod volume_claim_templates {
 
     /// ★ NEGATIVE CONTROL. Without this, `build_pvcs` could return a claim
     /// unconditionally and every assertion above would still pass while every
-    /// storage-less StatefulSet acquired a phantom volume.
+    /// storage-less `StatefulSet` acquired a phantom volume.
     #[test]
     fn a_statefulset_without_templates_gets_no_claims() {
         let no_key = json!({"metadata": {"name": "x"}, "spec": {"replicas": 1}});
@@ -945,7 +945,7 @@ mod volume_claim_templates {
         assert_eq!(pvcs[0].0, "ok-mysql-0");
     }
 
-    /// ★ RETENTION. Kubernetes keeps a StatefulSet's PVCs when the set is
+    /// ★ RETENTION. Kubernetes keeps a `StatefulSet`'s PVCs when the set is
     /// deleted — the data outlives the workload. An ownerReference would
     /// garbage-collect them, which on a PITR restore target would delete the
     /// very data the drill exists to prove recoverable.

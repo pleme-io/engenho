@@ -95,13 +95,11 @@ fn podman_container_exists(name: &str) -> bool {
     Command::new("podman")
         .args(["ps", "-a", "--filter", &filter, "--format", "{{.Names}}"])
         .output()
-        .ok()
-        .map(|o| {
+        .is_ok_and(|o| {
             String::from_utf8_lossy(&o.stdout)
                 .lines()
                 .any(|l| l.trim() == name)
         })
-        .unwrap_or(false)
 }
 
 /// Start a detached, self-restarting TCP listener on `port` inside
@@ -128,9 +126,7 @@ fn podman_tcp_reachable(from_container: &str, to_ip: &str, port: u16) -> bool {
     Command::new("podman")
         .args(["exec", from_container, "nc", "-z", "-w3", to_ip, &port_s])
         .output()
-        .ok()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }
 
 /// Resolve `name` from a SEPARATE short-lived client container on `network`
@@ -198,9 +194,7 @@ fn client_connect_by_name(network: &str, name: &str, port: u16) -> bool {
             &port_s,
         ])
         .output()
-        .ok()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }
 
 // =====================================================================
@@ -299,7 +293,7 @@ fn poll_until_blocking<F: FnMut() -> bool>(
 // =====================================================================
 
 /// Durable config in `data_dir`, apiserver on an ephemeral loopback port,
-/// kubelet driven by the **real PodmanBackend**, endpoints reconciler
+/// kubelet driven by the **real `PodmanBackend`**, endpoints reconciler
 /// ENABLED (so the podIP→Endpoints path runs), fast fallback + small
 /// debounce. Mirrors `durable_podman_config` from the M0.2 test.
 fn durable_podman_config(data_dir: &std::path::Path) -> EngenhoConfig {
@@ -324,7 +318,7 @@ fn durable_podman_config(data_dir: &std::path::Path) -> EngenhoConfig {
 }
 
 /// A ClusterIP-less Service selecting `app=<dep>` on port 80→80. The
-/// EndpointsController only needs the selector + ports to materialize an
+/// `EndpointsController` only needs the selector + ports to materialize an
 /// Endpoints object from matching ready pods (no clusterIP allocation
 /// exists yet — that's a later networking brick).
 fn service_body(dep_name: &str) -> serde_json::Value {
@@ -694,7 +688,7 @@ async fn two_replica_deployment_gets_real_ips_endpoints_and_pod_to_pod_reachabil
 // M0.3 cluster-DNS — Service-name resolution via aardvark-dns
 // =====================================================================
 
-/// The shared engenho-net network the PodmanBackend attaches pods to (its
+/// The shared engenho-net network the `PodmanBackend` attaches pods to (its
 /// default). aardvark-dns runs for this user-defined network, resolving
 /// `--network-alias` names the kubelet feeds at pod-start.
 const ENGENHO_NET: &str = "engenho-net";
@@ -742,7 +736,7 @@ fn labeled_deployment_body(dep_name: &str, app_label: &str) -> serde_json::Value
 /// M0.3 cluster-DNS: a Service name resolves to its backend pod IPs via
 /// aardvark-dns, and a SEPARATE client container connects to a backend BY
 /// NAME — proving the `--network-alias` feed the kubelet computes at
-/// pod-start is load-bearing headless-Service DNS (no ClusterIP / kube-proxy).
+/// pod-start is load-bearing headless-Service DNS (no `ClusterIP` / kube-proxy).
 ///
 /// Multi-thread runtime is REQUIRED for the same reason as the sibling test:
 /// the probe path shells out to `podman` via blocking `std::process` +

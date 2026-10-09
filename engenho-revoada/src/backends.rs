@@ -1,4 +1,4 @@
-//! # backends — the 5 R5/R6 real-system StoreBackend impls
+//! # backends — the 5 R5/R6 real-system `StoreBackend` impls
 //!
 //! One backend per face kind. Each carries the domain-specific
 //! configuration its real-system integration will need (raft
@@ -6,12 +6,12 @@
 //! an [`InMemoryStore`] for verb dispatch. The wrapping pattern is
 //! the same one [`FileSystemBackend`](crate::FileSystemBackend)
 //! established — overlay a real backing system on top of an
-//! InMemoryStore cache for watch fan-out + fast reads; real I/O
+//! `InMemoryStore` cache for watch fan-out + fast reads; real I/O
 //! lives in the wrapping methods.
 //!
 //! ## What ships today vs what R5/R6 fills in
 //!
-//! Today's impl uses InMemoryStore for all 5 backends — the typed
+//! Today's impl uses `InMemoryStore` for all 5 backends — the typed
 //! shape ships now so operator code can take a dependency on it +
 //! tests cover the wiring end-to-end. R5/R6 PRs fill in the
 //! real-system wiring (raft replication / kube-apiserver POST /
@@ -67,8 +67,8 @@ pub struct RaftConfig {
 /// surface so [`Face`](crate::Face) impls can use raft replication
 /// without depending on openraft directly.
 ///
-/// **R5 wiring:** today the verbs route through InMemoryStore;
-/// the R5 PR overlays raft client_write on every apply (followers
+/// **R5 wiring:** today the verbs route through `InMemoryStore`;
+/// the R5 PR overlays raft `client_write` on every apply (followers
 /// see writes through the state-machine apply path).
 pub struct RaftBackend {
     config: RaftConfig,
@@ -101,7 +101,7 @@ impl RaftBackend {
 }
 
 impl StoreBackend for RaftBackend {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "openraft"
     }
 
@@ -182,12 +182,12 @@ pub struct KubeApiServerConfig {
 
 /// Bridge to a real kube-apiserver. Wraps
 /// [`engenho-kube-client`](https://github.com/pleme-io/engenho)'s
-/// client + an InMemoryStore mirror for fast reads + watch
+/// client + an `InMemoryStore` mirror for fast reads + watch
 /// fan-out.
 ///
 /// **R6 wiring:** verbs proxy to the apiserver over HTTPS using
 /// the configured credentials; the watch stream subscribes to
-/// `/api/v1/.../?watch=true&resourceVersion=...`. The InMemoryStore
+/// `/api/v1/.../?watch=true&resourceVersion=...`. The `InMemoryStore`
 /// mirror keeps fresh from the watch stream so reads don't hit
 /// the apiserver on hot paths.
 pub struct KubeApiServerBackend {
@@ -213,7 +213,7 @@ impl KubeApiServerBackend {
 }
 
 impl StoreBackend for KubeApiServerBackend {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "kube-apiserver"
     }
 
@@ -283,7 +283,7 @@ pub struct NomadHttpConfig {
 }
 
 /// Bridge to a real Nomad HTTP API. Wraps a future Nomad client +
-/// an InMemoryStore mirror.
+/// an `InMemoryStore` mirror.
 ///
 /// **R6 wiring:** verbs proxy through POST `/v1/jobs/{name}`,
 /// GET `/v1/job/{name}`, list `/v1/jobs?prefix=...`. Watch via
@@ -309,7 +309,7 @@ impl NomadHttpBackend {
 }
 
 impl StoreBackend for NomadHttpBackend {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "nomad-http"
     }
 
@@ -378,7 +378,7 @@ pub struct SystemdDbusConfig {
 ///
 /// **R6 wiring:** apply → render unit file to the right path +
 /// dbus reload. delete → stop unit + remove file. watch → subscribe
-/// to PropertiesChanged on the systemd Unit interface.
+/// to `PropertiesChanged` on the systemd Unit interface.
 pub struct SystemdDbusBackend {
     config: SystemdDbusConfig,
     store: InMemoryStore,
@@ -404,7 +404,7 @@ impl SystemdDbusBackend {
 }
 
 impl StoreBackend for SystemdDbusBackend {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "systemd-dbus"
     }
 
@@ -486,7 +486,7 @@ impl SupervisedSystemdBackend {
 }
 
 impl StoreBackend for SupervisedSystemdBackend {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "supervised-systemd"
     }
 

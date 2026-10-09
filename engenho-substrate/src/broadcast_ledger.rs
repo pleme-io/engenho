@@ -1,10 +1,10 @@
-//! BroadcastLedger — wraps any `MaterializationLedger` + emits
+//! `BroadcastLedger` — wraps any `MaterializationLedger` + emits
 //! typed events on every ingest.
 //!
 //! Same pattern as `WatchedCache` (which wraps `DerivationCacheBackend`).
-//! Gives consumers an event-driven path so PlantioController can
+//! Gives consumers an event-driven path so `PlantioController` can
 //! schedule a reconcile tick the instant a receipt lands (paired
-//! with EventDrivenController from engenho-controllers).
+//! with `EventDrivenController` from engenho-controllers).
 //!
 //! ## Composition
 //!
@@ -65,6 +65,7 @@ impl BroadcastLedger {
     }
 
     /// Subscribe to ledger events.
+    #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<LedgerEvent> {
         self.sender.subscribe()
     }
@@ -158,15 +159,10 @@ mod tests {
         let mut rx = l.subscribe();
         l.ingest(&stage(), nz(1), &rcpt(1, 5)).await.unwrap();
         let event = rx.recv().await.unwrap();
-        match event {
-            LedgerEvent::ReceiptIngested {
-                stage_id,
-                verdict: _,
-            } => {
-                assert_eq!(stage_id, stage());
-            }
-            _ => panic!("expected ReceiptIngested"),
-        }
+        let LedgerEvent::ReceiptIngested { stage_id, .. } = event else {
+            panic!("expected ReceiptIngested");
+        };
+        assert_eq!(stage_id, stage());
     }
 
     #[tokio::test]

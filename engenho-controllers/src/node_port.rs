@@ -10,7 +10,7 @@
 //!
 //! ★ THE RANGE IS A CONTRACT WITH THE NODE, NOT A PREFERENCE. 30000–32767
 //! is upstream's default `--service-node-port-range`, and it is chosen to
-//! sit above the ephemeral-port floor so an allocated NodePort cannot
+//! sit above the ephemeral-port floor so an allocated `NodePort` cannot
 //! collide with an outbound connection's source port. Allocating outside
 //! it produces a service that works until the kernel happens to pick the
 //! same port for something else — an intermittent failure with no
@@ -49,7 +49,7 @@ pub enum NodePortError {
     AlreadyAllocated { port: u16 },
 }
 
-/// Collision-free NodePort allocation over a fixed range.
+/// Collision-free `NodePort` allocation over a fixed range.
 #[derive(Debug, Clone)]
 pub struct NodePortAllocator {
     low: u16,
@@ -129,10 +129,10 @@ impl NodePortAllocator {
     }
 }
 
-/// Does this Service type get NodePorts?
+/// Does this Service type get `NodePorts`?
 ///
-/// `LoadBalancer` does too — upstream allocates a NodePort for it as the
-/// backing path, and omitting that would make a LoadBalancer Service
+/// `LoadBalancer` does too — upstream allocates a `NodePort` for it as the
+/// backing path, and omitting that would make a `LoadBalancer` Service
 /// unreachable on every cloud whose controller programs the balancer to
 /// forward at the node port.
 #[must_use]

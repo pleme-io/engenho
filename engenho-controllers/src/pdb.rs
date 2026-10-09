@@ -1,4 +1,4 @@
-//! R19 — PodDisruptionBudget controller.
+//! R19 — `PodDisruptionBudget` controller.
 //!
 //! Tracks per-pod-set disruption budgets. The substrate's
 //! voluntary-eviction path (the `/eviction` subresource — a SEPARATE
@@ -12,7 +12,7 @@
 //!   * Find pods in the PDB's namespace matching `spec.selector`
 //!     (reuses [`crate::selector::matches_labels`] +
 //!     [`crate::selector::selector_match_labels`] — the same
-//!     selector logic the EndpointsController uses; no fork).
+//!     selector logic the `EndpointsController` uses; no fork).
 //!   * `expectedPods` = matched pods.
 //!   * `currentHealthy` = matched pods that are Ready (status.conditions
 //!     `Ready=True`).
@@ -63,7 +63,7 @@ pub struct PdbStatus {
     pub observed_generation: i64,
 }
 
-/// PodDisruptionBudget controller.
+/// `PodDisruptionBudget` controller.
 pub struct PodDisruptionBudgetController {
     store: Arc<StoreMesh>,
     namespace: Option<String>,

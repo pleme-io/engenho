@@ -32,8 +32,8 @@ impl Default for RuntimeConfig {
     }
 }
 
-/// Wire engenho-config's top-level ControllersConfig into the runtime.
-/// The single fallback_interval_seconds becomes default_interval —
+/// Wire engenho-config's top-level `ControllersConfig` into the runtime.
+/// The single `fallback_interval_seconds` becomes `default_interval` —
 /// individual controllers can still override per-registration.
 impl From<&engenho_config::ControllersConfig> for RuntimeConfig {
     fn from(top: &engenho_config::ControllersConfig) -> Self {
@@ -96,7 +96,7 @@ impl ControllerRuntime {
         self
     }
 
-    /// Spawn the per-controller tick loops. Returns one JoinHandle
+    /// Spawn the per-controller tick loops. Returns one `JoinHandle`
     /// per controller. The caller can abort each handle to stop a
     /// controller individually.
     ///

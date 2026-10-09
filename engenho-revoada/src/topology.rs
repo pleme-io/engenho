@@ -199,7 +199,7 @@ impl RoleAssignment {
     pub fn voting_count(&self) -> usize {
         self.assignments
             .iter()
-            .filter(|(_, s)| s.role().map(Role::is_voting).unwrap_or(false))
+            .filter(|(_, s)| s.role().is_some_and(Role::is_voting))
             .count()
     }
 
@@ -473,7 +473,7 @@ impl TopologyStrategy for Pair {
     }
 }
 
-/// Quorum3M — 3 masters; etcd/raft-style quorum.
+/// `Quorum3M` — 3 masters; etcd/raft-style quorum.
 #[derive(Debug, Default, Clone)]
 pub struct Quorum3M;
 
@@ -554,7 +554,7 @@ impl TopologyStrategy for Quorum3M {
     }
 }
 
-/// Cluster3MNW — 3 masters + N workers. The classic K8s shape.
+/// `Cluster3MNW` — 3 masters + N workers. The classic K8s shape.
 #[derive(Debug, Default, Clone)]
 pub struct Cluster3MNW;
 
@@ -582,7 +582,7 @@ impl TopologyStrategy for Cluster3MNW {
     }
 }
 
-/// MeshAllPeers — every eligible node is a Master. Used for
+/// `MeshAllPeers` — every eligible node is a Master. Used for
 /// gossip-heavy workloads where every peer is symmetric.
 #[derive(Debug, Default, Clone)]
 pub struct MeshAllPeers;
@@ -628,7 +628,7 @@ impl Phalanx {
             return 0;
         }
         // Round UP to ensure odd-count quorum where possible.
-        ((eligible * 2) + 4) / 5
+        (eligible * 2).div_ceil(5)
     }
 }
 
@@ -826,16 +826,17 @@ impl TopologyReactor {
         // from {N standby nodes} to {target shape} in a single
         // observe_membership call.
         let no_active_masters = current.nodes_with_role(Role::Master).is_empty();
-        if no_active_masters && self.enough_to_form(eligible_now) {
-            if let Ok(target) = self.strategy.assign(eligible_now) {
-                for (id, state) in &target.assignments {
-                    if let Some(role) = state.role() {
-                        // Skip nodes that already hold this role
-                        // (idempotency); admit ones the loop above
-                        // already queued.
-                        if current.get(id).and_then(NodeState::role) != Some(role) {
-                            tx.push(Transition::Promote(id.clone(), role));
-                        }
+        if no_active_masters
+            && self.enough_to_form(eligible_now)
+            && let Ok(target) = self.strategy.assign(eligible_now)
+        {
+            for (id, state) in &target.assignments {
+                if let Some(role) = state.role() {
+                    // Skip nodes that already hold this role
+                    // (idempotency); admit ones the loop above
+                    // already queued.
+                    if current.get(id).and_then(NodeState::role) != Some(role) {
+                        tx.push(Transition::Promote(id.clone(), role));
                     }
                 }
             }
@@ -1053,7 +1054,7 @@ mod tests {
         for t in tx {
             match t {
                 Transition::Promote(id, r) | Transition::Reassign(id, r) => {
-                    current.set(id, NodeState::Active(r))
+                    current.set(id, NodeState::Active(r));
                 }
                 Transition::Evict(id) => current.set(id, NodeState::Failed),
                 _ => {}
@@ -1076,7 +1077,7 @@ mod tests {
         for t in tx {
             match t {
                 Transition::Promote(id, r) | Transition::Reassign(id, r) => {
-                    current.set(id, NodeState::Active(r))
+                    current.set(id, NodeState::Active(r));
                 }
                 Transition::Evict(id) => current.set(id, NodeState::Failed),
                 _ => {}
@@ -1161,7 +1162,7 @@ mod tests {
         }
     }
 
-    /// Resilience invariant: any strategy with N>=min_nodes must
+    /// Resilience invariant: any strategy with `N>=min_nodes` must
     /// always produce an assignment that validates AND has at
     /// least one voting node (so the cluster isn't stuck).
     #[test]

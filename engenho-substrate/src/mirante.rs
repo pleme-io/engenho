@@ -214,15 +214,15 @@ impl<S: Clone + Send + Sync + 'static> ObservationChannel<S> {
     }
 }
 
-/// ObservationChannel impl Named + Observable (v1.04 SSC) —
-/// completes the SubscriberSnapshot family by exposing the
-/// channel itself as observable. Joins BroadcastLedger +
-/// WatchedCache + FakeGossipTransport as the 4th SubscriberSnapshot
+/// `ObservationChannel` impl Named + Observable (v1.04 SSC) —
+/// completes the `SubscriberSnapshot` family by exposing the
+/// channel itself as observable. Joins `BroadcastLedger` +
+/// `WatchedCache` + `FakeGossipTransport` as the 4th `SubscriberSnapshot`
 /// consumer.
 ///
 /// Hand-rolled (not `define_named!` / `impl_observable_subscriber!`)
 /// because S has multi-bound generic shape (`Clone + Send + Sync +
-/// '`static`) that the existing macros don't fit. 2nd site of
+/// 'static`) that the existing macros don't fit. 2nd site of
 /// "literal-name multi-bound generic" — TSR clock at 2/3.
 impl<S: Clone + Send + Sync + 'static> Named for ObservationChannel<S> {
     fn name(&self) -> &'static str {
@@ -352,7 +352,7 @@ pub struct MiranteSnapshot {
     pub name: &'static str,
     /// Number of registered channels.
     pub channel_count: usize,
-    /// Names of registered channels (sorted by BTreeMap iteration).
+    /// Names of registered channels (sorted by `BTreeMap` iteration).
     pub channel_names: Vec<String>,
 }
 
@@ -479,9 +479,9 @@ mod tests {
     async fn channel_subscriber_count_tracks_lifetimes() {
         let ch = ObservationChannel::new(0u32, frozen_clock(0));
         assert_eq!(ch.subscriber_count(), 1); // internal rx counts
-        let _rx2 = ch.subscribe();
+        let rx2 = ch.subscribe();
         assert_eq!(ch.subscriber_count(), 2);
-        drop(_rx2);
+        drop(rx2);
         assert_eq!(ch.subscriber_count(), 1);
     }
 

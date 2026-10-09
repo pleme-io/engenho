@@ -114,7 +114,7 @@ pub enum KindFilter {
     All,
     /// Wake only on events whose `key.kind` is in the list. Match
     /// is case-sensitive — pass canonical K8s kind names
-    /// ("Pod", "ReplicaSet", "Service", …).
+    /// ("Pod", "`ReplicaSet`", "Service", …).
     Kinds(Vec<String>),
 }
 
@@ -744,14 +744,14 @@ async fn observed<F: std::future::Future>(
     let started = std::time::Instant::now();
     tokio::pin!(tick);
     loop {
-        match tokio::time::timeout(stuck_after, &mut tick).await {
-            Ok(outcome) => return outcome,
-            Err(_) => tracing::error!(
-                controller,
-                elapsed_s = started.elapsed().as_secs(),
-                "reconcile tick has NOT returned; this controller is blocked (not cancelled \u{2014} cancelling mid-tick would strand side effects)"
-            ),
+        if let Ok(outcome) = tokio::time::timeout(stuck_after, &mut tick).await {
+            return outcome;
         }
+        tracing::error!(
+            controller,
+            elapsed_s = started.elapsed().as_secs(),
+            "reconcile tick has NOT returned; this controller is blocked (not cancelled \u{2014} cancelling mid-tick would strand side effects)"
+        );
     }
 }
 

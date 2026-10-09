@@ -1,4 +1,4 @@
-//! ComposeIr — typed docker-compose intermediate representation.
+//! `ComposeIr` — typed docker-compose intermediate representation.
 //!
 //! Per the user's directive ("source from IR, build new IR as the
 //! leveraged move"), this module ships the TYPED docker-compose
@@ -13,21 +13,21 @@
 //! 2. **Materialize-and-throw** — bring the stack up for the
 //!    duration of one test or one materialization, then `docker
 //!    compose down`. Disposability is the leveraged property.
-//! 3. **Verify via real containers** — Verificacao::SmokeTest +
-//!    Independent + HashEquality run against the live stack, not
+//! 3. **Verify via real containers** — `Verificacao::SmokeTest` +
+//!    Independent + `HashEquality` run against the live stack, not
 //!    mocks. Real Docker is the test harness.
 //!
 //! ## What ships in this commit
 //!
 //!   * `ComposeIr` typed value (services + networks + volumes)
 //!   * `ComposeService` (image / command / env / ports / volumes /
-//!     depends_on / healthcheck)
+//!     `depends_on` / healthcheck)
 //!   * `compose_yaml` pure renderer — IR → YAML string
 //!   * `ComposeStack` runtime — holds the IR + dispatches
-//!     `docker compose up/down` via CommandRunner; auto-cleans on
+//!     `docker compose up/down` via `CommandRunner`; auto-cleans on
 //!     drop unless `.persist()` flipped (test idiom).
 //!
-//! All BLAKE3-addressable: ComposeIr.fingerprint() gives a stable
+//! All BLAKE3-addressable: `ComposeIr.fingerprint()` gives a stable
 //! hash the substrate uses as receipt evidence + cache key.
 
 use std::collections::BTreeMap;
@@ -123,7 +123,7 @@ impl ComposeIr {
 
     /// BLAKE3 fingerprint over the canonical-JSON encoding.
     /// Deterministic across nodes for the same IR — fits the
-    /// receipt evidence_hash + cache key contract.
+    /// receipt `evidence_hash` + cache key contract.
     ///
     /// Generated via [`engenho_substrate::Fingerprint`] / [`engenho_substrate::impl_fingerprint!`].
     #[must_use]
@@ -137,6 +137,10 @@ engenho_substrate::impl_fingerprint!(ComposeIr);
 impl ComposeIr {
     /// Render the IR as a docker-compose v3-shape YAML string.
     /// Pure helper — no I/O, no validation against docker.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: every field serializes to JSON and YAML.
     #[must_use]
     pub fn to_yaml(&self) -> String {
         // Build the YAML by typed shape — no direct string templating
@@ -165,13 +169,13 @@ impl ComposeIr {
     }
 }
 
-/// ComposeIr errors.
+/// `ComposeIr` errors.
 #[derive(Debug, Clone, Error)]
 pub enum ComposeError {
-    /// Backend (docker / CommandRunner) returned an error.
+    /// Backend (docker / `CommandRunner`) returned an error.
     #[error("backend: {0}")]
     Backend(String),
-    /// IR rendered invalid for docker (e.g. cyclic depends_on).
+    /// IR rendered invalid for docker (e.g. cyclic `depends_on`).
     #[error("invalid ir: {0}")]
     InvalidIr(String),
     /// I/O failure writing the compose file to disk.
@@ -243,11 +247,11 @@ impl ComposeStack {
     pub async fn up(&self) -> Result<(), ComposeError> {
         // Write the IR to disk.
         let yaml = self.ir.to_yaml();
-        if let Some(parent) = self.compose_file.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| ComposeError::Io(format!("mkdir {}: {e}", parent.display())))?;
-            }
+        if let Some(parent) = self.compose_file.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| ComposeError::Io(format!("mkdir {}: {e}", parent.display())))?;
         }
         std::fs::write(&self.compose_file, yaml.as_bytes())
             .map_err(|e| ComposeError::Io(format!("write {}: {e}", self.compose_file.display())))?;
@@ -291,7 +295,7 @@ impl ComposeStack {
         Ok(())
     }
 
-    /// Pure helper: typed CommandRequest for `compose up`.
+    /// Pure helper: typed `CommandRequest` for `compose up`.
     #[must_use]
     pub fn build_up_request(&self) -> CommandRequest {
         CommandRequest::new(
@@ -309,7 +313,7 @@ impl ComposeStack {
         )
     }
 
-    /// Pure helper: typed CommandRequest for `compose down`.
+    /// Pure helper: typed `CommandRequest` for `compose down`.
     #[must_use]
     pub fn build_down_request(&self) -> CommandRequest {
         CommandRequest::new(

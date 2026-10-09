@@ -131,9 +131,7 @@ fn parse_app_ref(sexp: &Sexp) -> LispResult<AppRef> {
     })?);
     let kw = parse_kwargs(&list[2..])?;
     reject_unknown_kwargs(&kw, &["version"])?;
-    let version = kw
-        .get("version")
-        .and_then(|s| s.as_string().map(|s| Arc::from(s)));
+    let version = kw.get("version").and_then(|s| s.as_string().map(Arc::from));
     Ok(AppRef { name, version })
 }
 
@@ -172,7 +170,7 @@ fn parse_infra_ref(sexp: &Sexp) -> LispResult<InfraRef> {
     };
     let name_sexp = list.get(1).ok_or_else(|| LispError::Compile {
         form: kwarg_form_string("infra"),
-        message: format!("({head} ...) requires a name string").into(),
+        message: format!("({head} ...) requires a name string"),
     })?;
     let name: Arc<str> = Arc::from(name_sexp.as_string().ok_or_else(|| LispError::Compile {
         form: kwarg_form_string("infra"),

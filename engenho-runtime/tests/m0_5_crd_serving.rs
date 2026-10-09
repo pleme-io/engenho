@@ -1,26 +1,26 @@
 //! M0.5 — CRD serving end-to-end through the live Runtime.
 //!
 //! Proves the full CRD lifecycle over ONE store in ONE process, driven by
-//! the SPAWNED `CrdController` (no manual `.tick()` — the WatchDriver loop +
+//! the SPAWNED `CrdController` (no manual `.tick()` — the `WatchDriver` loop +
 //! fallback tick run it). The chain under test:
 //!
 //!   1. The `apiextensions.k8s.io/v1.CustomResourceDefinition` kind is
 //!      SERVED out of the box (cataloged opaque-JSON `StoreBackedHandler`):
 //!      `GET /apis/apiextensions.k8s.io/v1` advertises
-//!      `customresourcedefinitions`, and POSTing a CRD object 201s.
-//!   2. The CrdController observes the CRD write + registers a
+//!      `customresourcedefinitions`, and `POSTing` a CRD object 201s.
+//!   2. The `CrdController` observes the CRD write + registers a
 //!      `StoreBackedHandler` for the served `example.com/v1` Widget version
-//!      into the live `RouterState` (via the DynamicHandlerSink).
+//!      into the live `RouterState` (via the `DynamicHandlerSink`).
 //!   3. The CR group + resource AUTO-APPEAR in discovery
 //!      (`/apis/example.com/v1` lists `widgets` with shortNames `[wd]`).
 //!   4. Generic CR-instance CRUD flows through the SAME catch-all + do_*
 //!      bodies (POST a Widget → 201 with resourceVersion + uid; GET reads
 //!      it back; DELETE removes it).
 //!   5. Deleting the CRD unregisters the handler — subsequent CR access is a
-//!      typed 404 NotFound ("the server doesn't have a resource type
+//!      typed 404 `NotFound` ("the server doesn't have a resource type
 //!      widgets").
 //!
-//! Constraints: no real container runtime (FakeBackend), no network beyond
+//! Constraints: no real container runtime (`FakeBackend`), no network beyond
 //! loopback (127.0.0.1:0), ephemeral store, fast fallback so the controller
 //! registers within ~1s.
 
@@ -30,7 +30,7 @@ use engenho_config::{EngenhoConfig, KubeletBackendKind};
 use engenho_runtime::Runtime;
 use shikumi::TieredConfig;
 
-/// Ephemeral, plaintext, fast-fallback config so the CrdController converges
+/// Ephemeral, plaintext, fast-fallback config so the `CrdController` converges
 /// quickly even if a single watch-wake is missed.
 fn crd_test_config(data_dir: &std::path::Path) -> EngenhoConfig {
     let mut cfg = EngenhoConfig::prescribed_default();
@@ -220,7 +220,9 @@ async fn crd_lifecycle_register_crud_discovery_unregister() {
         Some("widget")
     );
     assert_eq!(
-        widget_row.get("namespaced").and_then(|n| n.as_bool()),
+        widget_row
+            .get("namespaced")
+            .and_then(serde_json::Value::as_bool),
         Some(true)
     );
     let short = widget_row
@@ -244,10 +246,9 @@ async fn crd_lifecycle_register_crud_discovery_unregister() {
     assert!(
         apis.get("groups")
             .and_then(|g| g.as_array())
-            .map(|gs| gs
+            .is_some_and(|gs| gs
                 .iter()
-                .any(|g| g.get("name").and_then(|n| n.as_str()) == Some("example.com")))
-            .unwrap_or(false),
+                .any(|g| g.get("name").and_then(|n| n.as_str()) == Some("example.com"))),
         "/apis advertises example.com after registration: {apis}"
     );
 
@@ -316,7 +317,7 @@ async fn crd_lifecycle_register_crud_discovery_unregister() {
     assert_eq!(
         list.get("items")
             .and_then(|i| i.as_array())
-            .map(|a| a.len()),
+            .map(std::vec::Vec::len),
         Some(1)
     );
 

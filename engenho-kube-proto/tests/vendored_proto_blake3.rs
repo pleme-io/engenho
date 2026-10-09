@@ -1,7 +1,7 @@
 //! Vendored Kubernetes protobuf (.proto) BLAKE3 manifest verification.
 //!
 //! Per theory/ENGENHO.md §VI.1, every byte the protobuf codec consumes
-//! is BLAKE3-attested — the same discipline as the vendored OpenAPI
+//! is BLAKE3-attested — the same discipline as the vendored `OpenAPI`
 //! schemas in engenho-types. This test reads `vendor/proto/MANIFEST.yaml`
 //! and recomputes the BLAKE3 of every vendored `.proto`, asserting the
 //! on-disk content matches the manifest byte-for-byte. Any upstream

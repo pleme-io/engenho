@@ -27,7 +27,7 @@
 //! * [`NetworkConfig`] — every k3s network knob (CNI, kube-proxy, CIDRs,
 //!   ingress, LB, DNS, IPv6 dual-stack, MTU, node-port range, TLS SANs,
 //!   bind/advertise addresses, disabled components)
-//! * [`BootstrapConfig`] — GitOps bootstrap: FluxCD + ArgoCD, each
+//! * [`BootstrapConfig`] — `GitOps` bootstrap: `FluxCD` + `ArgoCD`, each
 //!   independently enableable, both pointing at typed sources.
 //!
 //! ## Render targets
@@ -88,7 +88,7 @@ pub struct ClusterConfig {
     #[serde(default)]
     pub network: NetworkConfig,
 
-    /// GitOps bootstrap. Both fluxcd and argocd default to disabled;
+    /// `GitOps` bootstrap. Both fluxcd and argocd default to disabled;
     /// enabling either drops the relevant install manifest into k3s'
     /// auto-apply directory at activation time.
     #[serde(default)]

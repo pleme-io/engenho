@@ -3,8 +3,8 @@
 //!
 //! ## The duplication this primitive removes
 //!
-//! Four status-writing workload controllers (ReplicaSet / Deployment /
-//! StatefulSet / Job) carried a byte-identical `tick` skeleton: list
+//! Four status-writing workload controllers (`ReplicaSet` / Deployment /
+//! `StatefulSet` / Job) carried a byte-identical `tick` skeleton: list
 //! parents → skip parents with no `metadata.uid` → build the parent's
 //! owner-ref → gather owned children → reconcile the child delta →
 //! re-list the children → write `.status` via CAS. The ONLY thing that

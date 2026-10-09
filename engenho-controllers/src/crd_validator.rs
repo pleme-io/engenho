@@ -141,6 +141,7 @@ impl CrdValidationWebhook {
     }
 
     /// True if `kind` is a substrate-known core kind.
+    #[must_use]
     pub fn is_core_kind(&self, kind: &str) -> bool {
         self.core.contains(kind)
     }
@@ -210,14 +211,13 @@ impl AdmissionWebhook for CrdValidationWebhook {
         }
         // Shallow required-fields check (Put only — Patch can omit required
         // fields as long as the merged result has them).
-        if request.action == AdmissionAction::Put {
-            if let Some(value) = &request.value {
-                if let Some(missing) = Self::first_missing_required(&entry.schema, value) {
-                    return Ok(AdmissionDecision::Deny(format!(
-                        "required field {missing} missing on {registry_key}"
-                    )));
-                }
-            }
+        if request.action == AdmissionAction::Put
+            && let Some(value) = &request.value
+            && let Some(missing) = Self::first_missing_required(&entry.schema, value)
+        {
+            return Ok(AdmissionDecision::Deny(format!(
+                "required field {missing} missing on {registry_key}"
+            )));
         }
         Ok(AdmissionDecision::Allow)
     }

@@ -1347,7 +1347,7 @@ impl engenho_apiserver::PodLogReader for KubeletLogReader {
 ///
 /// Returns `None` only if the Pod descriptor is somehow absent from the
 /// catalog (impossible — Pod is always cataloged); the caller logs + continues
-/// (the existing no-log Pod handler stays, and `/log` returns NotFound — never
+/// (the existing no-log Pod handler stays, and `/log` returns `NotFound` — never
 /// a panic).
 fn build_pod_log_handler(
     store: &Arc<StoreMesh>,
@@ -1403,12 +1403,7 @@ const STDERR_TAIL_MAX: usize = 400;
 /// to fix, arrived at from the opposite direction.
 fn stderr_tail(stderr: &[u8]) -> String {
     let text = String::from_utf8_lossy(stderr);
-    let Some(line) = text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .next_back()
-    else {
+    let Some(line) = text.lines().map(str::trim).rfind(|l| !l.is_empty()) else {
         return String::new();
     };
     let mut out = String::from(": ");
@@ -1537,7 +1532,7 @@ fn preflight_backend(boot: &BootConfig) -> Result<(), RuntimeError> {
 
 /// The `kubernetes` Service's address, as `seed_kubernetes_service` creates it.
 ///
-/// The IP is the ClusterIP allocator's FIRST assignment (see that function's
+/// The IP is the `ClusterIP` allocator's FIRST assignment (see that function's
 /// doc) and the port is upstream's conventional 443, which fronts the
 /// apiserver's real listen port as the target. Stated here as a constant
 /// because `build_backend` runs before the store exists, so the seeded object
@@ -1549,7 +1544,7 @@ fn preflight_backend(boot: &BootConfig) -> Result<(), RuntimeError> {
 /// mode is silent (a container gets coordinates that route nowhere).
 const DEFAULT_KUBERNETES_SERVICE_IP: &str = "10.96.0.1";
 
-/// The `iss` and `aud` engenho stamps on ServiceAccount tokens.
+/// The `iss` and `aud` engenho stamps on `ServiceAccount` tokens.
 ///
 /// Upstream's in-cluster default. Kept as one constant because the issuer a
 /// token CLAIMS and the audience the apiserver ACCEPTS must agree — split
@@ -1557,13 +1552,13 @@ const DEFAULT_KUBERNETES_SERVICE_IP: &str = "10.96.0.1";
 /// key problem.
 const SA_ISSUER: &str = "https://kubernetes.default.svc";
 
-/// Mints a pod's ServiceAccount credentials from the cluster's signing key.
+/// Mints a pod's `ServiceAccount` credentials from the cluster's signing key.
 ///
 /// Lives here because it is the only layer holding BOTH the apiserver's
 /// signing key and the kubelet — `engenho-kubelet` deliberately does not
 /// depend on `engenho-apiserver`, so the kubelet takes this as a trait.
 ///
-/// Upstream mints tokens through the TokenRequest API, so a remote kubelet
+/// Upstream mints tokens through the `TokenRequest` API, so a remote kubelet
 /// asks the apiserver rather than holding the key. In a single-binary
 /// runtime the two are the same process, which makes issuing directly the
 /// honest shape — and the thing that must change first when engenho grows a
@@ -1599,7 +1594,7 @@ impl engenho_kubelet::ServiceAccountProjector for RuntimeSaProjector {
             // The SA object's uid is not resolved here; the pod's identity is
             // what a reader needs to trace a request back to a workload.
             pod_uid,
-            &[self.audience.clone()],
+            std::slice::from_ref(&self.audience),
             Some(engenho_apiserver::sa_token::NamedUid {
                 name: pod_name.to_string(),
                 uid: pod_uid.to_string(),
@@ -1644,7 +1639,7 @@ impl engenho_kubelet::ServiceAccountProjector for RuntimeSaProjector {
 /// stops looking for a kubeconfig. The address half had not learned it.
 ///
 /// Measured 2026-09-01 on a darwin workstation: engenho injected the
-/// `kubernetes` Service ClusterIP (10.96.0.1:443), pods authenticated with a
+/// `kubernetes` Service `ClusterIP` (10.96.0.1:443), pods authenticated with a
 /// valid token, and every call failed to connect — surfacing as
 /// `Leader election acquire attempt failed … client error (Connect)` in an
 /// operator that had already started, reached its database and reported
@@ -1654,7 +1649,7 @@ enum ApiserverReachability {
     /// A service datapath (kube-proxy rules, or an equivalent) actually
     /// serves the cluster Service VIP, so the conventional coordinates work.
     ServiceVip {
-        /// The `kubernetes` Service ClusterIP.
+        /// The `kubernetes` Service `ClusterIP`.
         ip: String,
         /// Its port (upstream's conventional 443).
         port: u16,
@@ -1874,7 +1869,7 @@ const RBAC_GROUP: &str = "rbac.authorization.k8s.io";
 const RBAC_VERSION: &str = "v1";
 
 /// Seed the bootstrap RBAC policy (Brick B). Idempotently `Put`s the canonical
-/// bootstrap ClusterRoles + ClusterRoleBindings so:
+/// bootstrap `ClusterRoles` + `ClusterRoleBindings` so:
 ///
 ///   * `system:masters` resolves `*.*` through a REAL binding (cluster-admin),
 ///     belt-and-suspenders behind the authorizer's short-circuit — so
@@ -1923,7 +1918,7 @@ async fn seed_system_namespaces(store: &StoreMesh) -> Result<(), RuntimeError> {
     Ok(())
 }
 
-/// The name of the seeded default StorageClass.
+/// The name of the seeded default `StorageClass`.
 const DEFAULT_STORAGE_CLASS: &str = "engenho-local-path";
 
 /// Seed the cluster's default `StorageClass`, so a PVC that names no class is
@@ -1932,8 +1927,8 @@ const DEFAULT_STORAGE_CLASS: &str = "engenho-local-path";
 /// ── ★ WHY A CAPABILITY THAT EXISTS STILL DID NOTHING ───────────────────────
 /// `PvBinderController` has shipped a local-path dynamic provisioner for some
 /// time, and it was never reachable: it provisions only for a PVC whose
-/// effective StorageClass names a local-path provisioner OR carries the
-/// default-class annotation, and NO StorageClass was ever seeded. A cluster
+/// effective `StorageClass` names a local-path provisioner OR carries the
+/// default-class annotation, and NO `StorageClass` was ever seeded. A cluster
 /// therefore had a working provisioner, an empty class list, and every PVC
 /// sitting `Pending` forever.
 ///
@@ -2098,7 +2093,7 @@ async fn seed_snapshot_crds(store: &StoreMesh) -> Result<(), RuntimeError> {
 /// 1. The Service did not exist. `kubernetes.default.svc` is how an in-cluster
 ///    client reaches the apiserver; every client-go `InClusterConfig()` and
 ///    every ServiceAccount-mounted kubeconfig resolves it.
-/// 2. Because it did not exist, the ClusterIP allocator handed **10.96.0.1**
+/// 2. Because it did not exist, the `ClusterIP` allocator handed **10.96.0.1**
 ///    — the address upstream reserves for exactly this Service — to the first
 ///    user Service that asked. A workload could take the apiserver's address.
 ///
@@ -2181,7 +2176,7 @@ const SYSTEM_NAMESPACES: &[&str] = &["default", "kube-system", "kube-public", "k
 /// kind of divergence a differential is built to catch.
 ///
 /// Carries all three things upstream guarantees:
-/// * the `kubernetes.io/metadata.name` label (upstream's NamespaceDefaultLabelName
+/// * the `kubernetes.io/metadata.name` label (upstream's `NamespaceDefaultLabelName`
 ///   admission plugin adds it; selectors in the wild rely on it),
 /// * `spec.finalizers = ["kubernetes"]`, the namespace-controller's hook,
 /// * `status.phase = "Active"`, which clients read to tell Active from Terminating.
@@ -2427,7 +2422,7 @@ async fn put_cluster_role_binding(
 }
 
 /// A serialize-failure during seeding (effectively impossible for the concrete
-/// typed structs) becomes a typed apiserver ServerError so boot fails loudly —
+/// typed structs) becomes a typed apiserver `ServerError` so boot fails loudly —
 /// never a silent skip.
 fn seed_serialize_err(kind: &str, e: &serde_json::Error) -> engenho_apiserver::ServerError {
     engenho_apiserver::ServerError::Serve(std::io::Error::other(format!(
@@ -2503,24 +2498,19 @@ fn host_memory_bytes() -> Option<u64> {
 /// because a made-up reservation is the same class of defect as the made-up
 /// total this replaces.
 pub(crate) fn host_capacity() -> (String, String) {
-    let cpus = std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(1);
-    let memory = match host_memory_bytes() {
-        Some(bytes) => {
-            // Plain bytes, not a rounded `Gi`: rounding down discards real
-            // capacity and rounding up over-claims, and the scheduler parses
-            // this back through the typed `Quantity` surface either way.
-            bytes.to_string()
-        }
-        None => {
-            warn!(
-                "cannot read total host memory on this target; advertising the \
-                 8Gi fallback — the scheduler will pack this node against a \
-                 value that is not measured"
-            );
-            "8Gi".to_string()
-        }
+    let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let memory = if let Some(bytes) = host_memory_bytes() {
+        // Plain bytes, not a rounded `Gi`: rounding down discards real
+        // capacity and rounding up over-claims, and the scheduler parses
+        // this back through the typed `Quantity` surface either way.
+        bytes.to_string()
+    } else {
+        warn!(
+            "cannot read total host memory on this target; advertising the \
+             8Gi fallback — the scheduler will pack this node against a \
+             value that is not measured"
+        );
+        "8Gi".to_string()
     };
     (cpus.to_string(), memory)
 }
@@ -2590,7 +2580,7 @@ fn build_authenticator(
     }
 }
 
-/// Build the ServiceAccount token MINTER for `POST serviceaccounts/<n>/token`.
+/// Build the `ServiceAccount` token MINTER for `POST serviceaccounts/<n>/token`.
 ///
 /// The exact mirror of [`build_authenticator`], and a named function for the
 /// same stated reason: the defect this whole area keeps producing is a WIRING
@@ -2745,7 +2735,7 @@ fn parse_extra_sans(raw: &[String]) -> Result<Vec<SanEntry>, RuntimeError> {
 }
 
 /// Write `data_dir/kubeconfig` (mode 0600) so an operator can immediately
-/// `kubectl --kubeconfig <data_dir>/kubeconfig get nodes`. server_url is
+/// `kubectl --kubeconfig <data_dir>/kubeconfig get nodes`. `server_url` is
 /// `https://127.0.0.1:<bound_port>` (loopback SAN + the real bound port);
 /// `ca_pem` is the cluster CA the server cert chains to.
 ///
@@ -3903,19 +3893,16 @@ fn build_kubelet(
     // unmanaged default, said once at warn.
     let closures: Arc<dyn engenho_kubelet::ClosureStore> = match boot.kubelet_backend {
         CfgBackendKind::Native => {
-            match engenho_kubelet::NixClosureStore::discover(
+            if let Some(store) = engenho_kubelet::NixClosureStore::discover(
                 Area::Pods.path(&boot.data_dir).join("gcroots"),
             ) {
-                Some(store) => {
-                    info!(roots = %store.root_dir().display(), "kubelet roots pod closures in the nix store");
-                    Arc::new(store)
-                }
-                None => {
-                    warn!(
-                        "no nix-store found: pod closures are neither fetched nor rooted, and garbage collection can remove a running pod's image"
-                    );
-                    Arc::new(engenho_kubelet::UnmanagedClosures)
-                }
+                info!(roots = %store.root_dir().display(), "kubelet roots pod closures in the nix store");
+                Arc::new(store)
+            } else {
+                warn!(
+                    "no nix-store found: pod closures are neither fetched nor rooted, and garbage collection can remove a running pod's image"
+                );
+                Arc::new(engenho_kubelet::UnmanagedClosures)
             }
         }
         _ => Arc::new(engenho_kubelet::UnmanagedClosures),

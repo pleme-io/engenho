@@ -67,7 +67,7 @@ impl<'a> From<&'a Secret> for SecretView<'a> {
 /// a Secret response" via `kind`/`apiVersion` injection at the
 /// outer layer.
 pub fn redact_secret(s: &Secret) -> serde_json::Value {
-    serde_json::to_value(&SecretView::from(s)).expect("SecretView is infallibly serializable")
+    serde_json::to_value(SecretView::from(s)).expect("SecretView is infallibly serializable")
 }
 
 #[cfg(test)]

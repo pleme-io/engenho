@@ -1,7 +1,7 @@
 //! In-memory mock [`KubeClient`] for tests. No HTTP, deterministic.
 //!
 //! Behavior mirrors the real apiserver for the typical CRUD path:
-//! GET returns NotFound when absent, CREATE assigns a synthetic
+//! GET returns `NotFound` when absent, CREATE assigns a synthetic
 //! resourceVersion, PATCH is a JSON merge against the stored body,
 //! WATCH streams events as objects are mutated.
 
@@ -45,7 +45,10 @@ impl MockKubeClient {
         let mut s = self.inner.lock().unwrap();
         s.counter += 1;
         let kind = kind_fqn::<R>();
-        let ns = r.namespace().map(|c| c.into_owned()).unwrap_or_default();
+        let ns = r
+            .namespace()
+            .map(std::borrow::Cow::into_owned)
+            .unwrap_or_default();
         let name = r.name().into_owned();
         let mut body = serde_json::to_value(&r).unwrap();
         if let Some(obj) = body.get_mut("metadata").and_then(|m| m.as_object_mut()) {
@@ -92,7 +95,7 @@ impl KubeClient for MockKubeClient {
         let kind = kind_fqn::<R>();
         let mut items: Vec<R> = Vec::new();
         for ((k, ns, _name), body) in &s.objects {
-            if k == &kind && namespace.map_or(true, |n| n == ns) {
+            if k == &kind && namespace.is_none_or(|n| n == ns) {
                 let r: R = serde_json::from_value(body.clone())
                     .map_err(|e| KubeError::Decode(format!("mock decode: {e}")))?;
                 items.push(r);
@@ -114,7 +117,7 @@ impl KubeClient for MockKubeClient {
         let kind = kind_fqn::<R>();
         let ns = resource
             .namespace()
-            .map(|c| c.into_owned())
+            .map(std::borrow::Cow::into_owned)
             .unwrap_or_default();
         let name = resource.name().into_owned();
         let key = (kind, ns, name);
@@ -146,7 +149,7 @@ impl KubeClient for MockKubeClient {
         let kind = kind_fqn::<R>();
         let ns = resource
             .namespace()
-            .map(|c| c.into_owned())
+            .map(std::borrow::Cow::into_owned)
             .unwrap_or_default();
         let name = resource.name().into_owned();
         let key = (kind, ns, name);
@@ -433,7 +436,10 @@ mod tests {
             self.metadata.name.as_str().into()
         }
         fn namespace(&self) -> Option<std::borrow::Cow<'_, str>> {
-            self.metadata.namespace.as_deref().map(|s| s.into())
+            self.metadata
+                .namespace
+                .as_deref()
+                .map(std::convert::Into::into)
         }
         fn resource_version(&self) -> Option<std::borrow::Cow<'_, str>> {
             if self.metadata.resource_version.is_empty() {

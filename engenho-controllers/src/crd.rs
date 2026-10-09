@@ -1,4 +1,4 @@
-//! R21 — CRD (CustomResourceDefinition) serving.
+//! R21 — CRD (`CustomResourceDefinition`) serving.
 //!
 //! Lets operators register new typed kinds at runtime without recompiling.
 //! A CRD declares:
@@ -19,9 +19,9 @@
 //! group + resource auto-appear in discovery (both fold the same live
 //! handler snapshot). There is NO parallel CR codepath.
 //!
-//! ## Reconcile rule (CrdController)
+//! ## Reconcile rule (`CrdController`)
 //!
-//! For each CustomResourceDefinition in the store:
+//! For each `CustomResourceDefinition` in the store:
 //!   1. Parse `spec` through the typed [`CrdSpec`] serde border.
 //!   2. For EACH served version, `sink.register_crd(...)` under
 //!      `(group, version, plural)` + scope + names + shortNames.
@@ -137,14 +137,14 @@ pub struct CrdVersion {
     /// without being silently dropped.
     #[serde(default)]
     pub subresources: Option<CrdSubresources>,
-    /// The OpenAPI v3 schema (`schema.openAPIV3Schema`) — captured opaque;
+    /// The `OpenAPI` v3 schema (`schema.openAPIV3Schema`) — captured opaque;
     /// structural validation against it is DEFERRED (CR creates are accepted
     /// as-is via `--validate=false`).
     #[serde(default)]
     pub schema: Value,
 }
 
-/// The typed `spec` of a CustomResourceDefinition — the parse border the
+/// The typed `spec` of a `CustomResourceDefinition` — the parse border the
 /// controller drives. Unknown fields tolerated (no `deny_unknown_fields`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CrdSpec {

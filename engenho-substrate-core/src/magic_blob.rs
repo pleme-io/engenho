@@ -76,7 +76,7 @@ pub struct MagicBlob<'m, T> {
     pub value: T,
 }
 
-impl<'m, T: Serialize + DeserializeOwned> MagicBlob<'m, T> {
+impl<T: Serialize + DeserializeOwned> MagicBlob<'_, T> {
     /// Encode to bytes: `magic | u64-le-length | blake3 | json-payload`.
     ///
     /// # Errors
@@ -112,11 +112,12 @@ impl<'m, T: Serialize + DeserializeOwned> MagicBlob<'m, T> {
         let len_offset = magic.len();
         let hash_offset = len_offset + 8;
         let payload_offset = hash_offset + blake3::OUT_LEN;
-        let payload_len = u64::from_le_bytes(
+        let payload_len = usize::try_from(u64::from_le_bytes(
             bytes[len_offset..hash_offset]
                 .try_into()
                 .map_err(|_| MagicBlobError::Truncated)?,
-        ) as usize;
+        ))
+        .map_err(|_| MagicBlobError::Truncated)?;
         if bytes.len() < payload_offset + payload_len {
             return Err(MagicBlobError::Truncated);
         }

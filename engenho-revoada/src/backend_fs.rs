@@ -1,4 +1,4 @@
-//! # FileSystemBackend — single-node persistent store on disk
+//! # `FileSystemBackend` — single-node persistent store on disk
 //!
 //! The first real (non-in-memory) [`StoreBackend`] impl. Persists
 //! every applied resource to disk under a deterministic path
@@ -22,18 +22,18 @@
 //! ## Architecture
 //!
 //! - Writes: serialize through the operator's chosen format
-//!   adapter to a CBOR NativeEnvelope; write to
+//!   adapter to a CBOR `NativeEnvelope`; write to
 //!   `{root}/{kind}/{ns}/{name}.envelope`; mirror in an
-//!   InMemoryStore for fast reads + watch fan-out.
-//! - Reads: served from the InMemoryStore cache (hot path). If
+//!   `InMemoryStore` for fast reads + watch fan-out.
+//! - Reads: served from the `InMemoryStore` cache (hot path). If
 //!   not cached, the cache is rebuilt from disk lazily on demand.
-//! - Watch: delegated entirely to the InMemoryStore cache —
+//! - Watch: delegated entirely to the `InMemoryStore` cache —
 //!   subscribers see Added/Modified/Deleted events as writes flow
-//!   through the same code path used by InMemoryBackend.
+//!   through the same code path used by `InMemoryBackend`.
 //! - Snapshot/restore: walks the filesystem; emits/receives a
 //!   single CBOR `Vec<(ResourceRef, Vec<u8>)>` matching the
-//!   InMemoryStore snapshot format. So a snapshot taken via an
-//!   InMemoryBackend can be restored into FileSystemBackend and
+//!   `InMemoryStore` snapshot format. So a snapshot taken via an
+//!   `InMemoryBackend` can be restored into `FileSystemBackend` and
 //!   vice versa — cross-backend interop by design.
 //!
 //! ## What this proves about the trait
@@ -43,7 +43,7 @@
 //! persistent durability requirements. The next backend
 //! (`RaftBackend`, `KubeApiServerBackend`, etc.) follows the same
 //! shape — overlay a real backing system on top of an
-//! InMemoryStore cache for watch + fast-read semantics.
+//! `InMemoryStore` cache for watch + fast-read semantics.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -55,7 +55,7 @@ use crate::format::{AdapterRegistry, FormatAdapter};
 
 /// Errors specific to filesystem persistence. Surface through
 /// [`FaceError::Unsupported`] (the trait's broadest error variant)
-/// with the io::Error's message attached.
+/// with the `io::Error`'s message attached.
 #[derive(Debug, thiserror::Error)]
 enum FsError {
     #[error("io error: {0}")]
@@ -99,7 +99,7 @@ const FORMAT_VERSION: u32 = 1;
 /// quorum, no consensus. A second engenho process writing to the
 /// same `root` simultaneously will race. For multi-node use
 /// `RaftBackend` (R5) or wrap multiple `FileSystemBackend`s in a
-/// FederatedFabric.
+/// `FederatedFabric`.
 pub struct FileSystemBackend {
     root: PathBuf,
     face_name: String,
@@ -201,7 +201,7 @@ impl FileSystemBackend {
     /// in-memory cache.
     fn load_cache_from_disk(&self) -> Result<(), FaceError> {
         let entries = Self::walk_envelopes(&self.root).map_err(FsError::Io)?;
-        for (reference, bytes) in entries {
+        for (_reference, bytes) in entries {
             // Replay through cache.apply via the Native passthrough
             // adapter — the on-disk envelope IS already the CBOR
             // NativeEnvelope shape.
@@ -271,7 +271,7 @@ impl FileSystemBackend {
 }
 
 impl StoreBackend for FileSystemBackend {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "filesystem"
     }
 
@@ -397,7 +397,7 @@ mod tests {
     use crate::face::encode_native_envelope;
 
     /// Make a temporary directory for filesystem tests. Returns
-    /// a TempDir so the directory is auto-cleaned on drop.
+    /// a `TempDir` so the directory is auto-cleaned on drop.
     fn temp_dir() -> tempfile::TempDir {
         tempfile::tempdir().expect("tempdir")
     }

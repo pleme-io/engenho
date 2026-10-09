@@ -4,17 +4,17 @@
 //! in ONE process. Existing tests prove each link in isolation (r7
 //! apiserver↔store, r8 scheduler bind, r9.5 deployment→RS→pod
 //! tick-by-tick, r10 kubelet start). This test proves they COMPOSE
-//! and that the WatchDriver wake-chain converges AUTONOMOUSLY — no
+//! and that the `WatchDriver` wake-chain converges AUTONOMOUSLY — no
 //! manual `.tick()` calls; the spawned drivers run the loops.
 //!
-//! Constraints honored: no real container runtime (FakeBackend), no
+//! Constraints honored: no real container runtime (`FakeBackend`), no
 //! network beyond loopback (127.0.0.1:0), durable store in a tempdir
 //! (proves the durable path + the restart-resume seam, not just
 //! ephemeral).
 //!
 //! The REAL-container peer is `m0_2_real_container.rs` (M0.2): same
 //! autonomous chain but driven by the live `PodmanBackend` instead of the
-//! FakeBackend, ignore-gated because it shells to `podman`. This test
+//! `FakeBackend`, ignore-gated because it shells to `podman`. This test
 //! stays FakeBackend-only so it runs in CI with no host runtime.
 
 use std::sync::Arc;
@@ -26,7 +26,7 @@ use engenho_runtime::Runtime;
 use shikumi::TieredConfig;
 
 /// Durable config in `data_dir`, apiserver on an ephemeral loopback
-/// port, kubelet driven by the FakeBackend, fast fallback so a missed
+/// port, kubelet driven by the `FakeBackend`, fast fallback so a missed
 /// watch-wake never strands the test for 30s.
 fn durable_config(data_dir: &std::path::Path) -> EngenhoConfig {
     let mut cfg = EngenhoConfig::prescribed_default();
@@ -415,7 +415,7 @@ async fn deployment_status_converges_then_reconcile_is_bounded() {
         let observed = status.get("observedGeneration")?.as_i64()?;
         let ready = status
             .get("readyReplicas")
-            .and_then(|r| r.as_i64())
+            .and_then(serde_json::Value::as_i64)
             .unwrap_or(0);
         if observed == generation && ready == 2 {
             Some(())
@@ -839,13 +839,13 @@ async fn fake_backend_boots_without_any_container_runtime() {
 
 /// **A create into a namespace that does not exist is rejected 404.**
 ///
-/// Measured 2026-08-28: a ConfigMap POSTed into `ghost-namespace` — a
+/// Measured 2026-08-28: a `ConfigMap` `POSTed` into `ghost-namespace` — a
 /// namespace that did not exist — returned **201**. The object was stored,
 /// listable, and permanently orphaned: nothing would ever collect it, because
 /// namespace deletion is what collects a namespace's contents and there was no
 /// namespace to delete.
 ///
-/// Upstream's NamespaceLifecycle admission plugin rejects this, naming the
+/// Upstream's `NamespaceLifecycle` admission plugin rejects this, naming the
 /// NAMESPACE rather than the object — what kubectl renders as
 /// `Error from server (NotFound): namespaces "ghost" not found`.
 #[tokio::test]
@@ -934,7 +934,7 @@ async fn create_into_a_nonexistent_namespace_is_rejected() {
 ///
 /// 1. `default/kubernetes` did not exist. It is how an in-cluster client
 ///    reaches the apiserver — every `InClusterConfig()` resolves it.
-/// 2. Because it did not exist, the ClusterIP allocator handed **10.96.0.1**,
+/// 2. Because it did not exist, the `ClusterIP` allocator handed **10.96.0.1**,
 ///    the address upstream reserves for it, to the first user Service that
 ///    asked. A workload could take the apiserver's own address.
 ///

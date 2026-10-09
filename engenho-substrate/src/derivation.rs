@@ -8,7 +8,7 @@
 //! Nix-as-substrate exploration). The recommendation was:
 //!
 //!   Highest leverage = `DerivationCacheBackend` trait + `MemoryBackend`
-//!   impl (~150 LoC). One typed slot unblocks every downstream consumer;
+//!   impl (~150 `LoC`). One typed slot unblocks every downstream consumer;
 //!   later iroh / NATS-Object / federation impls slot in without
 //!   touching call sites.
 //!
@@ -18,12 +18,12 @@
 //! |----------|------------------------------------------------------------|
 //! | Strong   | `MagicBlob<Drv>` committed via `engenho-store` Raft         |
 //! | Eventual | Per-node `DrvCacheState` gossiped via chitchat              |
-//! | Durable  | `BuildEvent` stream via JetStream                           |
+//! | Durable  | `BuildEvent` stream via `JetStream`                           |
 //! | Content  | `NarBlob` bytes resolved P2P via iroh / NATS Object         |
 //!
 //! ## What's in this commit
 //!
-//! - [`Drv`] — typed derivation value (drv_hash, system, outputs, inputs)
+//! - [`Drv`] — typed derivation value (`drv_hash`, system, outputs, inputs)
 //! - [`DrvHash`] / [`NarHash`] — newtype BLAKE3 hashes; not interchangeable
 //! - [`OutputPath`] — typed `/nix/store/...` paths
 //! - [`NarBlob`] — content-addressed blob with the NAR bytes
@@ -55,7 +55,7 @@ crate::define_hash_newtype! {
 }
 
 /// Typed `/nix/store/{hash}-{name}` path. The hash here is the
-/// Nix-style truncated hash (matched 1:1 to upstream CppNix paths
+/// Nix-style truncated hash (matched 1:1 to upstream `CppNix` paths
 /// when bridging sui's translation); we keep it opaque since it's
 /// store-format-dependent, not a BLAKE3 of payload.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -64,7 +64,7 @@ pub struct OutputPath(pub String);
 impl OutputPath {
     /// New from arbitrary string. Caller responsible for `/nix/store/`
     /// shape; trait does not validate (different stores have different
-    /// shapes — sui-store / CppNix / future content-addressed stores).
+    /// shapes — sui-store / `CppNix` / future content-addressed stores).
     #[must_use]
     pub fn new(s: impl Into<String>) -> Self {
         Self(s.into())
@@ -86,9 +86,9 @@ impl std::fmt::Display for OutputPath {
 /// Typed derivation — substrate-side analog of sui's
 /// `sui_compat::derivation::Derivation`.
 ///
-/// Keeps the same shape (fields named to match the ATerm format) so
+/// Keeps the same shape (fields named to match the `ATerm` format) so
 /// translation in/out is a field-by-field copy. Sui owns the canonical
-/// parser + serializer for ATerm; the substrate owns the typed value.
+/// parser + serializer for `ATerm`; the substrate owns the typed value.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Drv {
     /// BLAKE3 hash of the canonical-form drv bytes. Identity for the
@@ -386,7 +386,7 @@ pub trait DerivationCacheBackend: Send + Sync {
 // =================================================================
 
 /// In-memory L0 cache. Fast, deterministic, suitable for unit tests
-/// + bootstrap-cluster scenarios where no on-disk store is yet
+/// and bootstrap-cluster scenarios where no on-disk store is yet
 /// configured. Production tiers wrap on-disk + cluster + federation
 /// backends (future rounds).
 #[derive(Default, Clone)]
@@ -398,7 +398,7 @@ pub struct MemoryDerivationCache {
 struct MemoryState {
     drvs: BTreeMap<DrvHash, Drv>,
     nars: BTreeMap<NarHash, NarBlob>,
-    /// realisations[drv_hash] = realisations for that drv
+    /// realisations[`drv_hash`] = realisations for that drv
     realisations: BTreeMap<DrvHash, Vec<Realisation>>,
 }
 

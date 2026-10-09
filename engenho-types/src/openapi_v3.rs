@@ -1,4 +1,4 @@
-//! Vendored Kubernetes OpenAPI v3 group documents, embedded into the
+//! Vendored Kubernetes `OpenAPI` v3 group documents, embedded into the
 //! binary.
 //!
 //! The apiserver serves the K8s OpenAPI-v3 discovery surface
@@ -27,49 +27,49 @@
 
 use std::collections::BTreeSet;
 
-/// The vendored core (`""`/v1) OpenAPI v3 document.
+/// The vendored core (`""`/v1) `OpenAPI` v3 document.
 pub const CORE_V1: &str = include_str!("../vendor/openapi/v1.34.0/api__v1_openapi.json");
 
-/// The vendored apps/v1 OpenAPI v3 document.
+/// The vendored apps/v1 `OpenAPI` v3 document.
 pub const APPS_V1: &str = include_str!("../vendor/openapi/v1.34.0/apis__apps__v1_openapi.json");
 
-/// The vendored rbac.authorization.k8s.io/v1 OpenAPI v3 document.
+/// The vendored rbac.authorization.k8s.io/v1 `OpenAPI` v3 document.
 pub const RBAC_V1: &str =
     include_str!("../vendor/openapi/v1.34.0/apis__rbac.authorization.k8s.io__v1_openapi.json");
 
-/// The vendored batch/v1 OpenAPI v3 document (Job, CronJob).
+/// The vendored batch/v1 `OpenAPI` v3 document (Job, `CronJob`).
 pub const BATCH_V1: &str = include_str!("../vendor/openapi/v1.34.0/apis__batch__v1_openapi.json");
 
-/// The vendored networking.k8s.io/v1 OpenAPI v3 document (Ingress,
-/// IngressClass, NetworkPolicy).
+/// The vendored networking.k8s.io/v1 `OpenAPI` v3 document (Ingress,
+/// `IngressClass`, `NetworkPolicy`).
 pub const NETWORKING_V1: &str =
     include_str!("../vendor/openapi/v1.34.0/apis__networking.k8s.io__v1_openapi.json");
 
-/// The vendored policy/v1 OpenAPI v3 document (PodDisruptionBudget).
+/// The vendored policy/v1 `OpenAPI` v3 document (`PodDisruptionBudget`).
 pub const POLICY_V1: &str = include_str!("../vendor/openapi/v1.34.0/apis__policy__v1_openapi.json");
 
-/// The vendored storage.k8s.io/v1 OpenAPI v3 document (StorageClass, CSINode,
-/// CSIDriver, VolumeAttachment, CSIStorageCapacity).
+/// The vendored storage.k8s.io/v1 `OpenAPI` v3 document (`StorageClass`, `CSINode`,
+/// `CSIDriver`, `VolumeAttachment`, `CSIStorageCapacity`).
 pub const STORAGE_V1: &str =
     include_str!("../vendor/openapi/v1.34.0/apis__storage.k8s.io__v1_openapi.json");
 
-/// The vendored scheduling.k8s.io/v1 OpenAPI v3 document (PriorityClass).
+/// The vendored scheduling.k8s.io/v1 `OpenAPI` v3 document (`PriorityClass`).
 pub const SCHEDULING_V1: &str =
     include_str!("../vendor/openapi/v1.34.0/apis__scheduling.k8s.io__v1_openapi.json");
 
-/// The vendored coordination.k8s.io/v1 OpenAPI v3 document (Lease).
+/// The vendored coordination.k8s.io/v1 `OpenAPI` v3 document (Lease).
 pub const COORDINATION_V1: &str =
     include_str!("../vendor/openapi/v1.34.0/apis__coordination.k8s.io__v1_openapi.json");
 
-/// The vendored node.k8s.io/v1 OpenAPI v3 document (RuntimeClass).
+/// The vendored node.k8s.io/v1 `OpenAPI` v3 document (`RuntimeClass`).
 pub const NODE_V1: &str =
     include_str!("../vendor/openapi/v1.34.0/apis__node.k8s.io__v1_openapi.json");
 
-/// The vendored autoscaling/v2 OpenAPI v3 document (HorizontalPodAutoscaler).
+/// The vendored autoscaling/v2 `OpenAPI` v3 document (`HorizontalPodAutoscaler`).
 pub const AUTOSCALING_V2: &str =
     include_str!("../vendor/openapi/v1.34.0/apis__autoscaling__v2_openapi.json");
 
-/// One served OpenAPI v3 group document: the `(group, version)` it
+/// One served `OpenAPI` v3 group document: the `(group, version)` it
 /// describes, the embedded body, and the BLAKE3 digest from the manifest
 /// (used as the `?hash=` cache key in the discovery index).
 #[derive(Clone, Copy, Debug)]
@@ -78,7 +78,7 @@ pub struct ServedDoc {
     pub group: &'static str,
     /// API version (`"v1"`).
     pub version: &'static str,
-    /// The full vendored OpenAPI v3 document body.
+    /// The full vendored `OpenAPI` v3 document body.
     pub body: &'static str,
     /// The BLAKE3 digest of `body` per `MANIFEST.yaml` — a stable per-doc
     /// cache key kubectl appends as `?hash=`.
@@ -99,7 +99,7 @@ impl ServedDoc {
     }
 }
 
-/// Every served OpenAPI v3 group document — the SINGLE source the discovery
+/// Every served `OpenAPI` v3 group document — the SINGLE source the discovery
 /// index + [`document_for`] both iterate. Scoped to exactly the schema-backed
 /// (non-opaque) cataloged groups. BLAKE3 digests mirror `MANIFEST.yaml` (and
 /// are re-verified against `body` by a test, so a manifest/body drift fails
@@ -176,7 +176,7 @@ pub const SERVED: &[ServedDoc] = &[
     },
 ];
 
-/// The verbatim OpenAPI v3 document for `(group, version)`, or `None` if no
+/// The verbatim `OpenAPI` v3 document for `(group, version)`, or `None` if no
 /// document is served for that pair. The core group is the empty string.
 ///
 /// Driven by [`SERVED`] so the lookup can never advertise a pair the
@@ -316,7 +316,7 @@ impl core::fmt::Display for Verb {
 }
 
 /// Derive the verb set upstream advertises for `plural` in `group`/`version`,
-/// **read out of the vendored OpenAPI document** rather than hand-listed.
+/// **read out of the vendored `OpenAPI` document** rather than hand-listed.
 ///
 /// This is the L1 half of the conformance differential: the pinned document is
 /// an oracle that is always present, needs no running cluster, and is the same
@@ -325,7 +325,7 @@ impl core::fmt::Display for Verb {
 ///
 /// The mapping is upstream's own REST convention:
 ///
-/// | OpenAPI path | method | verb |
+/// | `OpenAPI` path | method | verb |
 /// |---|---|---|
 /// | `…/{plural}` | `get` | `list` |
 /// | `…/{plural}` | `post` | `create` |

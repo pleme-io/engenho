@@ -76,10 +76,10 @@ fn walk_drop(v: &mut Value, segs: &[PathSeg]) {
                 }
             }
             PathSeg::Index(i) => {
-                if let Some(a) = v.as_array_mut() {
-                    if *i < a.len() {
-                        a.remove(*i);
-                    }
+                if let Some(a) = v.as_array_mut()
+                    && *i < a.len()
+                {
+                    a.remove(*i);
                 }
             }
             PathSeg::Wildcard => {

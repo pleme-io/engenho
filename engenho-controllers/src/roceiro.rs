@@ -4,14 +4,14 @@
 //! [`Verifier`](engenho_substrate::Verifier) into one typed surface the
 //! [`PlantioController`](crate::plantio::PlantioController) dispatches:
 //! "materialize this Stage on this node, run its verifiers,
-//! return a typed MaterializationReceipt."
+//! return a typed `MaterializationReceipt`."
 //!
 //! ## Trait shape
 //!
 //! Pluggable so consumers can swap in:
 //!   * `FakeRoceiro` — deterministic for tests
-//!   * `BuildBackendRoceiro` — production: drives a BuildBackend
-//!      + a Verifier + ingests into a DerivationCacheBackend
+//!   * `BuildBackendRoceiro` — production: drives a `BuildBackend`
+//!      + a Verifier + ingests into a `DerivationCacheBackend`
 //!   * `SuiRoceiro` (future) — production: invokes sui directly
 //!
 //! ## Composition
@@ -73,7 +73,7 @@ pub trait Roceiro: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// Materialize `stage` on `node`. Returns the typed receipt the
-    /// PlantioController feeds into the ledger.
+    /// `PlantioController` feeds into the ledger.
     ///
     /// # Errors
     /// [`RoceiroError::Backend`] for build / cache failures;
@@ -92,7 +92,7 @@ pub trait Roceiro: Send + Sync {
 
 /// In-memory materializer. Records every materialize call;
 /// produces synthetic receipts whose evidence is keyed by
-/// (stage_id, shape) — all nodes agree on the same bytes for a
+/// (`stage_id`, shape) — all nodes agree on the same bytes for a
 /// given stage. Use `dissent_on()` to inject byzantine-emitter
 /// behavior where each node reports a different evidence hash.
 #[derive(Default, Clone)]
@@ -102,9 +102,9 @@ pub struct FakeRoceiro {
 
 #[derive(Default)]
 struct FakeRoceiroState {
-    /// Stage IDs whose materialize() should fail with Backend.
+    /// Stage IDs whose `materialize()` should fail with Backend.
     backend_fail: std::collections::BTreeSet<StageId>,
-    /// Stage IDs whose materialize() should deny verification.
+    /// Stage IDs whose `materialize()` should deny verification.
     deny_verify: std::collections::BTreeSet<StageId>,
     /// Stage IDs whose evidence should diverge per node (byzantine).
     dissent: std::collections::BTreeSet<StageId>,
@@ -130,7 +130,7 @@ impl FakeRoceiro {
     }
 
     /// Make `stage_id` produce divergent evidence per node — the
-    /// QuorumTracker will report Dissent. Simulates byzantine
+    /// `QuorumTracker` will report Dissent. Simulates byzantine
     /// emitter behavior for testing the dissent path.
     pub async fn dissent_on(&self, stage_id: StageId) {
         self.inner.lock().await.dissent.insert(stage_id);

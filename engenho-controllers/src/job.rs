@@ -1,30 +1,30 @@
-//! R16 — Job + R16b CronJob controllers.
+//! R16 — Job + R16b `CronJob` controllers.
 //!
 //! Job: runs N pods to completion. Tracks completions/failures.
-//! CronJob: time-triggered Job factory driven by a real 5-field cron
+//! `CronJob`: time-triggered Job factory driven by a real 5-field cron
 //! parser ([`crate::cron::CronSchedule`]) against an injected
-//! [`Clock`] — so the whole CronJob → Job → Pod workload chain
-//! functions end-to-end (the JobController then runs the created Job's
+//! [`Clock`] — so the whole `CronJob` → Job → Pod workload chain
+//! functions end-to-end (the `JobController` then runs the created Job's
 //! Pods via the kubelet).
 //!
 //! ## Job reconcile rule
 //!
 //! For each Job:
-//!   * desired_completions = spec.completions (default 1)
-//!   * desired_parallelism = spec.parallelism (default 1)
-//!   * owned_pods = pods with controller-ref UID matching
+//!   * `desired_completions` = spec.completions (default 1)
+//!   * `desired_parallelism` = spec.parallelism (default 1)
+//!   * `owned_pods` = pods with controller-ref UID matching
 //!   * succeeded = pods with status.phase == "Succeeded"
 //!   * if succeeded >= completions → mark Job complete (no-op)
-//!   * else if active_pods < parallelism → create more
+//!   * else if `active_pods` < parallelism → create more
 //!
-//! ## CronJob reconcile rule
+//! ## `CronJob` reconcile rule
 //!
-//! Each tick, for every CronJob:
+//! Each tick, for every `CronJob`:
 //!   * skip when `spec.suspend == true`
 //!   * parse `spec.schedule` (a 5-field cron expression); a malformed
 //!     schedule is a typed skip, never a panic
 //!   * compute the most recent scheduled minute strictly after the last
-//!     run anchor (`status.lastScheduleTime`, else the CronJob's
+//!     run anchor (`status.lastScheduleTime`, else the `CronJob`'s
 //!     creationTimestamp, else now) and at-or-before `clock.now()`
 //!   * honour `spec.startingDeadlineSeconds` — a due time older than the
 //!     deadline is missed and skipped
@@ -33,7 +33,7 @@
 //!       - `Replace` → delete the active owned Job(s), then create
 //!       - `Allow`   → always create
 //!   * create a Job named `{cronjob}-{unix_ts}` from `spec.jobTemplate`,
-//!     owner-referenced back to the CronJob + labelled
+//!     owner-referenced back to the `CronJob` + labelled
 //!   * patch `status.lastScheduleTime` + `status.active`
 //!
 //! Deferred (named typed follow-ups): history GC
@@ -313,7 +313,7 @@ impl OwnedChildrenReconciler for JobController {
 // CronJobController — R16b
 // =================================================================
 
-/// Concurrency policy for a CronJob's overlapping executions.
+/// Concurrency policy for a `CronJob`'s overlapping executions.
 ///
 /// Parsed from `spec.concurrencyPolicy`; unknown / absent values default
 /// to [`ConcurrencyPolicy::Allow`] (the Kubernetes default).
@@ -339,7 +339,7 @@ impl ConcurrencyPolicy {
     }
 }
 
-/// CronJob controller — parses `spec.schedule` (5-field cron) and creates
+/// `CronJob` controller — parses `spec.schedule` (5-field cron) and creates
 /// `batch/v1` Jobs at scheduled times against an injected [`Clock`].
 ///
 /// The clock is the testability contract: tests construct a
@@ -370,7 +370,7 @@ impl CronJobController {
 
     /// The last-schedule anchor (unix seconds) the next-due search starts
     /// strictly after: `status.lastScheduleTime` if present, else the
-    /// CronJob's `metadata.creationTimestamp`, else `now` (a CronJob with
+    /// `CronJob`'s `metadata.creationTimestamp`, else `now` (a `CronJob` with
     /// no creation stamp never back-fires for past minutes).
     fn last_schedule_anchor(cj: &Value, now: u64) -> u64 {
         if let Some(last) = cj
@@ -388,7 +388,7 @@ impl CronJobController {
             .unwrap_or(now)
     }
 
-    /// Construct a Job from the CronJob's `spec.jobTemplate` (both its
+    /// Construct a Job from the `CronJob`'s `spec.jobTemplate` (both its
     /// `spec` AND any template metadata labels/annotations are carried
     /// over). `ts` is the scheduled time in unix seconds — it names the
     /// Job `{cronjob}-{ts}`.
@@ -435,7 +435,7 @@ impl CronJobController {
         owned.iter().filter(|(_, j)| !job_is_terminal(j)).collect()
     }
 
-    /// All Jobs owned (controller-ref) by `cj_uid`, in this CronJob's
+    /// All Jobs owned (controller-ref) by `cj_uid`, in this `CronJob`'s
     /// namespace.
     async fn owned_jobs(&self, cj_uid: &str, job_ns: &str) -> Vec<(ResourceKey, Value)> {
         self.store
@@ -508,7 +508,7 @@ enum CronTickOutcome {
 }
 
 impl CronJobController {
-    /// Reconcile a single CronJob at `now` (unix seconds). Pure decision
+    /// Reconcile a single `CronJob` at `now` (unix seconds). Pure decision
     /// logic + store writes; returns the typed [`CronTickOutcome`] so
     /// [`Self::tick`] stays a thin aggregator.
     async fn reconcile_one_cronjob(
@@ -642,7 +642,7 @@ impl CronJobController {
         ))
     }
 
-    /// Patch the CronJob's `status.lastScheduleTime` (always) and — when a
+    /// Patch the `CronJob`'s `status.lastScheduleTime` (always) and — when a
     /// Job was created — its `status.active` list with the new Job's ref.
     async fn patch_last_schedule(
         &self,
@@ -677,7 +677,7 @@ impl CronJobController {
 /// last slot ≤ now. This fires AT MOST ONCE per tick even when several
 /// slots elapsed between ticks (no catch-up storm) — the missed slots are
 /// collapsed to the latest, matching the Kubernetes single-fire-per-tick
-/// behaviour for a CronJob with no backlog policy.
+/// behaviour for a `CronJob` with no backlog policy.
 fn most_recent_due(schedule: &crate::cron::CronSchedule, anchor: u64, now: u64) -> Option<u64> {
     let mut candidate = schedule.next_after_unix(anchor)?;
     if candidate > now {
@@ -960,7 +960,7 @@ mod tests {
     use engenho_store::{InProcessRouter, default_config};
     use std::time::Duration;
 
-    /// Single-node in-memory StoreMesh — the controller-test rig the
+    /// Single-node in-memory `StoreMesh` — the controller-test rig the
     /// other reconciler tests use.
     async fn test_store(name: &str) -> Arc<StoreMesh> {
         let router = InProcessRouter::new();
@@ -982,7 +982,7 @@ mod tests {
             .expect("put");
     }
 
-    /// Seed a CronJob at `default/<name>` with the given schedule + a
+    /// Seed a `CronJob` at `default/<name>` with the given schedule + a
     /// jobTemplate that runs one container. The creationTimestamp is the
     /// search anchor; pin it so a frozen clock can advance past a slot.
     fn cronjob_value(name: &str, schedule: &str, created: u64) -> Value {

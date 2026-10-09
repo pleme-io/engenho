@@ -24,9 +24,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Promotion strategy applied on every `get_*` hit.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum PromotionPolicy {
     /// Promote to every higher tier on every hit.
+    #[default]
     Eager,
     /// Never promote on read.
     Lazy,
@@ -36,12 +37,6 @@ pub enum PromotionPolicy {
     /// Promote only to tiers with index ≤ `max_tier`. (Tiers are
     /// 0-indexed from fastest; `OnlyTo(0)` ≡ promote only to L0.)
     OnlyTo(usize),
-}
-
-impl Default for PromotionPolicy {
-    fn default() -> Self {
-        Self::Eager
-    }
 }
 
 /// Decision context for a single hit.
@@ -91,7 +86,7 @@ impl PromotionGate {
                     return Some(ctx.source_tier);
                 }
                 let n = self.counter.fetch_add(1, Ordering::Relaxed);
-                if n % rate == 0 {
+                if n.is_multiple_of(rate) {
                     Some(ctx.source_tier)
                 } else {
                     None

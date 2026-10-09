@@ -33,11 +33,11 @@ pub struct NetworkConfig {
     /// kube-DNS address (see `cluster_dns`) lives inside this.
     pub service_cidr: String,
 
-    /// CoreDNS / cluster-DNS service IP. Must live inside
+    /// `CoreDNS` / cluster-DNS service IP. Must live inside
     /// `service_cidr`. k3s default `10.43.0.10`.
     pub cluster_dns: Ipv4Addr,
 
-    /// `--service-node-port-range` for NodePort services. Default
+    /// `--service-node-port-range` for `NodePort` services. Default
     /// `30000-32767` matches upstream Kubernetes + k3s.
     pub node_port_range: PortRange,
 
@@ -49,7 +49,7 @@ pub struct NetworkConfig {
     /// kube-proxy mode + tuning.
     pub kube_proxy: KubeProxyConfig,
 
-    /// NetworkPolicy enforcement. k3s installs a network-policy
+    /// `NetworkPolicy` enforcement. k3s installs a network-policy
     /// controller by default; disabling it is required when running
     /// a CNI that provides its own (cilium, calico).
     pub network_policy: NetworkPolicyConfig,
@@ -66,7 +66,7 @@ pub struct NetworkConfig {
     pub load_balancer: LoadBalancerChoice,
 
     /// Cluster DNS provider. k3s default `coredns`. `nodelocal-dns`
-    /// installs the upstream NodeLocal DNSCache addon on top.
+    /// installs the upstream `NodeLocal` `DNSCache` addon on top.
     pub dns: DnsChoice,
 
     /// IPv6 + dual-stack. Off by default. Enabling adds an IPv6
@@ -129,13 +129,13 @@ impl Default for NetworkConfig {
 pub enum CniChoice {
     /// k3s' default — flannel with vxlan backend. Zero-config.
     Flannel,
-    /// Calico — BGP/VXLAN/IPIP-capable, NetworkPolicy native.
+    /// Calico — BGP/VXLAN/IPIP-capable, `NetworkPolicy` native.
     /// k3s started with `--flannel-backend=none`; install manifest
     /// drops calico's operator.
     Calico,
     /// Cilium — eBPF-based, replaces kube-proxy when configured.
     /// Same `--flannel-backend=none`; install manifest is cilium's
-    /// CRDs + agent DaemonSet.
+    /// CRDs + agent `DaemonSet`.
     Cilium,
     /// `--flannel-backend=none --disable-network-policy --disable-cni
     /// true` — caller installs their own CNI out-of-band.
@@ -154,7 +154,7 @@ pub enum FlannelBackend {
     WireguardNative,
     /// Flannel wireguard-legacy — userspace wireguard.
     WireguardLegacy,
-    /// Flannel IPSec.
+    /// Flannel `IPSec`.
     Ipsec,
 }
 
@@ -195,7 +195,7 @@ pub enum KubeProxyMode {
     Nftables,
 }
 
-/// NetworkPolicy enforcement.
+/// `NetworkPolicy` enforcement.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case", default)]
 pub struct NetworkPolicyConfig {
@@ -214,7 +214,7 @@ impl Default for NetworkPolicyConfig {
     }
 }
 
-/// NetworkPolicy enforcement choice.
+/// `NetworkPolicy` enforcement choice.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum NetworkPolicyEnforce {
@@ -249,7 +249,7 @@ pub enum IngressChoice {
 pub enum LoadBalancerChoice {
     /// k3s' default — klipper-lb (servicelb).
     Servicelb,
-    /// MetalLB — L2/BGP-mode LoadBalancer for bare metal.
+    /// `MetalLB` — L2/BGP-mode `LoadBalancer` for bare metal.
     Metallb,
     /// kube-vip — VIP + load balancer + control-plane HA in one pod.
     KubeVip,
@@ -263,7 +263,7 @@ pub enum LoadBalancerChoice {
 pub enum DnsChoice {
     /// k3s' default — coredns as the only DNS service.
     Coredns,
-    /// coredns + NodeLocal DNSCache for per-node caching.
+    /// coredns + `NodeLocal` `DNSCache` for per-node caching.
     NodelocalDns,
     /// `--disable=coredns`; operator brings their own DNS.
     External,
@@ -272,6 +272,7 @@ pub enum DnsChoice {
 /// IPv6 / dual-stack configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case", default)]
+#[derive(Default)]
 pub struct Ipv6Config {
     /// `true` enables dual-stack; renderer appends an IPv6 CIDR to
     /// `cluster_cidr` and `service_cidr` (k3s expects a
@@ -285,17 +286,7 @@ pub struct Ipv6Config {
     pub service_cidr_v6: Option<String>,
 }
 
-impl Default for Ipv6Config {
-    fn default() -> Self {
-        Self {
-            dual_stack: false,
-            cluster_cidr_v6: None,
-            service_cidr_v6: None,
-        }
-    }
-}
-
-/// `--service-node-port-range` for NodePort services.
+/// `--service-node-port-range` for `NodePort` services.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PortRange {
@@ -318,7 +309,7 @@ impl Default for PortRange {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum K3sComponent {
-    /// Disable the bundled traefik HelmChart.
+    /// Disable the bundled traefik `HelmChart`.
     Traefik,
     /// Disable klipper-lb (servicelb).
     Servicelb,

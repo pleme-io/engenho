@@ -5,8 +5,8 @@
 //! (R-NOMAD.1 — adds `hcl-rs` parser/emitter in a follow-up).
 //!
 //! Scope today (R-NOMAD.0):
-//!   * Job + TaskGroup + Task + Resources + DriverConfig (docker,
-//!     exec, raw_exec).
+//!   * Job + `TaskGroup` + Task + Resources + `DriverConfig` (docker,
+//!     exec, `raw_exec`).
 //!   * Service registration block.
 //!   * Network + port definitions.
 //!   * Update strategy (rolling deploys).

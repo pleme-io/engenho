@@ -29,9 +29,9 @@
 //!
 //! chitchat is a string-keyed KV store under the hood. The mesh
 //! advertises a single key `"engenho.revoada.node"` whose value
-//! is a serde_json encoding of [`NodeState`]. R5+ may break this
+//! is a `serde_json` encoding of [`NodeState`]. R5+ may break this
 //! into smaller keys if delta efficiency matters; for the typical
-//! ~few-hundred-byte NodeState the single-blob shape is simpler
+//! ~few-hundred-byte `NodeState` the single-blob shape is simpler
 //! and chitchat handles deltas at the message layer.
 
 use std::collections::BTreeSet;
@@ -66,7 +66,7 @@ pub struct GossipConfig {
     /// first, ≥1 reachable seed is required.
     pub seed_nodes: Vec<String>,
     /// Cluster identifier — nodes only gossip with peers on the
-    /// same cluster_id. Different engenho clusters can share a
+    /// same `cluster_id`. Different engenho clusters can share a
     /// network without merging.
     pub cluster_id: String,
     /// How often to send gossip messages. chitchat default 1s;
@@ -80,7 +80,7 @@ pub struct GossipConfig {
     /// Grace period before a marked-dead node's state is GC'd.
     /// Default 30s.
     pub marked_for_deletion_grace_period: Duration,
-    /// Initial NodeState to advertise. Updates flow through
+    /// Initial `NodeState` to advertise. Updates flow through
     /// [`GossipMesh::update_local_state`] after start.
     pub initial_state: NodeState,
 }
@@ -143,7 +143,7 @@ pub struct NodeState {
 }
 
 impl NodeState {
-    /// Deterministic canonical bytes for signing/verification. serde_json over a
+    /// Deterministic canonical bytes for signing/verification. `serde_json` over a
     /// struct is field-order-stable and `BTreeSet<NodeRole>` serializes sorted, so
     /// the same `NodeState` always produces the same bytes — sign-then-verify holds
     /// across the gossip round-trip.
@@ -275,7 +275,7 @@ impl GossipMesh {
     /// Construct + spawn the gossip server. Returns once chitchat
     /// has bound its UDP socket and the bridge task is running.
     ///
-    /// Defaults to `WallClock` for the ChitchatId generation timestamp.
+    /// Defaults to `WallClock` for the `ChitchatId` generation timestamp.
     /// Tests pinning the timestamp should use [`Self::start_with_clock`].
     ///
     /// # Errors
@@ -287,7 +287,7 @@ impl GossipMesh {
     }
 
     /// Construct + spawn with an explicit typed `Clock` for the
-    /// ChitchatId generation timestamp. Pattern #7 (concrete-first,
+    /// `ChitchatId` generation timestamp. Pattern #7 (concrete-first,
     /// trait-back) — production unchanged via `start()`; tests get
     /// determinism via `FrozenClock`. Closes the v0.62/v0.74
     /// membership backlog.
@@ -385,12 +385,12 @@ impl GossipMesh {
         let cc = self.handle.chitchat();
         let cc = cc.lock().await;
         let chitchat_id = cc.self_chitchat_id().clone();
-        if let Some(node) = cc.node_state(&chitchat_id) {
-            if let Some(blob) = node.get(STATE_KEY) {
-                let signed: SignedNodeState = serde_json::from_str(blob)?;
-                // Our own state must verify under our own key.
-                return Ok(signed.into_verified());
-            }
+        if let Some(node) = cc.node_state(&chitchat_id)
+            && let Some(blob) = node.get(STATE_KEY)
+        {
+            let signed: SignedNodeState = serde_json::from_str(blob)?;
+            // Our own state must verify under our own key.
+            return Ok(signed.into_verified());
         }
         Ok(None)
     }
@@ -505,7 +505,7 @@ fn build_view(
             state,
         });
     }
-    members.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    members.sort_by_key(|a| a.node_id);
     MembershipView { members }
 }
 

@@ -594,7 +594,7 @@ fn newly_added_conformance_kinds_carry_correct_metadata() {
 // ── contract-derived verb parity (the L1 conformance differential) ────────
 
 /// **Every non-opaque cataloged kind's verb set, DERIVED from the vendored
-/// upstream OpenAPI, is exactly the CRUD set engenho advertises.**
+/// upstream `OpenAPI`, is exactly the CRUD set engenho advertises.**
 ///
 /// engenho advertises a single unconditional 7-verb list to every kind
 /// (`engenho-apiserver::discovery::VERBS`) plus `deletecollection` where the
@@ -647,7 +647,7 @@ fn contract_derived_verbs_match_the_advertised_crud_set() {
     let mut skipped_opaque = 0usize;
     let mut divergent: Vec<String> = Vec::new();
 
-    for d in RESOURCE_CATALOG.iter() {
+    for d in RESOURCE_CATALOG {
         if d.opaque {
             skipped_opaque += 1;
             continue;

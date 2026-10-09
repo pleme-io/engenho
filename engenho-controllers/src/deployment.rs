@@ -1,18 +1,18 @@
 //! `DeploymentController` — reconciles Deployments into
-//! ReplicaSets.
+//! `ReplicaSets`.
 //!
 //! K8s rule:
-//!   * each Deployment owns 1..N ReplicaSets via ownerReferences
+//!   * each Deployment owns 1..N `ReplicaSets` via ownerReferences
 //!   * the CURRENT `ReplicaSet` is the one whose `spec.template` EQUALS the
 //!     Deployment's, ignoring the `pod-template-hash` label (upstream's
 //!     `EqualIgnoreHash`, see [`crate::pod_template`]) — the hash only
 //!     names a new one
-//!   * older ReplicaSets are kept around at `replicas=0` so
+//!   * older `ReplicaSets` are kept around at `replicas=0` so
 //!     `kubectl rollout undo` still works (revision history)
 //!
 //! R9.5 implementation (this file):
 //!   1. For each Deployment, normalize its template.
-//!   2. Find owned ReplicaSets (via uid).
+//!   2. Find owned `ReplicaSets` (via uid).
 //!   3. Pick the current one: an owned RS running an equal template
 //!      ([`current_replicaset`]). If there is none, create one, named by the
 //!      template's hash.
@@ -72,7 +72,7 @@ impl DeploymentController {
         }
     }
 
-    /// Build a ReplicaSet object from a Deployment + chosen
+    /// Build a `ReplicaSet` object from a Deployment + chosen
     /// template hash. The RS's `spec.template` is the
     /// Deployment's, and its `spec.replicas` is `replicas` — the
     /// Deployment's count, already read (a malformed one never gets
@@ -92,7 +92,7 @@ impl DeploymentController {
         // defensively so the key + the object can never disagree.
         let d_namespace = d
             .namespace()
-            .map_or_else(|| "default".to_string(), |c| c.to_owned());
+            .map_or_else(|| "default".to_string(), std::borrow::ToOwned::to_owned);
         let template = d.get("spec").and_then(|s| s.get("template"))?.clone();
         let rs_name = format!("{d_name}-{hash}");
         let value = json!({
@@ -240,9 +240,10 @@ impl OwnedChildrenReconciler for DeploymentController {
                     // (`ns`, None→"default") keyed the RS where the owned-RS
                     // query never looks → the controller never saw the RS it
                     // created → recreate-every-tick hot loop + status thrash.
-                    let rs_ns = d_value
-                        .namespace()
-                        .map_or_else(|| ns.unwrap_or("default").to_string(), |c| c.to_owned());
+                    let rs_ns = d_value.namespace().map_or_else(
+                        || ns.unwrap_or("default").to_string(),
+                        std::borrow::ToOwned::to_owned,
+                    );
                     let rs_key =
                         ResourceKey::namespaced("apps", "v1", "ReplicaSet", &rs_ns, &rs_name);
                     commands.push(ResourceCommand::Put {

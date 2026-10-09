@@ -83,7 +83,7 @@ pub trait KubeletApi: Send + Sync + 'static {
 /// Query parameters `kubectl logs` sends.
 ///
 /// Field names are upstream's camelCase wire spelling. Renaming them to
-/// snake_case would silently ignore every parameter kubectl sends — the
+/// `snake_case` would silently ignore every parameter kubectl sends — the
 /// server would answer, and answer wrongly, which is worse than a 400.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]

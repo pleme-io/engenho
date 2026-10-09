@@ -1,4 +1,4 @@
-//! `PvBinderController` — the PersistentVolume / PersistentVolumeClaim
+//! `PvBinderController` — the `PersistentVolume` / `PersistentVolumeClaim`
 //! binder PLUS a minimal local-path dynamic provisioner.
 //!
 //! ## What it does (the Storage CNCF brick)
@@ -14,7 +14,7 @@
 //!      `PVC.status.phase = Bound`, `PV.status.phase = Bound`, and
 //!      `PV.spec.claimRef → {namespace,name,uid}` of the PVC.
 //!   2. **Dynamic provision** — if no static PV matches AND the PVC's
-//!      effective StorageClass uses the local-path provisioner (or is the
+//!      effective `StorageClass` uses the local-path provisioner (or is the
 //!      cluster default SC), it CREATES a `PersistentVolume` named
 //!      `pvc-<uid>` with a node-local `hostPath` source under
 //!      `<data_dir>/local-path/pvc-<uid>_<ns>_<name>`, `capacity = request`,
@@ -108,14 +108,14 @@ pub use identity::{ClaimUid, LocalPathDir, NoVolumeIdentity, PvName};
 use lifecycle::PROVISIONED_BY;
 pub use lifecycle::{ReclaimError, ReclaimPolicy, Unreclaimable};
 
-/// The local-path provisioner identifier. A StorageClass whose
+/// The local-path provisioner identifier. A `StorageClass` whose
 /// `provisioner` is this string (the rancher.io/local-path de-facto
 /// standard) OR engenho's own alias triggers dynamic provisioning.
 pub const LOCAL_PATH_PROVISIONER: &str = "rancher.io/local-path";
 /// engenho's own alias for the same node-local-hostPath provisioner.
 pub const ENGENHO_LOCAL_PATH_PROVISIONER: &str = "engenho.io/local-path";
 
-/// The annotation marking a StorageClass as the cluster default.
+/// The annotation marking a `StorageClass` as the cluster default.
 const DEFAULT_SC_ANNOTATION: &str = "storageclass.kubernetes.io/is-default-class";
 
 /// Upstream's `source.component` for the PV controller, which signs the
@@ -267,7 +267,7 @@ pub struct PvBinderController {
     /// The filesystem seam (mockable).
     env: Arc<dyn ProvisionerEnv>,
     /// The CSI provisioning seam. Defaults to [`NoCsiProvisioner`], under
-    /// which every CSI StorageClass stays Pending exactly as it did before
+    /// which every CSI `StorageClass` stays Pending exactly as it did before
     /// this branch existed — so wiring it is opt-in and its absence is not
     /// a behaviour change.
     csi: Arc<dyn CsiProvisioner>,
@@ -391,7 +391,7 @@ impl PvBinderController {
     /// A resource's `spec.storageClassName` as `Option<&str>`. `None` (nil) and
     /// `Some("")` are distinct in K8s but bind-compatible only with each other;
     /// this returns the raw value (nil → `None`, `""` → `Some("")`).
-    fn storage_class<'a>(spec_obj: &'a Value) -> Option<&'a str> {
+    fn storage_class(spec_obj: &Value) -> Option<&str> {
         spec_obj
             .get("spec")
             .and_then(|sp| sp.get("storageClassName"))
@@ -490,16 +490,15 @@ impl PvBinderController {
     }
 
     /// The PVC's `volumeBindingMode` — resolved from its effective
-    /// StorageClass. Returns `true` for `WaitForFirstConsumer` (provisioning
+    /// `StorageClass`. Returns `true` for `WaitForFirstConsumer` (provisioning
     /// deferred), `false` (default) for `Immediate` / absent.
     fn is_wait_for_first_consumer(sc: Option<&Value>) -> bool {
         sc.and_then(|c| c.get("volumeBindingMode"))
             .and_then(|m| m.as_str())
-            .map(|m| m == "WaitForFirstConsumer")
-            .unwrap_or(false)
+            .is_some_and(|m| m == "WaitForFirstConsumer")
     }
 
-    /// Find the StorageClass object for a PVC: its explicit
+    /// Find the `StorageClass` object for a PVC: its explicit
     /// `spec.storageClassName`, else the cluster default SC (annotation).
     /// Returns the SC `Value` if one applies, `None` when the PVC has an
     /// empty/nil class and there is no default SC.
@@ -610,7 +609,7 @@ impl PvBinderController {
         })
     }
 
-    /// The VolumeSnapshot name a PVC restores from, if any.
+    /// The `VolumeSnapshot` name a PVC restores from, if any.
     ///
     /// Reads `spec.dataSource` (and accepts `spec.dataSourceRef`, which
     /// upstream added as the general form). The apiGroup is CHECKED: a
@@ -631,7 +630,7 @@ impl PvBinderController {
         ds.get("name").and_then(Value::as_str).map(str::to_string)
     }
 
-    /// Resolve a VolumeSnapshot to the directory holding its data.
+    /// Resolve a `VolumeSnapshot` to the directory holding its data.
     ///
     /// Returns `None` unless the snapshot is READY and its bound content
     /// carries a `snapshotHandle`. Every other outcome — missing snapshot,
@@ -680,7 +679,7 @@ impl PvBinderController {
     /// a retry after a transient failure returns the SAME volume instead of
     /// provisioning a second disk nobody will ever delete — and a claim
     /// recreated under the same name is a different key, so a driver that
-    /// answers CreateVolume idempotently by name cannot hand it the deleted
+    /// answers `CreateVolume` idempotently by name cannot hand it the deleted
     /// claim's disk.
     async fn provision_csi(
         &self,
@@ -905,17 +904,16 @@ fn set_phase(v: &mut Value, phase: &str) {
     }
 }
 
-/// Is this StorageClass the cluster default (`...is-default-class: "true"`)?
+/// Is this `StorageClass` the cluster default (`...is-default-class: "true"`)?
 fn is_default_sc(sc: &Value) -> bool {
     sc.get("metadata")
         .and_then(|m| m.get("annotations"))
         .and_then(|a| a.get(DEFAULT_SC_ANNOTATION))
         .and_then(|v| v.as_str())
-        .map(|s| s == "true")
-        .unwrap_or(false)
+        .is_some_and(|s| s == "true")
 }
 
-/// Does a StorageClass use the local-path provisioner (either the
+/// Does a `StorageClass` use the local-path provisioner (either the
 /// rancher.io standard or engenho's alias)?
 fn sc_is_local_path(sc: &Value) -> bool {
     matches!(

@@ -1,9 +1,9 @@
-//! M0.2 — engenho runs a REAL container via the PodmanBackend.
+//! M0.2 — engenho runs a REAL container via the `PodmanBackend`.
 //!
 //! The peer of `m0_1_single_node_convergence.rs`: same autonomous
-//! WatchDriver wake-chain (POST a Deployment over real HTTP → RS → Pod →
+//! `WatchDriver` wake-chain (POST a Deployment over real HTTP → RS → Pod →
 //! scheduler binds → kubelet starts the container), but the kubelet is
-//! driven by the **real `PodmanBackend`** instead of the FakeBackend, so
+//! driven by the **real `PodmanBackend`** instead of the `FakeBackend`, so
 //! this proves engenho materializes an ACTUAL `podman` container on the
 //! host — not just an in-memory record.
 //!
@@ -97,13 +97,11 @@ fn podman_container_exists(name: &str) -> bool {
     Command::new("podman")
         .args(["ps", "-a", "--filter", &filter, "--format", "{{.Names}}"])
         .output()
-        .ok()
-        .map(|o| {
+        .is_ok_and(|o| {
             String::from_utf8_lossy(&o.stdout)
                 .lines()
                 .any(|l| l.trim() == name)
         })
-        .unwrap_or(false)
 }
 
 /// `true` iff a container named exactly `name` reports `State.Running`.
@@ -113,8 +111,7 @@ fn podman_container_running(name: &str) -> bool {
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
-        .unwrap_or(false)
+        .is_some_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
 }
 
 // =====================================================================
@@ -213,7 +210,7 @@ fn poll_until_blocking<F: FnMut() -> bool>(
 // =====================================================================
 
 /// Durable config in `data_dir`, apiserver on an ephemeral loopback port,
-/// kubelet driven by the **real PodmanBackend**, fast fallback + small
+/// kubelet driven by the **real `PodmanBackend`**, fast fallback + small
 /// debounce. Mirrors `durable_config` from the convergence test but
 /// selects `kubelet_backend = Podman` so the config-selection path
 /// (`build_backend → make_container_runtime → PodmanBackend`) is exercised.
@@ -503,7 +500,7 @@ fn namespace_body(name: &str) -> serde_json::Value {
 /// `team-c_<pod>_main`, NOT `default_…`). Regression guard for the
 /// namespace-propagation bug at the REAL-runtime layer. Same `#[ignore]`
 /// gating as the default-namespace test (needs podman + cached busybox +
-/// REGISTRY_AUTH_FILE).
+/// `REGISTRY_AUTH_FILE`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "real-container: needs podman + cached busybox + REGISTRY_AUTH_FILE"]
 async fn deployment_in_nondefault_namespace_runs_a_real_container() {

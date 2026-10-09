@@ -1,7 +1,7 @@
 //! C5 — per-resource consistency-tier annotations.
 //!
 //! Per `docs/CONSISTENCY-FABRIC.md`, engenho's data plane has four
-//! transports (Strong / EventualGossip / DurableStream / Content).
+//! transports (Strong / `EventualGossip` / `DurableStream` / Content).
 //! Most resources default to Strong (Raft) at admission; this module
 //! provides the typed surface for callers to opt resources into
 //! other tiers via the canonical annotation:
@@ -23,7 +23,7 @@
 //!   `ResourceValue::consistency_tier` (R7.5c schema extension).
 //! - At write time (post-R7.5c), the apiserver consults the typed
 //!   variant + routes the propose through the correct transport
-//!   (Raft for Strong; gossip topic for EventualGossip; etc.).
+//!   (Raft for Strong; gossip topic for `EventualGossip`; etc.).
 //!
 //! ## Invariant
 //!
@@ -40,10 +40,12 @@ pub const CONSISTENCY_TIER_ANNOTATION: &str = "engenho.io/consistency-tier";
 /// Typed consistency tier — one variant per transport.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ConsistencyTier {
     /// Linearizable Raft commits. Default. Reads see latest committed
     /// state. Used for resources that controllers expect to read
     /// linearizably (Pod.spec, Service, Endpoints, Secret, RBAC).
+    #[default]
     Strong,
 
     /// Eventually-consistent via chitchat gossip. 1-3s convergence.
@@ -51,21 +53,15 @@ pub enum ConsistencyTier {
     /// node liveness signals, cluster membership.
     EventualGossip,
 
-    /// Durable streamed via NATS JetStream. At-least-once with
+    /// Durable streamed via NATS `JetStream`. At-least-once with
     /// cursor replay. Used for audit logs, attestation receipts,
     /// watch event archives, anything that must be REPLAYABLE.
     DurableStream,
 
     /// Content-addressed via iroh or NATS Object. BLAKE3 hash →
     /// P2P resolve. Used for large blobs (image layers, large
-    /// ConfigMap data, Helm chart tarballs). Deduplicated.
+    /// `ConfigMap` data, Helm chart tarballs). Deduplicated.
     Content,
-}
-
-impl Default for ConsistencyTier {
-    fn default() -> Self {
-        Self::Strong
-    }
 }
 
 impl ConsistencyTier {
@@ -73,16 +69,15 @@ impl ConsistencyTier {
     /// on unknown values — invalid annotations don't promote a write
     /// to a weaker tier by accident.
     ///
-    /// Accepts snake_case (canonical), kebab-case, or PascalCase
+    /// Accepts `snake_case` (canonical), kebab-case, or `PascalCase`
     /// so YAML authors don't have to remember the exact case.
     #[must_use]
     pub fn from_annotation(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().replace('-', "_").as_str() {
-            "strong" => Self::Strong,
             "eventual_gossip" | "eventualgossip" | "gossip" => Self::EventualGossip,
             "durable_stream" | "durablestream" | "stream" => Self::DurableStream,
             "content" | "content_addressed" | "contentaddressed" => Self::Content,
-            _ => Self::Strong, // safe default for unknown
+            _ => Self::Strong,
         }
     }
 
@@ -111,7 +106,7 @@ impl ConsistencyTier {
     }
 
     /// Returns true if writes through this tier persist a durable
-    /// record (Raft log OR JetStream stream). Strong + DurableStream
+    /// record (Raft log OR `JetStream` stream). Strong + `DurableStream`
     /// both qualify; gossip is in-memory + best-effort.
     #[must_use]
     pub fn persists(self) -> bool {

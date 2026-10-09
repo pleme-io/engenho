@@ -188,29 +188,26 @@ pub fn make_container_runtime_on_node(
             // ended up on, because silently running podman when the operator
             // asked for CRI is the kind of substitution that gets discovered
             // three debugging hours later.
-            match crate::cri_backend::CriBackend::discover(None) {
-                Some(b) => {
-                    tracing::info!(
-                        endpoint = b.endpoint_path(),
-                        "kubelet driving a CRI runtime over gRPC"
-                    );
-                    Arc::new(match apiserver {
-                        Some((h, p)) => b.with_kubernetes_service(h, p),
-                        None => b,
-                    })
-                }
-                None => {
-                    tracing::warn!(
-                        tried = ?crate::cri::DEFAULT_ENDPOINTS,
-                        "no CRI socket found — falling back to podman for this boot; \
-                         the kubelet is NOT on the runtime that was selected"
-                    );
-                    let b = PodmanBackend::new();
-                    Arc::new(match apiserver {
-                        Some((h, p)) => b.with_kubernetes_service(h, p),
-                        None => b,
-                    })
-                }
+            if let Some(b) = crate::cri_backend::CriBackend::discover(None) {
+                tracing::info!(
+                    endpoint = b.endpoint_path(),
+                    "kubelet driving a CRI runtime over gRPC"
+                );
+                Arc::new(match apiserver {
+                    Some((h, p)) => b.with_kubernetes_service(h, p),
+                    None => b,
+                })
+            } else {
+                tracing::warn!(
+                    tried = ?crate::cri::DEFAULT_ENDPOINTS,
+                    "no CRI socket found — falling back to podman for this boot; \
+                     the kubelet is NOT on the runtime that was selected"
+                );
+                let b = PodmanBackend::new();
+                Arc::new(match apiserver {
+                    Some((h, p)) => b.with_kubernetes_service(h, p),
+                    None => b,
+                })
             }
         }
         KubeletBackendKind::Fake => Arc::new(FakeBackend::new()),

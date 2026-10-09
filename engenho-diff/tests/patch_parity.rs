@@ -1,6 +1,6 @@
-//! PATCH parity — the three K8s patch content-types against a ConfigMap
+//! PATCH parity — the three K8s patch content-types against a `ConfigMap`
 //! (full-object parity kind) AND a Pod (strategic list-merge vehicle,
-//! FIELD-FOCUSED to isolate the merge signal from PodSpec defaulting).
+//! FIELD-FOCUSED to isolate the merge signal from `PodSpec` defaulting).
 //!
 //! Content-types exercised:
 //!   * `application/merge-patch+json`            (RFC 7386 — deep map merge,
@@ -10,7 +10,7 @@
 //!   * `application/json-patch+json`             (RFC 6902 — op array)
 //!
 //! Each PATCH's RESPONSE (the mutated object) is diffed against the oracle.
-//! ConfigMap diffs whole-object (proven parity in m0); Pod diffs are FOCUSED
+//! `ConfigMap` diffs whole-object (proven parity in m0); Pod diffs are FOCUSED
 //! on the single field the patch touches, so a Pod's unrelated server-side
 //! defaulting (imagePullPolicy, terminationMessagePath, …) never pollutes the
 //! ratchet — the highest-value probe (strategic `kubectl set image` preserving

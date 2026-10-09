@@ -23,7 +23,7 @@
 //! | rule | max | alphabet | example holder |
 //! |---|---|---|---|
 //! | [`NameRule::Label`] | 63 | `[a-z0-9-]`, must start+end alphanumeric | Namespace, Service |
-//! | [`NameRule::Subdomain`] | 253 | `[a-z0-9-.]`, each dot-separated part a label | Pod, ConfigMap, … |
+//! | [`NameRule::Subdomain`] | 253 | `[a-z0-9-.]`, each dot-separated part a label | Pod, `ConfigMap`, … |
 //!
 //! ## Tier honesty
 //!

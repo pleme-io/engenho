@@ -21,7 +21,7 @@ use engenho_cluster_config::ClusterConfig;
 #[derive(Parser, Debug)]
 #[command(name = "engenho-cluster-config-render", version, about)]
 struct Args {
-    /// Path to the YAML ClusterConfig.
+    /// Path to the YAML `ClusterConfig`.
     #[arg(long)]
     input: PathBuf,
 

@@ -1,23 +1,23 @@
-//! BuildBackendRoceiro — production Roceiro that composes
-//! BuildBackend + DerivationCacheBackend + Verifier into one
+//! `BuildBackendRoceiro` — production Roceiro that composes
+//! `BuildBackend` + `DerivationCacheBackend` + Verifier into one
 //! materializer surface.
 //!
 //! ## Reconcile rule (per Stage on per Node)
 //!
-//! 1. Build the drv referenced by the stage's shape via BuildBackend.
+//! 1. Build the drv referenced by the stage's shape via `BuildBackend`.
 //!    (For now the stage's `shape` is the witness, and the actual
 //!    drv hash is the substrate's existing typed primitive — we
 //!    derive a synthetic drv per stage so the test path doesn't
 //!    require a full sui integration. Production wires the real
 //!    Drv via Stage extension fields.)
-//! 2. Ingest the BuildResult's NARs + realisations into the cache.
+//! 2. Ingest the `BuildResult`'s NARs + realisations into the cache.
 //! 3. Run every Verificacao in stage.verify through the Verifier.
-//! 4. Emit a typed MaterializationReceipt the ledger consumes.
+//! 4. Emit a typed `MaterializationReceipt` the ledger consumes.
 //!
 //! ## Bridging Stage → Drv
 //!
 //! This commit ships the composition layer with a synthetic
-//! drv-per-stage (BLAKE3 of stage_id). Future Stage extension:
+//! drv-per-stage (BLAKE3 of `stage_id`). Future Stage extension:
 //! a `drv_hash: Option<DrvHash>` field that the operator pins
 //! explicitly. Until then, every test uses the synthetic.
 

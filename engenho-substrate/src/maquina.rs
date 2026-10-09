@@ -2,7 +2,7 @@
 //!
 //! Per the research brief — MEDIUM-leverage inventive primitive.
 //! The substrate has multiple ad-hoc state machines (Plantio
-//! stage state, Transient lifecycle, QuorumState enum, search
+//! stage state, Transient lifecycle, `QuorumState` enum, search
 //! Ensaio status) hand-rolled with match statements + bare
 //! enums. máquina folds them into one typed surface.
 //!
@@ -29,7 +29,7 @@
 //!   - `Named` supertrait → every machine has telemetry name
 //!   - `relógio::Instant` for transition timestamps
 //!   - `Fingerprint` over State + Event (caller supplies)
-//!   - `ErrorKind` on M::Err
+//!   - `ErrorKind` on `M::Err`
 
 use serde::{Deserialize, Serialize};
 
@@ -40,7 +40,7 @@ use crate::relogio::Instant;
 ///   - `Event`: input events (Clone + Serialize)
 ///   - `Effect`: side-effects the step requests be performed
 ///     by the runner's consumer (telemetry, log line, action)
-///   - `Err`: error type — must implement ErrorKind
+///   - `Err`: error type — must implement `ErrorKind`
 ///
 /// The step function is PURE — no I/O, no side effects beyond
 /// returning the Effect for the runner to dispatch. This is what
@@ -313,6 +313,7 @@ mod tests {
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[allow(clippy::enum_variant_names)]
     pub enum DoorEvent {
         OpenIt,
         CloseIt,
@@ -410,10 +411,7 @@ mod tests {
         let mut r = make_runner();
         // Closed + UnlockIt is invalid.
         let err = r.step(DoorEvent::UnlockIt).unwrap_err();
-        match err {
-            MachineError::Step(_) => {}
-            _ => panic!("expected step error"),
-        }
+        assert!(matches!(err, MachineError::Step(_)), "expected step error");
         // State unchanged + no history.
         assert_eq!(r.state(), &DoorState::Closed);
         assert_eq!(r.step_count(), 0);
@@ -547,10 +545,7 @@ mod tests {
         r.step(OneShotEvent).unwrap(); // Pending -> Done
         assert!(r.is_terminal());
         let err = r.step(OneShotEvent).unwrap_err();
-        match err {
-            MachineError::Terminal => {}
-            _ => panic!("expected Terminal"),
-        }
+        assert!(matches!(err, MachineError::Terminal), "expected Terminal");
         // No transition recorded for the failed terminal step.
         assert_eq!(r.step_count(), 1);
     }

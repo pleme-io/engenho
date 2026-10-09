@@ -63,7 +63,7 @@ async fn propose_latency_on_an_empty_durable_store() {
     // than a 200KB one, so payload size is not the variable under test.
     let mut timings = Vec::new();
     for i in 0..20 {
-        let key = ResourceKey::namespaced("", "v1", "Secret", "default", &format!("probe-{i}"));
+        let key = ResourceKey::namespaced("", "v1", "Secret", "default", format!("probe-{i}"));
         let value = secret(&format!("probe-{i}"), "YQ==");
         let t = Instant::now();
         store

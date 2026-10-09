@@ -351,7 +351,7 @@ pub enum FaceKind {
         version: String,
         certified_cncf: bool,
     },
-    /// HashiCorp Nomad jobs.
+    /// `HashiCorp` Nomad jobs.
     Nomad { version: String },
     /// Renders to systemd unit files; for non-clustered single-node
     /// or supervised-VM deployments.

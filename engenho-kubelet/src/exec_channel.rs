@@ -196,7 +196,7 @@ pub const SUBPROTOCOL_V5: &str = "v5.channel.k8s.io";
 /// framed, and answering a v4 client with v5 semantics produces a session
 /// that works until the command fails.
 #[must_use]
-pub fn negotiate<'a>(offered: &'a str) -> Option<&'static str> {
+pub fn negotiate(offered: &str) -> Option<&'static str> {
     offered
         .split(',')
         .map(str::trim)

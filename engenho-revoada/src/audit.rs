@@ -1,4 +1,4 @@
-//! # AuditLog — typed event stream for every mutation
+//! # `AuditLog` — typed event stream for every mutation
 //!
 //! Every apply/get/list/delete/watch verb call against a wrapped
 //! backend emits a typed [`AuditEvent`] to an [`AuditLog`] sink.
@@ -104,7 +104,7 @@ impl AuditEvent {
     ///
     /// Preserves nanosecond precision via `SystemTime`. For typed
     /// substrate-Clock construction (loses ns precision in exchange
-    /// for FrozenClock determinism in tests), use [`Self::at`].
+    /// for `FrozenClock` determinism in tests), use [`Self::at`].
     #[must_use]
     pub fn now(verb: VerbKind) -> Self {
         let now = SystemTime::now()
@@ -244,7 +244,7 @@ impl InMemoryAuditLog {
     /// Current number of retained events.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.events.lock().map(|e| e.len()).unwrap_or(0)
+        self.events.lock().map_or(0, |e| e.len())
     }
 
     /// True iff no events retained.
@@ -311,7 +311,7 @@ impl FileAuditLog {
     ///
     /// # Errors
     ///
-    /// Returns the underlying io::Error wrapped in [`FaceError::Unsupported`].
+    /// Returns the underlying `io::Error` wrapped in [`FaceError::Unsupported`].
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, FaceError> {
         AuditFileSink::new(path.as_ref())
             .map(Self)
@@ -340,8 +340,8 @@ impl AuditLog for FileAuditLog {}
 /// 3. Records the event to the audit sink.
 /// 4. Returns the inner backend's result.
 ///
-/// Composition is the killer — works with InMemoryStore,
-/// FileSystemBackend, RaftBackend, any future backend.
+/// Composition is the killer — works with `InMemoryStore`,
+/// `FileSystemBackend`, `RaftBackend`, any future backend.
 pub struct AuditingBackend<B: StoreBackend> {
     inner: B,
     log: Box<dyn AuditLog>,

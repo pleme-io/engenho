@@ -35,7 +35,7 @@
 /// after it means a reader can find any symbol in upstream's api.proto by
 /// the same path they would use in Go.
 pub mod v1 {
-    #![allow(clippy::doc_markdown, clippy::large_enum_variant)]
+    #![allow(clippy::pedantic, clippy::all)]
     include!(concat!(env!("OUT_DIR"), "/runtime.v1.rs"));
 }
 

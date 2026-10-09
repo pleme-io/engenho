@@ -392,8 +392,7 @@ pub fn is_pending(pod: &Value) -> bool {
     pod.get("spec")
         .and_then(|s| s.get("nodeName"))
         .and_then(|n| n.as_str())
-        .map(str::is_empty)
-        .unwrap_or(true)
+        .is_none_or(str::is_empty)
 }
 
 #[cfg(test)]
@@ -474,7 +473,7 @@ mod tests {
             no_nodes_observed: no_nodes,
             bound: (0..bound)
                 .map(|i| Binding {
-                    pod_key: ResourceKey::namespaced("", "v1", "Pod", "default", &i.to_string()),
+                    pod_key: ResourceKey::namespaced("", "v1", "Pod", "default", i.to_string()),
                     node_name: "node-1".into(),
                 })
                 .collect(),

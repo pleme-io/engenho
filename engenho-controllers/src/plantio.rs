@@ -1,14 +1,14 @@
-//! PlantioController — reconciles `PlantioCR` resources by
+//! `PlantioController` — reconciles `PlantioCR` resources by
 //! driving a `Roceiro` materializer + watching a
 //! `MaterializationLedger` for confirmation.
 //!
 //! ## Reconcile rule
 //!
-//! For each PlantioCR (engenho.io/v1.Plantio):
+//! For each `PlantioCR` (engenho.io/v1.Plantio):
 //!   1. Read + validate the embedded Plantio.
-//!   2. Compile to MaterializationJobs.
+//!   2. Compile to `MaterializationJobs`.
 //!   3. For each job whose stage is Ready (deps Confirmed):
-//!        a. Dispatch via Roceiro.materialize(stage, target_node)
+//!        a. Dispatch via Roceiro.materialize(stage, `target_node`)
 //!        b. Ingest receipt into the ledger
 //!        c. Mark per-job status (Materialized / Failed)
 //!   4. Walk the stages:
@@ -44,18 +44,18 @@ use crate::effect::Effect;
 use crate::error::ControllerError;
 use crate::roceiro::Roceiro;
 
-/// Resolves abstract JobTargets (AnyOne/AnyK/AllNodes) into
-/// concrete NodeIds. The substrate doesn't have a live cluster
+/// Resolves abstract `JobTargets` (AnyOne/AnyK/AllNodes) into
+/// concrete `NodeIds`. The substrate doesn't have a live cluster
 /// directory baked in; consumers supply the resolver.
 #[async_trait]
 pub trait NodeResolver: Send + Sync {
     /// Backend identifier for telemetry.
     fn name(&self) -> &'static str;
 
-    /// Resolve a target into a concrete set of NodeIds.
+    /// Resolve a target into a concrete set of `NodeIds`.
     ///
     /// # Errors
-    /// Implementations may surface backend errors via ControllerError.
+    /// Implementations may surface backend errors via `ControllerError`.
     async fn resolve(&self, target: &JobTarget) -> Result<Vec<NodeId>, ControllerError>;
 }
 
@@ -128,7 +128,7 @@ impl PlantioController {
     }
 
     /// Confirmation threshold for a stage. Maps the typed
-    /// ConfirmacaoPolicy + Placement into the non-zero threshold the
+    /// `ConfirmacaoPolicy` + Placement into the non-zero threshold the
     /// ledger counts against. A `k` of 0 still parses (the policy
     /// carries a `usize`) and means one.
     #[must_use]
@@ -144,7 +144,7 @@ impl PlantioController {
         NonZeroUsize::new(k).unwrap_or(NonZeroUsize::MIN)
     }
 
-    /// Compute the set of StageIds whose deps are all Confirmed.
+    /// Compute the set of `StageIds` whose deps are all Confirmed.
     /// Pure helper.
     #[must_use]
     pub fn ready_stages(plantio: &Plantio, confirmed: &BTreeSet<StageId>) -> Vec<StageId> {

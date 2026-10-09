@@ -87,7 +87,7 @@ pub fn epoch_to_rfc3339_utc(secs: i64) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    /// MicroTime carries six fractional digits and a Zulu suffix, and parses
+    /// `MicroTime` carries six fractional digits and a Zulu suffix, and parses
     /// back through the same reader the lease staleness check uses.
     #[test]
     fn micro_time_is_microsecond_rfc3339() {

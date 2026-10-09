@@ -5,7 +5,7 @@
 //! The apiserver HTTP boundary stamps `metadata.creationTimestamp` on
 //! every kubectl-created object (`handler::stamp_creation_timestamp`),
 //! so `kubectl get <kind>` renders a real `AGE`. But objects a
-//! CONTROLLER creates — ReplicaSets (from the Deployment controller),
+//! CONTROLLER creates — `ReplicaSets` (from the Deployment controller),
 //! Pods (from the ReplicaSet/StatefulSet/Job controllers), Endpoints
 //! (from the Endpoints controller) — never crossed that HTTP boundary;
 //! they are born inside a reconcile via [`engenho_store::command::ResourceCommand::Put`].

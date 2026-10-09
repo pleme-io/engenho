@@ -232,7 +232,7 @@ impl RaftMesh {
     }
 
     /// Snapshot of this node's local attestation chain. The chain
-    /// is now owned by the state machine — RaftMesh forwards.
+    /// is now owned by the state machine — `RaftMesh` forwards.
     pub fn attestation_chain(&self) -> &AttestationChain {
         self.store.attestation_chain()
     }

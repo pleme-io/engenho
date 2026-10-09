@@ -1,8 +1,8 @@
 //! Property tests on the codegen'd kinds: JSON round-trip identity +
-//! KubeResource GVK invariants.
+//! `KubeResource` GVK invariants.
 //!
 //! Asserts that every kind emitted by engenho-kube-codegen:
-//!   1. Round-trips through serde_json identically.
+//!   1. Round-trips through `serde_json` identically.
 //!   2. Exposes a non-empty GVR resource string.
 //!   3. Has `KubeResource::name()` matching `metadata.name`.
 
@@ -383,7 +383,7 @@ fn real_ingress_manifest_deserializes_into_typed_struct() {
 /// Every newly-typed group now serves a `/openapi/v3` document carrying the
 /// promoted kind's schema — this is what makes `kubectl explain <kind>` work
 /// and lets `kubectl apply` validate without `--validate=false`. The schema
-/// key is the kind's OpenAPI definition key (`io.k8s.api.<g>.<v>.<Kind>`).
+/// key is the kind's `OpenAPI` definition key (`io.k8s.api.<g>.<v>.<Kind>`).
 #[test]
 fn promoted_kinds_have_openapi_v3_schema_documents() {
     use engenho_types::openapi_v3::document_for;

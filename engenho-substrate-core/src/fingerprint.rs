@@ -14,7 +14,7 @@
 //!   - `EnsaioId::derive()` — composite BLAKE3
 //!   - `GeracaoId::derive()` — composite BLAKE3
 //!
-//! All shared the same idiom: serialize via serde_json → hash
+//! All shared the same idiom: serialize via `serde_json` → hash
 //! with BLAKE3 → return `[u8; 32]`. This module gives ONE typed
 //! surface (`Fingerprint`) + ONE macro (`impl_fingerprint!`) +
 //! ONE helper (`fingerprint_blake3`).
@@ -78,7 +78,7 @@ pub fn fingerprint_blake3<T: Serialize>(value: &T) -> [u8; 32] {
 }
 
 /// Generate `impl Fingerprint for $type` via the canonical
-/// serde_json → BLAKE3 path.
+/// `serde_json` → BLAKE3 path.
 ///
 /// Use the manual `impl Fingerprint` form for composite or
 /// salted hashing (chain-style, magic-versioned, etc.).

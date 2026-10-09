@@ -1,25 +1,25 @@
-//! TieredCacheReconciler — proactive promotion across cache tiers.
+//! `TieredCacheReconciler` — proactive promotion across cache tiers.
 //!
-//! Complement to TieredCache's on-read promotion: this controller
+//! Complement to `TieredCache`'s on-read promotion: this controller
 //! sweeps lower-tier entries that haven't yet reached upper tiers
-//! + fans them out. Useful when the operator's PromotionPolicy is
-//! Lazy or SampleRate (which deliberately skip on-read promotion).
+//! + fans them out. Useful when the operator's `PromotionPolicy` is
+//! Lazy or `SampleRate` (which deliberately skip on-read promotion).
 //!
 //! ## Reconcile rule
 //!
-//! For a configured set of (drv_hash, output_name) of interest:
+//! For a configured set of (`drv_hash`, `output_name`) of interest:
 //!   1. Walk all tiers via separate handles (NOT through the
 //!      tiered facade — we need per-tier visibility).
 //!   2. For each item present in tier `i` but absent in tier `j<i`,
 //!      copy the bytes from `i` → `j`.
-//!   3. Report per-tier promotion counts via ReconcileReport.
+//!   3. Report per-tier promotion counts via `ReconcileReport`.
 //!
 //! ## Configuring "items of interest"
 //!
 //! The controller doesn't sweep the whole drv-space (that's
 //! O(cluster-wide). Instead it consults a [`PromotionScope`]
 //! trait that yields drv hashes worth promoting (e.g. from a
-//! DerivationCR list, from a watched-cache subscription, from
+//! `DerivationCR` list, from a watched-cache subscription, from
 //! a static config of "always-cache-locally" pins).
 
 use std::sync::Arc;
@@ -64,7 +64,7 @@ impl PromotionScope for StaticPromotionScope {
 
 /// Reconciler controller.
 pub struct TieredCacheReconciler {
-    /// Tiers ordered fastest-to-slowest (same convention as TieredCache).
+    /// Tiers ordered fastest-to-slowest (same convention as `TieredCache`).
     tiers: Vec<Arc<dyn DerivationCacheBackend>>,
     scope: Arc<dyn PromotionScope>,
 }

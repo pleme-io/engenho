@@ -281,17 +281,16 @@ mod tests {
         let (b, _) = budget(50, 0, 0);
         b.try_consume(50).unwrap();
         let err = b.try_consume(1).unwrap_err();
-        match err {
-            BudgetError::Exhausted {
-                available,
-                requested,
-                ..
-            } => {
-                assert_eq!(available, 0);
-                assert_eq!(requested, 1);
-            }
-            _ => panic!("expected Exhausted, got {err:?}"),
-        }
+        let BudgetError::Exhausted {
+            available,
+            requested,
+            ..
+        } = err
+        else {
+            panic!("expected Exhausted, got {err:?}");
+        };
+        assert_eq!(available, 0);
+        assert_eq!(requested, 1);
     }
 
     #[test]
@@ -357,13 +356,10 @@ mod tests {
         let (b, _) = budget(100, 10, 1000);
         b.try_consume(100).unwrap();
         let err = b.try_consume(5).unwrap_err();
-        match err {
-            BudgetError::Exhausted { replenish_at, .. } => {
-                assert!(replenish_at.is_some());
-                assert!(replenish_at.unwrap().physical_ms >= 1500);
-            }
-            _ => panic!("expected Exhausted"),
-        }
+        let BudgetError::Exhausted { replenish_at, .. } = err else {
+            panic!("expected Exhausted");
+        };
+        assert!(replenish_at.is_some_and(|at| at.physical_ms >= 1500));
     }
 
     #[test]

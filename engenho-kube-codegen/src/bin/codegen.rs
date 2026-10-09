@@ -1,4 +1,4 @@
-//! `engenho-kube-codegen` — emit typed kinds from vendored OpenAPI v3.
+//! `engenho-kube-codegen` — emit typed kinds from vendored `OpenAPI` v3.
 //!
 //! Two modes:
 //!
@@ -11,7 +11,8 @@
 //!     contract (theory/ENGENHO.md §VI.1).
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -24,7 +25,7 @@ use engenho_kube_codegen::{
 #[derive(Parser, Debug)]
 #[command(name = "engenho-kube-codegen", version, about)]
 struct Args {
-    /// Path to the vendored OpenAPI v3 schema directory containing
+    /// Path to the vendored `OpenAPI` v3 schema directory containing
     /// `api__v1_openapi.json`, `apis__apps__v1_openapi.json`,
     /// `apis__rbac.authorization.k8s.io__v1_openapi.json`.
     #[arg(long)]
@@ -136,27 +137,16 @@ fn main() -> Result<()> {
         let shared = shared_substructs(&kind_keys, &kind_names, &schemas);
         let shared_src = emit_shared_module(&shared, KIND_CATALOG);
         let shared_src = format_source(&shared_src)?;
-        let shared_target = args.output.join("types.rs");
-        if args.check {
-            let existing = std::fs::read_to_string(&shared_target).unwrap_or_default();
-            if existing != shared_src {
-                eprintln!("DRIFT: {}", shared_target.display());
-                drift = true;
-            }
-        } else {
-            std::fs::create_dir_all(&args.output)
-                .with_context(|| format!("create {}", args.output.display()))?;
-            std::fs::write(&shared_target, shared_src)
-                .with_context(|| format!("write {}", shared_target.display()))?;
-        }
+        settle(
+            &args.output.join("types.rs"),
+            &shared_src,
+            args.check,
+            &mut drift,
+        )?;
     }
 
     for (module, entries) in &by_module {
         let module_dir = args.output.join(module);
-        if !args.check {
-            std::fs::create_dir_all(&module_dir)
-                .with_context(|| format!("create {}", module_dir.display()))?;
-        }
 
         // Emit each kind (typed: walks properties + transitive $ref closure).
         for entry in entries {
@@ -166,32 +156,13 @@ fn main() -> Result<()> {
             let rust = emit_kind_typed(entry, view, &schemas);
             let rust = format_source(&rust)?;
             let target = module_dir.join(format!("{}.rs", entry.kind.to_lowercase()));
-            if args.check {
-                let existing = std::fs::read_to_string(&target).unwrap_or_default();
-                if existing != rust {
-                    eprintln!("DRIFT: {}", target.display());
-                    drift = true;
-                }
-            } else {
-                std::fs::write(&target, rust)
-                    .with_context(|| format!("write {}", target.display()))?;
-            }
+            settle(&target, &rust, args.check, &mut drift)?;
         }
 
         // Emit module-level mod.rs.
         let mod_rs = emit_module(module, entries);
         let mod_rs = format_source(&mod_rs)?;
-        let mod_target = module_dir.join("mod.rs");
-        if args.check {
-            let existing = std::fs::read_to_string(&mod_target).unwrap_or_default();
-            if existing != mod_rs {
-                eprintln!("DRIFT: {}", mod_target.display());
-                drift = true;
-            }
-        } else {
-            std::fs::write(&mod_target, mod_rs)
-                .with_context(|| format!("write {}", mod_target.display()))?;
-        }
+        settle(&module_dir.join("mod.rs"), &mod_rs, args.check, &mut drift)?;
     }
 
     // Runtime-iterable catalog (one ResourceDescriptor per KIND_CATALOG
@@ -201,19 +172,12 @@ fn main() -> Result<()> {
     {
         let catalog_src = emit_catalog(KIND_CATALOG);
         let catalog_src = format_source(&catalog_src)?;
-        let catalog_target = args.output.join("catalog.rs");
-        if args.check {
-            let existing = std::fs::read_to_string(&catalog_target).unwrap_or_default();
-            if existing != catalog_src {
-                eprintln!("DRIFT: {}", catalog_target.display());
-                drift = true;
-            }
-        } else {
-            std::fs::create_dir_all(&args.output)
-                .with_context(|| format!("create {}", args.output.display()))?;
-            std::fs::write(&catalog_target, catalog_src)
-                .with_context(|| format!("write {}", catalog_target.display()))?;
-        }
+        settle(
+            &args.output.join("catalog.rs"),
+            &catalog_src,
+            args.check,
+            &mut drift,
+        )?;
     }
 
     // Top-level `lib.rs`-includable mod.rs.
@@ -222,7 +186,7 @@ fn main() -> Result<()> {
             "//! GENERATED — engenho-kube-codegen — every K8s kind we currently emit.\n\n",
         );
         for module in by_module.keys() {
-            s.push_str(&format!("pub mod {};\n", module));
+            let _ = writeln!(s, "pub mod {module};");
         }
         // Shared sub-structs module + flat re-export.
         s.push_str("pub mod types;\npub use types::*;\n");
@@ -230,19 +194,12 @@ fn main() -> Result<()> {
         s.push_str("pub mod catalog;\npub use catalog::*;\n");
         s
     };
-    let top_target = args.output.join("mod.rs");
-    if args.check {
-        let existing = std::fs::read_to_string(&top_target).unwrap_or_default();
-        if existing != top_mod {
-            eprintln!("DRIFT: {}", top_target.display());
-            drift = true;
-        }
-    } else {
-        std::fs::create_dir_all(&args.output)
-            .with_context(|| format!("create {}", args.output.display()))?;
-        std::fs::write(&top_target, top_mod)
-            .with_context(|| format!("write {}", top_target.display()))?;
-    }
+    settle(
+        &args.output.join("mod.rs"),
+        &top_mod,
+        args.check,
+        &mut drift,
+    )?;
 
     if args.check && drift {
         anyhow::bail!("generated source is stale — re-run without --check to regenerate");
@@ -253,4 +210,19 @@ fn main() -> Result<()> {
         by_module.len(),
     );
     Ok(())
+}
+
+fn settle(target: &Path, src: &str, check: bool, drift: &mut bool) -> Result<()> {
+    if check {
+        let existing = std::fs::read_to_string(target).unwrap_or_default();
+        if existing != src {
+            eprintln!("DRIFT: {}", target.display());
+            *drift = true;
+        }
+        return Ok(());
+    }
+    if let Some(dir) = target.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    std::fs::write(target, src).with_context(|| format!("write {}", target.display()))
 }

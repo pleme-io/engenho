@@ -48,11 +48,11 @@
 //!         CsiVolumeBackend (R13b — gRPC to CSI plugins)
 //! ```
 //!
-//! ## Why a new trait vs reusing ContainerRuntime
+//! ## Why a new trait vs reusing `ContainerRuntime`
 //!
 //! Storage has independent lifecycle from containers: a PVC
 //! survives container restart; CSI plugins are out-of-process;
-//! mount can fail differently (NoCapacity, AlreadyMounted). The
+//! mount can fail differently (`NoCapacity`, `AlreadyMounted`). The
 //! sibling trait keeps the kubelet's container path uncluttered
 //! by volume concerns.
 
@@ -74,9 +74,9 @@ pub struct VolumeSpec {
     pub storage_class: String,
     /// Requested size in MiB. Backends may reject if below capacity.
     pub size_mib: u64,
-    /// Access mode: ReadWriteOnce / ReadOnlyMany / ReadWriteMany.
+    /// Access mode: `ReadWriteOnce` / `ReadOnlyMany` / `ReadWriteMany`.
     pub access_mode: AccessMode,
-    /// Backend-specific parameters (storage_class.parameters).
+    /// Backend-specific parameters (`storage_class.parameters`).
     pub parameters: BTreeMap<String, String>,
 }
 
@@ -159,7 +159,7 @@ pub trait VolumeRuntime: Send + Sync {
 // FakeVolumeBackend — in-memory deterministic backend for tests
 // =================================================================
 
-/// In-memory backend. Tracks mounts in a BTreeMap + records every
+/// In-memory backend. Tracks mounts in a `BTreeMap` + records every
 /// mount/unmount call for test assertions.
 #[derive(Default, Clone)]
 pub struct FakeVolumeBackend {
@@ -250,7 +250,7 @@ impl VolumeRuntime for FakeVolumeBackend {
 // =================================================================
 
 /// Mounts volumes as host directories under a configurable root.
-/// Suitable for single-node homelab clusters; storage_class must
+/// Suitable for single-node homelab clusters; `storage_class` must
 /// be "hostpath".
 #[derive(Clone)]
 pub struct HostPathVolumeBackend {

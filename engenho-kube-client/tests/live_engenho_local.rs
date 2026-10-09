@@ -5,9 +5,9 @@
 //! file is safe to ship in CI without the cluster on the runner.
 //! Locally (with the cluster up), exercises the FULL engenho stack:
 //!
-//!   Kubeconfig::load → resolve_connection → ReqwestKubeClient
-//!     → KubeClient::list<Pod> via reqwest/rustls
-//!     → engenho-types::Pod (typed PodSpec / PodStatus)
+//!   `Kubeconfig::load` → `resolve_connection` → `ReqwestKubeClient`
+//!     → `KubeClient::list`<Pod> via reqwest/rustls
+//!     → `engenho-types::Pod` (typed `PodSpec` / `PodStatus`)
 //!     → assertion that podinfo replicas show up + parse correctly
 //!
 //! This is the first test that exercises engenho-types' typed

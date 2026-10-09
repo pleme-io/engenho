@@ -363,7 +363,7 @@ async fn a_change_to_the_declared_file_retries_a_held_boot() {
 /// how `control_uds` failed on ubuntu while every darwin run passed.
 ///
 /// TIER — this is a LINUX-side gate, and measured to be vacuous on darwin:
-/// with the fix reverted it still passes here, because FSEvents coalesces the
+/// with the fix reverted it still passes here, because `FSEvents` coalesces the
 /// write and delivers one event after the writer has closed, late enough that
 /// the edge-triggered path accepts it. On Linux the same revert holds the
 /// daemon and this times out. Do not read a green run on a Mac as evidence.

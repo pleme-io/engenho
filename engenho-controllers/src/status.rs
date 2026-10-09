@@ -1,6 +1,6 @@
 //! M0.1 item 8 — shared status-subresource write primitive.
 //!
-//! Every workload controller (Deployment / ReplicaSet / StatefulSet /
+//! Every workload controller (Deployment / `ReplicaSet` / `StatefulSet` /
 //! Job) computes a `.status` from the LIVE owned children it already
 //! listed in its tick + writes it back. Per the Prime Directive this is
 //! solved ONCE here: [`write_status_cas`] is the single shape all four

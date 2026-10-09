@@ -17,10 +17,10 @@
 //! decide about the technology behind it afterwards. The honest move is to
 //! keep the surface and make the ABSENCE queryable.
 //!
-//! ★ WHY `Available=False` ON APIService IS THE LOAD-BEARING HALF.
+//! ★ WHY `Available=False` ON `APIService` IS THE LOAD-BEARING HALF.
 //! `Available` is not decoration: it is the field a client reads to decide
 //! whether to ROUTE to an aggregated service. metrics-server registers an
-//! APIService and expects the apiserver to proxy `metrics.k8s.io` to it.
+//! `APIService` and expects the apiserver to proxy `metrics.k8s.io` to it.
 //! Left with no status, its registration looks successful and every query
 //! to that group silently goes nowhere — a broken feature that reports
 //! itself healthy. `Available=False` turns that into `kubectl get
@@ -28,7 +28,7 @@
 //!
 //! ★ THE OTHER TWO GET AN ENGENHO-SCOPED CONDITION, NOT AN UPSTREAM ONE.
 //! `FlowSchema` has an upstream `Dangling` condition meaning something
-//! specific (it references a PriorityLevelConfiguration that does not
+//! specific (it references a `PriorityLevelConfiguration` that does not
 //! exist). Reusing it to mean "engenho has no APF" would be a lie in
 //! upstream's own vocabulary — a client acting on `Dangling` would go fix a
 //! reference that is perfectly correct. A condition type we own cannot be

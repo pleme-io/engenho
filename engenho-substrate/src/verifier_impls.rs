@@ -12,8 +12,8 @@
 //!     build itself is the verification proof.
 //!
 //!   * [`IndependentVerifier`] — runs a second build path
-//!     (operator-supplied async closure that returns NAR bytes)
-//!     + emits a receipt whose evidence is the BLAKE3 of those
+//!     (operator-supplied async closure that returns NAR bytes) and
+//!     emits a receipt whose evidence is the BLAKE3 of those
 //!     bytes. Downstream `QuorumTracker` surfaces a Dissent
 //!     outcome if the independent rebuild produces a different
 //!     hash from the primary materializer's claim.
@@ -83,20 +83,16 @@ impl Verifier for HashEqualityVerifier {
                 ));
             }
         };
-        let bytes = match (self.accessor)(subject_hash).await? {
-            Some(b) => b,
-            None => {
-                return Err(VerifyError::Failed(format!(
-                    "no bytes available for subject {}",
-                    hex_encode(&subject_hash)
-                )));
-            }
+        let Some(bytes) = (self.accessor)(subject_hash).await? else {
+            return Err(VerifyError::Failed(format!(
+                "no bytes available for subject {}",
+                hex_encode(&subject_hash)
+            )));
         };
         let actual = NarHash::from_bytes(&bytes);
         if actual != expected {
             return Err(VerifyError::Failed(format!(
-                "hash mismatch: expected {} got {}",
-                expected, actual
+                "hash mismatch: expected {expected} got {actual}"
             )));
         }
         let receipt = MaterializationReceipt::new(
@@ -278,7 +274,7 @@ crate::async_closure_type! {
 /// Verifies cosign-style signatures via an operator-supplied check.
 /// Evidence is BLAKE3 over the returned signature bytes — faithful
 /// nodes presenting the same signature for the same subject produce
-/// identical evidence (QuorumTracker reaches; tampered nodes
+/// identical evidence (`QuorumTracker` reaches; tampered nodes
 /// produce a divergent signature → Dissent).
 pub struct TameshiVerifier {
     name: &'static str,

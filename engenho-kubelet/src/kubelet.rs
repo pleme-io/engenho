@@ -525,7 +525,7 @@ struct ContainerRecord {
     ///
     /// ── ★ WHY THE RECORD REMEMBERS THEM ──────────────────────────────
     /// Mounts are resolved on the create path only: it holds the
-    /// `volName → MountSource` map and the projected ServiceAccount, and
+    /// `volName → MountSource` map and the projected `ServiceAccount`, and
     /// stamps them onto the spec. The restart path rebuilds its specs from
     /// `pod_to_container_specs`, a pure function of the Pod value, which
     /// emits `mounts: vec![]` because resolution needs `&self` and an
@@ -535,8 +535,8 @@ struct ContainerRecord {
     /// This is the same defect the `kubernetes_service` field records one
     /// field over — an input written at ONE of the three `backend.start`
     /// call sites, missing from the restart path. Measured 2026-08-31: a
-    /// controller lost its projected ServiceAccount token on its first
-    /// restart and then CrashLooped on `Config::incluster()`, which reads
+    /// controller lost its projected `ServiceAccount` token on its first
+    /// restart and then `CrashLooped` on `Config::incluster()`, which reads
     /// as an auth bug and is really a lost mount.
     ///
     /// Remembering is correct rather than re-resolving: mounts are
@@ -558,7 +558,7 @@ struct SeenDown {
     /// ★ FIRST observation, not most recent: the backoff clock must run from
     /// the exit, and re-stamping it every tick would reset the wait on every
     /// poll — a hold that never elapses, which is a hang wearing a
-    /// CrashLoopBackOff label.
+    /// `CrashLoopBackOff` label.
     at: Instant,
     /// How it ended, folded across every poll of this run by
     /// [`Termination::known_after`]: an exit once observed is not turned into
@@ -790,7 +790,7 @@ pub struct Kubelet {
     /// Which host paths a pod may mount directly. Deny-all unless a node opts
     /// in, so the default stays exactly what it was.
     host_path_policy: crate::pod_volume::HostPathPolicy,
-    /// Supplies a pod's ServiceAccount credentials. Defaults to
+    /// Supplies a pod's `ServiceAccount` credentials. Defaults to
     /// [`NoServiceAccountProjection`] so a kubelet with no signing key
     /// projects nothing rather than an empty token.
     sa_projector: Arc<dyn crate::pod_volume::ServiceAccountProjector>,
@@ -835,7 +835,7 @@ pub struct Kubelet {
     /// exactly the hot-loop tripwire it exists to be. Upstream renews on
     /// `RENEW_INTERVAL`, not per sync loop, for the same reason.
     last_lease_renewal: Mutex<Option<Instant>>,
-    /// When this kubelet last rewrote its pods' projected ServiceAccount
+    /// When this kubelet last rewrote its pods' projected `ServiceAccount`
     /// tokens. Same cadence discipline as `last_lease_renewal` and for the
     /// same reason — re-minting on every tick would make every idle reconcile
     /// a filesystem write.
@@ -889,7 +889,7 @@ impl Kubelet {
     /// Absent this, the kubelet denies every hostPath — the behaviour before
     /// the policy existed. A node opts IN by naming prefixes; it never
     /// inherits the permission.
-    #[must_use]
+
     pub fn with_host_path_policy(mut self, policy: crate::pod_volume::HostPathPolicy) -> Self {
         self.host_path_policy = policy;
         self
@@ -939,7 +939,7 @@ impl Kubelet {
         self
     }
 
-    /// Builder: supply the pod ServiceAccount projector.
+    /// Builder: supply the pod `ServiceAccount` projector.
     #[must_use]
     pub fn with_sa_projector(
         mut self,
@@ -991,7 +991,7 @@ impl Kubelet {
         (lifetime / 3).max(std::time::Duration::from_secs(10))
     }
 
-    /// Rewrite every started pod's projected ServiceAccount token before it
+    /// Rewrite every started pod's projected `ServiceAccount` token before it
     /// expires.
     ///
     /// ── ★ WHAT ITS ABSENCE BROKE, AND WHY IT LOOKED LIKE SOMETHING ELSE ───
@@ -1042,11 +1042,11 @@ impl Kubelet {
         {
             let now = self.now();
             let mut last = self.last_sa_refresh.lock().await;
-            if let Some(prev) = *last {
-                if now.saturating_duration_since(prev) < interval {
-                    report.skipped_not_due = true;
-                    return report;
-                }
+            if let Some(prev) = *last
+                && now.saturating_duration_since(prev) < interval
+            {
+                report.skipped_not_due = true;
+                return report;
             }
             *last = Some(now);
         }
@@ -1112,10 +1112,10 @@ impl Kubelet {
         {
             let now = self.now();
             let mut last = self.last_lease_renewal.lock().await;
-            if let Some(prev) = *last {
-                if now.saturating_duration_since(prev) < crate::node_lease::RENEW_INTERVAL {
-                    return;
-                }
+            if let Some(prev) = *last
+                && now.saturating_duration_since(prev) < crate::node_lease::RENEW_INTERVAL
+            {
+                return;
             }
             *last = Some(now);
         }
@@ -1456,7 +1456,7 @@ impl Kubelet {
                 .ok_or_else(|| invalid(format!("env {key}: valueFrom.{kind}.key missing")))?;
             let optional = krf
                 .get("optional")
-                .and_then(|o| o.as_bool())
+                .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
 
             let Some(obj) = sources.get(&(kubekind.to_string(), ref_name.to_string())) else {
@@ -1973,7 +1973,7 @@ impl Kubelet {
     /// [`EndpointsController`]: engenho_controllers::EndpointsController
     #[must_use]
     /// `/etc/hosts` entries mapping every Service's DNS names to its
-    /// **ClusterIP**, in podman's `"name:ip"` `--add-host` shape.
+    /// **`ClusterIP`**, in podman's `"name:ip"` `--add-host` shape.
     ///
     /// ## Why this exists alongside `service_aliases_for_pod`
     ///
@@ -1986,11 +1986,11 @@ impl Kubelet {
     /// whole time. kustomize-controller could not fetch a single artifact.
     ///
     /// `/etc/hosts` is consulted BEFORE DNS, so mapping the same names to the
-    /// ClusterIP puts the request back on the Service VIP, where the iptables
+    /// `ClusterIP` puts the request back on the Service VIP, where the iptables
     /// datapath performs the port translation the Service declares. That is
     /// what makes a `port != targetPort` Service work at all.
     ///
-    /// Headless Services (no ClusterIP, or the literal `"None"`) are
+    /// Headless Services (no `ClusterIP`, or the literal `"None"`) are
     /// deliberately SKIPPED — their contract is "resolve to the pod IPs",
     /// which is exactly what the alias path already provides. Overriding them
     /// here would break the one case the aliases get right.
@@ -2008,11 +2008,11 @@ impl Kubelet {
     /// these `fqdn → clusterIP` records and is not yet served to pods).
     /// Everything a container needs to resolve Service names, computed in ONE
     /// place: the aardvark aliases for the Services that select this pod, and
-    /// the ClusterIP `/etc/hosts` map for the Services it consumes.
+    /// the `ClusterIP` `/etc/hosts` map for the Services it consumes.
     ///
     /// ★ Why this is a single function. The two halves used to be computed
     /// separately at each start path, and there are THREE start paths — first
-    /// start, init containers, and restart-after-exit. The ClusterIP map was
+    /// start, init containers, and restart-after-exit. The `ClusterIP` map was
     /// wired into two of them. Measured on rio 2026-09-15: kustomize-controller
     /// exited once while waiting on its leader lease, came back through the
     /// RESTART path with an empty `host_add`, resolved source-controller to
@@ -2342,8 +2342,7 @@ impl Kubelet {
             .get("spec")
             .and_then(|s| s.get("nodeName"))
             .and_then(|n| n.as_str())
-            .map(|n| n == node_name)
-            .unwrap_or(false)
+            .is_some_and(|n| n == node_name)
     }
 
     /// Build the desired Pod `status` from the typed
@@ -3590,8 +3589,7 @@ impl Kubelet {
                 .lock()
                 .await
                 .get(key)
-                .map(|lp| lp.init_complete)
-                .unwrap_or(false);
+                .is_some_and(|lp| lp.init_complete);
             if !init_complete {
                 // Drive the init sequence (starts init[0] on the first pass).
                 return self
@@ -3664,7 +3662,7 @@ impl Kubelet {
         // never even starts a container. The ProbeRuntimes are stamped at the
         // container's start instant below, but the spec parse is what can fail.
         let now = self.now();
-        let pod_label = key.label().to_string();
+        let pod_label = key.label().clone();
         let mut probe_state_by_cname: BTreeMap<String, ContainerProbes> = BTreeMap::new();
         for (cname, _spec) in &specs {
             let Some(cjson) = Self::container_json(value, cname) else {
@@ -3743,25 +3741,27 @@ impl Kubelet {
         let automount = value
             .pointer("/spec/automountServiceAccountToken")
             .and_then(Value::as_bool)
-            .unwrap_or_else(|| true);
-        let automount = match value.pointer("/spec/automountServiceAccountToken") {
-            Some(_) => automount,
-            None => {
-                let sa_key = ResourceKey::namespaced(
-                    "",
-                    "v1",
-                    "ServiceAccount",
-                    namespace,
-                    sa_name_for_automount,
-                );
-                self.store
-                    .get(&sa_key)
-                    .await
-                    .as_ref()
-                    .and_then(|sa| sa.pointer("/automountServiceAccountToken"))
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true)
-            }
+            .unwrap_or(true);
+        let automount = if value
+            .pointer("/spec/automountServiceAccountToken")
+            .is_some()
+        {
+            automount
+        } else {
+            let sa_key = ResourceKey::namespaced(
+                "",
+                "v1",
+                "ServiceAccount",
+                namespace,
+                sa_name_for_automount,
+            );
+            self.store
+                .get(&sa_key)
+                .await
+                .as_ref()
+                .and_then(|sa| sa.pointer("/automountServiceAccountToken"))
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
         };
 
         let sa_name = value
@@ -3773,11 +3773,7 @@ impl Kubelet {
             .and_then(Value::as_str)
             .unwrap_or_default();
         let cnames: Vec<String> = specs.iter().map(|(c, _)| c.clone()).collect();
-        let sa_mount = if !automount {
-            // No projection, no materialization, no mount. The pod asked for
-            // no credential and gets none.
-            None
-        } else {
+        let sa_mount = if automount {
             match self
                 .project_service_account(namespace, sa_name, &key.name, pod_uid)
                 .await
@@ -3816,6 +3812,10 @@ impl Kubelet {
                     return Ok(());
                 }
             }
+        } else {
+            // No projection, no materialization, no mount. The pod asked for
+            // no credential and gets none.
+            None
         };
 
         let Some(resolved) = self
@@ -4247,7 +4247,7 @@ impl Kubelet {
     /// `<ns>_<pod>_<cname>`, so the old one (running for a liveness restart,
     /// or exited-but-still-named for an exit-code restart) MUST be removed
     /// first or `podman run --name` fails with "name already in use". (The
-    /// M0.2 exit-code path's start-then-remove only worked under FakeBackend,
+    /// M0.2 exit-code path's start-then-remove only worked under `FakeBackend`,
     /// which doesn't enforce name uniqueness — surfaced live by the liveness
     /// restart bar.)
     ///
@@ -4958,7 +4958,7 @@ impl Kubelet {
     /// init container reported `Terminated{ exit 0 }` (Succeeded), in
     /// `spec.initContainers` order. Reads the recorded init [`ContainerRecord`]
     /// for each container's id + restart count; an init container missing from
-    /// the local record (shouldn't happen once init_complete, but defensively
+    /// the local record (shouldn't happen once `init_complete`, but defensively
     /// handled) is rendered Terminated exit 0 with no id rather than dropped.
     async fn init_statuses_terminated(
         &self,
@@ -4979,7 +4979,7 @@ impl Kubelet {
                     // observation replayed, not a default.
                     state: ContainerState::terminated(crate::cri::ExitDisposition::Code(0)),
                     container_id: rec.map(|r| r.container_id.clone()),
-                    restart_count: rec.map(|r| r.restart_count).unwrap_or(0),
+                    restart_count: rec.map_or(0, |r| r.restart_count),
                 }
             })
             .collect()
@@ -4992,7 +4992,7 @@ impl Kubelet {
     /// name from [`Self::pod_to_init_container_specs`].
     ///
     /// Returns the populated spec, or a typed error if the container's
-    /// `volumeMounts[]` reference an undeclared volume (NoSource) — the caller
+    /// `volumeMounts[]` reference an undeclared volume (`NoSource`) — the caller
     /// surfaces it (never a fake start).
     fn build_init_spec(
         value: &Value,
@@ -5398,10 +5398,10 @@ impl Kubelet {
 
     /// Ensure the active init container (`index`) is started or restarted.
     ///
-    ///   * Not yet recorded → start it fresh (restart_count 0).
+    ///   * Not yet recorded → start it fresh (`restart_count` 0).
     ///   * Recorded + Terminated with a restartable exit (the sequencer only
     ///     returns `AwaitInit` for a Terminated init container when the policy
-    ///     restarts it) → stop+remove the old, start fresh, bump restart_count.
+    ///     restarts it) → stop+remove the old, start fresh, bump `restart_count`.
     ///   * Recorded + Running → in flight: nothing to do (await its exit).
     ///
     /// Returns the active init container's pod IP when freshly started/restarted
@@ -5475,7 +5475,7 @@ impl Kubelet {
                 // count); a Running one is awaited (no-op).
                 match self.backend.status(&record.container_id).await {
                     Ok(Some(s)) if s.is_running() => Ok(s.pod_ip),
-                    Ok(Some(_)) | Ok(None) => {
+                    Ok(Some(_) | None) => {
                         // Terminated (restartable — the sequencer said
                         // AwaitInit for it) OR vanished → (re)start fresh,
                         // when its start curve allows. Asked BEFORE the old
@@ -5528,7 +5528,7 @@ impl Kubelet {
     }
 
     /// Render `initContainerStatuses` from the freshly-built observations (used
-    /// on the InitFailed path so the failed container's exact non-zero exit is
+    /// on the `InitFailed` path so the failed container's exact non-zero exit is
     /// reported).
     fn init_statuses_observed(
         &self,
@@ -5547,7 +5547,7 @@ impl Kubelet {
     }
 
     /// Render `initContainerStatuses` by re-reading the CURRENT init records +
-    /// polling each (used on the AwaitInit path so the just-started/restarted
+    /// polling each (used on the `AwaitInit` path so the just-started/restarted
     /// active container shows Running, prior ones Terminated exit 0, later ones
     /// Waiting). Order follows `init_specs`.
     ///
@@ -5612,7 +5612,7 @@ impl Kubelet {
     /// Resolves the container's backend id from the local bookkeeping, then
     /// asks the backend. `container` selects which container; `None` defaults
     /// to the FIRST container in the pod (deterministic — sorted by name in
-    /// the BTreeMap; kubectl defaults to the first container in spec order, and
+    /// the `BTreeMap`; kubectl defaults to the first container in spec order, and
     /// for a single-container pod they coincide).
     ///
     /// # Errors
@@ -5665,7 +5665,7 @@ impl Kubelet {
     ///
     /// When the parent has no parseable `resourceVersion` yet (freshly
     /// minted, not re-listed), `write_status_cas` skips the CAS write
-    /// rather than issuing an unconditional one — that NoChange is a
+    /// rather than issuing an unconditional one — that `NoChange` is a
     /// genuine no-op here too (the next watch-wake re-reads fresh state).
     async fn write_pod_status(
         &self,
@@ -5942,7 +5942,7 @@ mod env_resolution_tests {
 
     /// THE REGRESSION. Every one of these used to VANISH — the extractor
     /// required a literal `value` key, so `valueFrom` entries were dropped
-    /// with no error and no Pending reason. `leader.rs` reads POD_NAME, so
+    /// with no error and no Pending reason. `leader.rs` reads `POD_NAME`, so
     /// leader election degraded silently on a healthy-looking pod.
     #[test]
     fn downward_api_entries_no_longer_vanish() {
@@ -6062,7 +6062,7 @@ mod env_resolution_tests {
         assert_eq!(v, "debug");
     }
 
-    /// A missing non-optional Secret is a typed InvalidPod naming the object.
+    /// A missing non-optional Secret is a typed `InvalidPod` naming the object.
     #[test]
     fn a_missing_secret_is_a_typed_invalid_pod() {
         let err = resolve(json!({
@@ -6848,7 +6848,7 @@ mod tests {
     /// The exact Service that stopped Flux: `port: 80` -> `targetPort: http`
     /// (9090). The alias path resolves the name to the POD IP, so a client
     /// using the service port connects to a port nothing listens on. The
-    /// ClusterIP entry puts it back on the VIP, where the datapath translates.
+    /// `ClusterIP` entry puts it back on the VIP, where the datapath translates.
     #[test]
     fn a_service_maps_to_its_cluster_ip_not_its_pod() {
         let services = vec![(
@@ -7071,7 +7071,7 @@ mod tests {
 /// The real kubelet behind [`crate::server::KubeletServer`].
 ///
 /// ★ THIS IMPL IS THE POINT. `KubeletApi` shipped with a trait, a router
-/// and a FakeApi in its own test module, and NO production implementor —
+/// and a `FakeApi` in its own test module, and NO production implementor —
 /// so :10250 existed as a type and not as a port. That shape (a type, a
 /// backend, and no producer) has now been the root of four separate gaps
 /// in this codebase; it defeats grep, because every symbol it names is

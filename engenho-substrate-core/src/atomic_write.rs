@@ -254,7 +254,12 @@ mod tests {
             .expect("read_dir")
             .filter_map(Result::ok)
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with(&stem) && n.ends_with(".tmp"))
+            .filter(|n| {
+                n.starts_with(&stem)
+                    && std::path::Path::new(n)
+                        .extension()
+                        .is_some_and(|e| e == "tmp")
+            })
             .collect();
         assert!(strays.is_empty(), "temp files left behind: {strays:?}");
         let _ = std::fs::remove_file(&path);
@@ -341,7 +346,7 @@ mod tests {
         assert_eq!(t.parent(), p.parent());
         let name = t.to_string_lossy().into_owned();
         assert!(name.starts_with("/tmp/x.bin."), "{name}");
-        assert!(name.ends_with(".tmp"), "{name}");
+        assert!(t.extension().is_some_and(|e| e == "tmp"), "{name}");
     }
 
     #[cfg(unix)]

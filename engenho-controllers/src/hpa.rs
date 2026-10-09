@@ -1,4 +1,4 @@
-//! R18 — HorizontalPodAutoscaler controller.
+//! R18 — `HorizontalPodAutoscaler` controller.
 //!
 //! Watches HPA objects + adjusts the target's `spec.replicas`
 //! based on observed metrics. Same trait shape as every other
@@ -12,9 +12,9 @@
 //!   2. Read `spec.minReplicas` (default 1) + `spec.maxReplicas`.
 //!   3. Ask the metrics provider for the current metric value
 //!      keyed by `(target.kind, target.name, namespace)`.
-//!   4. Compute desired = ceil(current_replicas × metric_value /
-//!                              target_value), clamped to [min, max].
-//!   5. If desired ≠ current_replicas → patch the target.
+//!   4. Compute desired = `ceil(current_replicas` × `metric_value` /
+//!                              `target_value`), clamped to [min, max].
+//!   5. If desired ≠ `current_replicas` → patch the target.
 //!
 //! ## Metrics provider
 //!
@@ -131,7 +131,7 @@ impl MetricsProvider for FakeMetricsProvider {
 // HorizontalPodAutoscalerController
 // =================================================================
 
-/// Controller — scales targets based on metric vs target_value.
+/// Controller — scales targets based on metric vs `target_value`.
 pub struct HorizontalPodAutoscalerController {
     store: Arc<StoreMesh>,
     metrics: Arc<dyn MetricsProvider>,
@@ -156,7 +156,7 @@ impl HorizontalPodAutoscalerController {
     fn target_value(hpa: &Value) -> f64 {
         hpa.get("spec")
             .and_then(|s| s.get("targetValue"))
-            .and_then(|n| n.as_f64())
+            .and_then(serde_json::Value::as_f64)
             .unwrap_or(50.0)
     }
 
@@ -251,7 +251,7 @@ impl Controller for HorizontalPodAutoscalerController {
                 }
             };
 
-            let observed = match self
+            let observed = if let Some(v) = self
                 .metrics
                 .observe(&ScaleTarget {
                     kind: target_kind.clone(),
@@ -261,14 +261,13 @@ impl Controller for HorizontalPodAutoscalerController {
                 .await
                 .map_err(|e| ControllerError::Internal(e.to_string()))?
             {
-                Some(v) => v,
-                None => {
-                    debug!(
-                        target = %format!("{ns}/{target_kind}/{target_name}"),
-                        "no metric signal; holding current replicas"
-                    );
-                    continue;
-                }
+                v
+            } else {
+                debug!(
+                    target = %format!("{ns}/{target_kind}/{target_name}"),
+                    "no metric signal; holding current replicas"
+                );
+                continue;
             };
 
             let desired = Self::compute_desired(current, observed, target_value, min, max);

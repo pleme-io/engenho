@@ -5,9 +5,9 @@
 //! - [`FabricStrategy`] — HOW the fabric converges (consensus +
 //!   placement + cadence).
 //! - [`FabricFace`] — WHICH external API the fabric speaks (K8s /
-//!   Nomad / Systemd / PureRaft / BareMetalSupervisor).
+//!   Nomad / Systemd / `PureRaft` / `BareMetalSupervisor`).
 //! - [`Box<dyn TopologyStrategy>`] — WHAT SHAPE the cluster takes
-//!   (Solo / Pair / Quorum3M / Cluster3MNW / MeshAllPeers / Phalanx).
+//!   (Solo / Pair / `Quorum3M` / `Cluster3MNW` / `MeshAllPeers` / Phalanx).
 //!
 //! Each surface alone is well-typed. The interesting failure mode is
 //! the *combination*: declaring a Solo (1-node) topology alongside a
@@ -268,7 +268,7 @@ impl Cluster {
     /// # Errors
     ///
     /// Returns [`ClusterRuntimeError::Face`] if the face couldn't
-    /// be instantiated (e.g. Systemd / BareMetalSupervisor today
+    /// be instantiated (e.g. Systemd / `BareMetalSupervisor` today
     /// — those return `Unsupported`).
     pub fn from_declaration(declaration: ClusterDeclaration) -> Result<Self, ClusterRuntimeError> {
         let face = face::instantiate(declaration.face())?;
@@ -617,7 +617,7 @@ impl ClusterBuilder {
         self
     }
 
-    /// Convenience: declare a PureRaft face with the given name.
+    /// Convenience: declare a `PureRaft` face with the given name.
     pub fn face_pure_raft(mut self, name: impl Into<String>) -> Self {
         self.face = Some(FabricFace {
             name: name.into(),
@@ -633,7 +633,7 @@ impl ClusterBuilder {
         self
     }
 
-    /// Set the topology strategy (boxed so any TopologyStrategy
+    /// Set the topology strategy (boxed so any `TopologyStrategy`
     /// impl works).
     pub fn topology<T: TopologyStrategy + 'static>(mut self, t: T) -> Self {
         self.topology = Some(Box::new(t));

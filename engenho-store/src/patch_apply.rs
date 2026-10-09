@@ -794,10 +794,10 @@ impl OpenApiPatchEnv {
 impl PatchSchemaEnv for OpenApiPatchEnv {
     fn merge_strategy(&self, gvk: &Gvk, json_path: &JsonPath) -> ListMergeStrategy {
         let cache_key = (gvk.clone(), json_path.dotted());
-        if let Ok(cache) = self.cache.lock() {
-            if let Some(hit) = cache.get(&cache_key) {
-                return hit.clone();
-            }
+        if let Ok(cache) = self.cache.lock()
+            && let Some(hit) = cache.get(&cache_key)
+        {
+            return hit.clone();
         }
         let strat = self.resolve(gvk, json_path);
         if let Ok(mut cache) = self.cache.lock() {

@@ -3,14 +3,13 @@
 //! Two entry points:
 //!
 //!   * [`emit_kind`]   — one kind's `.rs` file. Generates struct +
-//!                       `KubeResource` impl. Idempotent: same input
-//!                       always produces the same string (no clock,
-//!                       no env, no random).
+//!     `KubeResource` impl. Idempotent: same input always produces the
+//!     same string (no clock, no env, no random).
 //!   * [`emit_module`] — module-level `.rs` (e.g. `core_v1/mod.rs`)
-//!                       declaring every per-kind submodule in the
-//!                       group. Pure data-driven.
+//!     declaring every per-kind submodule in the group. Pure data-driven.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 use crate::catalog::{KindEntry, Subresource};
 use crate::emit_typed::{SchemaView, emit_fields, emit_struct};
@@ -38,7 +37,7 @@ use crate::meta::ObjectMeta;
 
 /// Emit the per-kind Rust source.
 ///
-/// `description` is taken from the OpenAPI schema's `description`
+/// `description` is taken from the `OpenAPI` schema's `description`
 /// field and inlined into the struct's rustdoc. Multiline doc
 /// comments are prefixed with `///` per line (no smart wrapping —
 /// upstream's doc strings are already wrapped at ~80).
@@ -138,7 +137,7 @@ fn is_empty_meta(m: &ObjectMeta) -> bool {{ m == &ObjectMeta::default() }}\n\
     )
 }
 
-/// First-paragraph rustdoc from an OpenAPI description, `///`-prefixed and
+/// First-paragraph rustdoc from an `OpenAPI` description, `///`-prefixed and
 /// left-trimmed (so rustdoc never sees an indented code block). Falls back to
 /// a generated one-liner.
 fn kind_doc(description: &str, api_version: &str, kind: &str) -> String {
@@ -164,7 +163,7 @@ fn kind_doc(description: &str, api_version: &str, kind: &str) -> String {
 
 /// Emit the per-kind Rust source with TYPED fields + transitive sub-structs
 /// (M0.0.4). Unlike [`emit_kind`] (opaque `spec: serde_json::Value`), this
-/// walks the kind's OpenAPI `properties` into typed fields and recursively
+/// walks the kind's `OpenAPI` `properties` into typed fields and recursively
 /// emits every `$ref`'d sub-struct from `schemas` (the merged cross-group
 /// schema map). apimachinery types are referenced from `crate::meta`; exotic
 /// shapes bottom out at `serde_json::Value`, so the output always compiles.
@@ -287,10 +286,7 @@ pub fn emit_shared_module(
     }
     for e in catalog {
         if referenced_keys.contains(e.openapi_key) {
-            out.push_str(&format!(
-                "use crate::generated_v1_34::{}::{};\n",
-                e.module, e.kind
-            ));
+            let _ = writeln!(out, "use crate::generated_v1_34::{}::{};", e.module, e.kind);
         }
     }
 
@@ -484,8 +480,9 @@ pub fn emit_catalog(catalog: &[KindEntry]) -> String {
         } else {
             format!("{}/{}", e.group, e.version)
         };
-        out.push_str(&format!(
-            "    ResourceDescriptor {{ group: {:?}, version: {:?}, kind: {:?}, plural: {:?}, namespaced: {}, api_version: {:?}, short_names: {}, singular: {:?}, categories: {}, opaque: {}, subresources: {} }},\n",
+        let _ = writeln!(
+            out,
+            "    ResourceDescriptor {{ group: {:?}, version: {:?}, kind: {:?}, plural: {:?}, namespaced: {}, api_version: {:?}, short_names: {}, singular: {:?}, categories: {}, opaque: {}, subresources: {} }},",
             e.group,
             e.version,
             e.kind,
@@ -497,7 +494,7 @@ pub fn emit_catalog(catalog: &[KindEntry]) -> String {
             render_str_slice(e.categories),
             e.opaque,
             render_subresources(e.subresources),
-        ));
+        );
     }
     out.push_str("];\n");
     out
@@ -554,11 +551,11 @@ pub fn emit_module(module_name: &str, entries: &[&KindEntry]) -> String {
     let mut out =
         format!("//! GENERATED — `{module_name}` typed kinds. Source: engenho-kube-codegen.\n\n");
     for e in entries {
-        out.push_str(&format!("mod {};\n", e.kind.to_lowercase()));
+        let _ = writeln!(out, "mod {};", e.kind.to_lowercase());
     }
     out.push('\n');
     for e in entries {
-        out.push_str(&format!("pub use {}::{};\n", e.kind.to_lowercase(), e.kind));
+        let _ = writeln!(out, "pub use {}::{};", e.kind.to_lowercase(), e.kind);
     }
     // Re-export the shared sub-structs at the group level so consumers can
     // import e.g. `core_v1::PodSpec` / `apps_v1::DeploymentSpec` (one canonical
@@ -593,7 +590,7 @@ mod tests {
     fn shape() -> KindShape {
         KindShape {
             gvks: vec![XGvk {
-                group: "".into(),
+                group: String::new(),
                 version: "v1".into(),
                 kind: "Pod".into(),
             }],
