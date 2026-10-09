@@ -17,7 +17,7 @@ publish = false
 [dependencies]
 # The leaf. This edge is also the fence: the leaf can never depend on
 # the incubator, because Cargo rejects the cycle.
-engenho-substrate  = { path = "../engenho-substrate" }
+engenho-substrate  = { workspace = true }
 async-trait        = { workspace = true }
 futures            = { workspace = true }
 thiserror          = { workspace = true }

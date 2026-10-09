@@ -22,7 +22,7 @@ async-trait = { workspace = true }
 thiserror   = { workspace = true }
 tracing     = { workspace = true }
 tokio       = { workspace = true, features = ["process", "io-util"] }
-engenho-substrate = { path = "../engenho-substrate" }
+engenho-substrate = { workspace = true }
 
 [dev-dependencies]
 tokio    = { workspace = true, features = ["macros", "rt-multi-thread"] }

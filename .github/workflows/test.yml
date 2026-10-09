@@ -216,6 +216,18 @@ jobs:
       # No credentials needed: rustfmt parses source, it does not resolve deps.
       - run: cargo fmt --all -- --check
 
+  package:
+    name: cargo package (every publishable crate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pleme-io/actions/git-credentials@main
+        with:
+          bot-pat: ${{ secrets.BOT_PAT }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo package --workspace --no-verify --locked
+
   clippy:
     name: clippy (pedantic + format-ban)
     runs-on: ubuntu-latest

@@ -24,8 +24,8 @@ tokio-stream   = "0.1"
 futures-core   = "0.3"
 async-stream   = "0.3"
 bytes         = "1"
-engenho-types = { path = "../engenho-types" }
-engenho-store = { path = "../engenho-store" }
+engenho-types = { workspace = true }
+engenho-store = { workspace = true }
 thiserror     = { workspace = true }
 
 [build-dependencies]

@@ -80,6 +80,9 @@ engenho-substrate-props = { path = "engenho-substrate-props", version = "0.53.12
 engenho-sui-typescape  = { path = "engenho-sui-typescape", version = "0.53.129" }
 engenho-fonte          = { path = "engenho-fonte", version = "0.53.129" }
 engenho-revoada        = { path = "engenho-revoada", version = "0.53.129" }
+engenho-cni            = { path = "engenho-cni", version = "0.53.129" }
+engenho-csi            = { path = "engenho-csi", version = "0.53.129" }
+engenho-etcd           = { path = "engenho-etcd", version = "0.53.129" }
 
 # Pleme-io sibling-directory path deps for typed-dispatcher
 # catalog integration (theory/UNIFIED-COMPUTING-MODEL.md §VI).
