@@ -635,7 +635,12 @@ impl NodeManifestsController {
         handlers.sort_by(|a, b| {
             (a.group(), a.version(), a.plural()).cmp(&(b.group(), b.version(), b.plural()))
         });
-        for handler in handlers {
+        // A read-only kind (`metrics.k8s.io`) holds nothing a file can
+        // declare and serves no delete, so it has nothing to prune. Listing
+        // it is not free either: the first NodeMetrics read samples the
+        // node's CPU over a one-second window, which made every pass a
+        // second longer on Linux.
+        for handler in handlers.into_iter().filter(|h| !h.read_only()) {
             let list = ApiPath {
                 group: handler.group(),
                 version: handler.version(),

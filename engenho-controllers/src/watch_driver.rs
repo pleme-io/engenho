@@ -134,6 +134,13 @@ impl KindFilter {
         }
     }
 
+    /// Whether no event can wake the controller: it runs on its fallback
+    /// alone.
+    #[must_use]
+    pub fn wakes_on_nothing(&self) -> bool {
+        matches!(self, Self::Kinds(list) if list.is_empty())
+    }
+
     fn matches(&self, ev: &WatchEvent) -> bool {
         self.wakes_on(&ev.key.kind)
     }
@@ -375,6 +382,13 @@ async fn run<C: Controller + ?Sized + 'static, S: WatchSource + ?Sized>(
     // `Shutdown` variant is gone: a data stream ending is a RE-SUBSCRIBE,
     // the way a closed `ResultChan` sends upstream's reflector back
     // through `ListAndWatch`.
+    // A driver no event can wake is a poller, and a poller polls first: its
+    // first pass is at start, not one whole fallback later. Without it a
+    // node-declared manifest waited ten seconds after boot to be applied,
+    // and three passes needed thirty seconds and change.
+    if filter.wakes_on_nothing() {
+        ticker.tick().await;
+    }
     loop {
         match wait_for_relevant_event(rx.as_mut(), &filter, fallback_interval, ticker.slot).await {
             EventOrTimer::Event => {
