@@ -51,6 +51,9 @@ tokio-rustls       = { version = "0.26", default-features = false, features = ["
 # The serve loop that owns every connection task (so a stop severs and awaits
 # open watches instead of leaking them with the store they hold).
 engenho-serve      = { workspace = true }
+hyper              = { workspace = true, features = ["server", "http1"] }
+hyper-util         = { workspace = true, features = ["tokio"] }
+tokio-tungstenite  = "0.24"
 time               = { workspace = true }
 # Production WebhookCaller — POST the AdmissionReview to a mutating webhook over
 # HTTPS. The trait seam keeps engenho-controllers reqwest-free; the live impl

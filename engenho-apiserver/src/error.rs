@@ -104,6 +104,8 @@ pub enum ApiError {
     Internal(String),
     #[error("storage error: {0}")]
     StorageError(String),
+    #[error("{0}")]
+    ServiceUnavailable(String),
 }
 
 /// Stable kind tag used in error JSON for clients to dispatch on.
@@ -124,6 +126,7 @@ pub enum ErrorKind {
     TooLargeResourceVersion,
     Internal,
     StorageError,
+    ServiceUnavailable,
 }
 
 impl ApiError {
@@ -145,6 +148,7 @@ impl ApiError {
             Self::TooLargeResourceVersion(_) => ErrorKind::TooLargeResourceVersion,
             Self::Internal(_) => ErrorKind::Internal,
             Self::StorageError(_) => ErrorKind::StorageError,
+            Self::ServiceUnavailable(_) => ErrorKind::ServiceUnavailable,
         }
     }
 
@@ -163,6 +167,7 @@ impl ApiError {
             Self::Gone(_) => StatusCode::GONE,
             Self::TooLargeResourceVersion(_) => StatusCode::GATEWAY_TIMEOUT,
             Self::Internal(_) | Self::StorageError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 }
@@ -392,7 +397,7 @@ impl ApiError {
             Self::Gone(_) => "Expired",
             Self::TooLargeResourceVersion(_) => "Timeout",
             Self::Internal(_) => "InternalError",
-            Self::StorageError(_) => "ServiceUnavailable",
+            Self::StorageError(_) | Self::ServiceUnavailable(_) => "ServiceUnavailable",
         }
     }
 

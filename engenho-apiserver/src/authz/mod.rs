@@ -958,7 +958,13 @@ mod tests {
         let u = || user("carol", &["system:authenticated"]);
         let base = attrs_resource(u(), "patch", "", "pods", Some("default"), Some("p1"));
         assert_eq!(authz.authorize(&base).await, Decision::Allow);
-        for (verb, sub) in [("patch", "status"), ("get", "log"), ("get", "exec")] {
+        for (verb, sub) in [
+            ("patch", "status"),
+            ("get", "log"),
+            ("create", "exec"),
+            ("create", "attach"),
+            ("create", "portforward"),
+        ] {
             let mut a = attrs_resource(u(), verb, "", "pods", Some("default"), Some("p1"));
             a.subresource = Some(sub.to_string());
             assert_eq!(

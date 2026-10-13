@@ -50,6 +50,7 @@ pub mod pki;
 pub mod pki_files;
 pub mod pki_inventory;
 pub mod pod_logs;
+pub mod pod_stream;
 pub mod proto_transcode;
 pub mod router;
 pub mod sa_token;
@@ -102,6 +103,10 @@ pub use pki::{
 };
 pub use pki_files::PkiFile;
 pub use pod_logs::{LogQuery, PodLogReader};
+pub use pod_stream::{
+    PodStreamKind, PodStreamProxy, PodStreamTarget, PodStreamUpstream, dial_kubelet,
+    kubelet_authority_of_node,
+};
 pub use router::{RouterState, build};
 pub use scale::{
     Scale, ScaleMeta, ScaleSpec, ScaleStatus, UnprojectableScale, label_selector_to_string,

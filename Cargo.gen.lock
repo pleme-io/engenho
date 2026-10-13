@@ -1,9 +1,9 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "ec02d6f2bc4b1167f3d6281a12ec802c30e3973cb74fc6b804638d247d717084",
+  "cargo_lock_sha256": "c934f8c20adabad89e8917dabdd6c5e6e0b63ff1cb5cc6eda1d7a39a5acf80b4",
   "manifest_sha256": {
     "Cargo.toml": "64815eaf890cd6e35f9e68a7cb3d63d6f0f49dd52aad003493c31f168a4e0d7f",
-    "engenho-apiserver/Cargo.toml": "a42bf1f662ba3dbab338a871c0979aa15dfb734a22435d96e36e65cfa47d5abf",
+    "engenho-apiserver/Cargo.toml": "79515dd5cf6035695922700a1d48f88ac61360969c362bdec1e175280209a894",
     "engenho-cluster-config-render/Cargo.toml": "5f5f6d40c2b9a572f18418d12e568412517972684259f34a9aa3d34de0a5dc8c",
     "engenho-cluster-config/Cargo.toml": "49d8ea7131956ec2d6323ae41968f624fab66bbbbca1afbb0537b2327a683391",
     "engenho-cni/Cargo.toml": "f885e491a2490e5d1503fafe0f625ada2c38ade0ccac21ee27a6ab595f368945",
@@ -20,7 +20,7 @@
     "engenho-kube-client/Cargo.toml": "91708a8a8ec2457678a3dcb977c6145d09b82a0930e609381cce93af4a1c7b3e",
     "engenho-kube-codegen/Cargo.toml": "2fd91bb5b562a4adbd5f8298595155bcdbb51c52070e49b2efc47cc805a070ea",
     "engenho-kube-proto/Cargo.toml": "7545b21650bdbf36fa4b0592ee3659069a39555f10174f42142bf337b1f1c00b",
-    "engenho-kubelet/Cargo.toml": "d48227c06f6993f2849a3c4991b32f91b37175b48334275d9c509899cea89f9a",
+    "engenho-kubelet/Cargo.toml": "cc440b0756fe9316bdf6a71dc90648a3097662919c89fe629727c520d78e8620",
     "engenho-mcp/Cargo.toml": "a73d0471a92fe4eeb98d75f5ca945aeafcf56c6034e36f47d06bbf980ed9e369",
     "engenho-oracle/Cargo.toml": "9b0da2a6c1d469c28eb0617b8d71df0b0bf6db7751596956e0bb74a6ac979984",
     "engenho-revoada/Cargo.toml": "08cfd6e45e8acfb75f3073e3a70a9a11a9c33575c43509d0199b1e73bb8012f9",
@@ -4023,6 +4023,34 @@
             "tree": "target"
           },
           {
+            "name": "hyper",
+            "package_key": "hyper-1.10.0",
+            "kind": "normal",
+            "features": [
+              "client",
+              "http1",
+              "http1",
+              "server"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "hyper_util",
+            "package_key": "hyper-util-0.1.20",
+            "kind": "normal",
+            "features": [
+              "tokio",
+              "tokio"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
             "name": "percent_encoding",
             "package_key": "percent-encoding-2.3.2",
             "kind": "normal",
@@ -4181,6 +4209,16 @@
               "ring"
             ],
             "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tokio_tungstenite",
+            "package_key": "tokio-tungstenite-0.24.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
             "optional": false,
             "target": null,
             "tree": "target"
@@ -6488,7 +6526,10 @@
             "kind": "normal",
             "features": [
               "fs",
-              "param"
+              "param",
+              "process",
+              "pty",
+              "termios"
             ],
             "uses_default_features": true,
             "optional": false,
@@ -33295,6 +33336,7 @@
               "fs",
               "param",
               "process",
+              "pty",
               "std",
               "system",
               "termios",
@@ -34494,6 +34536,7 @@
               "fs",
               "param",
               "process",
+              "pty",
               "std",
               "system",
               "termios",
@@ -35541,6 +35584,7 @@
               "fs",
               "param",
               "process",
+              "pty",
               "std",
               "system",
               "termios",
@@ -36412,6 +36456,7 @@
               "fs",
               "param",
               "process",
+              "pty",
               "std",
               "system",
               "termios",
@@ -37622,6 +37667,7 @@
               "fs",
               "param",
               "process",
+              "pty",
               "std",
               "system",
               "termios",
@@ -38680,6 +38726,7 @@
               "fs",
               "param",
               "process",
+              "pty",
               "std",
               "system",
               "termios",

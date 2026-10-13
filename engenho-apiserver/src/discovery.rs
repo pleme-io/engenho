@@ -243,6 +243,23 @@ fn subresource_row(h: &dyn ResourceHandler, sub: Subresource) -> APIResource {
             group: Some("authentication.k8s.io".to_string()),
             version: Some("v1".to_string()),
         },
+        Subresource::Exec => stream_row(h, crate::pod_stream::PodStreamKind::Exec),
+        Subresource::Attach => stream_row(h, crate::pod_stream::PodStreamKind::Attach),
+        Subresource::PortForward => stream_row(h, crate::pod_stream::PodStreamKind::PortForward),
+    }
+}
+
+fn stream_row(h: &dyn ResourceHandler, kind: crate::pod_stream::PodStreamKind) -> APIResource {
+    APIResource {
+        name: format!("{}/{}", h.plural(), kind.subresource()),
+        singular_name: String::new(),
+        namespaced: h.namespaced(),
+        kind: kind.options_kind().to_string(),
+        verbs: vec!["create".to_string(), "get".to_string()],
+        short_names: Vec::new(),
+        categories: Vec::new(),
+        group: None,
+        version: None,
     }
 }
 

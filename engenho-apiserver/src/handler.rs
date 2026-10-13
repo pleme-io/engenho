@@ -22,6 +22,7 @@ use crate::field_validation::PatchFields;
 use crate::object_body::ObjectBody;
 use crate::params::{DryRun, ResumePoint, Selectors, body_precondition};
 use crate::pod_logs::{LogQuery, PodLogReader};
+use crate::pod_stream::{PodStreamKind, PodStreamProxy, PodStreamTarget, PodStreamUpstream};
 use crate::scale::{Scale, project_scale};
 use crate::watch_start::{WatchRefusal, WatchStart};
 
@@ -169,6 +170,21 @@ pub trait ResourceHandler: Send + Sync + 'static {
         _query: &LogQuery,
     ) -> Result<String, ApiError> {
         Err(self.no_subresource("log", name))
+    }
+
+    /// Open the kubelet side of a Pod `exec`/`attach`/`portforward` stream.
+    /// Default: a typed `NotFound`; the Pod handler overrides it through an
+    /// installed [`PodStreamProxy`].
+    async fn open_pod_stream(
+        &self,
+        _namespace: Option<&str>,
+        name: &str,
+        kind: PodStreamKind,
+        _container: Option<&str>,
+        _query: &str,
+        _protocols: &[String],
+    ) -> Result<PodStreamUpstream, ApiError> {
+        Err(self.no_subresource(kind.subresource(), name))
     }
 
     /// Build the typed `NotFound` a handler returns when asked for a
@@ -501,6 +517,7 @@ pub struct StoreBackedHandler {
     /// delegates to it; when `None`, `/log` returns a typed `NotFound` (no
     /// fake-empty log). Installed by the runtime via [`Self::with_log_reader`].
     log_reader: Option<Arc<dyn PodLogReader>>,
+    stream_proxy: Option<Arc<dyn PodStreamProxy>>,
     /// How often a watch that asked for bookmarks gets one while the store's
     /// revision advances. [`WATCH_BOOKMARK_EVERY`] unless
     /// [`Self::with_bookmark_every`] set it.
@@ -578,6 +595,7 @@ impl StoreBackedHandler {
             namespace_lifecycle: false,
             crd_schema: None,
             log_reader: None,
+            stream_proxy: None,
             bookmark_every: WATCH_BOOKMARK_EVERY,
         }
     }
@@ -602,6 +620,15 @@ impl StoreBackedHandler {
     #[must_use]
     pub fn with_log_reader(mut self, reader: Arc<dyn PodLogReader>) -> Self {
         self.log_reader = Some(reader);
+        self
+    }
+
+    /// Install the [`PodStreamProxy`] that relays `exec`/`attach`/`portforward`
+    /// to the pod's node kubelet. Without one those subresources are a typed
+    /// `NotFound`.
+    #[must_use]
+    pub fn with_stream_proxy(mut self, proxy: Arc<dyn PodStreamProxy>) -> Self {
+        self.stream_proxy = Some(proxy);
         self
     }
 
@@ -974,6 +1001,41 @@ impl ResourceHandler for StoreBackedHandler {
         // any other verb).
         let ns = namespace.unwrap_or("default");
         reader.read_pod_logs(ns, name, query).await
+    }
+
+    async fn open_pod_stream(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+        kind: PodStreamKind,
+        container: Option<&str>,
+        query: &str,
+        protocols: &[String],
+    ) -> Result<PodStreamUpstream, ApiError> {
+        let Some(proxy) = &self.stream_proxy else {
+            return Err(self.no_subresource(kind.subresource(), name));
+        };
+        let pod = self.get(namespace, name).await?;
+        let container = if kind.targets_container() {
+            Some(crate::pod_stream::choose_container(&pod, container)?)
+        } else {
+            None
+        };
+        let node_name = pod
+            .pointer("/spec/nodeName")
+            .and_then(Value::as_str)
+            .filter(|n| !n.is_empty())
+            .map(str::to_owned);
+        let target = PodStreamTarget {
+            kind,
+            namespace: namespace.unwrap_or("default").to_owned(),
+            pod: name.to_owned(),
+            container,
+            node_name,
+            query: query.to_owned(),
+            protocols: protocols.to_vec(),
+        };
+        proxy.open(&target).await
     }
 
     async fn get(&self, namespace: Option<&str>, name: &str) -> Result<Value, ApiError> {
