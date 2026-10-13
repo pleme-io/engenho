@@ -1414,7 +1414,9 @@ struct KubeletMetricsReader {
     kubelet: KubeletSlot,
 }
 
-fn metrics_window(u: &engenho_kubelet::usage::Usage) -> engenho_apiserver::resource_metrics::Window {
+fn metrics_window(
+    u: &engenho_kubelet::usage::Usage,
+) -> engenho_apiserver::resource_metrics::Window {
     engenho_apiserver::resource_metrics::Window {
         timestamp: u.timestamp,
         length: u.window,
@@ -1445,7 +1447,8 @@ impl engenho_apiserver::resource_metrics::ResourceMetricsReader for KubeletMetri
                             });
                         }
                         Err(why) => {
-                            unmeasurable.get_or_insert_with(|| [c.name.as_str(), ": ", &why].concat());
+                            unmeasurable
+                                .get_or_insert_with(|| [c.name.as_str(), ": ", &why].concat());
                         }
                     }
                 }
@@ -1465,10 +1468,13 @@ impl engenho_apiserver::resource_metrics::ResourceMetricsReader for KubeletMetri
 
     async fn nodes(&self) -> Vec<engenho_apiserver::resource_metrics::NodeSample> {
         let kubelet = self.kubelet.load_full();
-        let usage = kubelet
-            .node_usage()
-            .await
-            .map(|u| (metrics_window(&u), u.cpu_nanocores, u.memory_working_set_bytes));
+        let usage = kubelet.node_usage().await.map(|u| {
+            (
+                metrics_window(&u),
+                u.cpu_nanocores,
+                u.memory_working_set_bytes,
+            )
+        });
         vec![engenho_apiserver::resource_metrics::NodeSample {
             name: kubelet.node_name().to_owned(),
             usage,

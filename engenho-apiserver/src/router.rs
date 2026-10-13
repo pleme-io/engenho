@@ -2468,7 +2468,12 @@ async fn resource_create(
         }) = target
         {
             let mut warnings = Warnings::default();
-            subresource_directive(raw_directive, WriteOptions::Create, "eviction", &mut warnings)?;
+            subresource_directive(
+                raw_directive,
+                WriteOptions::Create,
+                "eviction",
+                &mut warnings,
+            )?;
             let result = do_eviction(
                 &h,
                 coords.namespace.as_deref(),

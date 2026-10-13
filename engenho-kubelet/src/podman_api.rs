@@ -1286,7 +1286,10 @@ impl PodmanApi {
     }
 
     /// Apply resizes through `POST {path}?h=&w=`.
-    fn resizes(&self, path: String) -> tokio::sync::mpsc::Sender<crate::exec_channel::TerminalSize> {
+    fn resizes(
+        &self,
+        path: String,
+    ) -> tokio::sync::mpsc::Sender<crate::exec_channel::TerminalSize> {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::exec_channel::TerminalSize>(8);
         let api = self.clone();
         tokio::spawn(async move {
@@ -1413,10 +1416,7 @@ impl PodmanApi {
             .config
             .unwrap_or_default()
             .tty;
-        let req = crate::stream::StreamRequest {
-            tty,
-            ..req.clone()
-        };
+        let req = crate::stream::StreamRequest { tty, ..req.clone() };
         let path = libpod_path(&format!(
             "containers/{id}/attach?stream=true&stdin={}&stdout={}&stderr={}",
             req.stdin, req.stdout, req.stderr
@@ -2549,7 +2549,8 @@ mod tests {
 
     #[test]
     fn a_stats_report_is_read_as_cumulative_cpu_and_memory() {
-        let body = br#"{"Error":null,"Stats":[{"ContainerID":"c","CPUNano":1500,"MemUsage":4096}]}"#;
+        let body =
+            br#"{"Error":null,"Stats":[{"ContainerID":"c","CPUNano":1500,"MemUsage":4096}]}"#;
         assert_eq!(
             super::parse_stats(body),
             Some(crate::usage::Cumulative {
@@ -2587,7 +2588,10 @@ mod tests {
                 ..LogOptions::default()
             },
         );
-        assert_eq!(next.text, "four\n", "the cursor counts lines, not shown bytes");
+        assert_eq!(
+            next.text, "four\n",
+            "the cursor counts lines, not shown bytes"
+        );
         assert_eq!(next.cursor, 4);
         let since = render_timestamped(
             &merged,

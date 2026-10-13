@@ -591,7 +591,11 @@ async fn a_streaming_exec_runs_the_closures_cat_on_live_stdin() {
     let backend = NativeBackend::new(Isolation::HostProcess, &logs_dir, Cgroups::Off);
     let image = format!("nix:{coreutils}");
     let started = backend
-        .start(&streaming_spec(&image, "native-exec-stream", &["sleep", "30"]))
+        .start(&streaming_spec(
+            &image,
+            "native-exec-stream",
+            &["sleep", "30"],
+        ))
         .await
         .expect("start");
 
@@ -649,7 +653,10 @@ async fn attach_reaches_a_native_containers_main_process() {
         .await
         .expect("attach");
     let stdin = session.stdin.expect("stdin wired");
-    stdin.send(b"to the main process\n".to_vec()).await.expect("send");
+    stdin
+        .send(b"to the main process\n".to_vec())
+        .await
+        .expect("send");
     drop(stdin);
     assert_eq!(
         drain(session.stdout.expect("stdout")).await,
@@ -677,9 +684,16 @@ async fn a_native_log_is_stamped_per_line_and_filtered_by_since() {
     let mut s = spec(&image, &["printf", "first line\\nsecond line\\n"], &[]);
     s.pod.name = "native-stamps".to_string();
     let before = std::time::SystemTime::now();
-    let started = backend.start(&s).await.expect("a realised closure must start");
+    let started = backend
+        .start(&s)
+        .await
+        .expect("a realised closure must start");
     for _ in 0..100 {
-        let st = backend.status(&started.container_id).await.unwrap().unwrap();
+        let st = backend
+            .status(&started.container_id)
+            .await
+            .unwrap()
+            .unwrap();
         if !st.is_running() {
             break;
         }

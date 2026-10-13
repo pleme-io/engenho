@@ -94,7 +94,9 @@ impl Pty {
     /// Duplicating the slave descriptor failed.
     pub fn wire(&self, cmd: &mut tokio::process::Command) -> std::io::Result<()> {
         let dup = || -> std::io::Result<std::process::Stdio> {
-            Ok(std::process::Stdio::from(self.slave.as_fd().try_clone_to_owned()?))
+            Ok(std::process::Stdio::from(
+                self.slave.as_fd().try_clone_to_owned()?,
+            ))
         };
         cmd.stdin(dup()?);
         cmd.stdout(dup()?);

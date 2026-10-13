@@ -308,7 +308,10 @@ pub fn framed_sink(
             append(&log, &mut out);
             let _ = done_tx.send(true);
         })?;
-    Ok((std::fs::File::from(std::os::fd::OwnedFd::from(writer)), done_rx))
+    Ok((
+        std::fs::File::from(std::os::fd::OwnedFd::from(writer)),
+        done_rx,
+    ))
 }
 
 fn append(log: &SharedLog, out: &mut Vec<u8>) {
@@ -358,7 +361,10 @@ mod tests {
         let mut line = long.clone();
         line.push(b'\n');
         let out = encode(&[(&line, 0)], LogStream::Stderr);
-        let records: Vec<&[u8]> = out.split(|b| *b == b'\n').filter(|r| !r.is_empty()).collect();
+        let records: Vec<&[u8]> = out
+            .split(|b| *b == b'\n')
+            .filter(|r| !r.is_empty())
+            .collect();
         assert_eq!(records.len(), 2);
         assert!(parse_record(records[0]).unwrap().partial);
         assert!(!parse_record(records[1]).unwrap().partial);

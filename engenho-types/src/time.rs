@@ -119,7 +119,9 @@ pub fn system_time_to_rfc3339_nano(t: std::time::SystemTime) -> Option<String> {
 /// Unix epoch.
 #[must_use]
 pub fn parse_rfc3339_system_time(stamp: &str) -> Option<std::time::SystemTime> {
-    let at = DateTime::parse_from_rfc3339(stamp).ok()?.with_timezone(&Utc);
+    let at = DateTime::parse_from_rfc3339(stamp)
+        .ok()?
+        .with_timezone(&Utc);
     let secs = u64::try_from(at.timestamp()).ok()?;
     Some(
         std::time::UNIX_EPOCH

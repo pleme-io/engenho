@@ -126,10 +126,16 @@ impl MetricsHandler {
                         continue;
                     }
                     let key = engenho_store::resource::ResourceKey::namespaced(
-                        "", "v1", "Pod", &p.namespace, &p.name,
+                        "",
+                        "v1",
+                        "Pod",
+                        &p.namespace,
+                        &p.name,
                     );
                     let labels = self.labels_of(&key).await;
-                    let body = p.usage.map(|(w, cs)| pod_metrics(&p.namespace, &p.name, &labels, w, &cs));
+                    let body = p
+                        .usage
+                        .map(|(w, cs)| pod_metrics(&p.namespace, &p.name, &labels, w, &cs));
                     out.push(((Some(p.namespace), p.name), body));
                 }
                 out

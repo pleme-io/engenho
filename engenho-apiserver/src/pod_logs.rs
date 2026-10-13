@@ -87,9 +87,11 @@ impl LogQuery {
                 "at most one of `sinceTime` or `sinceSeconds` may be specified".into(),
             ));
         }
-        if self.since_time.as_deref().is_some_and(|t| {
-            engenho_types::time::parse_rfc3339_system_time(t).is_none()
-        }) {
+        if self
+            .since_time
+            .as_deref()
+            .is_some_and(|t| engenho_types::time::parse_rfc3339_system_time(t).is_none())
+        {
             return Err(ApiError::BadRequest(
                 "sinceTime: Invalid value: must be an RFC3339 timestamp".into(),
             ));
@@ -181,8 +183,7 @@ pub trait PodLogReader: Send + Sync {
         query: &LogQuery,
     ) -> Result<LogChunk, ApiError> {
         let text = self.read_pod_logs(namespace, name, query).await?;
-        let cursor =
-            query.from_byte.unwrap_or(0) + u64::try_from(text.len()).unwrap_or(u64::MAX);
+        let cursor = query.from_byte.unwrap_or(0) + u64::try_from(text.len()).unwrap_or(u64::MAX);
         Ok(LogChunk { text, cursor })
     }
 }

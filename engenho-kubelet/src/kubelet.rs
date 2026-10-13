@@ -5706,9 +5706,11 @@ impl Kubelet {
         let key = ResourceKey::namespaced("", "v1", "Pod", namespace, name);
         let defaulted = match container {
             Some(c) => Some(c.to_owned()),
-            None => self.store.get(&key).await.and_then(|pod| {
-                engenho_types::pod::default_container(&pod).map(str::to_owned)
-            }),
+            None => self
+                .store
+                .get(&key)
+                .await
+                .and_then(|pod| engenho_types::pod::default_container(&pod).map(str::to_owned)),
         };
         let local = self.local.lock().await;
         let lp = local.get(&key).ok_or_else(|| KubeletError::InvalidPod {
@@ -5755,7 +5757,9 @@ impl Kubelet {
                     lp.containers
                         .iter()
                         .filter(|(_, r)| !r.container_id.is_empty())
-                        .map(move |(c, r)| (ns.clone(), pod.clone(), c.clone(), r.container_id.clone()))
+                        .map(move |(c, r)| {
+                            (ns.clone(), pod.clone(), c.clone(), r.container_id.clone())
+                        })
                 })
                 .collect()
         };
@@ -5783,15 +5787,20 @@ impl Kubelet {
                 rates.insert(id, r);
             }
         }
-        let live: std::collections::HashSet<String> =
-            targets.iter().map(|t| t.3.clone()).chain([NODE_USAGE_KEY.to_owned()]).collect();
+        let live: std::collections::HashSet<String> = targets
+            .iter()
+            .map(|t| t.3.clone())
+            .chain([NODE_USAGE_KEY.to_owned()])
+            .collect();
         self.usage.retain(&live);
         let mut pods: BTreeMap<(String, String), Vec<ContainerUsage>> = BTreeMap::new();
         for (ns, pod, name, id) in targets {
             let usage = rates
                 .remove(&id)
                 .unwrap_or_else(|| Err("no reading was taken".into()));
-            pods.entry((ns, pod)).or_default().push(ContainerUsage { name, usage });
+            pods.entry((ns, pod))
+                .or_default()
+                .push(ContainerUsage { name, usage });
         }
         pods.into_iter()
             .map(|((namespace, name), containers)| PodUsage {
@@ -5809,11 +5818,12 @@ impl Kubelet {
     /// The reason the node cannot be measured.
     pub async fn node_usage(&self) -> Result<crate::usage::Usage, String> {
         let take = || match crate::usage::node_reading() {
-            crate::usage::Reading::Measured(c) => {
-                Ok(self
-                    .usage
-                    .observe(NODE_USAGE_KEY, Instant::now(), std::time::SystemTime::now(), c))
-            }
+            crate::usage::Reading::Measured(c) => Ok(self.usage.observe(
+                NODE_USAGE_KEY,
+                Instant::now(),
+                std::time::SystemTime::now(),
+                c,
+            )),
             crate::usage::Reading::Unmeasurable(why) => Err(why),
         };
         if let Some(u) = take()? {

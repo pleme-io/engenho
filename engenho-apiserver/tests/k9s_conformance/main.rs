@@ -15,6 +15,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
+use engenho_apiserver::resource_metrics::{
+    ContainerSample, MetricsHandler, MetricsKind, NodeSample, PodSample, ResourceMetricsReader,
+    Window,
+};
 use engenho_apiserver::{
     ApiError, ApiServer, LogQuery, PodLogReader, PodStreamKind, PodStreamProxy, PodStreamTarget,
     PodStreamUpstream, ResourceHandler, RouterState, StoreBackedHandler, dial_kubelet,
@@ -22,10 +26,6 @@ use engenho_apiserver::{
 };
 use engenho_kubelet::port_forward_spdy::client::Client;
 use engenho_kubelet::spdy::{Frame, RstStatus};
-use engenho_apiserver::resource_metrics::{
-    ContainerSample, MetricsHandler, MetricsKind, NodeSample, PodSample, ResourceMetricsReader,
-    Window,
-};
 use engenho_store::command::{Reason, ResourceCommand};
 use engenho_store::{InProcessRouter, ResourceKey, StoreMesh, default_config};
 use futures::{SinkExt, StreamExt};
@@ -462,7 +462,11 @@ async fn cluster(test: &str) -> Cluster {
     let mut handlers = handlers_from_catalog(store.clone());
     handlers.push(pods);
     for kind in [MetricsKind::Pod, MetricsKind::Node] {
-        handlers.push(Arc::new(MetricsHandler::new(kind, Arc::new(Usage), store.clone())));
+        handlers.push(Arc::new(MetricsHandler::new(
+            kind,
+            Arc::new(Usage),
+            store.clone(),
+        )));
     }
     let server = ApiServer::start_with_state(
         "127.0.0.1:0".parse().unwrap(),

@@ -189,8 +189,7 @@ pub trait ResourceHandler: Send + Sync + 'static {
         query: &LogQuery,
     ) -> Result<crate::pod_logs::LogChunk, ApiError> {
         let text = self.logs(namespace, name, query).await?;
-        let cursor =
-            query.from_byte.unwrap_or(0) + u64::try_from(text.len()).unwrap_or(u64::MAX);
+        let cursor = query.from_byte.unwrap_or(0) + u64::try_from(text.len()).unwrap_or(u64::MAX);
         Ok(crate::pod_logs::LogChunk { text, cursor })
     }
 
@@ -1072,7 +1071,11 @@ impl ResourceHandler for StoreBackedHandler {
         if !self.subresources().contains(&Subresource::Eviction) {
             return Err(self.no_subresource("eviction", name));
         }
-        let dry_run = if eviction.dry_run { DryRun::All } else { dry_run };
+        let dry_run = if eviction.dry_run {
+            DryRun::All
+        } else {
+            dry_run
+        };
         let key = self.key(namespace, name)?;
         let (pod, meta) = self
             .store

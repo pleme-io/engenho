@@ -74,8 +74,8 @@
 //! cgroup kill on Linux and by none of the others.
 
 use crate::backend::{
-    Confinement, ContainerRuntime, ContainerSpec, ContainerStatus, ExecOutcome, LogOptions, LogRead,
-    Readoption, Resources,
+    Confinement, ContainerRuntime, ContainerSpec, ContainerStatus, ExecOutcome, LogOptions,
+    LogRead, Readoption, Resources,
 };
 use crate::cgroup::{
     CgroupPlan, CgroupTree, Cgroups, ResourceEnforcement, Unenforceable, UnparseableResources,
@@ -1091,10 +1091,14 @@ impl ContainerRuntime for NativeBackend {
     async fn usage(&self, container_id: &str) -> Result<crate::usage::Reading, KubeletError> {
         let leaf = {
             let guard = self.state.lock().map_err(|_| NativeError::StatePoisoned)?;
-            let c = guard.get(container_id).ok_or_else(|| NativeError::NoSuchContainer {
-                id: container_id.to_string(),
-            })?;
-            c.leaf.as_ref().map(|l| (Arc::clone(&l.tree), l.name.clone()))
+            let c = guard
+                .get(container_id)
+                .ok_or_else(|| NativeError::NoSuchContainer {
+                    id: container_id.to_string(),
+                })?;
+            c.leaf
+                .as_ref()
+                .map(|l| (Arc::clone(&l.tree), l.name.clone()))
         };
         let Some((tree, name)) = leaf else {
             let why = match self.cgroups.enforcement() {
@@ -1113,7 +1117,11 @@ impl ContainerRuntime for NativeBackend {
 
     /// The log is CRI records ([`crate::cri_log`]); the cursor is a byte
     /// offset into them, always on a record boundary.
-    async fn read_log(&self, container_id: &str, opts: &LogOptions) -> Result<LogRead, KubeletError> {
+    async fn read_log(
+        &self,
+        container_id: &str,
+        opts: &LogOptions,
+    ) -> Result<LogRead, KubeletError> {
         let found = {
             let mut guard = self.state.lock().map_err(|_| NativeError::StatePoisoned)?;
             match guard.get_mut(container_id) {

@@ -38,7 +38,10 @@ impl Eviction {
     /// [`ApiError::BadRequest`] for a body that is not a policy `Eviction`,
     /// or whose `metadata.name` names another pod.
     pub fn from_body(body: &Value, name: &str) -> Result<Self, ApiError> {
-        let kind = body.get("kind").and_then(Value::as_str).unwrap_or("Eviction");
+        let kind = body
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("Eviction");
         let api_version = body
             .get("apiVersion")
             .and_then(Value::as_str)
@@ -114,7 +117,10 @@ pub fn decide(pod: &Value, pdb: &Value, now: &str) -> Result<Decision, ApiError>
         .pointer("/metadata/name")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let status_int = |f: &str| pdb.pointer(&["/status/", f].concat()).and_then(Value::as_i64);
+    let status_int = |f: &str| {
+        pdb.pointer(&["/status/", f].concat())
+            .and_then(Value::as_i64)
+    };
     let current = status_int("currentHealthy").unwrap_or(0);
     let desired = status_int("desiredHealthy").unwrap_or(0);
     if !engenho_controllers::status::pod_is_ready(pod) {
@@ -184,7 +190,9 @@ mod tests {
     #[test]
     fn a_spent_budget_is_a_429_naming_it() {
         let err = decide(&pod(true), &pdb(0, 2, 2), "t").unwrap_err();
-        assert!(matches!(&err, ApiError::DisruptionBudget(m) if m.contains("web needs 2 healthy pods and has 2")));
+        assert!(
+            matches!(&err, ApiError::DisruptionBudget(m) if m.contains("web needs 2 healthy pods and has 2"))
+        );
     }
 
     #[test]
@@ -204,7 +212,10 @@ mod tests {
 
     #[test]
     fn an_unready_pod_a_healthy_budget_can_spare_does_not_spend_it() {
-        assert_eq!(decide(&pod(false), &pdb(0, 2, 2), "t").unwrap(), Decision::Delete);
+        assert_eq!(
+            decide(&pod(false), &pdb(0, 2, 2), "t").unwrap(),
+            Decision::Delete
+        );
         let mut always = pdb(0, 0, 2);
         always["spec"] = json!({"unhealthyPodEvictionPolicy": "AlwaysAllow"});
         assert_eq!(decide(&pod(false), &always, "t").unwrap(), Decision::Delete);

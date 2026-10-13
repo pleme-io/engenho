@@ -692,13 +692,18 @@ pub struct LogRead {
 #[must_use]
 pub fn render_timestamped(text: &str, opts: &LogOptions) -> LogRead {
     let from = usize::try_from(opts.from_byte.unwrap_or(0)).unwrap_or(usize::MAX);
-    let complete: Vec<&str> = text.split_inclusive('\n').filter(|l| l.ends_with('\n')).collect();
+    let complete: Vec<&str> = text
+        .split_inclusive('\n')
+        .filter(|l| l.ends_with('\n'))
+        .collect();
     let fresh = complete.get(from..).unwrap_or_default();
     let mut records = Vec::new();
     for line in fresh {
         let body = line.strip_suffix('\n').unwrap_or(line);
         match body.split_once(' ') {
-            Some((stamp, msg)) if engenho_types::time::parse_rfc3339_system_time(stamp).is_some() => {
+            Some((stamp, msg))
+                if engenho_types::time::parse_rfc3339_system_time(stamp).is_some() =>
+            {
                 records.extend_from_slice(stamp.as_bytes());
                 records.extend_from_slice(b" stdout F ");
                 records.extend_from_slice(msg.as_bytes());
@@ -993,7 +998,11 @@ pub trait ContainerRuntime: Send + Sync {
     /// # Errors
     ///
     /// As [`Self::logs`].
-    async fn read_log(&self, container_id: &str, opts: &LogOptions) -> Result<LogRead, KubeletError> {
+    async fn read_log(
+        &self,
+        container_id: &str,
+        opts: &LogOptions,
+    ) -> Result<LogRead, KubeletError> {
         let text = self.logs(container_id, opts).await?;
         let cursor = opts.from_byte.unwrap_or(0) + u64::try_from(text.len()).unwrap_or(u64::MAX);
         Ok(LogRead { text, cursor })
@@ -2592,7 +2601,11 @@ impl ContainerRuntime for PodmanBackend {
     /// `podman logs --timestamps`, always: the stamps are what `since`
     /// filters on and what a follow's line cursor stays aligned with
     /// whether or not the caller asked to see them.
-    async fn read_log(&self, container_id: &str, opts: &LogOptions) -> Result<LogRead, KubeletError> {
+    async fn read_log(
+        &self,
+        container_id: &str,
+        opts: &LogOptions,
+    ) -> Result<LogRead, KubeletError> {
         let stamped = LogOptions {
             timestamps: true,
             ..LogOptions::default()

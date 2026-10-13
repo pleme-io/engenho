@@ -595,8 +595,9 @@ fn probes(
     {
         for (group, subresource) in served.of_parent(parent, &rule.api_groups) {
             // Streams and evictions are authorized as `create` only.
-            let create_only = engenho_apiserver::PodStreamKind::is_streaming_subresource(subresource)
-                || subresource == "eviction";
+            let create_only =
+                engenho_apiserver::PodStreamKind::is_streaming_subresource(subresource)
+                    || subresource == "eviction";
             for verb in &verbs {
                 if create_only && matches!(verb, Dim::Named(v) if v != "create") {
                     continue;

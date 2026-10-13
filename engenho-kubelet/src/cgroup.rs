@@ -511,17 +511,24 @@ impl CgroupTree {
         let dir = self.leaf(name);
         let cpu = dir.join("cpu.stat");
         let stat_field = |path: &Path, text: &str, field: &str| {
-            crate::usage::keyed_u64(text, field)
-                .ok_or_else(|| CgroupError::io(CgroupOp::Read, path, &io::Error::other(
-                    ["no ", field, " line"].concat(),
-                )))
+            crate::usage::keyed_u64(text, field).ok_or_else(|| {
+                CgroupError::io(
+                    CgroupOp::Read,
+                    path,
+                    &io::Error::other(["no ", field, " line"].concat()),
+                )
+            })
         };
         let cpu_text = read(self.fs.as_ref(), &cpu)?;
         let usage_usec = stat_field(&cpu, &cpu_text, "usage_usec")?;
         let current_path = dir.join("memory.current");
         let current = read(self.fs.as_ref(), &current_path)?;
         let current = current.trim().parse::<u64>().map_err(|e| {
-            CgroupError::io(CgroupOp::Read, &current_path, &io::Error::other(e.to_string()))
+            CgroupError::io(
+                CgroupOp::Read,
+                &current_path,
+                &io::Error::other(e.to_string()),
+            )
         })?;
         let mem_stat = dir.join("memory.stat");
         let mem_text = read(self.fs.as_ref(), &mem_stat)?;
