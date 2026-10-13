@@ -38,6 +38,7 @@ pub mod coords;
 pub mod defaulting;
 pub mod discovery;
 pub mod error;
+pub mod eviction;
 pub mod field_validation;
 pub mod handler;
 pub mod health;
@@ -52,6 +53,7 @@ pub mod pki_inventory;
 pub mod pod_logs;
 pub mod pod_stream;
 pub mod proto_transcode;
+pub mod resource_metrics;
 pub mod router;
 pub mod sa_token;
 pub mod scale;
@@ -102,7 +104,7 @@ pub use pki::{
     load_or_generate_ca, parse_client_cert,
 };
 pub use pki_files::PkiFile;
-pub use pod_logs::{LogQuery, PodLogReader};
+pub use pod_logs::{LogChunk, LogQuery, PodLogReader};
 pub use pod_stream::{
     PodStreamKind, PodStreamProxy, PodStreamTarget, PodStreamUpstream, dial_kubelet,
     kubelet_authority_of_node,

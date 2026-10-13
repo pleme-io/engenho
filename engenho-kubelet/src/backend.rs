@@ -649,9 +649,98 @@ pub struct LogOptions {
     /// `--timestamps` — prefix each line with an RFC3339 timestamp. Default
     /// `false`. Forward-compat (kubectl `--timestamps`).
     pub timestamps: bool,
-    /// Read from this byte offset of the log instead of its start.
+    /// Resume a follow: the [`LogRead::cursor`] a previous read returned.
+    /// Opaque to the caller; each backend says what it counts.
     #[serde(default)]
     pub from_byte: Option<u64>,
+    /// `sinceSeconds` / `sinceTime`, resolved to an instant: only lines
+    /// written at or after it.
+    #[serde(default)]
+    pub since: Option<std::time::SystemTime>,
+}
+
+impl LogOptions {
+    /// The [`crate::cri_log::RenderOptions`] these options ask for.
+    #[must_use]
+    pub const fn render(&self) -> crate::cri_log::RenderOptions {
+        crate::cri_log::RenderOptions {
+            timestamps: self.timestamps,
+            since: self.since,
+            tail: self.tail,
+        }
+    }
+}
+
+/// A log read: the text, and where the next read of a follow resumes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LogRead {
+    /// The log text as `kubectl logs` prints it.
+    pub text: String,
+    /// Pass back as [`LogOptions::from_byte`] to read only what follows.
+    pub cursor: u64,
+}
+
+/// Render a runtime's `--timestamps` output (`<RFC3339Nano> <message>` per
+/// line, the shape podman and docker print) under `opts`, resuming after the
+/// first `from_line` complete lines.
+///
+/// The cursor counts complete lines, not bytes: the bytes a caller sees
+/// depend on `timestamps`, and a cursor that counted them would land
+/// mid-line the moment the two disagreed. A last line with no newline yet is
+/// not consumed. `since` and `timestamps` read the runtime's own stamp, so a
+/// line's time is when the runtime saw it, never when it was read.
+#[must_use]
+pub fn render_timestamped(text: &str, opts: &LogOptions) -> LogRead {
+    let from = usize::try_from(opts.from_byte.unwrap_or(0)).unwrap_or(usize::MAX);
+    let complete: Vec<&str> = text.split_inclusive('\n').filter(|l| l.ends_with('\n')).collect();
+    let fresh = complete.get(from..).unwrap_or_default();
+    let mut records = Vec::new();
+    for line in fresh {
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        match body.split_once(' ') {
+            Some((stamp, msg)) if engenho_types::time::parse_rfc3339_system_time(stamp).is_some() => {
+                records.extend_from_slice(stamp.as_bytes());
+                records.extend_from_slice(b" stdout F ");
+                records.extend_from_slice(msg.as_bytes());
+            }
+            _ => records.extend_from_slice(body.as_bytes()),
+        }
+        records.push(b'\n');
+    }
+    let rendered = crate::cri_log::render(&records, opts.render(), false);
+    LogRead {
+        text: rendered.text,
+        cursor: u64::try_from(from.min(complete.len()) + fresh.len()).unwrap_or(u64::MAX),
+    }
+}
+
+/// Merge two `--timestamps` outputs (stdout, stderr) into one, ordered by
+/// each line's stamp; a line without a parseable stamp keeps its place.
+#[must_use]
+pub fn merge_timestamped(stdout: &str, stderr: &str) -> String {
+    let key = |l: &str| {
+        l.split_once(' ')
+            .and_then(|(s, _)| engenho_types::time::parse_rfc3339_system_time(s))
+    };
+    let mut out = stdout.split_inclusive('\n').peekable();
+    let mut err = stderr.split_inclusive('\n').peekable();
+    let mut merged = String::with_capacity(stdout.len() + stderr.len());
+    loop {
+        let take_err = match (out.peek(), err.peek()) {
+            (Some(o), Some(e)) => match (key(o), key(e)) {
+                (Some(a), Some(b)) => b < a,
+                _ => false,
+            },
+            (None, Some(_)) => true,
+            (_, None) => false,
+        };
+        let next = if take_err { err.next() } else { out.next() };
+        match next {
+            Some(l) => merged.push_str(l),
+            None => break,
+        }
+    }
+    merged
 }
 
 impl LogOptions {
@@ -878,6 +967,37 @@ pub trait ContainerRuntime: Send + Sync {
     /// container, podman spawn failure). A not-found container surfaces a
     /// typed error — never a silently-empty success.
     async fn logs(&self, container_id: &str, opts: &LogOptions) -> Result<String, KubeletError>;
+
+    /// The container's cumulative CPU and working-set reading, for
+    /// `metrics.k8s.io`. The default is unmeasurable, naming the backend: a
+    /// backend that can read usage overrides it, and one that cannot never
+    /// answers with zeros.
+    ///
+    /// # Errors
+    ///
+    /// [`KubeletError::Backend`] when the container is unknown.
+    async fn usage(&self, _container_id: &str) -> Result<crate::usage::Reading, KubeletError> {
+        Ok(crate::usage::Reading::Unmeasurable(format!(
+            "the {} backend reports no resource usage",
+            self.name()
+        )))
+    }
+
+    /// [`Self::logs`], plus the cursor a follow resumes from.
+    ///
+    /// The default suits a backend whose log text is its raw stored bytes
+    /// and whose `from_byte` is a byte offset into them: the cursor is the
+    /// offset plus what was read. A backend whose printed text differs from
+    /// what it stores (timestamps added, records parsed) overrides this.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::logs`].
+    async fn read_log(&self, container_id: &str, opts: &LogOptions) -> Result<LogRead, KubeletError> {
+        let text = self.logs(container_id, opts).await?;
+        let cursor = opts.from_byte.unwrap_or(0) + u64::try_from(text.len()).unwrap_or(u64::MAX);
+        Ok(LogRead { text, cursor })
+    }
 }
 
 // =================================================================
@@ -2466,12 +2586,18 @@ impl ContainerRuntime for PodmanBackend {
     }
 
     async fn logs(&self, container_id: &str, opts: &LogOptions) -> Result<String, KubeletError> {
-        if opts.from_byte.is_some() {
-            return Err(KubeletError::Backend(
-                "podman logs: reading from a byte offset is not supported on this backend".into(),
-            ));
-        }
-        let argv = Self::logs_argv(container_id, opts);
+        Ok(self.read_log(container_id, opts).await?.text)
+    }
+
+    /// `podman logs --timestamps`, always: the stamps are what `since`
+    /// filters on and what a follow's line cursor stays aligned with
+    /// whether or not the caller asked to see them.
+    async fn read_log(&self, container_id: &str, opts: &LogOptions) -> Result<LogRead, KubeletError> {
+        let stamped = LogOptions {
+            timestamps: true,
+            ..LogOptions::default()
+        };
+        let argv = Self::logs_argv(container_id, &stamped);
         let out = self
             .command(&argv)
             .output()
@@ -2485,9 +2611,13 @@ impl ContainerRuntime for PodmanBackend {
                 "podman logs failed for {container_id}: {stderr}"
             )));
         }
-        // podman writes container stdout to its own stdout; stderr carries
-        // podman diagnostics (empty on success). The container log is stdout.
-        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+        // The CLI writes the container's stdout to its stdout and the
+        // container's stderr to its stderr; both are the log.
+        let merged = merge_timestamped(
+            &String::from_utf8_lossy(&out.stdout),
+            &String::from_utf8_lossy(&out.stderr),
+        );
+        Ok(render_timestamped(&merged, opts))
     }
 }
 
@@ -3860,7 +3990,7 @@ mod tests {
         let opts = LogOptions {
             tail: Some(10),
             timestamps: true,
-            from_byte: None,
+            ..LogOptions::default()
         };
         assert_eq!(
             PodmanBackend::logs_argv("cid", &opts),

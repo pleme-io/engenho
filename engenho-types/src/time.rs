@@ -85,6 +85,49 @@ pub fn epoch_to_rfc3339_utc(secs: i64) -> Option<String> {
     DateTime::<Utc>::from_timestamp(secs, 0).map(to_rfc3339_utc)
 }
 
+/// Render a [`std::time::SystemTime`] as Go's `time.RFC3339Nano` in UTC:
+/// nanosecond precision with trailing zeros (and a bare `.`) dropped, Zulu
+/// suffix — `2026-10-13T12:00:00.5Z`, `2026-10-13T12:00:00Z`.
+///
+/// The shape a container runtime writes at the head of every CRI log line
+/// and the kubelet prints for `kubectl logs --timestamps`; a client that
+/// strips the first space-separated token of each line (k9s) relies on it
+/// containing no space. `None` for an instant chrono cannot represent.
+#[must_use]
+pub fn system_time_to_rfc3339_nano(t: std::time::SystemTime) -> Option<String> {
+    let since = t.duration_since(std::time::UNIX_EPOCH).ok()?;
+    let secs = i64::try_from(since.as_secs()).ok()?;
+    let at = DateTime::<Utc>::from_timestamp(secs, since.subsec_nanos())?;
+    let full = at.to_rfc3339_opts(SecondsFormat::Nanos, true);
+    let body = full.strip_suffix('Z')?;
+    let trimmed = match body.split_once('.') {
+        Some((whole, frac)) => {
+            let frac = frac.trim_end_matches('0');
+            if frac.is_empty() {
+                whole.to_owned()
+            } else {
+                [whole, ".", frac].concat()
+            }
+        }
+        None => body.to_owned(),
+    };
+    Some([trimmed.as_str(), "Z"].concat())
+}
+
+/// Parse an RFC3339 timestamp (any precision, any offset) into a
+/// [`std::time::SystemTime`]. `None` when it does not parse or precedes the
+/// Unix epoch.
+#[must_use]
+pub fn parse_rfc3339_system_time(stamp: &str) -> Option<std::time::SystemTime> {
+    let at = DateTime::parse_from_rfc3339(stamp).ok()?.with_timezone(&Utc);
+    let secs = u64::try_from(at.timestamp()).ok()?;
+    Some(
+        std::time::UNIX_EPOCH
+            + std::time::Duration::from_secs(secs)
+            + std::time::Duration::from_nanos(u64::from(at.timestamp_subsec_nanos())),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     /// MicroTime carries six fractional digits and a Zulu suffix, and parses
@@ -214,4 +257,41 @@ pub fn age_since_rfc3339(stamp: &str) -> Option<std::time::Duration> {
         .ok()?
         .with_timezone(&Utc);
     (Utc::now() - then).to_std().ok()
+}
+
+#[cfg(test)]
+mod nano_render {
+    use super::{parse_rfc3339_system_time, system_time_to_rfc3339_nano};
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn trailing_zeros_are_dropped_as_go_does() {
+        let t = UNIX_EPOCH + Duration::new(1_760_356_800, 500_000_000);
+        assert_eq!(
+            system_time_to_rfc3339_nano(t).as_deref(),
+            Some("2025-10-13T12:00:00.5Z")
+        );
+        let whole = UNIX_EPOCH + Duration::from_secs(1_760_356_800);
+        assert_eq!(
+            system_time_to_rfc3339_nano(whole).as_deref(),
+            Some("2025-10-13T12:00:00Z")
+        );
+        let fine = UNIX_EPOCH + Duration::new(1_760_356_800, 123_456_789);
+        assert_eq!(
+            system_time_to_rfc3339_nano(fine).as_deref(),
+            Some("2025-10-13T12:00:00.123456789Z")
+        );
+    }
+
+    #[test]
+    fn a_rendered_stamp_parses_back_to_the_same_instant() {
+        let t = UNIX_EPOCH + Duration::new(1_760_356_800, 42);
+        let s = system_time_to_rfc3339_nano(t).unwrap();
+        assert_eq!(parse_rfc3339_system_time(&s), Some(t));
+        assert_eq!(
+            parse_rfc3339_system_time("2025-10-13T09:00:00-03:00"),
+            Some(UNIX_EPOCH + Duration::from_secs(1_760_356_800))
+        );
+        assert_eq!(parse_rfc3339_system_time("yesterday"), None);
+    }
 }

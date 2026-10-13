@@ -54,6 +54,31 @@ pub fn qos_class(spec: Option<&Value>) -> &'static str {
     }
 }
 
+/// The annotation naming the container `kubectl` and k9s address when a
+/// request names none.
+pub const DEFAULT_CONTAINER_ANNOTATION: &str = "kubectl.kubernetes.io/default-container";
+
+/// The container a request that names none is about: the
+/// [`DEFAULT_CONTAINER_ANNOTATION`] when it names an app container, else the
+/// first app container in spec order (never an alphabetical first).
+/// `None` for a pod with no app containers.
+#[must_use]
+pub fn default_container(pod: &Value) -> Option<&str> {
+    let names = || {
+        pod.pointer("/spec/containers")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|c| c.get("name").and_then(Value::as_str))
+    };
+    let annotated = pod
+        .pointer("/metadata/annotations")
+        .and_then(|a| a.get(DEFAULT_CONTAINER_ANNOTATION))
+        .and_then(Value::as_str)
+        .filter(|d| names().any(|n| n == *d));
+    annotated.or_else(|| names().next())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,5 +126,19 @@ mod tests {
         stamp_birth_status(&mut body);
         assert_eq!(body["status"]["phase"], "Running");
         assert_eq!(body["status"]["qosClass"], "Guaranteed");
+    }
+
+    #[test]
+    fn the_default_container_is_the_annotation_else_the_first_in_spec_order() {
+        let spec = json!({"containers": [{"name": "zeta"}, {"name": "alpha"}]});
+        let plain = json!({"metadata": {"name": "p"}, "spec": spec});
+        assert_eq!(default_container(&plain), Some("zeta"));
+        let annotated = json!({"metadata": {"name": "p", "annotations": {
+            DEFAULT_CONTAINER_ANNOTATION: "alpha"}}, "spec": spec});
+        assert_eq!(default_container(&annotated), Some("alpha"));
+        let stale = json!({"metadata": {"name": "p", "annotations": {
+            DEFAULT_CONTAINER_ANNOTATION: "gone"}}, "spec": spec});
+        assert_eq!(default_container(&stale), Some("zeta"));
+        assert_eq!(default_container(&json!({"spec": {}})), None);
     }
 }

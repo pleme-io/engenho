@@ -88,6 +88,12 @@ pub trait ResourceHandler: Send + Sync + 'static {
         true
     }
 
+    /// Whether this kind serves only `get` and `list` (`metrics.k8s.io`).
+    /// Discovery advertises exactly those verbs for it. Default `false`.
+    fn read_only(&self) -> bool {
+        false
+    }
+
     /// GET the parent object's `/status` view. Default: a typed `NotFound`
     /// (this kind does not serve `/status`) — never a panic. `StoreBackedHandler`
     /// overrides for status-bearing kinds: it reads the live object (the
@@ -170,6 +176,37 @@ pub trait ResourceHandler: Send + Sync + 'static {
         _query: &LogQuery,
     ) -> Result<String, ApiError> {
         Err(self.no_subresource("log", name))
+    }
+
+    /// [`Self::logs`] with the cursor a follow resumes from
+    /// ([`crate::pod_logs::LogChunk`]). The default reads [`Self::logs`] and
+    /// counts its bytes from `from_byte`; the Pod handler overrides it
+    /// through its [`PodLogReader`].
+    async fn log_chunk(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+        query: &LogQuery,
+    ) -> Result<crate::pod_logs::LogChunk, ApiError> {
+        let text = self.logs(namespace, name, query).await?;
+        let cursor =
+            query.from_byte.unwrap_or(0) + u64::try_from(text.len()).unwrap_or(u64::MAX);
+        Ok(crate::pod_logs::LogChunk { text, cursor })
+    }
+
+    /// POST `pods/<name>/eviction`: delete the pod unless a
+    /// PodDisruptionBudget forbids it ([`crate::eviction`]). Default: a
+    /// typed `NotFound`; `StoreBackedHandler` serves it for a kind that
+    /// declares [`Subresource::Eviction`].
+    async fn evict(
+        &self,
+        _namespace: Option<&str>,
+        name: &str,
+        _eviction: &crate::eviction::Eviction,
+        _user_info: &UserInfo,
+        _dry_run: DryRun,
+    ) -> Result<(), ApiError> {
+        Err(self.no_subresource("eviction", name))
     }
 
     /// Open the kubelet side of a Pod `exec`/`attach`/`portforward` stream.
@@ -989,6 +1026,15 @@ impl ResourceHandler for StoreBackedHandler {
         name: &str,
         query: &LogQuery,
     ) -> Result<String, ApiError> {
+        Ok(self.log_chunk(namespace, name, query).await?.text)
+    }
+
+    async fn log_chunk(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+        query: &LogQuery,
+    ) -> Result<crate::pod_logs::LogChunk, ApiError> {
         // The Pod `/log` subresource. Delegate to the in-process kubelet log
         // reader when one is installed; without it (apiserver-only / tests),
         // serve a typed NotFound — never a fake-empty log.
@@ -1000,7 +1046,62 @@ impl ResourceHandler for StoreBackedHandler {
         // "default" defensively (key() would have rejected a scope mismatch on
         // any other verb).
         let ns = namespace.unwrap_or("default");
-        reader.read_pod_logs(ns, name, query).await
+        if query.container.is_some() {
+            return reader.read_pod_log_chunk(ns, name, query).await;
+        }
+        // No `?container=`: the one the pod names as its default, else its
+        // first in spec order — the same choice exec and attach make.
+        let pod = self.get(namespace, name).await?;
+        let container = crate::pod_stream::choose_container(&pod, None)?;
+        let defaulted = LogQuery {
+            container: Some(container),
+            ..query.clone()
+        };
+        reader.read_pod_log_chunk(ns, name, &defaulted).await
+    }
+
+    async fn evict(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+        eviction: &crate::eviction::Eviction,
+        user_info: &UserInfo,
+        dry_run: DryRun,
+    ) -> Result<(), ApiError> {
+        use crate::eviction::ignores_budgets;
+        if !self.subresources().contains(&Subresource::Eviction) {
+            return Err(self.no_subresource("eviction", name));
+        }
+        let dry_run = if eviction.dry_run { DryRun::All } else { dry_run };
+        let key = self.key(namespace, name)?;
+        let (pod, meta) = self
+            .store
+            .get_with_meta(&key)
+            .await
+            .ok_or_else(|| ApiError::NotFound(format!("pods \"{name}\" not found")))?;
+        if let Some(uid) = &eviction.uid
+            && pod.pointer("/metadata/uid").and_then(Value::as_str) != Some(uid.as_str())
+        {
+            return Err(ApiError::ResourceVersionConflict(format!(
+                "Operation cannot be fulfilled on pods \"{name}\": the UID in the precondition \
+                 ({uid}) does not match the UID in record"
+            )));
+        }
+        let expected = match &eviction.resource_version {
+            Some(rv) => Some(Revision(rv.parse::<u64>().map_err(|_| {
+                ApiError::BadRequest(format!("invalid resourceVersion precondition {rv:?}"))
+            })?)),
+            None => None,
+        };
+        if expected.is_some_and(|rv| rv != meta.mod_revision) {
+            return Err(self.rv_conflict(name, expected));
+        }
+        if !ignores_budgets(&pod) {
+            self.spend_budget(namespace, &pod, dry_run).await?;
+        }
+        self.delete_with_precondition(namespace, name, expected, user_info, dry_run)
+            .await
+            .map(|_| ())
     }
 
     async fn open_pod_stream(
@@ -1537,6 +1638,68 @@ impl StoreBackedHandler {
             .await
             .ok_or_else(|| ApiError::Internal("subresource patch lost during commit".into()))?;
         Ok(inject_type_meta(&stored, self.api_version(), &self.kind))
+    }
+}
+
+impl StoreBackedHandler {
+    /// The budget half of an eviction: find the one PodDisruptionBudget that
+    /// selects `pod` and spend a disruption from it, retrying a lost CAS
+    /// against a fresh read. `Ok` when no budget selects the pod or the one
+    /// that does lets it go without spending.
+    async fn spend_budget(
+        &self,
+        namespace: Option<&str>,
+        pod: &Value,
+        dry_run: DryRun,
+    ) -> Result<(), ApiError> {
+        use crate::eviction::{Decision, decide};
+        const ATTEMPTS: usize = 3;
+        for _ in 0..ATTEMPTS {
+            let pdbs: Vec<(ResourceKey, Value)> = self
+                .store
+                .list("policy", "v1", "PodDisruptionBudget", namespace)
+                .await
+                .into_iter()
+                .filter(|(_, pdb)| engenho_controllers::pdb_selects(pdb, pod))
+                .collect();
+            let (pdb_key, pdb) = match pdbs.as_slice() {
+                [] => return Ok(()),
+                [one] => one.clone(),
+                _ => {
+                    return Err(ApiError::Internal(
+                        "This pod has more than one PodDisruptionBudget, which the eviction \
+                         subresource does not support."
+                            .into(),
+                    ));
+                }
+            };
+            let patch = match decide(pod, &pdb, &engenho_types::time::now_rfc3339_utc())? {
+                Decision::Delete => return Ok(()),
+                Decision::Spend(patch) => patch,
+            };
+            if dry_run.is_dry() {
+                return Ok(());
+            }
+            let Some((_, meta)) = self.store.get_with_meta(&pdb_key).await else {
+                continue;
+            };
+            let applied = self
+                .store
+                .propose(ResourceCommand::patch_cas(
+                    pdb_key,
+                    patch,
+                    Some(meta.mod_revision),
+                    Reason::Operator,
+                ))
+                .await
+                .map_err(|e| ApiError::StorageError(e.to_string()))?;
+            if applied.op != ResourceOp::Conflict {
+                return Ok(());
+            }
+        }
+        Err(ApiError::DisruptionBudget(
+            "the disruption budget kept changing while this eviction was judged; retry".into(),
+        ))
     }
 }
 

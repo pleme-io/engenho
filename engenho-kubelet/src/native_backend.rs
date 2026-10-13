@@ -74,7 +74,7 @@
 //! cgroup kill on Linux and by none of the others.
 
 use crate::backend::{
-    Confinement, ContainerRuntime, ContainerSpec, ContainerStatus, ExecOutcome, LogOptions,
+    Confinement, ContainerRuntime, ContainerSpec, ContainerStatus, ExecOutcome, LogOptions, LogRead,
     Readoption, Resources,
 };
 use crate::cgroup::{
@@ -333,6 +333,8 @@ struct NativeContainer {
     /// The process's stdio as attachers reach it. Its output fan-outs also
     /// say when the log has received the last byte.
     stdio: crate::stream::AttachPoint,
+    /// One per stream framer: `true` once its last record is on disk.
+    log_written: Vec<tokio::sync::watch::Receiver<bool>>,
 }
 
 #[derive(Debug)]
@@ -718,6 +720,11 @@ impl NativeBackend {
             return Ok(Admission::Unbounded);
         };
         let plan = CgroupPlan::try_from(resources).map_err(NativeError::ResourcesUnparseable)?;
+        // A delegated tree gives every container a leaf, bounded or not: the
+        // leaf is also what its CPU and memory are read from.
+        if let Cgroups::Delegated(tree) = &self.cgroups {
+            return Ok(Admission::Bounded(Arc::clone(tree), plan));
+        }
         if plan.is_empty() {
             return Ok(Admission::Unbounded);
         }
@@ -856,14 +863,14 @@ impl NativeBackend {
     }
 }
 
-fn read_log_from(path: &Path, offset: u64) -> std::io::Result<String> {
+fn read_log_from(path: &Path, offset: u64) -> std::io::Result<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
     file.seek(SeekFrom::Start(offset.min(len)))?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok(bytes)
 }
 
 #[async_trait::async_trait]
@@ -910,14 +917,21 @@ impl ContainerRuntime for NativeBackend {
             detail: e.to_string(),
         })?;
         let log_path = self.log_dir.join(&id);
-        let log = std::fs::File::create(&log_path).map_err(|e| NativeError::Log {
+        let file = std::fs::File::create(&log_path).map_err(|e| NativeError::Log {
             path: log_path.clone(),
             detail: e.to_string(),
         })?;
-        let log_err = log.try_clone().map_err(|e| NativeError::Log {
-            path: log_path.clone(),
-            detail: e.to_string(),
-        })?;
+        // The log is CRI records, stamped as each line arrives: what
+        // `timestamps`, `sinceSeconds` and `sinceTime` read.
+        let shared = Arc::new(std::sync::Mutex::new(file));
+        let framed = |stream| {
+            crate::cri_log::framed_sink(Arc::clone(&shared), stream).map_err(|e| NativeError::Log {
+                path: log_path.clone(),
+                detail: e.to_string(),
+            })
+        };
+        let (log, out_written) = framed(crate::cri_log::LogStream::Stdout)?;
+        let (log_err, err_written) = framed(crate::cri_log::LogStream::Stderr)?;
 
         let mut cmd = workload_command(&program, argv.iter().skip(1), &spec.env);
         let pty = if spec.stdio.tty {
@@ -995,6 +1009,7 @@ impl ContainerRuntime for NativeBackend {
                 process: Process::Live(child),
                 leaf,
                 stdio,
+                log_written: vec![out_written, err_written],
             },
         );
         drop(state);
@@ -1067,30 +1082,53 @@ impl ContainerRuntime for NativeBackend {
     }
 
     async fn logs(&self, container_id: &str, opts: &LogOptions) -> Result<String, KubeletError> {
+        Ok(self.read_log(container_id, opts).await?.text)
+    }
+
+    /// Read from the container's cgroup leaf. A container with no leaf
+    /// (cgroups off, not delegated, or a host with none) is unmeasurable,
+    /// with the reason the node gives for not bounding it.
+    async fn usage(&self, container_id: &str) -> Result<crate::usage::Reading, KubeletError> {
+        let leaf = {
+            let guard = self.state.lock().map_err(|_| NativeError::StatePoisoned)?;
+            let c = guard.get(container_id).ok_or_else(|| NativeError::NoSuchContainer {
+                id: container_id.to_string(),
+            })?;
+            c.leaf.as_ref().map(|l| (Arc::clone(&l.tree), l.name.clone()))
+        };
+        let Some((tree, name)) = leaf else {
+            let why = match self.cgroups.enforcement() {
+                ResourceEnforcement::NotEnforced(reason) => reason.to_string(),
+                ResourceEnforcement::Enforced => {
+                    "the container has no cgroup leaf to read".to_owned()
+                }
+            };
+            return Ok(crate::usage::Reading::Unmeasurable(why));
+        };
+        Ok(match tree.usage(&name) {
+            Ok(c) => crate::usage::Reading::Measured(c),
+            Err(e) => crate::usage::Reading::Unmeasurable(e.to_string()),
+        })
+    }
+
+    /// The log is CRI records ([`crate::cri_log`]); the cursor is a byte
+    /// offset into them, always on a record boundary.
+    async fn read_log(&self, container_id: &str, opts: &LogOptions) -> Result<LogRead, KubeletError> {
         let found = {
             let mut guard = self.state.lock().map_err(|_| NativeError::StatePoisoned)?;
             match guard.get_mut(container_id) {
                 Some(c) => {
                     c.settle(container_id)?;
                     let exited = !c.run_state().is_running();
-                    Some((c.log_path.clone(), exited.then(|| c.stdio.clone())))
+                    Some((
+                        c.log_path.clone(),
+                        exited.then(|| (c.stdio.clone(), c.log_written.clone())),
+                    ))
                 }
                 None => None,
             }
         };
-        let path = found.as_ref().map(|(p, _)| p.clone());
-        if let Some((_, Some(stdio))) = found {
-            // The process is gone but its pump may still hold its last
-            // bytes; a log read right after exit must include them.
-            let drained = async {
-                stdio.stdout.ended().await;
-                if let Some(err) = &stdio.stderr {
-                    err.ended().await;
-                }
-            };
-            let _ = tokio::time::timeout(Duration::from_secs(2), drained).await;
-        }
-        let Some(path) = path else {
+        let Some((path, exited)) = found else {
             // A typed error, never a silently-empty success — the same rule the
             // trait states for podman.
             return Err(NativeError::NoSuchContainer {
@@ -1098,22 +1136,32 @@ impl ContainerRuntime for NativeBackend {
             }
             .into());
         };
-        let body =
-            read_log_from(&path, opts.from_byte.unwrap_or(0)).map_err(|e| NativeError::Log {
-                path: path.clone(),
-                detail: e.to_string(),
-            })?;
-        Ok(match opts.tail {
-            Some(n) => {
-                let lines: Vec<&str> = body.lines().collect();
-                let start = lines.len().saturating_sub(n as usize);
-                let mut out = lines[start..].join("\n");
-                if !out.is_empty() {
-                    out.push('\n');
+        let mut ended = false;
+        if let Some((stdio, written)) = exited {
+            // The process is gone but its pumps and framers may still hold
+            // its last bytes; a log read right after exit must include them.
+            let drained = async {
+                stdio.stdout.ended().await;
+                if let Some(err) = &stdio.stderr {
+                    err.ended().await;
                 }
-                out
-            }
-            None => body,
+                for mut w in written {
+                    let _ = w.wait_for(|done| *done).await;
+                }
+            };
+            ended = tokio::time::timeout(Duration::from_secs(2), drained)
+                .await
+                .is_ok();
+        }
+        let from = opts.from_byte.unwrap_or(0);
+        let bytes = read_log_from(&path, from).map_err(|e| NativeError::Log {
+            path: path.clone(),
+            detail: e.to_string(),
+        })?;
+        let rendered = crate::cri_log::render(&bytes, opts.render(), ended);
+        Ok(LogRead {
+            text: rendered.text,
+            cursor: from + u64::try_from(rendered.consumed).unwrap_or(u64::MAX),
         })
     }
 
@@ -1258,10 +1306,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("c.log");
         std::fs::write(&path, "one\ntwo\n").unwrap();
-        assert_eq!(read_log_from(&path, 0).unwrap(), "one\ntwo\n");
-        assert_eq!(read_log_from(&path, 4).unwrap(), "two\n");
-        assert_eq!(read_log_from(&path, 8).unwrap(), "");
-        assert_eq!(read_log_from(&path, 99).unwrap(), "");
+        assert_eq!(read_log_from(&path, 0).unwrap(), b"one\ntwo\n");
+        assert_eq!(read_log_from(&path, 4).unwrap(), b"two\n");
+        assert_eq!(read_log_from(&path, 8).unwrap(), b"");
+        assert_eq!(read_log_from(&path, 99).unwrap(), b"");
     }
 
     fn spec(image: &str, command: &[&str]) -> ContainerSpec {

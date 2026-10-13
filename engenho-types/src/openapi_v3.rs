@@ -69,6 +69,18 @@ pub const NODE_V1: &str =
 pub const AUTOSCALING_V2: &str =
     include_str!("../vendor/openapi/v1.34.0/apis__autoscaling__v2_openapi.json");
 
+/// The vendored authorization.k8s.io/v1 OpenAPI v3 document
+/// (SelfSubjectAccessReview and the other review kinds). Served so
+/// `kubectl create -f` of a review validates client-side.
+pub const AUTHORIZATION_V1: &str =
+    include_str!("../vendor/openapi/v1.34.0/apis__authorization.k8s.io__v1_openapi.json");
+
+/// Groups whose catalog rows are opaque (served by dedicated apiserver
+/// routes; the review kinds store nothing) but whose OpenAPI documents are
+/// served all the same, so client-side validation of them passes. The catalog-reflection invariant is
+/// `SERVED == non-opaque catalog pairs ∪ ROUTE_SERVED`.
+pub const ROUTE_SERVED: &[(&str, &str)] = &[("authorization.k8s.io", "v1")];
+
 /// One served OpenAPI v3 group document: the `(group, version)` it
 /// describes, the embedded body, and the BLAKE3 digest from the manifest
 /// (used as the `?hash=` cache key in the discovery index).
@@ -173,6 +185,13 @@ pub const SERVED: &[ServedDoc] = &[
         version: "v2",
         body: AUTOSCALING_V2,
         blake3: "c9985c686485a5d03bf250b32ac48d73d287e56e3493242f5b354565d8e5d396",
+    },
+    // ── route-served groups (ROUTE_SERVED) ─────────────────────────────────
+    ServedDoc {
+        group: "authorization.k8s.io",
+        version: "v1",
+        body: AUTHORIZATION_V1,
+        blake3: "17ca9852dba2c1b26b897d984d01c50c55a43c670b28f40d1772c78155a93755",
     },
 ];
 
@@ -436,11 +455,24 @@ mod verb_tests {
     #[test]
     fn unvendored_group_is_none_not_empty() {
         assert_eq!(
-            verbs_for("authorization.k8s.io", "v1", "selfsubjectaccessreviews"),
+            verbs_for("certificates.k8s.io", "v1", "certificatesigningrequests"),
             None,
-            "the 8 opaque groups have no vendored document — report ignorance"
+            "an opaque group has no vendored document — report ignorance"
         );
         assert_eq!(verbs_for("no.such.group", "v1", "widgets"), None);
+    }
+
+    /// The review kinds' document is vendored: `kubectl create -f` of a
+    /// SelfSubjectAccessReview validates against it.
+    #[test]
+    fn the_authorization_document_is_served_with_its_create_verb() {
+        let v = verbs_for("authorization.k8s.io", "v1", "selfsubjectaccessreviews")
+            .expect("authorization.k8s.io/v1 is vendored");
+        assert!(v.contains(&Verb::Create));
+        assert!(
+            document_for("authorization.k8s.io", "v1")
+                .is_some_and(|d| d.contains("io.k8s.api.authorization.v1.SelfSubjectAccessReview"))
+        );
     }
 
     /// A plural that does not appear in a vendored doc is also ignorance.

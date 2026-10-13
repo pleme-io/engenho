@@ -252,6 +252,7 @@ fn every_subresources_slice_is_a_subset_of_known_subresources() {
                         | Subresource::Exec
                         | Subresource::Attach
                         | Subresource::PortForward
+                        | Subresource::Eviction
                 ),
                 "{}: subresource must be a known variant",
                 d.kind
@@ -284,12 +285,13 @@ fn log_subresource_is_only_on_pod() {
 }
 
 #[test]
-fn streaming_subresources_are_only_on_pod() {
+fn pod_only_subresources_are_only_on_pod() {
     for d in RESOURCE_CATALOG {
         for sub in [
             Subresource::Exec,
             Subresource::Attach,
             Subresource::PortForward,
+            Subresource::Eviction,
         ] {
             let has = d.subresources.contains(&sub);
             if d.kind == "Pod" {
@@ -406,6 +408,7 @@ fn served_openapi_tuples_equal_non_opaque_catalog_group_version_pairs() {
         .iter()
         .filter(|d| !d.opaque)
         .map(|d| (d.group, d.version))
+        .chain(engenho_types::openapi_v3::ROUTE_SERVED.iter().copied())
         .collect();
     let served_pairs: std::collections::BTreeSet<(&str, &str)> = engenho_types::openapi_v3::SERVED
         .iter()
@@ -413,7 +416,7 @@ fn served_openapi_tuples_equal_non_opaque_catalog_group_version_pairs() {
         .collect();
     assert_eq!(
         served_pairs, catalog_pairs,
-        "served OpenAPI-v3 (group,version) set must equal the NON-OPAQUE RESOURCE_CATALOG's"
+        "served OpenAPI-v3 (group,version) set must equal the NON-OPAQUE RESOURCE_CATALOG's plus ROUTE_SERVED"
     );
 
     // And the apiextensions group (the opaque CRD kind) is deliberately

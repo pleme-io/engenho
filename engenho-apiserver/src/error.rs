@@ -106,6 +106,15 @@ pub enum ApiError {
     StorageError(String),
     #[error("{0}")]
     ServiceUnavailable(String),
+    /// An eviction a PodDisruptionBudget does not allow now — upstream's 429
+    /// `TooManyRequests` with one `DisruptionBudget` cause naming the budget
+    /// (`pods/eviction`). kubectl drain reads the 429 and retries.
+    #[error("Cannot evict pod as it would violate the pod's disruption budget.")]
+    DisruptionBudget(String),
+    /// A verb the resource does not serve at all — upstream's 405
+    /// `MethodNotAllowed` (a write on `metrics.k8s.io`).
+    #[error("{0}")]
+    MethodNotAllowed(String),
 }
 
 /// Stable kind tag used in error JSON for clients to dispatch on.
@@ -127,6 +136,8 @@ pub enum ErrorKind {
     Internal,
     StorageError,
     ServiceUnavailable,
+    DisruptionBudget,
+    MethodNotAllowed,
 }
 
 impl ApiError {
@@ -149,6 +160,8 @@ impl ApiError {
             Self::Internal(_) => ErrorKind::Internal,
             Self::StorageError(_) => ErrorKind::StorageError,
             Self::ServiceUnavailable(_) => ErrorKind::ServiceUnavailable,
+            Self::DisruptionBudget(_) => ErrorKind::DisruptionBudget,
+            Self::MethodNotAllowed(_) => ErrorKind::MethodNotAllowed,
         }
     }
 
@@ -168,6 +181,8 @@ impl ApiError {
             Self::TooLargeResourceVersion(_) => StatusCode::GATEWAY_TIMEOUT,
             Self::Internal(_) | Self::StorageError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::DisruptionBudget(_) => StatusCode::TOO_MANY_REQUESTS,
+            Self::MethodNotAllowed(_) => StatusCode::METHOD_NOT_ALLOWED,
         }
     }
 }
@@ -398,6 +413,8 @@ impl ApiError {
             Self::TooLargeResourceVersion(_) => "Timeout",
             Self::Internal(_) => "InternalError",
             Self::StorageError(_) | Self::ServiceUnavailable(_) => "ServiceUnavailable",
+            Self::DisruptionBudget(_) => "TooManyRequests",
+            Self::MethodNotAllowed(_) => "MethodNotAllowed",
         }
     }
 
@@ -436,6 +453,15 @@ impl ApiError {
                         message: "Too large resource version",
                     }],
                     retry_after_seconds: crate::list_floor::TOO_LARGE_RETRY_AFTER_SECONDS,
+                }),
+            )
+            .to_value(),
+            Self::DisruptionBudget(cause) => K8sStatus::failure(
+                code,
+                self.reason(),
+                self.to_string(),
+                Some(StatusCauseDetails {
+                    causes: serde_json::json!([{"reason": "DisruptionBudget", "message": cause}]),
                 }),
             )
             .to_value(),

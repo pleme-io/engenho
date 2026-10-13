@@ -102,3 +102,9 @@ files:
     description: "Autoscaling API — HorizontalPodAutoscaler"
     blake3: "c9985c686485a5d03bf250b32ac48d73d287e56e3493242f5b354565d8e5d396"
     bytes: 201301
+  - path: apis__authorization.k8s.io__v1_openapi.json
+    group: authorization.k8s.io
+    version: v1
+    description: "Authorization API — SelfSubjectAccessReview, SelfSubjectRulesReview, SubjectAccessReview, LocalSubjectAccessReview (served by dedicated routes, not catalog kinds)"
+    blake3: "17ca9852dba2c1b26b897d984d01c50c55a43c670b28f40d1772c78155a93755"
+    bytes: 77913
