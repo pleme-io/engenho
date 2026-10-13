@@ -2141,10 +2141,11 @@ async fn do_get_log(
     name: &str,
     query: &crate::pod_logs::LogQuery,
 ) -> Result<Response, ApiError> {
+    query.admit(name)?;
     if query.follow {
         return follow_log(h, ns, name, query).await;
     }
-    let text = h.logs(ns, name, query).await?;
+    let text = crate::pod_logs::truncate_to(h.logs(ns, name, query).await?, query.limit_bytes);
     // text/plain — the log stream body. kubectl reads stdout verbatim.
     Ok((
         StatusCode::OK,
@@ -2174,6 +2175,7 @@ async fn follow_log(
         Some(n) => crate::pod_logs::last_lines(&text, n),
         None => text,
     };
+    let budget = query.limit_bytes.unwrap_or(u64::MAX);
     let state = (
         Arc::clone(h),
         ns.map(str::to_owned),
@@ -2206,12 +2208,40 @@ async fn follow_log(
             }
         }
     });
+    let stream = limit_stream(stream, budget);
     Ok((
         StatusCode::OK,
         [(CONTENT_TYPE, "text/plain; charset=utf-8")],
         axum::body::Body::from_stream(stream),
     )
         .into_response())
+}
+
+/// End a followed log once `budget` bytes have been sent (`?limitBytes=`):
+/// the response closes on the chunk that spends the budget, not on the next.
+fn limit_stream<S>(
+    inner: S,
+    budget: u64,
+) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>>
+where
+    S: futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static,
+{
+    use futures::StreamExt;
+    futures::stream::unfold((inner.boxed(), budget), |(mut inner, left)| async move {
+        if left == 0 {
+            return None;
+        }
+        match inner.next().await? {
+            Ok(mut chunk) => {
+                let n = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+                if n > left {
+                    chunk.truncate(usize::try_from(left).unwrap_or(usize::MAX));
+                }
+                Some((Ok(chunk), (inner, left.saturating_sub(n))))
+            }
+            Err(e) => Some((Err(e), (inner, 0))),
+        }
+    })
 }
 
 async fn do_put_scale(
@@ -2377,15 +2407,19 @@ async fn resource_create(
     // the typed BadRequest below.
     if let Some(sub) = &coords.subresource {
         let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
-        if let Ok(Some(SubresourceTarget { subresource, name })) = resolve_subresource(&coords, &h)
+        // An undeclared subresource is upstream's 404 whatever the verb: a
+        // client probing `pods/eviction` (kubectl drain, k9s drain) must read
+        // "not served", not "bad request".
+        let target = resolve_subresource(&coords, &h)?;
+        if let Some(SubresourceTarget { subresource, name }) = target
             && let Some(kind) = PodStreamKind::of(subresource)
         {
             return do_pod_stream(&h, coords.namespace.as_deref(), name, kind, upgrade, &uri).await;
         }
-        if let Ok(Some(SubresourceTarget {
+        if let Some(SubresourceTarget {
             subresource: Subresource::Token,
             name,
-        })) = resolve_subresource(&coords, &h)
+        }) = target
         {
             let mut warnings = Warnings::default();
             subresource_directive(raw_directive, WriteOptions::Create, "token", &mut warnings)?;

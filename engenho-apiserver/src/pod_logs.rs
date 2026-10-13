@@ -30,10 +30,69 @@ pub struct LogQuery {
     /// (kubectl `--timestamps`). Default `false`.
     #[serde(default)]
     pub timestamps: bool,
+    /// `?follow=true` — keep the response open and stream what is appended
+    /// (kubectl `-f`, and every k9s Logs view).
     #[serde(default)]
     pub follow: bool,
+    /// `?previous=true` — the previous terminated instance's log (kubectl
+    /// `-p`, k9s `p`). No backend keeps a previous instance's log, so this is
+    /// refused the way upstream refuses it when there is none, never answered
+    /// with the current instance's log.
+    #[serde(default)]
+    pub previous: bool,
+    /// `?limitBytes=<n>` — end the response after `n` bytes (k9s "head").
+    #[serde(default, rename = "limitBytes")]
+    pub limit_bytes: Option<u64>,
+    /// `?sinceSeconds=<n>` — validated (upstream's `>= 1`), not yet honoured:
+    /// the native log carries no per-line time.
+    #[serde(default, rename = "sinceSeconds")]
+    pub since_seconds: Option<i64>,
     #[serde(skip)]
     pub from_byte: Option<u64>,
+}
+
+impl LogQuery {
+    /// Refuse what upstream refuses before any log is read.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::BadRequest`] for `previous=true` (no previous instance is
+    /// kept), a `sinceSeconds` below 1, or a `limitBytes` of 0.
+    pub fn admit(&self, pod: &str) -> Result<(), ApiError> {
+        if self.previous {
+            let container = self.container.as_deref().unwrap_or_default();
+            return Err(ApiError::BadRequest(format!(
+                "previous terminated container {container:?} in pod {pod:?} not found"
+            )));
+        }
+        if self.since_seconds.is_some_and(|s| s < 1) {
+            return Err(ApiError::BadRequest(
+                "sinceSeconds: Invalid value: must be greater than 0".into(),
+            ));
+        }
+        if self.limit_bytes == Some(0) {
+            return Err(ApiError::BadRequest(
+                "limitBytes: Invalid value: must be greater than 0".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Cut `text` to at most `limit` bytes on a char boundary.
+#[must_use]
+pub fn truncate_to(mut text: String, limit: Option<u64>) -> String {
+    let Some(limit) = limit.and_then(|l| usize::try_from(l).ok()) else {
+        return text;
+    };
+    if text.len() > limit {
+        let mut cut = limit;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+    }
+    text
 }
 
 /// The in-process Pod-log reader the apiserver's Pod handler delegates to.
@@ -72,7 +131,15 @@ pub fn last_lines(text: &str, n: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::last_lines;
+    use super::{last_lines, truncate_to};
+
+    #[test]
+    fn truncate_to_respects_the_limit_and_char_boundaries() {
+        assert_eq!(truncate_to("abcdef".into(), Some(3)), "abc");
+        assert_eq!(truncate_to("ab".into(), Some(3)), "ab");
+        assert_eq!(truncate_to("aé".into(), Some(2)), "a");
+        assert_eq!(truncate_to("abc".into(), None), "abc");
+    }
 
     #[test]
     fn last_lines_keeps_the_tail_and_its_newline() {
