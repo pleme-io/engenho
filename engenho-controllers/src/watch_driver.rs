@@ -1171,6 +1171,44 @@ mod tests {
         probe.stats()
     }
 
+    /// Ticks in the first `run_for` of a driver with `filter` and a
+    /// fallback far longer than that.
+    async fn ticks_before_the_fallback(filter: KindFilter) -> u64 {
+        let probe = Probe::new(Answer::Done);
+        let config = WatchDriverConfig {
+            filter,
+            fallback_interval: Duration::from_secs(600),
+            ..WatchDriverConfig::default()
+        };
+        let driver = tokio::spawn(run(
+            probe.clone(),
+            Feed::new(),
+            config,
+            Arc::new(Heartbeat::new()),
+        ));
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        driver.abort();
+        let _ = driver.await;
+        probe.stats().ticks
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_poller_ticks_at_start_and_an_event_driven_driver_waits() {
+        assert!(KindFilter::Kinds(Vec::new()).wakes_on_nothing());
+        assert!(!KindFilter::kind("Pod").wakes_on_nothing());
+        assert!(!KindFilter::All.wakes_on_nothing());
+        assert_eq!(
+            ticks_before_the_fallback(KindFilter::Kinds(Vec::new())).await,
+            1,
+            "a driver no event wakes polls first"
+        );
+        assert_eq!(
+            ticks_before_the_fallback(KindFilter::kind("Pod")).await,
+            0,
+            "an event-driven driver is woken by its events"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_controller_that_always_requeues_gets_one_slot_not_a_chain() {
         let probe = Probe::new(Answer::Requeue(REQUEUE_AFTER));
