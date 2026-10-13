@@ -249,8 +249,11 @@ fn every_subresources_slice_is_a_subset_of_known_subresources() {
                         | Subresource::Scale
                         | Subresource::Log
                         | Subresource::Token
+                        | Subresource::Exec
+                        | Subresource::Attach
+                        | Subresource::PortForward
                 ),
-                "{}: subresource must be Status, Scale, Log, or Token",
+                "{}: subresource must be a known variant",
                 d.kind
             );
         }
@@ -276,6 +279,24 @@ fn log_subresource_is_only_on_pod() {
             assert!(has_log, "Pod must serve the /log subresource");
         } else {
             assert!(!has_log, "{} must NOT serve /log (Pod-only)", d.kind);
+        }
+    }
+}
+
+#[test]
+fn streaming_subresources_are_only_on_pod() {
+    for d in RESOURCE_CATALOG {
+        for sub in [
+            Subresource::Exec,
+            Subresource::Attach,
+            Subresource::PortForward,
+        ] {
+            let has = d.subresources.contains(&sub);
+            if d.kind == "Pod" {
+                assert!(has, "Pod must serve {sub:?}");
+            } else {
+                assert!(!has, "{} must NOT serve {sub:?} (Pod-only)", d.kind);
+            }
         }
     }
 }

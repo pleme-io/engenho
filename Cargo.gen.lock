@@ -1,9 +1,9 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "ec02d6f2bc4b1167f3d6281a12ec802c30e3973cb74fc6b804638d247d717084",
+  "cargo_lock_sha256": "c934f8c20adabad89e8917dabdd6c5e6e0b63ff1cb5cc6eda1d7a39a5acf80b4",
   "manifest_sha256": {
     "Cargo.toml": "64815eaf890cd6e35f9e68a7cb3d63d6f0f49dd52aad003493c31f168a4e0d7f",
-    "engenho-apiserver/Cargo.toml": "a42bf1f662ba3dbab338a871c0979aa15dfb734a22435d96e36e65cfa47d5abf",
+    "engenho-apiserver/Cargo.toml": "79515dd5cf6035695922700a1d48f88ac61360969c362bdec1e175280209a894",
     "engenho-cluster-config-render/Cargo.toml": "5f5f6d40c2b9a572f18418d12e568412517972684259f34a9aa3d34de0a5dc8c",
     "engenho-cluster-config/Cargo.toml": "49d8ea7131956ec2d6323ae41968f624fab66bbbbca1afbb0537b2327a683391",
     "engenho-cni/Cargo.toml": "f885e491a2490e5d1503fafe0f625ada2c38ade0ccac21ee27a6ab595f368945",
@@ -4023,6 +4023,34 @@
             "tree": "target"
           },
           {
+            "name": "hyper",
+            "package_key": "hyper-1.10.0",
+            "kind": "normal",
+            "features": [
+              "client",
+              "http1",
+              "http1",
+              "server"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "hyper_util",
+            "package_key": "hyper-util-0.1.20",
+            "kind": "normal",
+            "features": [
+              "tokio",
+              "tokio"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
             "name": "percent_encoding",
             "package_key": "percent-encoding-2.3.2",
             "kind": "normal",
@@ -4181,6 +4209,16 @@
               "ring"
             ],
             "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tokio_tungstenite",
+            "package_key": "tokio-tungstenite-0.24.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
             "optional": false,
             "target": null,
             "tree": "target"

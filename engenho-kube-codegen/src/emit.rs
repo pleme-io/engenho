@@ -360,6 +360,12 @@ pub enum Subresource {
     /// whose response body is not the stored object — nothing is persisted,
     /// the minted token is returned in `.status.token` and never stored.
     Token,
+    /// `/exec` — WebSocket stream relayed to the node kubelet.
+    Exec,
+    /// `/attach` — WebSocket stream relayed to the node kubelet.
+    Attach,
+    /// `/portforward` — WebSocket stream relayed to the node kubelet.
+    PortForward,
 }
 
 /// One runtime row describing a routable/discoverable Kubernetes kind.
@@ -538,6 +544,9 @@ fn render_subresources(items: &[Subresource]) -> String {
             Subresource::Scale => "Subresource::Scale",
             Subresource::Log => "Subresource::Log",
             Subresource::Token => "Subresource::Token",
+            Subresource::Exec => "Subresource::Exec",
+            Subresource::Attach => "Subresource::Attach",
+            Subresource::PortForward => "Subresource::PortForward",
         })
         .collect::<Vec<_>>()
         .join(", ");

@@ -308,6 +308,14 @@ impl RequestInfo {
 
     fn classify(method: &str, target: RequestTarget, is_watch: bool) -> Self {
         let verb = match &target {
+            RequestTarget::Resource(c)
+                if c.name.is_some()
+                    && c.subresource.as_deref().is_some_and(
+                        crate::pod_stream::PodStreamKind::is_streaming_subresource,
+                    ) =>
+            {
+                "create".to_string()
+            }
             RequestTarget::Resource(c) => resource_verb(method, c.name.is_some(), is_watch),
             // The RBAC verb for a non-resource path is the lowercased method.
             RequestTarget::NonResource(_) => method.to_ascii_lowercase(),
@@ -409,6 +417,25 @@ fn watch_requested(uri: &Uri) -> Result<bool, RequestInfoError> {
         .iter()
         .find(|(k, _)| k == "watch")
         .is_some_and(|(_, v)| crate::params::query_flag(v)))
+}
+
+#[cfg(test)]
+mod stream_verb_tests {
+    use super::RequestInfo;
+
+    #[test]
+    fn streaming_subresources_are_judged_as_create_for_every_method() {
+        for sub in ["exec", "attach", "portforward"] {
+            let path = format!("/api/v1/namespaces/default/pods/p1/{sub}");
+            for method in ["GET", "POST"] {
+                let info = RequestInfo::from_method_path(method, &path, false);
+                assert_eq!(info.verb, "create", "{method} {sub}");
+            }
+        }
+        let log =
+            RequestInfo::from_method_path("GET", "/api/v1/namespaces/default/pods/p1/log", false);
+        assert_eq!(log.verb, "get");
+    }
 }
 
 /// Map an HTTP method on a RESOURCE path to the RBAC verb, given whether the

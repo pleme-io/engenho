@@ -564,7 +564,7 @@ impl Runtime {
         //     IS this process's kubelet, so the read is in-process. `register`
         //     keys on (group, version, plural) so it overwrites the Pod entry
         //     atomically (same swap mechanism the CRD sink uses).
-        if let Some(pod_handler) = build_pod_log_handler(store, &admission, parts.log_reader()) {
+        if let Some(pod_handler) = build_pod_log_handler(store, &admission, &parts) {
             router_state_for_logs.register(pod_handler);
             info!("registered Pod /log handler (in-process kubelet log reader)");
         }
@@ -1352,7 +1352,7 @@ impl engenho_apiserver::PodLogReader for KubeletLogReader {
 fn build_pod_log_handler(
     store: &Arc<StoreMesh>,
     admission: &Arc<AdmissionChain>,
-    log_reader: Arc<dyn engenho_apiserver::PodLogReader>,
+    parts: &Parts,
 ) -> Option<Arc<dyn engenho_apiserver::ResourceHandler>> {
     let pod_descriptor = engenho_types::generated_v1_34::RESOURCE_CATALOG
         .iter()
@@ -1360,8 +1360,74 @@ fn build_pod_log_handler(
     let handler =
         engenho_apiserver::StoreBackedHandler::from_descriptor(store.clone(), pod_descriptor)
             .with_admission(admission.clone())
-            .with_log_reader(log_reader);
+            .with_log_reader(parts.log_reader())
+            .with_stream_proxy(parts.stream_proxy());
     Some(Arc::new(handler))
+}
+
+/// Where this node's kubelet listener is bound, once it is: `None` before the
+/// first bind and after it stops.
+pub(crate) type KubeletEndpoint = Arc<arc_swap::ArcSwapOption<SocketAddr>>;
+
+/// The Pod streaming relay: resolves the pod's node to a kubelet address and
+/// dials it over the kubelet's own WebSocket protocol, even on this node.
+struct KubeletStreamProxy {
+    store: Arc<StoreMesh>,
+    local_node: String,
+    local_kubelet: KubeletEndpoint,
+}
+
+impl KubeletStreamProxy {
+    async fn authority(&self, node: &str) -> Result<String, engenho_apiserver::ApiError> {
+        if node == self.local_node {
+            let Some(bound) = self.local_kubelet.load_full() else {
+                return Err(engenho_apiserver::ApiError::ServiceUnavailable(format!(
+                    "the kubelet listener on node {node} is not bound"
+                )));
+            };
+            let ip = match bound.ip() {
+                std::net::IpAddr::V4(v4) if v4.is_unspecified() => {
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                }
+                std::net::IpAddr::V6(v6) if v6.is_unspecified() => {
+                    std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+                }
+                ip => ip,
+            };
+            return Ok(SocketAddr::new(ip, bound.port()).to_string());
+        }
+        let Some(live) = self
+            .store
+            .get(&crate::node_registration::node_key(node))
+            .await
+        else {
+            return Err(engenho_apiserver::ApiError::NotFound(format!(
+                "node {node} not found"
+            )));
+        };
+        engenho_apiserver::kubelet_authority_of_node(&live).ok_or_else(|| {
+            engenho_apiserver::ApiError::ServiceUnavailable(format!(
+                "node {node} publishes no kubelet address (status.addresses)"
+            ))
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl engenho_apiserver::PodStreamProxy for KubeletStreamProxy {
+    async fn open(
+        &self,
+        target: &engenho_apiserver::PodStreamTarget,
+    ) -> Result<engenho_apiserver::PodStreamUpstream, engenho_apiserver::ApiError> {
+        let Some(node) = target.node_name.as_deref() else {
+            return Err(engenho_apiserver::ApiError::BadRequest(format!(
+                "pod {}/{} does not have a host assigned",
+                target.namespace, target.pod
+            )));
+        };
+        let authority = self.authority(node).await?;
+        engenho_apiserver::dial_kubelet(&authority, target).await
+    }
 }
 
 /// Render a small signed int without `format!()` (★★ TYPED EMISSION).
@@ -3340,6 +3406,7 @@ struct Parts {
     events: Arc<dyn EventSink>,
     scheduler: Arc<ConfiguredSchedulerLoop>,
     kubelet: KubeletSlot,
+    kubelet_endpoint: KubeletEndpoint,
     /// The apiserver's own route table (the SAME Arc-backed state it
     /// serves): the node-manifests driver applies through it, so a node's
     /// declared objects take the path `kubectl apply --server-side` takes.
@@ -3391,6 +3458,7 @@ impl Parts {
             events,
             scheduler,
             kubelet: Arc::new(ArcSwap::new(kubelet)),
+            kubelet_endpoint: KubeletEndpoint::default(),
             router: router.clone(),
         }
     }
@@ -3428,6 +3496,16 @@ impl Parts {
         })
     }
 
+    /// The Pod `exec`/`attach`/`portforward` relay, which dials the kubelet
+    /// listener of the pod's node.
+    fn stream_proxy(&self) -> Arc<KubeletStreamProxy> {
+        Arc::new(KubeletStreamProxy {
+            store: self.store.clone(),
+            local_node: self.boot.node_name.clone(),
+            local_kubelet: self.kubelet_endpoint.clone(),
+        })
+    }
+
     /// Put a [`Renewal`] in place: the next [`Self::task`] builds from it.
     fn install(&mut self, renewal: Renewal) {
         match renewal {
@@ -3447,6 +3525,7 @@ impl Parts {
                 &self.boot,
                 Arc::downgrade(&self.kubelet.load()),
                 &self.store,
+                &self.kubelet_endpoint,
             )),
             // Renewed by the kubelet's row, so built from it. The kubelet is
             // walked first and always enabled; were it absent, the lease
@@ -3712,6 +3791,7 @@ pub(crate) fn listener_task(
     boot: &BootConfig,
     kubelet: std::sync::Weak<Kubelet>,
     store: &Arc<StoreMesh>,
+    kubelet_endpoint: &KubeletEndpoint,
 ) -> ChildTask {
     let beat = Arc::new(Heartbeat::new());
     let addr = listener.listen_addr(boot).to_owned();
@@ -3719,10 +3799,11 @@ pub(crate) fn listener_task(
         Listener::KubeletHttp => {
             let api: Arc<dyn engenho_kubelet::server::KubeletApi> =
                 Arc::new(WeakKubeletApi { kubelet });
+            let endpoint = kubelet_endpoint.clone();
             ChildTask::new(
                 beat.clone(),
                 serve_rebinding(listener, beat, move || {
-                    serve_kubelet_http(addr.clone(), api.clone())
+                    serve_kubelet_http(addr.clone(), api.clone(), endpoint.clone())
                 }),
             )
         }
@@ -3949,15 +4030,21 @@ fn build_kubelet(
 /// and killing a working control plane because one auxiliary port is taken
 /// trades a partial outage for a total one. This is ONE attempt; when it
 /// ends, [`serve_rebinding`] records it and binds again after a backoff.
-async fn serve_kubelet_http(addr: String, api: Arc<dyn engenho_kubelet::server::KubeletApi>) {
+async fn serve_kubelet_http(
+    addr: String,
+    api: Arc<dyn engenho_kubelet::server::KubeletApi>,
+    endpoint: KubeletEndpoint,
+) {
     match tokio::net::TcpListener::bind(&addr).await {
         Ok(listener) => {
-            let bound = listener
-                .local_addr()
-                .map_or_else(|_| addr.clone(), |a| a.to_string());
+            let local = listener.local_addr().ok();
+            endpoint.store(local.map(Arc::new));
+            let bound = local.map_or_else(|| addr.clone(), |a| a.to_string());
             info!(addr = %bound, "kubelet HTTP surface bound");
             let app = engenho_kubelet::server::KubeletServer::new(api).routes();
-            match axum::serve(listener, app).await {
+            let served = axum::serve(listener, app).await;
+            endpoint.store(None);
+            match served {
                 Ok(()) => warn!(addr = %bound, "kubelet HTTP surface stopped"),
                 Err(e) => warn!(addr = %bound, error = %e, "kubelet HTTP surface stopped"),
             }

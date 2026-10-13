@@ -258,7 +258,7 @@ impl HostOwned {
 }
 
 /// The store key of a Node.
-fn node_key(node: &str) -> ResourceKey {
+pub(crate) fn node_key(node: &str) -> ResourceKey {
     ResourceKey::cluster_scoped(Node::GVK.group, Node::GVK.version, Node::GVK.kind, node)
 }
 

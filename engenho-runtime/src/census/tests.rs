@@ -571,6 +571,33 @@ async fn a_bare_parent_grant_of_a_served_subresource_is_reported() {
     );
 }
 
+#[tokio::test]
+async fn a_streaming_subresource_is_probed_only_under_create() {
+    let source = rbac_fixture(
+        vec![cluster_role(
+            "pod-maker",
+            &json!([
+                {"apiGroups": [""], "resources": ["pods"], "verbs": ["create", "get"]},
+                {"apiGroups": [""], "resources": ["pods/log", "pods/status"], "verbs": ["create", "get"]}
+            ]),
+        )],
+        vec![crb(
+            "carol-pods",
+            "pod-maker",
+            &json!([{"kind": "User", "name": "carol"}]),
+        )],
+    );
+    let report = census(Predicate::RbacBareParentOnly, &source).await;
+    assert_eq!(
+        lost(&report),
+        [
+            "User carol create pods/attach",
+            "User carol create pods/exec",
+            "User carol create pods/portforward"
+        ]
+    );
+}
+
 /// A subject whose rules grant the subresource explicitly lost nothing
 /// there; `system:masters` is allowed everything and never reported. What
 /// the explicit rules do not cover is still reported.

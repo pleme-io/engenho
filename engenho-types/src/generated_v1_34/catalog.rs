@@ -40,6 +40,12 @@ pub enum Subresource {
     /// whose response body is not the stored object — nothing is persisted,
     /// the minted token is returned in `.status.token` and never stored.
     Token,
+    /// `/exec` — WebSocket stream relayed to the node kubelet.
+    Exec,
+    /// `/attach` — WebSocket stream relayed to the node kubelet.
+    Attach,
+    /// `/portforward` — WebSocket stream relayed to the node kubelet.
+    PortForward,
 }
 /// One runtime row describing a routable/discoverable Kubernetes kind.
 ///
@@ -145,7 +151,13 @@ pub const RESOURCE_CATALOG: &[ResourceDescriptor] = &[
         singular: "pod",
         categories: &["all"],
         opaque: false,
-        subresources: &[Subresource::Status, Subresource::Log],
+        subresources: &[
+            Subresource::Status,
+            Subresource::Log,
+            Subresource::Exec,
+            Subresource::Attach,
+            Subresource::PortForward,
+        ],
     },
     ResourceDescriptor {
         group: "",

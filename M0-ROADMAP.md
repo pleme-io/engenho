@@ -144,7 +144,7 @@ reuse is wanted — not needed to ship M0.0). What actually landed:
   typed `NotFound`); cgroup-v2 limit enforcement via rustix; eviction; image
   pull + imagePullSecrets.
 - **GATE:** real-pod e2e; `kubectl logs` **(MET)**; `kubectl exec/port-forward`
-  (deferred); Pending→Running→Ready→Terminated **(MET for the run/restart
+  (apiserver relay MET 2026-10-13; kubelet stream protocol in progress); Pending→Running→Ready→Terminated **(MET for the run/restart
   lifecycle; probes-driven Ready deferred)**.
 
 ### M0.4 — Data-plane networking *(single-node complete; rio-ready; ~6–8 wk)*

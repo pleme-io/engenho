@@ -200,9 +200,13 @@ fn listener_with(listener: Listener, fault: Fault, world: &World) -> ChildTask {
             serve_rebinding(listener, beat, returning_attempt),
         ),
         // The listener's own body, binding its own address, which is taken.
-        Fault::BindFailure => {
-            listener_task(listener, &world.boot, std::sync::Weak::new(), &world.store)
-        }
+        Fault::BindFailure => listener_task(
+            listener,
+            &world.boot,
+            std::sync::Weak::new(),
+            &world.store,
+            &crate::runtime::KubeletEndpoint::default(),
+        ),
     }
 }
 

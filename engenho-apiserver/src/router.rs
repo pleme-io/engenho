@@ -65,6 +65,7 @@ use crate::params::{
     DryRun, InitialEvents, ListWatchParams, ResumePoint, Selectors, WatchGvk, bookmark_line,
     error_line, event_line, gvk_ns_matches,
 };
+use crate::pod_stream::{PodStreamKind, StreamUpgrade, UpgradeRefusal};
 use crate::proto_transcode::{self, Decoded, Losses};
 use crate::watch_end::{AfterGone, WatchProgress};
 use crate::watch_start::{WatchRefusal, WatchStart};
@@ -1877,6 +1878,11 @@ fn resolve_subresource<'a>(
         "scale" if h.subresources().contains(&Subresource::Scale) => Subresource::Scale,
         "log" if h.subresources().contains(&Subresource::Log) => Subresource::Log,
         "token" if h.subresources().contains(&Subresource::Token) => Subresource::Token,
+        "exec" if h.subresources().contains(&Subresource::Exec) => Subresource::Exec,
+        "attach" if h.subresources().contains(&Subresource::Attach) => Subresource::Attach,
+        "portforward" if h.subresources().contains(&Subresource::PortForward) => {
+            Subresource::PortForward
+        }
         other => {
             return Err(ApiError::NotFound(format!(
                 "the server could not find the requested resource: {} does not serve subresource {:?}",
@@ -1885,6 +1891,13 @@ fn resolve_subresource<'a>(
         }
     };
     Ok(Some(SubresourceTarget { subresource, name }))
+}
+
+fn stream_verb_refusal(sub: Subresource, verb: &str) -> ApiError {
+    let segment = PodStreamKind::of(sub).map_or("stream", PodStreamKind::subresource);
+    ApiError::BadRequest(format!(
+        "the {segment} subresource supports only a WebSocket upgrade (GET or POST), not {verb}"
+    ))
 }
 
 /// Default token lifetime when a `TokenRequest` names none — one hour, the
@@ -2226,6 +2239,30 @@ async fn do_patch_scale(
     Ok((StatusCode::OK, Json(v)).into_response())
 }
 
+/// GET or POST with `Upgrade: websocket` on `pods/<name>/{exec,attach,portforward}`:
+/// open the kubelet side, then answer 101 and relay frames both ways.
+async fn do_pod_stream(
+    h: &Arc<dyn ResourceHandler>,
+    ns: Option<&str>,
+    name: &str,
+    kind: PodStreamKind,
+    upgrade: Result<StreamUpgrade, UpgradeRefusal>,
+    uri: &axum::http::Uri,
+) -> Result<Response, ApiError> {
+    let upgrade = upgrade.map_err(|r| crate::pod_stream::websocket_only(kind, r))?;
+    let query = uri.query().unwrap_or_default();
+    let Query(pairs) = Query::<Vec<(String, String)>>::try_from_uri(uri)
+        .map_err(|e| ApiError::BadRequest(format!("malformed query: {e}")))?;
+    let container = pairs
+        .iter()
+        .find(|(k, _)| k == "container")
+        .map(|(_, v)| v.as_str());
+    let upstream = h
+        .open_pod_stream(ns, name, kind, container, query, upgrade.protocols())
+        .await?;
+    Ok(upgrade.relay(upstream))
+}
+
 /// GET on a resource path — LIST/WATCH a collection (no `name`) or GET a
 /// single instance (with `name`). The `?watch=` flag + `coords.name` pick
 /// the branch, exactly as the legacy list-vs-get split did.
@@ -2235,6 +2272,8 @@ async fn resource_get_or_list(
     // `info.is_watch()`, the verb authz judged.
     info: crate::coords::RequestInfo,
     headers: HeaderMap,
+    uri: axum::http::Uri,
+    upgrade: Result<StreamUpgrade, UpgradeRefusal>,
     // The `/log` subresource reads its typed `?container=&tailLines=&timestamps=`
     // knobs from this extractor. axum parses the WHOLE query string into BOTH
     // `LogQuery` and `ListWatchParams` independently — neither denies unknown
@@ -2258,6 +2297,12 @@ async fn resource_get_or_list(
             Subresource::Scale => do_get_scale(&h, coords.namespace.as_deref(), name).await,
             // `/log` — read-only; the typed LogQuery is already decoded above.
             Subresource::Log => do_get_log(&h, coords.namespace.as_deref(), name, &log_query).await,
+            Subresource::Exec | Subresource::Attach | Subresource::PortForward => {
+                let Some(kind) = PodStreamKind::of(subresource) else {
+                    return Err(ApiError::Internal("unclassified stream subresource".into()));
+                };
+                do_pod_stream(&h, coords.namespace.as_deref(), name, kind, upgrade, &uri).await
+            }
             // `/token` is WRITE-ONLY (POST/create). A GET cannot return the
             // last token because none is stored — the mint is the only copy
             // that ever exists. Typed BadRequest naming the verb, never an
@@ -2311,12 +2356,15 @@ pub struct WriteParams {
     pub field_validation: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn resource_create(
     State(state): State<RouterState>,
     user_info: ExtractUserInfo,
     coords: crate::coords::ResourceCoords,
     Query(write): Query<WriteParams>,
     headers: HeaderMap,
+    uri: axum::http::Uri,
+    upgrade: Result<StreamUpgrade, UpgradeRefusal>,
     raw: Bytes,
 ) -> Result<Response, ApiError> {
     let dry_run = DryRun::parse(write.dry_run.as_deref())?;
@@ -2329,6 +2377,11 @@ async fn resource_create(
     // the typed BadRequest below.
     if let Some(sub) = &coords.subresource {
         let h = state.lookup(coords.group_key(), coords.version_key(), &coords.plural)?;
+        if let Ok(Some(SubresourceTarget { subresource, name })) = resolve_subresource(&coords, &h)
+            && let Some(kind) = PodStreamKind::of(subresource)
+        {
+            return do_pod_stream(&h, coords.namespace.as_deref(), name, kind, upgrade, &uri).await;
+        }
         if let Ok(Some(SubresourceTarget {
             subresource: Subresource::Token,
             name,
@@ -2416,6 +2469,9 @@ async fn resource_put(
         Some(Subresource::Log) => Err(ApiError::BadRequest(
             "the log subresource is read-only (GET only)".into(),
         )),
+        Some(sub @ (Subresource::Exec | Subresource::Attach | Subresource::PortForward)) => {
+            Err(stream_verb_refusal(sub, "PUT"))
+        }
         // PUT on the main object (no subresource) — the kubectl `replace` /
         // update verb. Store-backed handlers do a real optimistic-concurrency
         // replace; handlers that don't override `replace` keep the typed 400.
@@ -2483,6 +2539,9 @@ async fn resource_patch(
         Some(Subresource::Log) => Err(ApiError::BadRequest(
             "the log subresource is read-only (GET only)".into(),
         )),
+        Some(sub @ (Subresource::Exec | Subresource::Attach | Subresource::PortForward)) => {
+            Err(stream_verb_refusal(sub, "PATCH"))
+        }
         None => {
             let mut border = Border::new(
                 Directive::parse(raw_directive, WriteOptions::Patch)?,
@@ -3682,9 +3741,9 @@ mod request_info_coverage {
 
     #[tokio::test]
     async fn websocket_upgrades_are_classified_before_authz() {
-        // No route serves a WebSocket today (exec/attach/portforward are not
-        // implemented), but an upgrade request must still be classified and
-        // judged like any other: the layers wrap the upgrade handshake too.
+        // An upgrade request is classified and judged like any other: the
+        // layers wrap the upgrade handshake too. A WebSocket GET on
+        // pods/exec is judged as `create`, as upstream does since 1.31.
         let (app, recorder) = recorded_router();
         let upgrade = [
             ("connection", "Upgrade"),
@@ -3705,7 +3764,7 @@ mod request_info_coverage {
         assert_eq!(judged.resource, "pods");
         assert_eq!(judged.subresource.as_deref(), Some("exec"));
         assert_eq!(judged.name.as_deref(), Some("p1"));
-        assert_eq!(judged.verb, "get");
+        assert_eq!(judged.verb, "create");
 
         // A watch negotiated over a WebSocket (client-go can) is a watch.
         let status = send(
