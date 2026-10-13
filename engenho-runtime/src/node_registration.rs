@@ -58,7 +58,9 @@ use engenho_controllers::{Effect, Refusal, node_lease};
 use engenho_store::command::{Reason, ResourceCommand, TxnCompare, TxnOp};
 use engenho_store::{ResourceKey, ResourceValue, StoreMesh};
 use engenho_types::generated_v1_34::core_v1::Node;
-use engenho_types::generated_v1_34::types::{NodeSpec, NodeStatus, Quantity};
+use engenho_types::generated_v1_34::types::{
+    DaemonEndpoint, NodeAddress, NodeDaemonEndpoints, NodeSpec, NodeStatus, Quantity,
+};
 use engenho_types::kind::KubeResource;
 use engenho_types::meta::ObjectMeta;
 use tracing::info;
@@ -155,6 +157,105 @@ pub(crate) enum Registered {
 pub(crate) struct HostOwned {
     labels: BTreeMap<String, String>,
     resources: BTreeMap<String, Quantity>,
+    endpoint: Option<KubeletEndpointFields>,
+}
+
+/// Where this node's kubelet can be reached: `status.addresses` and
+/// `status.daemonEndpoints.kubeletEndpoint.Port`.
+///
+/// An apiserver on ANOTHER node reaches this node's pods (exec, attach,
+/// port-forward, logs) only through these two fields; a Node without them
+/// answers every such request with 503 "publishes no kubelet address". They
+/// are derived from the address the kubelet listener actually bound, never
+/// declared separately, so the published endpoint cannot name a port nothing
+/// listens on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KubeletEndpointFields {
+    addresses: Vec<(NodeAddressType, String)>,
+    port: u16,
+}
+
+/// The `status.addresses[].type` values this node publishes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NodeAddressType {
+    /// An address other nodes route to.
+    InternalIp,
+    /// The node's name, resolvable where the fleet's names are.
+    Hostname,
+}
+
+impl NodeAddressType {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::InternalIp => "InternalIP",
+            Self::Hostname => "Hostname",
+        }
+    }
+}
+
+impl KubeletEndpointFields {
+    /// The endpoint of a kubelet bound at `bound` on node `node_name`, with
+    /// `advertise_address` (`runtime.advertise_address`) as the routable
+    /// address when the bind names none.
+    ///
+    /// * A bind on a specific IP publishes that IP: it is the only address
+    ///   the listener answers on. Loopback included — that is the truth, and
+    ///   it is what lets several nodes on one host reach each other.
+    /// * A bind on every interface (`0.0.0.0`, `::`) publishes the advertised
+    ///   host when it is an IP literal, and no InternalIP otherwise: an
+    ///   unspecified address is not one anybody can dial.
+    /// * `Hostname` is always the node name, as upstream's kubelet publishes.
+    #[must_use]
+    pub(crate) fn derive(
+        node_name: &str,
+        bound: std::net::SocketAddr,
+        advertise_address: &str,
+    ) -> Self {
+        let internal = if bound.ip().is_unspecified() {
+            crate::runtime::advertised_ip(advertise_address)
+        } else {
+            Some(bound.ip())
+        };
+        let mut addresses = Vec::with_capacity(2);
+        if let Some(ip) = internal {
+            addresses.push((NodeAddressType::InternalIp, ip.to_string()));
+        }
+        if !node_name.is_empty() {
+            addresses.push((NodeAddressType::Hostname, node_name.to_owned()));
+        }
+        Self {
+            addresses,
+            port: bound.port(),
+        }
+    }
+
+    fn typed_addresses(&self) -> Vec<NodeAddress> {
+        self.addresses
+            .iter()
+            .map(|(ty, address)| NodeAddress {
+                address: address.clone(),
+                r#type: ty.as_str().to_owned(),
+            })
+            .collect()
+    }
+
+    fn typed_endpoints(&self) -> NodeDaemonEndpoints {
+        NodeDaemonEndpoints {
+            kubelet_endpoint: Some(DaemonEndpoint {
+                port: i32::from(self.port),
+            }),
+        }
+    }
+
+    fn is_current_on(&self, status: Option<&ResourceValue>) -> bool {
+        let want = serde_json::to_value(self.typed_addresses()).ok();
+        let addresses_current = status.and_then(|s| s.get("addresses")) == want.as_ref();
+        let port_current = status
+            .and_then(|s| s.pointer("/daemonEndpoints/kubeletEndpoint/Port"))
+            .and_then(serde_json::Value::as_u64)
+            == Some(u64::from(self.port));
+        addresses_current && port_current
+    }
 }
 
 impl HostOwned {
@@ -174,6 +275,12 @@ impl HostOwned {
         self
     }
 
+    /// These fields plus where the kubelet listens.
+    pub(crate) fn reachable_at(mut self, endpoint: KubeletEndpointFields) -> Self {
+        self.endpoint = Some(endpoint);
+        self
+    }
+
     /// The fields for a Node named `node_name` on a host with `cpu` logical
     /// CPUs and `memory` total memory (both as Kubernetes quantities).
     pub(crate) fn of_host(node_name: &str, cpu: String, memory: String) -> Self {
@@ -183,6 +290,7 @@ impl HostOwned {
                 ("cpu".to_owned(), Quantity(cpu)),
                 ("memory".to_owned(), Quantity(memory)),
             ]),
+            endpoint: None,
         }
     }
 
@@ -199,6 +307,15 @@ impl HostOwned {
             status: Some(NodeStatus {
                 capacity: self.resources.clone(),
                 allocatable: self.resources.clone(),
+                addresses: self
+                    .endpoint
+                    .as_ref()
+                    .map(KubeletEndpointFields::typed_addresses)
+                    .unwrap_or_default(),
+                daemon_endpoints: self
+                    .endpoint
+                    .as_ref()
+                    .map(KubeletEndpointFields::typed_endpoints),
                 ..NodeStatus::default()
             }),
         }
@@ -253,7 +370,11 @@ impl HostOwned {
                 map.and_then(|m| m.get(k)).and_then(|x| x.as_str()) == Some(q.0.as_str())
             })
         });
-        labels_current && resources_current
+        let endpoint_current = self
+            .endpoint
+            .as_ref()
+            .is_none_or(|e| e.is_current_on(status));
+        labels_current && resources_current && endpoint_current
     }
 }
 
@@ -722,6 +843,89 @@ mod registration_tests {
             node(&store).await["metadata"]["resourceVersion"],
             before,
             "an unchanged host must not consume a revision or wake a watcher"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_bound_kubelet_endpoint_is_published_and_a_rebind_moves_it() {
+        use super::KubeletEndpointFields;
+        let store = boot().await;
+        register_node(&store, NODE, &host()).await.expect("boot");
+        let bound: std::net::SocketAddr = "10.0.0.7:10251".parse().expect("addr");
+        let reachable = host().reachable_at(KubeletEndpointFields::derive(NODE, bound, ""));
+        assert_eq!(
+            register_node(&store, NODE, &reachable)
+                .await
+                .expect("publish"),
+            Registered::Merged
+        );
+        let n = node(&store).await;
+        assert_eq!(
+            n["status"]["addresses"],
+            json!([{"address": "10.0.0.7", "type": "InternalIP"},
+                   {"address": NODE, "type": "Hostname"}]),
+            "{n}"
+        );
+        assert_eq!(
+            n["status"]["daemonEndpoints"]["kubeletEndpoint"]["Port"],
+            10251
+        );
+        assert_eq!(
+            engenho_apiserver::kubelet_authority_of_node(&n).as_deref(),
+            Some("10.0.0.7:10251"),
+            "the apiserver's resolver reads what registration wrote"
+        );
+        assert_eq!(
+            register_node(&store, NODE, &reachable)
+                .await
+                .expect("again"),
+            Registered::AlreadyCurrent
+        );
+        let moved: std::net::SocketAddr = "10.0.0.8:10250".parse().expect("addr");
+        register_node(
+            &store,
+            NODE,
+            &host().reachable_at(KubeletEndpointFields::derive(NODE, moved, "")),
+        )
+        .await
+        .expect("rebind");
+        let n = node(&store).await;
+        assert_eq!(
+            engenho_apiserver::kubelet_authority_of_node(&n).as_deref(),
+            Some("10.0.0.8:10250")
+        );
+        assert_eq!(n["status"]["addresses"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn an_unspecified_bind_publishes_the_advertised_ip_or_no_internal_ip() {
+        use super::KubeletEndpointFields;
+        let any: std::net::SocketAddr = "0.0.0.0:10250".parse().expect("addr");
+        let body = |advertise: &str| {
+            host()
+                .reachable_at(KubeletEndpointFields::derive(NODE, any, advertise))
+                .merge_patch(NODE)
+                .expect("serializes")["status"]["addresses"]
+                .clone()
+        };
+        assert_eq!(
+            body("100.64.0.9:6443"),
+            json!([{"address": "100.64.0.9", "type": "InternalIP"},
+                   {"address": NODE, "type": "Hostname"}])
+        );
+        assert_eq!(
+            body("rio.pleme.internal"),
+            json!([{"address": NODE, "type": "Hostname"}]),
+            "a name is not an InternalIP; 0.0.0.0 is not an address"
+        );
+        let v6: std::net::SocketAddr = "[fd00::7]:10250".parse().expect("addr");
+        let n = host()
+            .reachable_at(KubeletEndpointFields::derive(NODE, v6, ""))
+            .merge_patch(NODE)
+            .expect("serializes");
+        assert_eq!(
+            engenho_apiserver::kubelet_authority_of_node(&n).as_deref(),
+            Some("[fd00::7]:10250")
         );
     }
 

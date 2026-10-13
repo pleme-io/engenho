@@ -1342,8 +1342,7 @@ impl engenho_kubelet::server::KubeletApi for WeakKubeletApi {
     }
 
     async fn pod_address(&self, namespace: &str, pod: &str) -> Result<std::net::IpAddr, String> {
-        engenho_kubelet::server::KubeletApi::pod_address(self.get()?.as_ref(), namespace, pod)
-            .await
+        engenho_kubelet::server::KubeletApi::pod_address(self.get()?.as_ref(), namespace, pod).await
     }
 }
 
@@ -2796,6 +2795,12 @@ fn advertised_host(advertise: &str) -> Option<&str> {
     Some(value)
 }
 
+/// The advertised host as an IP literal, or `None` when nothing is advertised
+/// or it is a name.
+pub(crate) fn advertised_ip(advertise: &str) -> Option<std::net::IpAddr> {
+    advertised_host(advertise).and_then(|h| h.parse().ok())
+}
+
 /// The `server:` URL remote clients are handed, or `None` when this apiserver is
 /// node-local.
 ///
@@ -3839,10 +3844,15 @@ pub(crate) fn listener_task(
             let api: Arc<dyn engenho_kubelet::server::KubeletApi> =
                 Arc::new(WeakKubeletApi { kubelet });
             let endpoint = kubelet_endpoint.clone();
+            let publish = KubeletPublish {
+                store: Arc::downgrade(store),
+                node_name: boot.node_name.clone(),
+                advertise_address: boot.advertise_address.clone(),
+            };
             ChildTask::new(
                 beat.clone(),
                 serve_rebinding(listener, beat, move || {
-                    serve_kubelet_http(addr.clone(), api.clone(), endpoint.clone())
+                    serve_kubelet_http(addr.clone(), api.clone(), endpoint.clone(), publish.clone())
                 }),
             )
         }
@@ -4069,15 +4079,53 @@ fn build_kubelet(
 /// and killing a working control plane because one auxiliary port is taken
 /// trades a partial outage for a total one. This is ONE attempt; when it
 /// ends, [`serve_rebinding`] records it and binds again after a backoff.
+/// What the kubelet listener needs to publish where it bound on this node's
+/// Node. The store is held weakly, like the listener's kubelet.
+#[derive(Clone)]
+pub(crate) struct KubeletPublish {
+    store: std::sync::Weak<StoreMesh>,
+    node_name: String,
+    advertise_address: String,
+}
+
+impl KubeletPublish {
+    /// Merge the bound endpoint into this node's Node, so an apiserver on
+    /// another node can reach the pods here. A failure is a warning: the
+    /// local node's own apiserver reaches its kubelet without the Node.
+    async fn publish(&self, bound: SocketAddr) {
+        let Some(store) = self.store.upgrade() else {
+            return;
+        };
+        let endpoint = crate::node_registration::KubeletEndpointFields::derive(
+            &self.node_name,
+            bound,
+            &self.advertise_address,
+        );
+        let host = HostOwned::measured(&self.node_name).reachable_at(endpoint);
+        if let Err(e) = register_node(&store, &self.node_name, &host).await {
+            warn!(
+                node = %self.node_name,
+                error = %e,
+                "could not publish the kubelet endpoint on the Node; pods here are \
+                 unreachable for exec, attach, port-forward and logs from other nodes"
+            );
+        }
+    }
+}
+
 async fn serve_kubelet_http(
     addr: String,
     api: Arc<dyn engenho_kubelet::server::KubeletApi>,
     endpoint: KubeletEndpoint,
+    publish: KubeletPublish,
 ) {
     match tokio::net::TcpListener::bind(&addr).await {
         Ok(listener) => {
             let local = listener.local_addr().ok();
             endpoint.store(local.map(Arc::new));
+            if let Some(bound) = local {
+                publish.publish(bound).await;
+            }
             let bound = local.map_or_else(|| addr.clone(), |a| a.to_string());
             info!(addr = %bound, "kubelet HTTP surface bound");
             let app = engenho_kubelet::server::KubeletServer::new(api).routes();
@@ -4690,6 +4738,54 @@ mod tests {
         );
         assert_eq!(beat.map(|b| b.ticks_started), Some(1), "{beat:?}");
         assert_eq!(beat.map(|b| b.panics), Some(1), "{beat:?}");
+    }
+
+    /// The kubelet listener publishes where it bound on the Node, and an
+    /// apiserver on ANOTHER node resolves the pod's node to exactly that
+    /// address instead of answering 503 "publishes no kubelet address".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_remote_apiserver_resolves_the_kubelet_this_node_published() {
+        let mut cfg = ephemeral_test_config();
+        cfg.runtime.kubelet_listen_addr = "127.0.0.1:0".into();
+        let rt = Runtime::start(cfg).await.unwrap();
+        let store = rt.store();
+        let key = crate::node_registration::node_key("node-A");
+        let deadline = std::time::Instant::now() + TICK_DEADLINE;
+        let published = loop {
+            let node = store.get(&key).await;
+            if let Some(a) = node
+                .as_ref()
+                .and_then(engenho_apiserver::kubelet_authority_of_node)
+            {
+                break (a, node);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the Node never carried a kubelet endpoint: {node:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let bound: SocketAddr = published.0.parse().expect("an ip:port authority");
+        assert!(
+            bound.ip().is_loopback() && bound.port() != 0,
+            "{:?}",
+            published.1
+        );
+        tokio::net::TcpStream::connect(bound)
+            .await
+            .expect("the published endpoint is the one the kubelet listens on");
+        let remote = KubeletStreamProxy {
+            store: store.clone(),
+            local_node: "node-B".into(),
+            local_kubelet: KubeletEndpoint::default(),
+        };
+        assert_eq!(remote.authority("node-A").await.unwrap(), bound.to_string());
+        assert!(matches!(
+            remote.authority("node-C").await,
+            Err(engenho_apiserver::ApiError::NotFound(_))
+        ));
+        drop((remote, store));
+        rt.shutdown().await.unwrap();
     }
 
     /// A listener whose port is taken at boot records `Halted`, stays a
