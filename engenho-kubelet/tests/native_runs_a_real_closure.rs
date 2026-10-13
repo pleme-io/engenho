@@ -565,3 +565,101 @@ async fn the_pods_run_as_user_is_the_workloads_uid_on_linux() {
         other => panic!("root={root}: {other:?}"),
     }
 }
+
+fn streaming_spec(image: &str, pod: &str, command: &[&str]) -> ContainerSpec {
+    let mut s = spec(image, command, &[]);
+    s.pod.name = pod.to_string();
+    s
+}
+
+async fn drain(mut rx: tokio::sync::mpsc::Receiver<Vec<u8>>) -> String {
+    let mut out = Vec::new();
+    while let Some(c) = rx.recv().await {
+        out.extend(c);
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// ★ `kubectl exec -i` against a native container: the command resolves in
+/// the container's closure, stdin reaches it while it runs, and closing stdin
+/// ends it with its real exit.
+#[tokio::test]
+async fn a_streaming_exec_runs_the_closures_cat_on_live_stdin() {
+    use engenho_kubelet::stream::{StreamExit, StreamRequest};
+    let coreutils = closure("nixpkgs#coreutils");
+    let logs_dir = std::env::temp_dir().join("engenho-native-e2e-stream");
+    let backend = NativeBackend::new(Isolation::HostProcess, &logs_dir, Cgroups::Off);
+    let image = format!("nix:{coreutils}");
+    let started = backend
+        .start(&streaming_spec(&image, "native-exec-stream", &["sleep", "30"]))
+        .await
+        .expect("start");
+
+    let session = backend
+        .exec_stream(
+            &started.container_id,
+            &StreamRequest {
+                argv: vec!["cat".into()],
+                stdin: true,
+                stdout: true,
+                stderr: true,
+                tty: false,
+            },
+        )
+        .await
+        .expect("a native container serves a streaming exec");
+    let stdin = session.stdin.expect("stdin wired");
+    stdin.send(b"live input\n".to_vec()).await.expect("send");
+    drop(stdin);
+    assert_eq!(drain(session.stdout.expect("stdout")).await, "live input\n");
+    assert_eq!(session.exit.await.expect("exit"), StreamExit::Code(0));
+
+    backend.stop(&started.container_id).await.expect("stop");
+}
+
+/// ★ `kubectl attach` to a native container declared `stdin: true`: the
+/// attacher's input reaches the main process, its output reaches the
+/// attacher AND the log, and `stdinOnce` ends it on detach.
+#[tokio::test]
+async fn attach_reaches_a_native_containers_main_process() {
+    use engenho_kubelet::backend::ContainerStdio;
+    use engenho_kubelet::stream::{StreamExit, StreamRequest};
+    let coreutils = closure("nixpkgs#coreutils");
+    let logs_dir = std::env::temp_dir().join("engenho-native-e2e-attach");
+    let backend = NativeBackend::new(Isolation::HostProcess, &logs_dir, Cgroups::Off);
+    let image = format!("nix:{coreutils}");
+    let mut s = streaming_spec(&image, "native-attach", &["cat"]);
+    s.stdio = ContainerStdio {
+        stdin: true,
+        stdin_once: true,
+        tty: false,
+    };
+    let started = backend.start(&s).await.expect("start");
+
+    let session = backend
+        .attach(
+            &started.container_id,
+            &StreamRequest {
+                stdin: true,
+                stdout: true,
+                stderr: true,
+                ..StreamRequest::default()
+            },
+        )
+        .await
+        .expect("attach");
+    let stdin = session.stdin.expect("stdin wired");
+    stdin.send(b"to the main process\n".to_vec()).await.expect("send");
+    drop(stdin);
+    assert_eq!(
+        drain(session.stdout.expect("stdout")).await,
+        "to the main process\n"
+    );
+    assert_eq!(session.exit.await.expect("exit"), StreamExit::Ended);
+
+    let logs = backend
+        .logs(&started.container_id, &LogOptions::default())
+        .await
+        .expect("logs");
+    assert_eq!(logs, "to the main process\n", "the log saw it too");
+}

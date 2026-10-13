@@ -568,6 +568,33 @@ pub struct ContainerSpec {
     /// stops with its own fixed timeout ignores it today; the native backend
     /// escalates on it.
     pub termination_grace: TerminationGrace,
+    /// The container's `stdin`, `stdinOnce` and `tty`: what `kubectl attach`
+    /// reaches. Default (all off) is the common case and changes nothing.
+    pub stdio: ContainerStdio,
+}
+
+/// A container's declared stdio: `spec.containers[i].{stdin,stdinOnce,tty}`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerStdio {
+    /// Keep a stdin open for attachers.
+    pub stdin: bool,
+    /// Close that stdin after the first attacher detaches.
+    pub stdin_once: bool,
+    /// Run the main process on a terminal.
+    pub tty: bool,
+}
+
+impl ContainerStdio {
+    /// Read the three fields off a container's JSON; absent means false.
+    #[must_use]
+    pub fn from_container_json(c: &serde_json::Value) -> Self {
+        let flag = |k: &str| c.get(k).and_then(serde_json::Value::as_bool) == Some(true);
+        Self {
+            stdin: flag("stdin"),
+            stdin_once: flag("stdinOnce"),
+            tty: flag("tty"),
+        }
+    }
 }
 
 /// Status the backend reports back.
@@ -746,6 +773,49 @@ pub trait ContainerRuntime: Send + Sync {
     /// [`KubeletError::Backend`] if the runtime could not run the exec at all
     /// (no such container, spawn failure).
     async fn exec(&self, container_id: &str, argv: &[String]) -> Result<ExecOutcome, KubeletError>;
+
+    /// Run `req.argv` inside a started container as a LIVE session: stdin
+    /// wired while it runs, a pty when `req.tty`, and the exit observed
+    /// through [`crate::stream::StreamSession::exit`]. The seam behind
+    /// `kubectl exec -i`, `-t` and `cp`; [`Self::exec`] stays the batch seam
+    /// probes use.
+    ///
+    /// # Errors
+    ///
+    /// [`KubeletError::StreamUnsupported`] from a runtime that cannot stream
+    /// (the default), [`KubeletError::Backend`] when the session cannot start.
+    async fn exec_stream(
+        &self,
+        container_id: &str,
+        req: &crate::stream::StreamRequest,
+    ) -> Result<crate::stream::StreamSession, KubeletError> {
+        let _ = (container_id, req);
+        Err(KubeletError::StreamUnsupported {
+            runtime: self.name(),
+            verb: crate::stream::StreamVerb::Exec,
+            reason: "this runtime implements no streaming exec",
+        })
+    }
+
+    /// Attach to a started container's main process: its output from now
+    /// on, and its stdin when the container was started with `stdin: true`.
+    ///
+    /// # Errors
+    ///
+    /// [`KubeletError::StreamUnsupported`] from a runtime that cannot attach
+    /// (the default), [`KubeletError::Backend`] for no such container.
+    async fn attach(
+        &self,
+        container_id: &str,
+        req: &crate::stream::StreamRequest,
+    ) -> Result<crate::stream::StreamSession, KubeletError> {
+        let _ = (container_id, req);
+        Err(KubeletError::StreamUnsupported {
+            runtime: self.name(),
+            verb: crate::stream::StreamVerb::Attach,
+            reason: "this runtime implements no attach",
+        })
+    }
 
     /// Start a container matching `spec`. Returns the new
     /// container's status (post-start; pod_ip may take a moment
@@ -1977,6 +2047,37 @@ impl PodmanBackend {
         out
     }
 
+    /// `podman exec [-i] [-t] <id> <argv...>` for a streaming session. `-t`
+    /// only with a tty: the kubelet then runs podman on its own pty, so
+    /// podman's terminal handling (and its resize forwarding) is the one
+    /// the client drives.
+    #[must_use]
+    pub fn exec_stream_argv(id: &str, req: &crate::stream::StreamRequest) -> Vec<String> {
+        let mut out = vec!["exec".to_string()];
+        if req.stdin {
+            out.push("-i".to_string());
+        }
+        if req.tty {
+            out.push("-t".to_string());
+        }
+        out.push(id.to_string());
+        out.extend(req.argv.iter().cloned());
+        out
+    }
+
+    /// `podman attach --sig-proxy=false [--no-stdin] <id>`. Signals are not
+    /// proxied: a client's `^C` on a detached terminal must not kill the
+    /// container's main process.
+    #[must_use]
+    pub fn attach_argv(id: &str, req: &crate::stream::StreamRequest) -> Vec<String> {
+        let mut out = vec!["attach".to_string(), "--sig-proxy=false".to_string()];
+        if !req.stdin {
+            out.push("--no-stdin".to_string());
+        }
+        out.push(id.to_string());
+        out
+    }
+
     /// `podman stop` argv for `id`.
     #[must_use]
     pub fn stop_argv(id: &str) -> Vec<String> {
@@ -2162,6 +2263,25 @@ impl ContainerRuntime for PodmanBackend {
             stdout: String::from_utf8_lossy(&out.stdout).to_string(),
             stderr: String::from_utf8_lossy(&out.stderr).to_string(),
         })
+    }
+
+    async fn exec_stream(
+        &self,
+        container_id: &str,
+        req: &crate::stream::StreamRequest,
+    ) -> Result<crate::stream::StreamSession, KubeletError> {
+        crate::stream::spawn_local(
+            self.command(&Self::exec_stream_argv(container_id, req)),
+            req,
+        )
+    }
+
+    async fn attach(
+        &self,
+        container_id: &str,
+        req: &crate::stream::StreamRequest,
+    ) -> Result<crate::stream::StreamSession, KubeletError> {
+        crate::stream::spawn_local(self.command(&Self::attach_argv(container_id, req)), req)
     }
 
     async fn start(&self, spec: &ContainerSpec) -> Result<ContainerStatus, KubeletError> {
@@ -3098,6 +3218,7 @@ mod tests {
             resources: Resources::default(),
             // Stop-time only; no argv carries it.
             termination_grace: TerminationGrace::default(),
+            stdio: ContainerStdio::default(),
             // No Pod identity: these argv tests construct a spec directly, not
             // through the Pod path, and a backend that needs identity must
             // check `is_present()` rather than assume it.

@@ -528,6 +528,12 @@ pub fn linux_resources(r: &crate::backend::Resources) -> Option<v1::LinuxContain
     })
 }
 
+/// Why the CRI backend serves no interactive stream.
+pub const CRI_STREAMING_REFUSAL: &str = "CRI Exec/Attach return a URL on the runtime's streaming \
+     server, and engenho has no client for that server's SPDY/WebSocket protocol; use \
+     `kubectl exec` without -i/-t (served through ExecSync by the batch path) or `crictl exec` \
+     on the node";
+
 #[async_trait]
 impl ContainerRuntime for CriBackend {
     fn name(&self) -> &'static str {
@@ -565,6 +571,37 @@ impl ContainerRuntime for CriBackend {
             &resp.stdout,
             &resp.stderr,
         ))
+    }
+
+    /// Refused by name. CRI's `Exec` answers with a URL on the runtime's own
+    /// streaming server, which upstream's kubelet reverse-proxies the
+    /// client's SPDY or WebSocket connection to; engenho has no client for
+    /// that server's protocol. Serving `ExecSync` instead would hand an
+    /// interactive client batch semantics — a prompt that never echoes.
+    async fn exec_stream(
+        &self,
+        _container_id: &str,
+        _req: &crate::stream::StreamRequest,
+    ) -> Result<crate::stream::StreamSession, KubeletError> {
+        Err(KubeletError::StreamUnsupported {
+            runtime: self.name(),
+            verb: crate::stream::StreamVerb::Exec,
+            reason: CRI_STREAMING_REFUSAL,
+        })
+    }
+
+    /// Refused for the same reason as [`Self::exec_stream`]: CRI's `Attach`
+    /// also answers only with a streaming-server URL.
+    async fn attach(
+        &self,
+        _container_id: &str,
+        _req: &crate::stream::StreamRequest,
+    ) -> Result<crate::stream::StreamSession, KubeletError> {
+        Err(KubeletError::StreamUnsupported {
+            runtime: self.name(),
+            verb: crate::stream::StreamVerb::Attach,
+            reason: CRI_STREAMING_REFUSAL,
+        })
     }
 
     async fn start(&self, spec: &ContainerSpec) -> Result<ContainerStatus, KubeletError> {

@@ -27,8 +27,10 @@ cargo run --bin engenho -- --help
 ```
 
 **Status: working, incomplete, and honest about which is which.** CRI,
-`/stats/summary` and etcd `Lease` are ABSENT. `kubectl exec` returns a
-reasoned 501. ServiceAccount-token authentication has an implementation
+`/stats/summary` and etcd `Lease` are ABSENT. The kubelet serves
+`exec` (with `-i`/`-t`), `attach` and `port-forward` over WebSocket on
+the native and podman runtimes; the CRI runtime refuses interactive
+streams with a reason. ServiceAccount-token authentication has an implementation
 with no caller. The ledger names all of it.
 
 > Internal framing, for pleme-io readers: Pangea declares the
@@ -232,7 +234,7 @@ clears? Reproduce by leaving a controller attached for hours, then plot
 | etcd v3 gRPC — `Watch` | `etcdctl watch`, cache-building clients | **SHIPPED** — multiplexed bidi streaming: many watches per gRPC stream, server-assigned ids, subscribe-before-replay, live event fan-out, cancel ack, progress requests, and a compaction cancel carrying `compact_revision`. A store that cannot subscribe gets the watch REFUSED, never history-then-silence |
 | etcd v3 gRPC — `Lease` | lease-holding clients | **ABSENT** — traits generated, not implemented |
 | kubelet API :10250 — logs/pods | `kubectl logs`, node inspection | **SHIPPED (routes)** — `/containerLogs/{ns}/{pod}/{container}`, `/pods`, `/runningpods/`, `/healthz` on upstream's exact paths and camelCase query spelling. Not yet bound to a listening socket by the runtime |
-| kubelet API :10250 — exec/attach/portForward | `kubectl exec/cp/port-forward` | **REFUSED (501, reasoned)** — needs SPDY or WebSocket stream multiplexing; a half-implemented stream protocol hangs a client rather than failing it |
+| kubelet API :10250 — exec/attach/portForward | `kubectl exec/attach/cp/port-forward` | **PARTIAL** — node side served over WebSocket: `v5.channel.k8s.io` (and `v4`) exec/attach with stdin, a real pty with resize and the v5 close-stdin signal; upstream's WebSocket port-forward (`?ports=`, data/error channel per port). Native and podman (CLI and libpod) runtimes stream; CRI refuses interactive streams with a typed reason (no client for its streaming server) and serves non-interactive exec through `ExecSync`. SPDY is not spoken. Real-socket tests: `engenho-kubelet/tests/exec_over_a_real_socket.rs` |
 | kubelet `/stats/summary`, `/metrics/*` | metrics-server, HPA | **ABSENT** |
 | Event recording | every "why did this fail" question | **PARTIAL** — typed recorder + upstream reason vocabulary landed; emission sites (kubelet/scheduler/controllers) pending |
 | `/metrics` (Prometheus) | monitoring, HPA | **SHIPPED** — Prometheus text exposition, served at `/metrics` |

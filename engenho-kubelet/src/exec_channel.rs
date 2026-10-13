@@ -1,4 +1,5 @@
-//! THE EXEC STREAM PROTOCOL — `v5.channel.k8s.io` framing.
+//! THE EXEC STREAM PROTOCOL — `v5.channel.k8s.io` / `v4.channel.k8s.io`
+//! framing, shared by exec and attach.
 //!
 //! ★ WHY THIS EXISTS AS ITS OWN MODULE. `kubectl exec`, `attach`, `cp` and
 //! `port-forward` all ride a multiplexed stream, and the multiplexing is
@@ -48,6 +49,10 @@ pub enum Channel {
     Error,
     /// Client → server: a terminal resize (`{"Width":N,"Height":M}`).
     Resize,
+    /// Client → server, `v5.channel.k8s.io` only: close the stream named by
+    /// the payload's single byte. This is how `kubectl cp` and `exec -i`
+    /// signal end of input without closing the socket they still read from.
+    Close,
 }
 
 impl Channel {
@@ -60,6 +65,7 @@ impl Channel {
             Self::Stderr => 2,
             Self::Error => 3,
             Self::Resize => 4,
+            Self::Close => 255,
         }
     }
 
@@ -77,6 +83,7 @@ impl Channel {
             2 => Some(Self::Stderr),
             3 => Some(Self::Error),
             4 => Some(Self::Resize),
+            255 => Some(Self::Close),
             _ => None,
         }
     }
@@ -88,7 +95,7 @@ impl Channel {
     /// session's output and, worse, forge a success status.
     #[must_use]
     pub fn client_may_send(self) -> bool {
-        matches!(self, Self::Stdin | Self::Resize)
+        matches!(self, Self::Stdin | Self::Resize | Self::Close)
     }
 }
 
@@ -116,6 +123,9 @@ pub enum FrameError {
     /// The client sent on a server-only channel.
     #[error("client may not send on the {channel:?} channel")]
     ClientMayNotSend { channel: Channel },
+    /// A close signal on a protocol that has none (v4 and below).
+    #[error("the close channel exists only in {SUBPROTOCOL_V5}")]
+    CloseNotInProtocol,
 }
 
 /// Encode a server → client frame.
@@ -127,12 +137,20 @@ pub fn encode(channel: Channel, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Decode a client → server frame, enforcing channel direction.
-pub fn decode_from_client(bytes: &[u8]) -> Result<Frame, FrameError> {
+/// Decode a client → server frame, enforcing channel direction and what the
+/// negotiated protocol defines.
+///
+/// # Errors
+///
+/// [`FrameError`] naming why the frame is not one this session speaks.
+pub fn decode_from_client(bytes: &[u8], protocol: Subprotocol) -> Result<Frame, FrameError> {
     let (&b, rest) = bytes.split_first().ok_or(FrameError::Empty)?;
     let channel = Channel::from_byte(b).ok_or(FrameError::UnknownChannel { byte: b })?;
     if !channel.client_may_send() {
         return Err(FrameError::ClientMayNotSend { channel });
+    }
+    if channel == Channel::Close && protocol != Subprotocol::V5 {
+        return Err(FrameError::CloseNotInProtocol);
     }
     Ok(Frame {
         channel,
@@ -186,22 +204,51 @@ pub fn exit_status(exit_code: i32) -> serde_json::Value {
     })
 }
 
-/// The subprotocol engenho speaks.
+/// The newest channel subprotocol: v4 plus the close signal.
 pub const SUBPROTOCOL_V5: &str = "v5.channel.k8s.io";
 
-/// Pick the subprotocol from a client's `Sec-WebSocket-Protocol` offer.
+/// The channel subprotocol kubectl falls back to, and the one upstream's
+/// WebSocket port-forward speaks.
+pub const SUBPROTOCOL_V4: &str = "v4.channel.k8s.io";
+
+/// A channel subprotocol engenho speaks.
 ///
-/// Returns `None` when v5 is not offered rather than falling back to an
-/// older channel protocol: v4 and below differ in how the error channel is
-/// framed, and answering a v4 client with v5 semantics produces a session
+/// v4 and v5 frame every channel identically and both carry a structured
+/// `Status` on the error channel; v5 adds only [`Channel::Close`]. v3 and
+/// below report the exit as a bare string on the error channel, so they are
+/// not accepted: answering a v3 client with v4 semantics produces a session
 /// that works until the command fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Subprotocol {
+    /// `v5.channel.k8s.io`.
+    V5,
+    /// `v4.channel.k8s.io`.
+    V4,
+}
+
+impl Subprotocol {
+    /// The header value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::V5 => SUBPROTOCOL_V5,
+            Self::V4 => SUBPROTOCOL_V4,
+        }
+    }
+}
+
+/// Pick the subprotocol from a client's `Sec-WebSocket-Protocol` offer: v5
+/// when offered, else v4, else none.
 #[must_use]
-pub fn negotiate<'a>(offered: &'a str) -> Option<&'static str> {
-    offered
-        .split(',')
-        .map(str::trim)
-        .any(|p| p == SUBPROTOCOL_V5)
-        .then_some(SUBPROTOCOL_V5)
+pub fn negotiate(offered: &str) -> Option<Subprotocol> {
+    let has = |want: &str| offered.split(',').map(str::trim).any(|p| p == want);
+    if has(SUBPROTOCOL_V5) {
+        Some(Subprotocol::V5)
+    } else if has(SUBPROTOCOL_V4) {
+        Some(Subprotocol::V4)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -219,6 +266,7 @@ mod tests {
             (Channel::Stderr, 2),
             (Channel::Error, 3),
             (Channel::Resize, 4),
+            (Channel::Close, 255),
         ] {
             assert_eq!(ch.as_byte(), byte, "{ch:?}");
             assert_eq!(Channel::from_byte(byte), Some(ch));
@@ -231,7 +279,7 @@ mod tests {
         // output and corrupt the session invisibly.
         assert_eq!(Channel::from_byte(5), None);
         assert_eq!(
-            decode_from_client(&[7, b'x']),
+            decode_from_client(&[7, b'x'], Subprotocol::V5),
             Err(FrameError::UnknownChannel { byte: 7 })
         );
     }
@@ -243,26 +291,30 @@ mod tests {
         for ch in [Channel::Stdout, Channel::Stderr, Channel::Error] {
             assert!(!ch.client_may_send(), "{ch:?}");
             assert_eq!(
-                decode_from_client(&[ch.as_byte(), b'x']),
+                decode_from_client(&[ch.as_byte(), b'x'], Subprotocol::V5),
                 Err(FrameError::ClientMayNotSend { channel: ch })
             );
         }
         assert!(Channel::Stdin.client_may_send());
         assert!(Channel::Resize.client_may_send());
+        assert!(Channel::Close.client_may_send());
     }
 
     #[test]
     fn an_empty_frame_is_a_skip_not_a_fatal_error() {
         // Some proxies emit empty frames as keepalives; tearing down an
         // exec for one would look like a random disconnect to the user.
-        assert_eq!(decode_from_client(&[]), Err(FrameError::Empty));
+        assert_eq!(
+            decode_from_client(&[], Subprotocol::V5),
+            Err(FrameError::Empty)
+        );
     }
 
     #[test]
     fn stdin_frames_decode_with_their_payload_intact() {
         // Anti-vacuity: a decoder that rejected everything would pass every
         // negative test above.
-        let f = decode_from_client(&[0, b'l', b's', b'\n']).expect("decodes");
+        let f = decode_from_client(&[0, b'l', b's', b'\n'], Subprotocol::V4).expect("decodes");
         assert_eq!(f.channel, Channel::Stdin);
         assert_eq!(f.payload, b"ls\n".to_vec());
     }
@@ -303,16 +355,28 @@ mod tests {
     }
 
     #[test]
-    fn only_the_v5_subprotocol_is_accepted() {
-        // v4 and below frame the error channel differently; answering a v4
-        // client with v5 semantics produces a session that works until the
-        // command fails.
-        assert_eq!(negotiate("v5.channel.k8s.io"), Some(SUBPROTOCOL_V5));
+    fn v5_is_preferred_v4_is_the_fallback_and_v3_is_refused() {
+        assert_eq!(negotiate("v5.channel.k8s.io"), Some(Subprotocol::V5));
         assert_eq!(
-            negotiate("v5.channel.k8s.io, v4.channel.k8s.io"),
-            Some(SUBPROTOCOL_V5)
+            negotiate("v4.channel.k8s.io, v5.channel.k8s.io"),
+            Some(Subprotocol::V5)
         );
-        assert_eq!(negotiate("v4.channel.k8s.io,v3.channel.k8s.io"), None);
+        assert_eq!(
+            negotiate("v4.channel.k8s.io,v3.channel.k8s.io"),
+            Some(Subprotocol::V4)
+        );
+        assert_eq!(negotiate("v3.channel.k8s.io"), None);
         assert_eq!(negotiate(""), None);
+    }
+
+    #[test]
+    fn the_close_signal_exists_only_in_v5() {
+        let f = decode_from_client(&[255, 0], Subprotocol::V5).expect("v5 close");
+        assert_eq!(f.channel, Channel::Close);
+        assert_eq!(f.payload, vec![Channel::Stdin.as_byte()]);
+        assert_eq!(
+            decode_from_client(&[255, 0], Subprotocol::V4),
+            Err(FrameError::CloseNotInProtocol)
+        );
     }
 }

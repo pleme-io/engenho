@@ -55,6 +55,19 @@ pub enum KubeletError {
     /// A volume could not be torn down.
     #[error("volume teardown: {0}")]
     VolumeTeardown(crate::pod_volume::VolumeResolveError),
+
+    /// The runtime cannot serve an interactive stream (exec with stdin or a
+    /// tty, attach) and says why, rather than accepting the session and
+    /// serving batch semantics a client reads as a hang.
+    #[error("{runtime} runtime does not serve streaming {verb}: {reason}")]
+    StreamUnsupported {
+        /// The runtime's [`crate::backend::ContainerRuntime::name`].
+        runtime: &'static str,
+        /// `exec` or `attach`.
+        verb: crate::stream::StreamVerb,
+        /// Why, in words an operator can act on.
+        reason: &'static str,
+    },
 }
 
 engenho_substrate::impl_error_kind! {
@@ -65,6 +78,7 @@ engenho_substrate::impl_error_kind! {
         { InvalidProbe { .. } } => "invalid_pod",
         { NotReaped { .. } } => "not_reaped",
         (VolumeTeardown(_)) => "volume_teardown",
+        { StreamUnsupported { .. } } => "stream_unsupported",
     }
 }
 

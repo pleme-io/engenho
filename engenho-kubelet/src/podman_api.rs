@@ -695,6 +695,50 @@ pub fn demux(mut buf: &[u8]) -> Result<Demuxed, KubeletError> {
     Ok(out)
 }
 
+/// [`demux`] for a LIVE stream: frames arrive split across reads, so a
+/// partial frame is kept until the rest of it arrives instead of refused.
+#[derive(Debug, Default)]
+pub struct DemuxStream {
+    pending: Vec<u8>,
+}
+
+impl DemuxStream {
+    /// Feed bytes; get every frame they complete, in order.
+    ///
+    /// # Errors
+    ///
+    /// [`KubeletError::Backend`] on an unknown stream kind — an unframed
+    /// (tty) stream read as a framed one.
+    pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<(StreamKind, Vec<u8>)>, KubeletError> {
+        self.pending.extend_from_slice(bytes);
+        let mut out = Vec::new();
+        let mut at = 0;
+        while self.pending.len() - at >= 8 {
+            let head = &self.pending[at..at + 8];
+            let kind = StreamKind::from_byte(head[0]).ok_or_else(|| {
+                KubeletError::Backend(format!(
+                    "unknown podman stream kind {} in a framed stream",
+                    head[0]
+                ))
+            })?;
+            let len = u32::from_be_bytes([head[4], head[5], head[6], head[7]]) as usize;
+            if self.pending.len() - at - 8 < len {
+                break;
+            }
+            out.push((kind, self.pending[at + 8..at + 8 + len].to_vec()));
+            at += 8 + len;
+        }
+        self.pending.drain(..at);
+        Ok(out)
+    }
+
+    /// Whether a partial frame is still waiting for its remainder.
+    #[must_use]
+    pub fn is_mid_frame(&self) -> bool {
+        !self.pending.is_empty()
+    }
+}
+
 // ── The transport ──────────────────────────────────────────────────────────
 
 /// A libpod client: HTTP/1.1 over the unix socket, no subprocess.
@@ -1108,6 +1152,292 @@ impl PodmanApi {
         demux(&bytes)
     }
 
+    /// Send one request asking libpod to HIJACK the connection, and return
+    /// the raw socket once it has: libpod answers `101` and from then on the
+    /// socket carries the process's stdin one way and its (framed, unless a
+    /// tty) output the other.
+    ///
+    /// # Errors
+    ///
+    /// [`KubeletError::Backend`] on connect failure or any answer but `101`.
+    async fn hijack(
+        &self,
+        path: &str,
+        body: Vec<u8>,
+    ) -> Result<(tokio::net::UnixStream, Vec<u8>), KubeletError> {
+        use http_body_util::{BodyExt as _, Full};
+        use hyper::body::Bytes;
+
+        let sock = self.endpoint.path();
+        let stream = tokio::net::UnixStream::connect(sock).await.map_err(|e| {
+            KubeletError::Backend(format!("connect to podman API at {}: {e}", sock.display()))
+        })?;
+        let (mut sender, conn) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+                .await
+                .map_err(|e| {
+                    KubeletError::Backend(format!(
+                        "podman API handshake at {}: {e}",
+                        sock.display()
+                    ))
+                })?;
+        tokio::spawn(async move {
+            let _ = conn.with_upgrades().await;
+        });
+        let req = hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri(path)
+            .header(hyper::header::HOST, "d")
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .header(hyper::header::CONNECTION, "Upgrade")
+            .header(hyper::header::UPGRADE, "tcp")
+            .body(Full::new(Bytes::from(body)))
+            .map_err(|e| KubeletError::Backend(format!("build podman request {path}: {e}")))?;
+        let resp = sender.send_request(req).await.map_err(|e| {
+            KubeletError::Backend(format!("podman API {path} at {}: {e}", sock.display()))
+        })?;
+        let status = resp.status();
+        if status != hyper::StatusCode::SWITCHING_PROTOCOLS {
+            let bytes = resp
+                .into_body()
+                .collect()
+                .await
+                .map(|b| b.to_bytes().to_vec())
+                .unwrap_or_default();
+            return Err(KubeletError::Backend(format!(
+                "podman {path}: expected a hijacked stream (HTTP 101), got HTTP {status}: {}",
+                String::from_utf8_lossy(&bytes)
+            )));
+        }
+        let upgraded = hyper::upgrade::on(resp)
+            .await
+            .map_err(|e| KubeletError::Backend(format!("podman {path} upgrade: {e}")))?;
+        let parts = upgraded
+            .downcast::<hyper_util::rt::TokioIo<tokio::net::UnixStream>>()
+            .map_err(|_| {
+                KubeletError::Backend(format!(
+                    "podman {path}: the hijacked stream is not the unix socket it was opened on"
+                ))
+            })?;
+        Ok((parts.io.into_inner(), parts.read_buf.to_vec()))
+    }
+
+    /// Turn a hijacked socket into a session: output demultiplexed (or raw,
+    /// with a tty) onto its channels, stdin written and half-closed on EOF.
+    /// `done` fires when the output stream ends.
+    fn session_over(
+        socket: tokio::net::UnixStream,
+        leftover: Vec<u8>,
+        req: &crate::stream::StreamRequest,
+        done: tokio::sync::oneshot::Sender<()>,
+    ) -> (
+        Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+        Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
+        Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    ) {
+        use tokio::io::AsyncReadExt as _;
+        use tokio::sync::mpsc;
+        let (read, write) = socket.into_split();
+        let stdin = req.stdin.then(|| crate::stream::pump_writer(write));
+        let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (err_tx, err_rx) = mpsc::channel::<Vec<u8>>(64);
+        let tty = req.tty;
+        let mut read = read;
+        tokio::spawn(async move {
+            let mut demux = DemuxStream::default();
+            let mut buf = vec![0u8; 32 * 1024];
+            let mut chunk = leftover;
+            loop {
+                if !chunk.is_empty() {
+                    if tty {
+                        let _ = out_tx.send(std::mem::take(&mut chunk)).await;
+                    } else {
+                        match demux.push(&chunk) {
+                            Ok(frames) => {
+                                for (kind, payload) in frames {
+                                    let tx = match kind {
+                                        StreamKind::Stdout => &out_tx,
+                                        StreamKind::Stderr => &err_tx,
+                                        StreamKind::Stdin => continue,
+                                    };
+                                    let _ = tx.send(payload).await;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "podman stream framing");
+                                break;
+                            }
+                        }
+                        chunk.clear();
+                    }
+                }
+                match read.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => chunk = buf[..n].to_vec(),
+                }
+            }
+            let _ = done.send(());
+        });
+        (
+            stdin,
+            req.stdout.then_some(out_rx),
+            (req.stderr && !req.tty).then_some(err_rx),
+        )
+    }
+
+    /// Apply resizes through `POST {path}?h=&w=`.
+    fn resizes(&self, path: String) -> tokio::sync::mpsc::Sender<crate::exec_channel::TerminalSize> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::exec_channel::TerminalSize>(8);
+        let api = self.clone();
+        tokio::spawn(async move {
+            while let Some(size) = rx.recv().await {
+                let uri = format!("{path}?h={}&w={}", size.height, size.width);
+                if let Err(e) = api.send(hyper::Method::POST, &uri, None).await {
+                    tracing::debug!(error = %e, "podman resize");
+                }
+            }
+        });
+        tx
+    }
+
+    /// A streaming exec: create, hijack the start, report the exit once the
+    /// output has ended.
+    ///
+    /// # Errors
+    ///
+    /// [`KubeletError::Backend`] when the exec cannot be created or started.
+    pub async fn exec_stream(
+        &self,
+        id: &str,
+        req: &crate::stream::StreamRequest,
+    ) -> Result<crate::stream::StreamSession, KubeletError> {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "AttachStdin": req.stdin,
+            "AttachStdout": true,
+            "AttachStderr": true,
+            "Tty": req.tty,
+            "Cmd": req.argv,
+        }))
+        .map_err(|e| KubeletError::Backend(format!("encode exec create: {e}")))?;
+        let (status, bytes) = self
+            .send(
+                hyper::Method::POST,
+                &libpod_path(&format!("containers/{id}/exec")),
+                Some(body),
+            )
+            .await?;
+        if !status.is_success() {
+            return Err(KubeletError::Backend(format!(
+                "podman exec create {id}: HTTP {status}: {}",
+                String::from_utf8_lossy(&bytes)
+            )));
+        }
+        #[derive(Deserialize)]
+        struct ExecCreated {
+            #[serde(rename = "Id")]
+            id: String,
+        }
+        let exec_id = serde_json::from_slice::<ExecCreated>(&bytes)
+            .map(|c| c.id)
+            .map_err(|e| KubeletError::Backend(format!("decode exec create: {e}")))?;
+        let start = serde_json::to_vec(&serde_json::json!({ "Detach": false, "Tty": req.tty }))
+            .map_err(|e| KubeletError::Backend(format!("encode exec start: {e}")))?;
+        let (socket, leftover) = self
+            .hijack(&libpod_path(&format!("exec/{exec_id}/start")), start)
+            .await?;
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let (stdin, stdout, stderr) = Self::session_over(socket, leftover, req, done_tx);
+        let resize = req
+            .tty
+            .then(|| self.resizes(libpod_path(&format!("exec/{exec_id}/resize"))));
+        let api = self.clone();
+        let exit: crate::stream::ExitWait = Box::pin(async move {
+            let _ = done_rx.await;
+            let mut last = None;
+            for _ in 0..20 {
+                match api.exec_exit_code(&exec_id).await {
+                    Ok(code) => return Ok(crate::stream::StreamExit::Code(code)),
+                    Err(e) => last = Some(e),
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(last.unwrap_or_else(|| {
+                KubeletError::Backend(format!("podman exec {exec_id}: no exit code"))
+            }))
+        });
+        Ok(crate::stream::StreamSession {
+            stdin,
+            stdout,
+            stderr,
+            resize,
+            exit,
+        })
+    }
+
+    /// Attach to a container's main process.
+    ///
+    /// # Errors
+    ///
+    /// [`KubeletError::Backend`] when the container cannot be inspected or
+    /// attached to.
+    pub async fn attach(
+        &self,
+        id: &str,
+        req: &crate::stream::StreamRequest,
+    ) -> Result<crate::stream::StreamSession, KubeletError> {
+        #[derive(Deserialize, Default)]
+        struct Config {
+            #[serde(rename = "Tty", default)]
+            tty: bool,
+        }
+        #[derive(Deserialize)]
+        struct Inspected {
+            #[serde(rename = "Config", default)]
+            config: Option<Config>,
+        }
+        let (status, bytes) = self
+            .send(
+                hyper::Method::GET,
+                &libpod_path(&format!("containers/{id}/json")),
+                None,
+            )
+            .await?;
+        if !status.is_success() {
+            return Err(KubeletError::Backend(format!(
+                "podman inspect {id}: HTTP {status}: {}",
+                String::from_utf8_lossy(&bytes)
+            )));
+        }
+        let tty = serde_json::from_slice::<Inspected>(&bytes)
+            .map_err(|e| KubeletError::Backend(format!("decode inspect {id}: {e}")))?
+            .config
+            .unwrap_or_default()
+            .tty;
+        let req = crate::stream::StreamRequest {
+            tty,
+            ..req.clone()
+        };
+        let path = libpod_path(&format!(
+            "containers/{id}/attach?stream=true&stdin={}&stdout={}&stderr={}",
+            req.stdin, req.stdout, req.stderr
+        ));
+        let (socket, leftover) = self.hijack(&path, Vec::new()).await?;
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let (stdin, stdout, stderr) = Self::session_over(socket, leftover, &req, done_tx);
+        let resize = tty.then(|| self.resizes(libpod_path(&format!("containers/{id}/resize"))));
+        let exit: crate::stream::ExitWait = Box::pin(async move {
+            let _ = done_rx.await;
+            Ok(crate::stream::StreamExit::Ended)
+        });
+        Ok(crate::stream::StreamSession {
+            stdin,
+            stdout,
+            stderr,
+            resize,
+            exit,
+        })
+    }
+
     /// `GET /libpod/exec/{exec_id}/json` — the exit code, after the run.
     ///
     /// # Errors
@@ -1491,6 +1821,22 @@ impl crate::backend::ContainerRuntime for PodmanApiBackend {
             stderr: String::from_utf8_lossy(&streams.stderr).into_owned(),
         })
     }
+
+    async fn exec_stream(
+        &self,
+        container_id: &str,
+        req: &crate::stream::StreamRequest,
+    ) -> Result<crate::stream::StreamSession, KubeletError> {
+        self.api.exec_stream(container_id, req).await
+    }
+
+    async fn attach(
+        &self,
+        container_id: &str,
+        req: &crate::stream::StreamRequest,
+    ) -> Result<crate::stream::StreamSession, KubeletError> {
+        self.api.attach(container_id, req).await
+    }
 }
 
 #[cfg(test)]
@@ -1636,6 +1982,7 @@ mod tests {
             pod: crate::backend::PodIdentity::default(),
             init_kind: crate::lifecycle::InitKind::Regular,
             termination_grace: crate::backend::TerminationGrace::default(),
+            stdio: crate::backend::ContainerStdio::default(),
         };
         let req = create_request(&spec, Some("engenho-net"));
 
@@ -1666,6 +2013,29 @@ mod tests {
         v.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         v.extend_from_slice(payload);
         v
+    }
+
+    #[test]
+    fn a_live_demux_holds_a_split_frame_until_its_remainder_arrives() {
+        let mut bytes = frame(1, b"hello");
+        bytes.extend(frame(2, b"oops"));
+        let mut d = DemuxStream::default();
+        let first = d.push(&bytes[..10]).expect("partial is fine");
+        assert!(first.is_empty() && d.is_mid_frame());
+        let rest = d.push(&bytes[10..]).expect("rest");
+        assert_eq!(
+            rest,
+            vec![
+                (StreamKind::Stdout, b"hello".to_vec()),
+                (StreamKind::Stderr, b"oops".to_vec())
+            ]
+        );
+        assert!(!d.is_mid_frame());
+    }
+
+    #[test]
+    fn a_live_demux_refuses_an_unframed_stream() {
+        assert!(DemuxStream::default().push(b"raw tty bytes").is_err());
     }
 
     #[test]

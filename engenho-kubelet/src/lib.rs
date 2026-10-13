@@ -73,8 +73,11 @@ mod node_readiness;
 pub use engenho_controllers::node_lease;
 pub mod pod_volume;
 pub mod podman_api;
+pub mod port_forward;
 pub mod probe;
+pub mod pty;
 pub mod server;
+pub mod stream;
 pub mod volume;
 
 pub use backend::{

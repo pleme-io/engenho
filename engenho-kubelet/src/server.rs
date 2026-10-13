@@ -19,14 +19,15 @@
 //!
 //! ★ WHAT IS AND IS NOT SERVED, stated plainly rather than discovered.
 //! `/containerLogs`, `/pods`, `/runningpods` and `/healthz` are served.
-//! `/exec` is served over the `v5.channel.k8s.io` WebSocket subprotocol
-//! for NON-interactive commands — `kubectl exec <pod> -- <cmd>` — which is
-//! the overwhelming majority of real exec traffic. `-i` and `-t` are
-//! REFUSED with a reason rather than accepted and served with batch
-//! semantics; see [`crate::exec_session`] for why a refusal beats a hang.
-//! `/attach` and `/portForward` remain a typed 501: both are inherently
-//! interactive and there is nothing honest to serve them with yet.
+//! `/exec` and `/attach` speak `v5.channel.k8s.io` (and `v4`, kubectl's
+//! fallback) over WebSocket: stdin, a real pty for `-t` with resizes, the
+//! v5 close-stdin signal `kubectl cp` relies on, and the exit status as a
+//! `Status` on the error channel. `/portForward` speaks upstream's WebSocket
+//! port-forward protocol (`?ports=`, a data and an error channel per port).
+//! A runtime that cannot stream answers with a `Status` naming why, on the
+//! error channel, never with a session that hangs.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use axum::Router;
@@ -36,10 +37,17 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use serde::Deserialize;
+use tokio::sync::mpsc;
 
 use crate::backend::{ExecOutcome, LogOptions};
-use crate::exec_channel::SUBPROTOCOL_V5;
-use crate::exec_session::{ExecQuery, ExecRefusal, backend_failure_frame, plan, session_frames};
+use crate::exec_channel::{
+    Channel, FrameError, SUBPROTOCOL_V4, SUBPROTOCOL_V5, decode_from_client, encode, parse_resize,
+};
+use crate::exec_session::{
+    ExecPlan, ExecQuery, ExecRefusal, backend_failure_frame, plan, plan_attach, status_frame,
+};
+use crate::port_forward::{self, Inbound, PortForwardRefusal};
+use crate::stream::{StreamRequest, StreamSession, StreamVerb};
 
 /// What the HTTP surface needs from the running kubelet.
 ///
@@ -78,6 +86,27 @@ pub trait KubeletApi: Send + Sync + 'static {
         container: &str,
         argv: &[String],
     ) -> Result<ExecOutcome, String>;
+
+    /// Start a streaming exec: the process's stdio wired to a live session.
+    async fn exec_stream(
+        &self,
+        namespace: &str,
+        pod: &str,
+        container: &str,
+        req: &StreamRequest,
+    ) -> Result<StreamSession, String>;
+
+    /// Attach to a running container's main process.
+    async fn attach(
+        &self,
+        namespace: &str,
+        pod: &str,
+        container: &str,
+        req: &StreamRequest,
+    ) -> Result<StreamSession, String>;
+
+    /// The address a port-forward to this pod dials.
+    async fn pod_address(&self, namespace: &str, pod: &str) -> Result<IpAddr, String>;
 }
 
 /// Query parameters `kubectl logs` sends.
@@ -142,19 +171,12 @@ impl KubeletServer {
             .route("/pods", get(pods))
             .route("/runningpods/", get(running_pods))
             .route("/healthz", get(healthz))
-            // Stream-multiplexed endpoints. A typed 501 rather than a
-            // missing route: a 404 would read as "wrong kubelet", sending
-            // an operator to debug their URL instead of learning the
-            // capability is absent.
             // Upstream's own segment shapes: exec/attach take
             // {namespace}/{pod}/{container}, portForward takes
             // {namespace}/{pod}.
             .route("/exec/:namespace/:pod/:container", get(exec))
-            .route(
-                "/attach/:namespace/:pod/:container",
-                get(stream_unsupported),
-            )
-            .route("/portForward/:namespace/:pod", get(stream_unsupported))
+            .route("/attach/:namespace/:pod/:container", get(attach))
+            .route("/portForward/:namespace/:pod", get(port_forward))
             .with_state(self)
     }
 }
@@ -184,7 +206,24 @@ async fn running_pods(State(s): State<KubeletServer>) -> impl IntoResponse {
     axum::Json(s.api.running_pods().await)
 }
 
-/// `kubectl exec` — upgrade to v5 channel framing and run the command.
+/// The subprotocol offer a request carries.
+fn offered(headers: &axum::http::HeaderMap) -> &str {
+    headers
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
+
+/// The answer to a stream request that is not a WebSocket upgrade.
+fn needs_upgrade(what: &str, protocols: &str) -> axum::response::Response {
+    (
+        StatusCode::BAD_REQUEST,
+        format!("{what} requires a WebSocket upgrade offering {protocols}"),
+    )
+        .into_response()
+}
+
+/// `kubectl exec` — upgrade to channel framing and run the command.
 async fn exec(
     State(s): State<KubeletServer>,
     Path((namespace, pod, container)): Path<(String, String, String)>,
@@ -197,66 +236,289 @@ async fn exec(
     // typed reason as the thing a client actually receives.
     ws: Option<WebSocketUpgrade>,
 ) -> axum::response::Response {
-    let offered = headers
-        .get("sec-websocket-protocol")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
     let query = ExecQuery::parse(raw.as_deref().unwrap_or(""));
-
     // ★ REFUSE BEFORE UPGRADING. A refusal after the upgrade is a socket
     // that opens and immediately closes, which kubectl reports as a
-    // connection error with no reason attached. Answering with a plain
-    // HTTP status keeps the explanation attached to the request.
-    let plan = match plan(&query, offered) {
+    // connection error with no reason attached.
+    let plan = match plan(&query, offered(&headers)) {
         Ok(p) => p,
-        Err(e) => {
-            let code = match e {
-                ExecRefusal::NoCommand => StatusCode::BAD_REQUEST,
-                ExecRefusal::StdinUnsupported
-                | ExecRefusal::TtyUnsupported
-                | ExecRefusal::SubprotocolUnsupported => StatusCode::NOT_IMPLEMENTED,
-            };
-            return (code, e.to_string()).into_response();
-        }
+        Err(e) => return refusal(&e),
     };
-
-    let Some(ws) = ws else {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!("exec requires a WebSocket upgrade offering {SUBPROTOCOL_V5}"),
-        )
-            .into_response();
-    };
-
-    // ★ THE PATH'S CONTAINER WINS over any `?container=`. On the kubelet's
-    // own surface the path IS the contract — the apiserver resolves which
-    // container and puts it there. The query field exists because the
-    // apiserver-side subresource reuses this parser, where it is the only
-    // place the name appears.
-    let _ = &plan.container;
-    ws.protocols([SUBPROTOCOL_V5])
-        .on_upgrade(move |socket| async move {
-            run_exec(socket, s, namespace, pod, container, plan).await;
-        })
+    stream_route(s, StreamVerb::Exec, namespace, pod, container, plan, ws)
 }
 
-async fn run_exec(
-    mut socket: WebSocket,
+/// `kubectl attach` — the same channel framing, on the container's main
+/// process instead of a new one.
+async fn attach(
+    State(s): State<KubeletServer>,
+    Path((namespace, pod, container)): Path<(String, String, String)>,
+    RawQuery(raw): RawQuery,
+    headers: axum::http::HeaderMap,
+    ws: Option<WebSocketUpgrade>,
+) -> axum::response::Response {
+    let query = ExecQuery::parse(raw.as_deref().unwrap_or(""));
+    let plan = match plan_attach(&query, offered(&headers)) {
+        Ok(p) => p,
+        Err(e) => return refusal(&e),
+    };
+    stream_route(s, StreamVerb::Attach, namespace, pod, container, plan, ws)
+}
+
+fn refusal(e: &ExecRefusal) -> axum::response::Response {
+    let code = match e {
+        ExecRefusal::NoCommand => StatusCode::BAD_REQUEST,
+        ExecRefusal::SubprotocolUnsupported => StatusCode::NOT_IMPLEMENTED,
+    };
+    (code, e.to_string()).into_response()
+}
+
+/// Upgrade and hand the socket to the session pump.
+///
+/// ★ THE PATH'S CONTAINER WINS over any `?container=`. On the kubelet's own
+/// surface the path IS the contract — the apiserver resolves which container
+/// and puts it there.
+fn stream_route(
     s: KubeletServer,
+    verb: StreamVerb,
     namespace: String,
     pod: String,
     container: String,
-    plan: crate::exec_session::ExecPlan,
-) {
-    let frames = match s.api.exec(&namespace, &pod, &container, &plan.argv).await {
-        Ok(outcome) => session_frames(&plan, &outcome),
-        Err(reason) => vec![backend_failure_frame(&reason)],
+    plan: ExecPlan,
+    ws: Option<WebSocketUpgrade>,
+) -> axum::response::Response {
+    let Some(ws) = ws else {
+        return needs_upgrade(
+            &verb.to_string(),
+            &format!("{SUBPROTOCOL_V5} or {SUBPROTOCOL_V4}"),
+        );
     };
-    for frame in frames {
-        if socket.send(Message::Binary(frame)).await.is_err() {
-            // The client hung up mid-stream. Nothing to report to and
-            // nothing to clean up: the command already ran to completion.
+    ws.protocols([plan.protocol.as_str()])
+        .on_upgrade(move |socket| async move {
+            let req = plan.request();
+            let session = match verb {
+                StreamVerb::Exec => s.api.exec_stream(&namespace, &pod, &container, &req).await,
+                StreamVerb::Attach => s.api.attach(&namespace, &pod, &container, &req).await,
+            };
+            pump_session(socket, &plan, session).await;
+        })
+}
+
+/// Receive from an output that may already be closed; a closed one never
+/// resolves, so `select!` keeps serving the others.
+async fn next_chunk(rx: &mut Option<mpsc::Receiver<Vec<u8>>>) -> Option<Vec<u8>> {
+    match rx {
+        Some(r) => r.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Carry one session over the socket until the process ends.
+///
+/// Output first, status last: the terminating `Status` is sent only after
+/// every output stream has reached EOF AND the process has exited, so a
+/// client never sees the exit before the last line the process printed.
+async fn pump_session(
+    mut socket: WebSocket,
+    plan: &ExecPlan,
+    session: Result<StreamSession, String>,
+) {
+    let session = match session {
+        Ok(s) => s,
+        Err(reason) => {
+            let _ = socket
+                .send(Message::Binary(backend_failure_frame(&reason)))
+                .await;
+            let _ = socket.close().await;
             return;
+        }
+    };
+    let StreamSession {
+        mut stdin,
+        mut stdout,
+        mut stderr,
+        resize,
+        mut exit,
+    } = session;
+    let mut finished = None;
+    let mut client_open = true;
+    while stdout.is_some() || stderr.is_some() || finished.is_none() {
+        tokio::select! {
+            chunk = next_chunk(&mut stdout), if stdout.is_some() => match chunk {
+                Some(b) => {
+                    if socket.send(Message::Binary(encode(Channel::Stdout, &b))).await.is_err() {
+                        return;
+                    }
+                }
+                None => stdout = None,
+            },
+            chunk = next_chunk(&mut stderr), if stderr.is_some() => match chunk {
+                Some(b) => {
+                    if socket.send(Message::Binary(encode(Channel::Stderr, &b))).await.is_err() {
+                        return;
+                    }
+                }
+                None => stderr = None,
+            },
+            ended = &mut exit, if finished.is_none() => finished = Some(ended),
+            msg = socket.recv(), if client_open => match msg {
+                Some(Ok(Message::Binary(bytes))) => {
+                    match decode_from_client(&bytes, plan.protocol) {
+                        Ok(f) => match f.channel {
+                            Channel::Stdin => {
+                                if let Some(tx) = &stdin
+                                    && tx.send(f.payload).await.is_err()
+                                {
+                                    stdin = None;
+                                }
+                            }
+                            Channel::Resize => {
+                                if let (Some(tx), Some(size)) = (&resize, parse_resize(&f.payload)) {
+                                    let _ = tx.send(size).await;
+                                }
+                            }
+                            Channel::Close => {
+                                if f.payload.first() == Some(&Channel::Stdin.as_byte()) {
+                                    stdin = None;
+                                }
+                            }
+                            Channel::Stdout | Channel::Stderr | Channel::Error => {}
+                        },
+                        Err(FrameError::Empty) => {}
+                        Err(e) => tracing::debug!(error = %e, "dropped a client frame"),
+                    }
+                }
+                Some(Ok(Message::Close(_)) | Err(_)) | None => {
+                    client_open = false;
+                    stdin = None;
+                }
+                Some(Ok(_)) => {}
+            },
+        }
+    }
+    let frame = match finished {
+        Some(Ok(exit)) => status_frame(exit),
+        Some(Err(e)) => backend_failure_frame(&e.to_string()),
+        None => return,
+    };
+    let _ = socket.send(Message::Binary(frame)).await;
+    let _ = socket.close().await;
+}
+
+/// `kubectl port-forward` — one WebSocket, a data and an error channel per
+/// requested port, each dialled on the pod's address.
+async fn port_forward(
+    State(s): State<KubeletServer>,
+    Path((namespace, pod)): Path<(String, String)>,
+    RawQuery(raw): RawQuery,
+    headers: axum::http::HeaderMap,
+    ws: Option<WebSocketUpgrade>,
+) -> axum::response::Response {
+    let ports = match port_forward::parse_ports(raw.as_deref().unwrap_or("")) {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+    let Some(protocol) = port_forward::negotiate(offered(&headers)) else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            PortForwardRefusal::SubprotocolUnsupported.to_string(),
+        )
+            .into_response();
+    };
+    let Some(ws) = ws else {
+        return needs_upgrade("portForward", &port_forward::SUBPROTOCOLS.join(" or "));
+    };
+    ws.protocols([protocol]).on_upgrade(move |socket| async move {
+        let addr = s.api.pod_address(&namespace, &pod).await;
+        pump_port_forward(socket, &namespace, &pod, addr, &ports).await;
+    })
+}
+
+/// Carry every port's TCP stream over the socket until each has closed.
+async fn pump_port_forward(
+    mut socket: WebSocket,
+    namespace: &str,
+    pod: &str,
+    addr: Result<IpAddr, String>,
+    ports: &[u16],
+) {
+    let (out_tx, mut out_rx) = mpsc::channel::<Option<(u8, Vec<u8>)>>(64);
+    let mut writers: Vec<Option<mpsc::Sender<Vec<u8>>>> = Vec::with_capacity(ports.len());
+    let mut live = 0usize;
+    for (i, &port) in ports.iter().enumerate() {
+        let data = port_forward::data_channel(i);
+        let error = port_forward::error_channel(i);
+        for ch in [data, error] {
+            if socket
+                .send(Message::Binary(port_forward::port_frame(ch, port)))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        let dialled = match &addr {
+            Ok(ip) => tokio::net::TcpStream::connect((*ip, port))
+                .await
+                .map_err(|e| e.to_string()),
+            Err(reason) => Err(reason.clone()),
+        };
+        match dialled {
+            Ok(stream) => {
+                let (read, write) = stream.into_split();
+                writers.push(Some(crate::stream::pump_writer(write)));
+                let mut rx = crate::stream::pump_reader(read);
+                let tx = out_tx.clone();
+                live += 1;
+                tokio::spawn(async move {
+                    while let Some(chunk) = rx.recv().await {
+                        if tx.send(Some((data, chunk))).await.is_err() {
+                            return;
+                        }
+                    }
+                    let _ = tx.send(None).await;
+                });
+            }
+            Err(reason) => {
+                writers.push(None);
+                let msg = format!(
+                    "error forwarding port {port} to pod {namespace}/{pod}: {reason}"
+                );
+                if socket
+                    .send(Message::Binary(port_forward::frame(error, msg.as_bytes())))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    }
+    drop(out_tx);
+    while live > 0 {
+        tokio::select! {
+            out = out_rx.recv() => match out {
+                Some(Some((ch, chunk))) => {
+                    if socket.send(Message::Binary(port_forward::frame(ch, &chunk))).await.is_err() {
+                        return;
+                    }
+                }
+                Some(None) => live -= 1,
+                None => break,
+            },
+            msg = socket.recv() => match msg {
+                Some(Ok(Message::Binary(bytes))) => {
+                    let Some((&ch, payload)) = bytes.split_first() else { continue };
+                    if let Inbound::Data(i) = port_forward::route(ch, ports.len()) {
+                        if let Some(Some(tx)) = writers.get(i) {
+                            if tx.send(payload.to_vec()).await.is_err() {
+                                writers[i] = None;
+                            }
+                        }
+                    }
+                }
+                Some(Ok(Message::Close(_)) | Err(_)) | None => return,
+                Some(Ok(_)) => {}
+            },
         }
     }
     let _ = socket.close().await;
@@ -264,15 +526,6 @@ async fn run_exec(
 
 async fn healthz() -> impl IntoResponse {
     "ok"
-}
-
-async fn stream_unsupported() -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        "this kubelet does not serve exec/attach/portForward: they require SPDY or WebSocket \
-         stream multiplexing, and a half-implemented stream protocol hangs a client rather than \
-         failing it. Use the container runtime directly on the node.",
-    )
 }
 
 #[cfg(test)]
@@ -323,6 +576,30 @@ mod tests {
 
         async fn running_pods(&self) -> serde_json::Value {
             serde_json::json!({ "kind": "PodList", "items": [] })
+        }
+
+        async fn exec_stream(
+            &self,
+            _ns: &str,
+            _pod: &str,
+            _container: &str,
+            _req: &StreamRequest,
+        ) -> Result<StreamSession, String> {
+            Err("not in this fake".into())
+        }
+
+        async fn attach(
+            &self,
+            _ns: &str,
+            _pod: &str,
+            _container: &str,
+            _req: &StreamRequest,
+        ) -> Result<StreamSession, String> {
+            Err("not in this fake".into())
+        }
+
+        async fn pod_address(&self, _ns: &str, _pod: &str) -> Result<IpAddr, String> {
+            Ok(IpAddr::from([127, 0, 0, 1]))
         }
     }
 
@@ -425,12 +702,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exec_refuses_interactive_before_upgrading() {
-        // The load-bearing shape: a plain HTTP status carrying the reason,
-        // NOT an upgrade that opens and immediately closes.
+    async fn interactive_exec_is_planned_and_only_the_missing_upgrade_is_reported() {
         let (status, body) = get_v5("/exec/default/p/c?command=sh&stdin=true&tty=true").await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-        assert!(body.contains("stdin"), "{body}");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("WebSocket upgrade"), "{body}");
     }
 
     #[tokio::test]
@@ -460,13 +735,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attach_and_port_forward_are_still_501_with_a_reason() {
-        // A 404 reads as "wrong kubelet" and sends an operator to debug
-        // their URL instead of learning the capability is absent.
-        for p in ["/attach/default/nginx/app", "/portForward/default/nginx"] {
-            let (s, body) = get_body(p).await;
-            assert_eq!(s, StatusCode::NOT_IMPLEMENTED, "{p}");
-            assert!(body.contains("multiplexing"), "{p}: {body}");
-        }
+    async fn attach_and_port_forward_answer_with_a_reason_not_a_404() {
+        let (s, body) = get_body("/attach/default/nginx/app").await;
+        assert_eq!(s, StatusCode::NOT_IMPLEMENTED);
+        assert!(body.contains("v5.channel.k8s.io"), "{body}");
+
+        let (s, body) = get_v5("/attach/default/nginx/app?stdout=true").await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(body.contains("WebSocket upgrade"), "{body}");
+
+        let (s, body) = get_body("/portForward/default/nginx").await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(body.contains("ports"), "{body}");
+
+        let (s, body) = get_body("/portForward/default/nginx?ports=80").await;
+        assert_eq!(s, StatusCode::NOT_IMPLEMENTED);
+        assert!(body.contains("subprotocol"), "{body}");
     }
 }

@@ -1306,6 +1306,45 @@ impl engenho_kubelet::server::KubeletApi for WeakKubeletApi {
         )
         .await
     }
+
+    async fn exec_stream(
+        &self,
+        namespace: &str,
+        pod: &str,
+        container: &str,
+        req: &engenho_kubelet::stream::StreamRequest,
+    ) -> Result<engenho_kubelet::stream::StreamSession, String> {
+        engenho_kubelet::server::KubeletApi::exec_stream(
+            self.get()?.as_ref(),
+            namespace,
+            pod,
+            container,
+            req,
+        )
+        .await
+    }
+
+    async fn attach(
+        &self,
+        namespace: &str,
+        pod: &str,
+        container: &str,
+        req: &engenho_kubelet::stream::StreamRequest,
+    ) -> Result<engenho_kubelet::stream::StreamSession, String> {
+        engenho_kubelet::server::KubeletApi::attach(
+            self.get()?.as_ref(),
+            namespace,
+            pod,
+            container,
+            req,
+        )
+        .await
+    }
+
+    async fn pod_address(&self, namespace: &str, pod: &str) -> Result<std::net::IpAddr, String> {
+        engenho_kubelet::server::KubeletApi::pod_address(self.get()?.as_ref(), namespace, pod)
+            .await
+    }
 }
 
 #[async_trait::async_trait]

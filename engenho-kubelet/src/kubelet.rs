@@ -1796,6 +1796,7 @@ impl Kubelet {
                     // Pod-level, carried per container so a stop can honour
                     // it without looking the pod up again.
                     termination_grace: crate::backend::TerminationGrace::of_pod(pod),
+                    stdio: crate::backend::ContainerStdio::from_container_json(c),
                     // ★ The identity, carried rather than fused. The four
                     // components are all in scope right here and were being
                     // thrown away into `backend_name`'s lossy join — which the
@@ -7118,6 +7119,74 @@ impl crate::server::KubeletApi for Kubelet {
             .exec(&id, argv)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    async fn exec_stream(
+        &self,
+        namespace: &str,
+        pod: &str,
+        container: &str,
+        req: &crate::stream::StreamRequest,
+    ) -> Result<crate::stream::StreamSession, String> {
+        let id = self
+            .container_id_of(namespace, pod, container)
+            .await
+            .ok_or_else(|| Self::no_such_container(namespace, pod, container))?;
+        match self.backend.exec_stream(&id, req).await {
+            // A runtime with no streaming seam still serves the batch exec
+            // that sends no input: for that request the captured result IS
+            // the whole session.
+            Err(KubeletError::StreamUnsupported { .. }) if !req.stdin && !req.tty => self
+                .backend
+                .exec(&id, &req.argv)
+                .await
+                .map(|outcome| crate::stream::StreamSession::completed(&outcome, req))
+                .map_err(|e| e.to_string()),
+            other => other.map_err(|e| e.to_string()),
+        }
+    }
+
+    async fn attach(
+        &self,
+        namespace: &str,
+        pod: &str,
+        container: &str,
+        req: &crate::stream::StreamRequest,
+    ) -> Result<crate::stream::StreamSession, String> {
+        let id = self
+            .container_id_of(namespace, pod, container)
+            .await
+            .ok_or_else(|| Self::no_such_container(namespace, pod, container))?;
+        self.backend
+            .attach(&id, req)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// The pod's IP as its runtime reports it; the loopback for a runtime
+    /// that reports none, which is a native pod's address (it shares the
+    /// host's network).
+    async fn pod_address(&self, namespace: &str, pod: &str) -> Result<std::net::IpAddr, String> {
+        let ids: Vec<String> = {
+            let key = ResourceKey::namespaced("", "v1", "Pod", namespace, pod);
+            let local = self.local.lock().await;
+            let entry = local
+                .get(&key)
+                .ok_or_else(|| format!("pod {namespace}/{pod} is not running on this node"))?;
+            entry
+                .containers
+                .values()
+                .map(|r| r.container_id.clone())
+                .collect()
+        };
+        for id in ids {
+            if let Ok(Some(status)) = self.backend.status(&id).await {
+                if let Some(ip) = status.pod_ip.and_then(|ip| ip.parse().ok()) {
+                    return Ok(ip);
+                }
+            }
+        }
+        Ok(std::net::IpAddr::from([127, 0, 0, 1]))
     }
 }
 

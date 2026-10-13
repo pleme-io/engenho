@@ -330,6 +330,9 @@ struct NativeContainer {
     /// Where the process is in its life, and who holds it.
     process: Process,
     leaf: Option<Leaf>,
+    /// The process's stdio as attachers reach it. Its output fan-outs also
+    /// say when the log has received the last byte.
+    stdio: crate::stream::AttachPoint,
 }
 
 #[derive(Debug)]
@@ -504,6 +507,60 @@ fn workload_command<'a>(
     cmd.stdin(std::process::Stdio::null());
     cmd.kill_on_drop(true);
     cmd
+}
+
+/// Route a started workload's stdio: every output byte to the container log
+/// FIRST and then to whoever is attached, stdin kept for attachers when the
+/// spec declares one, the terminal's master when it declares `tty`.
+///
+/// The process never writes the log itself any more: a pipe the kubelet
+/// reads is the only way to hand the same bytes to `kubectl attach` without
+/// re-reading a file that interleaves stdout and stderr.
+fn wire_stdio(
+    child: &mut tokio::process::Child,
+    pty: Option<crate::pty::Pty>,
+    declared: crate::backend::ContainerStdio,
+    log: std::fs::File,
+    log_err: std::fs::File,
+) -> std::io::Result<crate::stream::AttachPoint> {
+    use crate::stream::{AttachPoint, fanout, pump_resizes, pump_writer, tee};
+    let (out_feed, stdout) = fanout();
+    if let Some(pty) = pty {
+        let master = pty.into_master()?;
+        tee(
+            tokio::fs::File::from_std(master.reader),
+            tokio::fs::File::from_std(log),
+            out_feed,
+        );
+        drop(log_err);
+        let stdin = declared
+            .stdin
+            .then(|| pump_writer(tokio::fs::File::from_std(master.writer)));
+        return Ok(AttachPoint {
+            stdout,
+            stderr: None,
+            stdin: Arc::new(tokio::sync::Mutex::new(stdin)),
+            stdin_once: declared.stdin_once,
+            resize: Some(pump_resizes(master.resizer)),
+        });
+    }
+    let (err_feed, stderr) = fanout();
+    match child.stdout.take() {
+        Some(r) => tee(r, tokio::fs::File::from_std(log), out_feed),
+        None => drop(out_feed),
+    }
+    match child.stderr.take() {
+        Some(r) => tee(r, tokio::fs::File::from_std(log_err), err_feed),
+        None => drop(err_feed),
+    }
+    let stdin = child.stdin.take().map(pump_writer);
+    Ok(AttachPoint {
+        stdout,
+        stderr: Some(stderr),
+        stdin: Arc::new(tokio::sync::Mutex::new(stdin)),
+        stdin_once: declared.stdin_once,
+        resize: None,
+    })
 }
 
 /// Stop `child`: `SIGTERM`, `SIGKILL` once `grace` has passed, then reap.
@@ -863,8 +920,24 @@ impl ContainerRuntime for NativeBackend {
         })?;
 
         let mut cmd = workload_command(&program, argv.iter().skip(1), &spec.env);
-        cmd.stdout(std::process::Stdio::from(log));
-        cmd.stderr(std::process::Stdio::from(log_err));
+        let pty = if spec.stdio.tty {
+            let pty = crate::pty::Pty::open().map_err(|e| NativeError::Spawn {
+                program: program.clone(),
+                detail: e.to_string(),
+            })?;
+            pty.wire(&mut cmd).map_err(|e| NativeError::Spawn {
+                program: program.clone(),
+                detail: e.to_string(),
+            })?;
+            Some(pty)
+        } else {
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+            if spec.stdio.stdin {
+                cmd.stdin(std::process::Stdio::piped());
+            }
+            None
+        };
         run_as.apply(&mut cmd);
 
         let leaf = match admission {
@@ -897,6 +970,21 @@ impl ContainerRuntime for NativeBackend {
             }
         };
         let pid = child.id();
+        let mut child = child;
+        let stdio = match wire_stdio(&mut child, pty, spec.stdio, log, log_err) {
+            Ok(stdio) => stdio,
+            Err(e) => {
+                drop(child);
+                if let Some(leaf) = leaf {
+                    leaf.release();
+                }
+                return Err(NativeError::Spawn {
+                    program,
+                    detail: e.to_string(),
+                }
+                .into());
+            }
+        };
 
         state.insert(
             id.clone(),
@@ -906,6 +994,7 @@ impl ContainerRuntime for NativeBackend {
                 grace: spec.termination_grace.duration(),
                 process: Process::Live(child),
                 leaf,
+                stdio,
             },
         );
         drop(state);
@@ -978,10 +1067,29 @@ impl ContainerRuntime for NativeBackend {
     }
 
     async fn logs(&self, container_id: &str, opts: &LogOptions) -> Result<String, KubeletError> {
-        let path = {
-            let guard = self.state.lock().map_err(|_| NativeError::StatePoisoned)?;
-            guard.get(container_id).map(|c| c.log_path.clone())
+        let found = {
+            let mut guard = self.state.lock().map_err(|_| NativeError::StatePoisoned)?;
+            match guard.get_mut(container_id) {
+                Some(c) => {
+                    c.settle(container_id)?;
+                    let exited = !c.run_state().is_running();
+                    Some((c.log_path.clone(), exited.then(|| c.stdio.clone())))
+                }
+                None => None,
+            }
         };
+        let path = found.as_ref().map(|(p, _)| p.clone());
+        if let Some((_, Some(stdio))) = found {
+            // The process is gone but its pump may still hold its last
+            // bytes; a log read right after exit must include them.
+            let drained = async {
+                stdio.stdout.ended().await;
+                if let Some(err) = &stdio.stderr {
+                    err.ended().await;
+                }
+            };
+            let _ = tokio::time::timeout(Duration::from_secs(2), drained).await;
+        }
         let Some(path) = path else {
             // A typed error, never a silently-empty success — the same rule the
             // trait states for podman.
@@ -1010,30 +1118,7 @@ impl ContainerRuntime for NativeBackend {
     }
 
     async fn exec(&self, container_id: &str, argv: &[String]) -> Result<ExecOutcome, KubeletError> {
-        let program = {
-            let guard = self.state.lock().map_err(|_| NativeError::StatePoisoned)?;
-            guard.get(container_id).map(|c| c.program.clone())
-        };
-        let Some(program) = program else {
-            return Err(NativeError::NoSuchContainer {
-                id: container_id.to_string(),
-            }
-            .into());
-        };
-        let Some(first) = argv.first() else {
-            return Err(NativeError::ExecNoCommand.into());
-        };
-        // Resolve against the same closure the container runs from, so an
-        // exec-probe cannot accidentally test a binary from the host's PATH
-        // instead of the one in the image.
-        let closure =
-            program
-                .parent()
-                .and_then(Path::parent)
-                .ok_or_else(|| NativeError::NoClosureRoot {
-                    program: program.clone(),
-                })?;
-        let target = Self::resolve_program(closure, std::slice::from_ref(first))?;
+        let target = self.exec_target(container_id, argv)?;
         let out = tokio::process::Command::new(&target)
             .args(argv.iter().skip(1))
             .output()
@@ -1047,6 +1132,60 @@ impl ContainerRuntime for NativeBackend {
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         })
+    }
+
+    async fn exec_stream(
+        &self,
+        container_id: &str,
+        req: &crate::stream::StreamRequest,
+    ) -> Result<crate::stream::StreamSession, KubeletError> {
+        let target = self.exec_target(container_id, &req.argv)?;
+        let mut cmd = tokio::process::Command::new(&target);
+        cmd.args(req.argv.iter().skip(1));
+        crate::stream::spawn_local(cmd, req)
+    }
+
+    async fn attach(
+        &self,
+        container_id: &str,
+        req: &crate::stream::StreamRequest,
+    ) -> Result<crate::stream::StreamSession, KubeletError> {
+        let point = {
+            let guard = self.state.lock().map_err(|_| NativeError::StatePoisoned)?;
+            guard.get(container_id).map(|c| c.stdio.clone())
+        };
+        let point = point.ok_or_else(|| NativeError::NoSuchContainer {
+            id: container_id.to_string(),
+        })?;
+        Ok(point.attach(req))
+    }
+}
+
+impl NativeBackend {
+    /// The program an exec of `argv` runs: `argv[0]` resolved against the
+    /// SAME closure the container runs from, so an exec cannot accidentally
+    /// run a binary from the host's PATH instead of the one in the image.
+    fn exec_target(&self, container_id: &str, argv: &[String]) -> Result<PathBuf, NativeError> {
+        let program = {
+            let guard = self.state.lock().map_err(|_| NativeError::StatePoisoned)?;
+            guard.get(container_id).map(|c| c.program.clone())
+        };
+        let Some(program) = program else {
+            return Err(NativeError::NoSuchContainer {
+                id: container_id.to_string(),
+            });
+        };
+        let Some(first) = argv.first() else {
+            return Err(NativeError::ExecNoCommand);
+        };
+        let closure =
+            program
+                .parent()
+                .and_then(Path::parent)
+                .ok_or_else(|| NativeError::NoClosureRoot {
+                    program: program.clone(),
+                })?;
+        Self::resolve_program(closure, std::slice::from_ref(first))
     }
 }
 

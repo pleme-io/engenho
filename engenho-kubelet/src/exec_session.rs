@@ -14,52 +14,36 @@
 //! the shapes someone remembered to open a socket for, and its failures are
 //! hangs rather than assertions.
 //!
-//! ★ WHAT ENGENHO CAN AND CANNOT SERVE TODAY, AND WHY THE LINE IS HERE.
-//! The runtime seam is [`crate::backend::ContainerRuntime::exec`], which is
-//! BATCH: it runs argv to completion and hands back a captured
-//! [`crate::backend::ExecOutcome`]. That is a complete answer for
-//! `kubectl exec <pod> -- <cmd>`, which is the overwhelming majority of
-//! real exec traffic. It is NOT an answer for `-i` or `-t`: an interactive
-//! session needs the process's stdin wired to the socket while it runs, and
-//! no amount of framing produces that from a batch call.
-//!
-//! So `stdin=true` and `tty=true` are REFUSED, with a reason, at the start.
-//! The alternative — accept the upgrade and serve batch semantics anyway —
-//! gives the user a shell prompt that never echoes and never exits, which
-//! reads as a broken cluster rather than a missing feature. A refusal a
-//! human can read is strictly better than a hang, and it is the honest
-//! statement of where the seam currently stops.
+//! ★ WHAT ENGENHO SERVES. Every exec and attach rides the streaming runtime
+//! seam ([`crate::backend::ContainerRuntime::exec_stream`] and
+//! [`crate::backend::ContainerRuntime::attach`]): the process's stdin is
+//! wired to the socket while it runs, a tty is a real pseudo-terminal with
+//! resizes applied, and `v5`'s close signal closes stdin so `kubectl cp`'s
+//! `tar` sees end of input. A runtime that cannot stream refuses with
+//! [`crate::error::KubeletError::StreamUnsupported`], which reaches the
+//! client as a `Status` on the error channel — never as a session that
+//! opens and then hangs.
 
 use crate::backend::ExecOutcome;
-use crate::exec_channel::{Channel, encode, exit_status};
+use crate::exec_channel::{Channel, Subprotocol, encode, exit_status};
+use crate::stream::{StreamExit, StreamRequest};
 
-/// Why engenho will not serve this exec.
-///
-/// Each variant names a *capability*, not a syntax error, so the message
-/// tells an operator what engenho cannot do rather than what they typed.
+/// Why engenho will not serve this exec or attach.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ExecRefusal {
     /// No `command` parameter. Upstream requires at least one.
     #[error("no command given: exec needs at least one `command` parameter")]
     NoCommand,
-    /// `stdin=true` — an interactive session.
+    /// The client offered neither `v5.channel.k8s.io` nor `v4.channel.k8s.io`.
     #[error(
-        "interactive exec (stdin) is not served: the runtime seam runs a \
-         command to completion and returns its output, so there is no \
-         running process to write stdin to"
+        "client offered no supported stream subprotocol (need {} or {})",
+        crate::exec_channel::SUBPROTOCOL_V5,
+        crate::exec_channel::SUBPROTOCOL_V4
     )]
-    StdinUnsupported,
-    /// `tty=true` — a pty-backed session.
-    #[error(
-        "tty exec is not served: allocating a pty requires the streaming \
-         runtime seam, which is not wired yet"
-    )]
-    TtyUnsupported,
-    /// The client did not offer `v5.channel.k8s.io`.
-    #[error("client offered no supported stream subprotocol (need {SUBPROTOCOL})")]
     SubprotocolUnsupported,
 }
 
+#[cfg(test)]
 const SUBPROTOCOL: &str = crate::exec_channel::SUBPROTOCOL_V5;
 
 /// What the client asked for, as parsed off the query string.
@@ -148,48 +132,85 @@ fn percent_decode(s: &str) -> String {
 /// A session engenho has agreed to serve.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecPlan {
-    /// argv to run inside the container.
+    /// argv to run inside the container. Empty for attach.
     pub argv: Vec<String>,
     /// Container name, when the client named one.
     pub container: Option<String>,
+    /// The negotiated channel subprotocol.
+    pub protocol: Subprotocol,
+    /// Whether the client's input is wired to the process.
+    pub stdin: bool,
     /// Whether the client wants the stdout channel.
     pub want_stdout: bool,
-    /// Whether the client wants the stderr channel.
+    /// Whether the client wants the stderr channel. Always `false` with a
+    /// tty: a terminal has one output, and upstream drops stderr there too.
     pub want_stderr: bool,
+    /// Whether the session runs on a terminal.
+    pub tty: bool,
 }
 
-/// Decide whether this request can be served, and how.
+impl ExecPlan {
+    /// The runtime request this plan asks for.
+    #[must_use]
+    pub fn request(&self) -> StreamRequest {
+        StreamRequest {
+            argv: self.argv.clone(),
+            stdin: self.stdin,
+            stdout: self.want_stdout,
+            stderr: self.want_stderr,
+            tty: self.tty,
+        }
+    }
+}
+
+/// Decide whether this exec can be served, and how.
 ///
 /// # Errors
 ///
-/// [`ExecRefusal`] naming the capability engenho does not have.
+/// [`ExecRefusal`] naming what is missing.
 pub fn plan(q: &ExecQuery, offered_subprotocols: &str) -> Result<ExecPlan, ExecRefusal> {
-    if crate::exec_channel::negotiate(offered_subprotocols).is_none() {
-        return Err(ExecRefusal::SubprotocolUnsupported);
-    }
+    let p = plan_attach(q, offered_subprotocols)?;
     if q.command.is_empty() {
         return Err(ExecRefusal::NoCommand);
     }
-    // Checked BEFORE tty on purpose: `kubectl exec -it` sets both, and
-    // stdin is the more fundamental of the two — a user told "no stdin"
-    // learns the real shape of the limit, where "no tty" invites them to
-    // retry with -i alone and hit the same wall.
-    if q.stdin {
-        return Err(ExecRefusal::StdinUnsupported);
-    }
-    if q.tty {
-        return Err(ExecRefusal::TtyUnsupported);
-    }
     Ok(ExecPlan {
         argv: q.command.clone(),
+        ..p
+    })
+}
+
+/// Decide whether this attach can be served, and how. Attach runs no
+/// command, so only the subprotocol can refuse it.
+///
+/// # Errors
+///
+/// [`ExecRefusal::SubprotocolUnsupported`].
+pub fn plan_attach(q: &ExecQuery, offered_subprotocols: &str) -> Result<ExecPlan, ExecRefusal> {
+    let protocol = crate::exec_channel::negotiate(offered_subprotocols)
+        .ok_or(ExecRefusal::SubprotocolUnsupported)?;
+    Ok(ExecPlan {
+        argv: Vec::new(),
         container: q.container.clone(),
+        protocol,
+        stdin: q.stdin,
         // Upstream's default when a client asks for neither is to send
         // both: a client that requested no output channel at all still
         // wants the exit code, and sending output it did not ask for is
         // harmless where withholding output it did is a silent truncation.
         want_stdout: q.stdout || !q.stderr,
-        want_stderr: q.stderr || !q.stdout,
+        want_stderr: !q.tty && (q.stderr || !q.stdout),
+        tty: q.tty,
     })
+}
+
+/// The terminating frame for a session that ended.
+#[must_use]
+pub fn status_frame(exit: StreamExit) -> Vec<u8> {
+    let code = match exit {
+        StreamExit::Code(c) => c,
+        StreamExit::Ended => 0,
+    };
+    encode(Channel::Error, exit_status(code).to_string().as_bytes())
 }
 
 /// The exact frames a completed exec sends, in order.
@@ -262,35 +283,45 @@ mod tests {
     }
 
     #[test]
-    fn interactive_and_tty_are_refused_with_a_reason_each() {
-        let sp = SUBPROTOCOL;
-        let stdin = plan(&q("command=sh&stdin=true"), sp).unwrap_err();
-        assert_eq!(stdin, ExecRefusal::StdinUnsupported);
-        assert!(stdin.to_string().contains("to completion"), "{stdin}");
-
-        let tty = plan(&q("command=sh&tty=true"), sp).unwrap_err();
-        assert_eq!(tty, ExecRefusal::TtyUnsupported);
+    fn dash_it_is_planned_with_stdin_and_a_tty_and_no_separate_stderr() {
+        let p = plan(
+            &q("command=sh&stdin=true&stdout=true&stderr=true&tty=true"),
+            SUBPROTOCOL,
+        )
+        .expect("interactive exec is served");
+        assert!(p.stdin && p.tty && p.want_stdout);
+        assert!(!p.want_stderr, "a terminal has one output");
+        assert_eq!(p.request().argv, vec!["sh"]);
     }
 
     #[test]
-    fn dash_it_reports_the_stdin_limit_not_the_tty_one() {
-        // `kubectl exec -it` sets both. Reporting tty first would send the
-        // user to retry with -i alone and hit the identical wall.
+    fn a_v4_client_is_served_and_a_v3_one_is_refused() {
         assert_eq!(
-            plan(&q("command=sh&stdin=true&tty=true"), SUBPROTOCOL).unwrap_err(),
-            ExecRefusal::StdinUnsupported
+            plan(&q("command=ls"), "v4.channel.k8s.io")
+                .expect("v4")
+                .protocol,
+            Subprotocol::V4
         );
-    }
-
-    #[test]
-    fn a_client_offering_no_v5_is_refused_before_anything_else() {
-        // Refused even though the request is otherwise perfectly valid:
-        // answering a v4 client with v5 error framing yields a session
-        // that works until the command fails.
         assert_eq!(
-            plan(&q("command=ls"), "v4.channel.k8s.io").unwrap_err(),
+            plan(&q("command=ls"), "v3.channel.k8s.io").unwrap_err(),
             ExecRefusal::SubprotocolUnsupported
         );
+    }
+
+    #[test]
+    fn attach_needs_no_command() {
+        let p = plan_attach(&q("stdin=true&stdout=true"), SUBPROTOCOL).expect("attach");
+        assert!(p.argv.is_empty() && p.stdin);
+    }
+
+    #[test]
+    fn an_ended_attach_reports_success_and_a_code_reports_its_cause() {
+        let ok: serde_json::Value =
+            serde_json::from_slice(&status_frame(StreamExit::Ended)[1..]).expect("JSON");
+        assert_eq!(ok["status"], "Success");
+        let bad: serde_json::Value =
+            serde_json::from_slice(&status_frame(StreamExit::Code(3))[1..]).expect("JSON");
+        assert_eq!(bad["details"]["causes"][0]["message"], "3");
     }
 
     #[test]
