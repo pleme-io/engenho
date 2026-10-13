@@ -46,6 +46,9 @@ pub enum Subresource {
     Attach,
     /// `/portforward` — WebSocket stream relayed to the node kubelet.
     PortForward,
+    /// `/eviction` — POST a policy/v1 `Eviction`: delete the pod unless a
+    /// PodDisruptionBudget forbids it (429). Create-only, Pod-only.
+    Eviction,
 }
 /// One runtime row describing a routable/discoverable Kubernetes kind.
 ///
@@ -157,6 +160,7 @@ pub const RESOURCE_CATALOG: &[ResourceDescriptor] = &[
             Subresource::Exec,
             Subresource::Attach,
             Subresource::PortForward,
+            Subresource::Eviction,
         ],
     },
     ResourceDescriptor {

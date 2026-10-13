@@ -1520,6 +1520,35 @@ impl PodmanApi {
         demux(&bytes)
     }
 
+    /// `GET /libpod/containers/stats?containers={id}&stream=false`: the
+    /// container's cumulative CPU (`CPUNano`) and memory (`MemUsage`).
+    ///
+    /// # Errors
+    ///
+    /// [`KubeletError::Backend`] on transport failure, a non-2xx status, or a
+    /// body with no stats for the container.
+    pub async fn stats(&self, id: &str) -> Result<crate::usage::Cumulative, KubeletError> {
+        let (status, bytes) = self
+            .send(
+                hyper::Method::GET,
+                &libpod_path(&format!("containers/stats?containers={id}&stream=false")),
+                None,
+            )
+            .await?;
+        if !status.is_success() {
+            return Err(KubeletError::Backend(format!(
+                "podman stats {id}: HTTP {status}: {}",
+                String::from_utf8_lossy(&bytes)
+            )));
+        }
+        parse_stats(&bytes).ok_or_else(|| {
+            KubeletError::Backend(format!(
+                "podman stats {id}: no CPUNano/MemUsage in {}",
+                String::from_utf8_lossy(&bytes)
+            ))
+        })
+    }
+
     /// `DELETE /libpod/containers/{id}?force=true`.
     ///
     /// # Errors
@@ -1548,6 +1577,16 @@ impl PodmanApi {
             String::from_utf8_lossy(&bytes)
         )))
     }
+}
+
+/// The first entry of a libpod stats report, as a cumulative reading.
+fn parse_stats(body: &[u8]) -> Option<crate::usage::Cumulative> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let first = v.get("Stats")?.as_array()?.first()?;
+    Some(crate::usage::Cumulative {
+        cpu_ns: first.get("CPUNano")?.as_u64()?,
+        memory_working_set_bytes: first.get("MemUsage")?.as_u64()?,
+    })
 }
 
 // ── The ContainerRuntime implementation ────────────────────────────────────
@@ -1784,21 +1823,36 @@ impl crate::backend::ContainerRuntime for PodmanApiBackend {
         container_id: &str,
         opts: &crate::backend::LogOptions,
     ) -> Result<String, KubeletError> {
-        // Interleave stdout and stderr the way `kubectl logs` presents them:
-        // one text blob, stdout first. The two are collected separately because
-        // the WIRE separates them; joining is a presentation choice made here
-        // rather than a distinction lost on the way in.
-        if opts.from_byte.is_some() {
-            return Err(KubeletError::Backend(
-                "podman logs: reading from a byte offset is not supported on this backend".into(),
-            ));
-        }
-        let out = self.api.logs(container_id, opts).await?;
-        let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
-        if !out.stderr.is_empty() {
-            s.push_str(&String::from_utf8_lossy(&out.stderr));
-        }
-        Ok(s)
+        Ok(self.read_log(container_id, opts).await?.text)
+    }
+
+    async fn usage(&self, container_id: &str) -> Result<crate::usage::Reading, KubeletError> {
+        Ok(match self.api.stats(container_id).await {
+            Ok(c) => crate::usage::Reading::Measured(c),
+            Err(e) => crate::usage::Reading::Unmeasurable(e.to_string()),
+        })
+    }
+
+    /// Always asks libpod for `timestamps=true` and no tail: the stamps
+    /// order stdout against stderr (the wire carries them separately), are
+    /// what `since` filters on, and keep a follow's line cursor aligned
+    /// whether or not the caller shows them. The caller's `tail`,
+    /// `timestamps` and `since` are applied to that whole record.
+    async fn read_log(
+        &self,
+        container_id: &str,
+        opts: &crate::backend::LogOptions,
+    ) -> Result<crate::backend::LogRead, KubeletError> {
+        let stamped = crate::backend::LogOptions {
+            timestamps: true,
+            ..crate::backend::LogOptions::default()
+        };
+        let out = self.api.logs(container_id, &stamped).await?;
+        let merged = crate::backend::merge_timestamped(
+            &String::from_utf8_lossy(&out.stdout),
+            &String::from_utf8_lossy(&out.stderr),
+        );
+        Ok(crate::backend::render_timestamped(&merged, opts))
     }
 
     async fn exec(
@@ -2491,5 +2545,57 @@ mod tests {
                 .exit()
                 .is_some_and(crate::cri::ExitDisposition::is_success)
         );
+    }
+
+    #[test]
+    fn a_stats_report_is_read_as_cumulative_cpu_and_memory() {
+        let body = br#"{"Error":null,"Stats":[{"ContainerID":"c","CPUNano":1500,"MemUsage":4096}]}"#;
+        assert_eq!(
+            super::parse_stats(body),
+            Some(crate::usage::Cumulative {
+                cpu_ns: 1500,
+                memory_working_set_bytes: 4096
+            })
+        );
+        assert_eq!(super::parse_stats(br#"{"Error":null,"Stats":[]}"#), None);
+    }
+
+    #[test]
+    fn a_followed_log_resumes_after_the_lines_it_has_sent_whatever_is_shown() {
+        use crate::backend::{LogOptions, merge_timestamped, render_timestamped};
+        let out = "2026-10-13T12:00:00Z one\n2026-10-13T12:00:02Z three\n";
+        let err = "2026-10-13T12:00:01Z two\n";
+        let merged = merge_timestamped(out, err);
+        assert_eq!(
+            merged,
+            "2026-10-13T12:00:00Z one\n2026-10-13T12:00:01Z two\n2026-10-13T12:00:02Z three\n"
+        );
+        let shown = render_timestamped(
+            &merged,
+            &LogOptions {
+                timestamps: true,
+                ..LogOptions::default()
+            },
+        );
+        assert_eq!(shown.text, merged);
+        assert_eq!(shown.cursor, 3);
+        let grown = [merged.as_str(), "2026-10-13T12:00:03Z four\n"].concat();
+        let next = render_timestamped(
+            &grown,
+            &LogOptions {
+                from_byte: Some(shown.cursor),
+                ..LogOptions::default()
+            },
+        );
+        assert_eq!(next.text, "four\n", "the cursor counts lines, not shown bytes");
+        assert_eq!(next.cursor, 4);
+        let since = render_timestamped(
+            &merged,
+            &LogOptions {
+                since: engenho_types::time::parse_rfc3339_system_time("2026-10-13T12:00:01Z"),
+                ..LogOptions::default()
+            },
+        );
+        assert_eq!(since.text, "two\nthree\n");
     }
 }

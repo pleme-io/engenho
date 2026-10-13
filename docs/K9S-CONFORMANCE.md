@@ -54,9 +54,47 @@ only, so every attempt was a 404. The kubelet's own HTTP API already fell
 back to init containers; the two lookups had drifted. One resolver,
 `LocalPod::container_named`, now serves both.
 
+## Logs carry their time (2026-10-13)
+
+The native backend writes container logs as CRI records
+(`<RFC3339Nano> <stdout|stderr> <F|P> <msg>`), stamped by the kubelet as each
+line arrives (`engenho-kubelet/src/cri_log.rs`). `timestamps=true` prefixes
+each line with that stamp and nothing else, so k9s strips the stamp and not a
+word of the line; `sinceSeconds` and `sinceTime` filter on it. A follow
+resumes from a cursor the backend returns (a record offset on native, a line
+count on podman), never from the length of the text it printed, which with
+timestamps on was a different number. Podman now always asks libpod for
+timestamps and orders stdout against stderr by them; its follow used to end
+after the first chunk.
+
+A request with no `container` reads the pod's
+`kubectl.kubernetes.io/default-container`, else its first container in spec
+order, for logs and for exec and attach alike
+(`engenho_types::pod::default_container`). Upstream's apiserver refuses a
+multi-container pod with no container named; kubectl and k9s default
+client-side the same way, so the answer they see is unchanged.
+
+## Eviction, metrics, review discovery (2026-10-13)
+
+- `pods/eviction` (policy/v1) is a catalog subresource, so discovery lists it
+  and drain evicts instead of deleting. A pod selected by one
+  PodDisruptionBudget spends one of its `disruptionsAllowed` (recorded in
+  `disruptedPods`, which the PDB controller now excludes from the healthy
+  count for two minutes) or is refused with 429 and a `DisruptionBudget`
+  cause; terminal, pending and terminating pods skip budgets; two budgets
+  are a 500, as upstream.
+- `metrics.k8s.io/v1beta1` serves PodMetrics and NodeMetrics from the node
+  runtime: native reads each container's cgroup leaf (every container now
+  gets one when the tree is delegated), podman reads its stats API, the node
+  reads `/proc`. What cannot be measured (macOS, cgroups off) is absent from
+  the list and a 404 naming why, never zeros. Single node: only the
+  in-process kubelet's pods and node.
+- `authorization.k8s.io/v1` is listed in discovery and its OpenAPI v3
+  document is served (vendored, BLAKE3-pinned), so `kubectl create -f` of a
+  SelfSubjectAccessReview maps and validates.
+
 ## Known gaps
 
-Each is an `Absent` row with its reason: `sinceSeconds` (validated, not
-honoured), `pods/eviction`, `metrics.k8s.io`, `events.k8s.io/v1`. Not yet a row: the
-native backend ignores `timestamps=true`, so k9s strips the first word of
-each line as if it were a timestamp.
+The only `Absent` row is `events.k8s.io/v1`. Eviction ignores
+`deleteOptions.gracePeriodSeconds` (a native delete has no grace period to
+carry it to).

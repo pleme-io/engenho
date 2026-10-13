@@ -169,6 +169,7 @@ const fn segment(sub: Subresource) -> &'static str {
         Subresource::Exec => "exec",
         Subresource::Attach => "attach",
         Subresource::PortForward => "portforward",
+        Subresource::Eviction => "eviction",
     }
 }
 
@@ -593,9 +594,11 @@ fn probes(
         .filter(|r| *r != "*" && !r.contains('/'))
     {
         for (group, subresource) in served.of_parent(parent, &rule.api_groups) {
-            let streaming = engenho_apiserver::PodStreamKind::is_streaming_subresource(subresource);
+            // Streams and evictions are authorized as `create` only.
+            let create_only = engenho_apiserver::PodStreamKind::is_streaming_subresource(subresource)
+                || subresource == "eviction";
             for verb in &verbs {
-                if streaming && matches!(verb, Dim::Named(v) if v != "create") {
+                if create_only && matches!(verb, Dim::Named(v) if v != "create") {
                     continue;
                 }
                 for name in &names {

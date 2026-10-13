@@ -858,7 +858,44 @@ pub struct Kubelet {
     /// restart we re-derive by re-creating (a managed bound Pod with no
     /// live container converges back to running).
     local: Mutex<BTreeMap<ResourceKey, LocalPod>>,
+    /// The last cumulative usage reading per container (and the node), from
+    /// which `metrics.k8s.io` rates are taken.
+    usage: crate::usage::Sampler,
 }
+
+/// One container's usage, or why it has none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerUsage {
+    /// The container's name in the pod spec.
+    pub name: String,
+    /// Its usage, or the reason it is unmeasurable.
+    pub usage: Result<crate::usage::Usage, String>,
+}
+
+/// One pod's containers' usage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PodUsage {
+    /// The pod's namespace.
+    pub namespace: String,
+    /// The pod's name.
+    pub name: String,
+    /// Its running app containers.
+    pub containers: Vec<ContainerUsage>,
+}
+
+/// The [`crate::usage::Sampler`] key of the node's own reading.
+const NODE_USAGE_KEY: &str = "\u{0}node";
+
+/// One container's reading against the sampler.
+enum Sampled {
+    Rate(crate::usage::Usage),
+    First,
+    Unmeasurable(String),
+}
+
+/// How long the first rate of a container is measured over, when no earlier
+/// reading exists: metrics-server's shortest resolution.
+const FIRST_USAGE_WINDOW: Duration = Duration::from_secs(1);
 
 impl Kubelet {
     /// Construct a kubelet for `node_name` with the real [`TokioNetProber`].
@@ -888,6 +925,7 @@ impl Kubelet {
             last_sa_refresh: Mutex::new(None),
             node_name: node_name.into(),
             local: Mutex::new(BTreeMap::new()),
+            usage: crate::usage::Sampler::default(),
         }
     }
 
@@ -5624,10 +5662,8 @@ impl Kubelet {
     ///
     /// Resolves the container's backend id from the local bookkeeping, then
     /// asks the backend. `container` selects an app or init container (see
-    /// [`LocalPod::container_named`]); `None` defaults
-    /// to the FIRST container in the pod (deterministic — sorted by name in
-    /// the BTreeMap; kubectl defaults to the first container in spec order, and
-    /// for a single-container pod they coincide).
+    /// [`LocalPod::container_named`]); `None` defaults as
+    /// [`Self::container_log_read`] says.
     ///
     /// # Errors
     ///
@@ -5642,33 +5678,165 @@ impl Kubelet {
         container: Option<&str>,
         opts: &LogOptions,
     ) -> Result<String, KubeletError> {
+        Ok(self
+            .container_log_read(namespace, name, container, opts)
+            .await?
+            .text)
+    }
+
+    /// [`Self::container_logs`], plus the cursor a follow resumes from
+    /// ([`crate::backend::LogRead`]).
+    ///
+    /// With no `container`, the pod's
+    /// [`engenho_types::pod::DEFAULT_CONTAINER_ANNOTATION`] names it, else
+    /// the first app container in spec order.
+    ///
+    /// # Errors
+    ///
+    /// [`KubeletError::InvalidPod`] when the pod is not on this node or the
+    /// container is not one of its containers; the backend's error when the
+    /// log cannot be read.
+    pub async fn container_log_read(
+        &self,
+        namespace: &str,
+        name: &str,
+        container: Option<&str>,
+        opts: &LogOptions,
+    ) -> Result<crate::backend::LogRead, KubeletError> {
         let key = ResourceKey::namespaced("", "v1", "Pod", namespace, name);
+        let defaulted = match container {
+            Some(c) => Some(c.to_owned()),
+            None => self.store.get(&key).await.and_then(|pod| {
+                engenho_types::pod::default_container(&pod).map(str::to_owned)
+            }),
+        };
         let local = self.local.lock().await;
         let lp = local.get(&key).ok_or_else(|| KubeletError::InvalidPod {
             pod: format!("{namespace}/{name}"),
             reason: "pod is not running on this node (no local container record)".into(),
         })?;
-        let record = match container {
+        let record = match defaulted.as_deref() {
             Some(c) => lp
                 .container_named(c)
                 .ok_or_else(|| KubeletError::InvalidPod {
                     pod: format!("{namespace}/{name}"),
                     reason: format!("container {c:?} not found in pod"),
                 })?,
-            // Default: the first container by name (BTreeMap iteration order).
-            None => lp
-                .containers
-                .values()
-                .next()
-                .ok_or_else(|| KubeletError::InvalidPod {
-                    pod: format!("{namespace}/{name}"),
-                    reason: "pod has no started containers".into(),
-                })?,
+            None => match lp.containers.values().collect::<Vec<_>>().as_slice() {
+                [only] => *only,
+                _ => {
+                    return Err(KubeletError::InvalidPod {
+                        pod: format!("{namespace}/{name}"),
+                        reason: "the pod's spec is unreadable and it has no single container; \
+                                 name the container"
+                            .into(),
+                    });
+                }
+            },
         };
         let container_id = record.container_id.clone();
         // Drop the lock before the backend await (no lock held across I/O).
         drop(local);
-        self.backend.logs(&container_id, opts).await
+        self.backend.read_log(&container_id, opts).await
+    }
+
+    /// The usage of every running app container on this node, as
+    /// `PodMetrics` carries it. A container whose backend cannot measure it
+    /// carries the reason instead. The first call for a container measures
+    /// over [`FIRST_USAGE_WINDOW`]; later calls over the time since the last.
+    pub async fn pod_usage(&self) -> Vec<PodUsage> {
+        let targets: Vec<(String, String, String, String)> = {
+            let local = self.local.lock().await;
+            local
+                .iter()
+                .flat_map(|(key, lp)| {
+                    let ns = key.namespace.clone().unwrap_or_default();
+                    let pod = key.name.clone();
+                    lp.containers
+                        .iter()
+                        .filter(|(_, r)| !r.container_id.is_empty())
+                        .map(move |(c, r)| (ns.clone(), pod.clone(), c.clone(), r.container_id.clone()))
+                })
+                .collect()
+        };
+        let mut rates: BTreeMap<String, Result<crate::usage::Usage, String>> = BTreeMap::new();
+        let mut first = Vec::new();
+        for (_, _, _, id) in &targets {
+            match self.sample(id).await {
+                Sampled::Rate(u) => {
+                    rates.insert(id.clone(), Ok(u));
+                }
+                Sampled::First => first.push(id.clone()),
+                Sampled::Unmeasurable(why) => {
+                    rates.insert(id.clone(), Err(why));
+                }
+            }
+        }
+        if !first.is_empty() {
+            tokio::time::sleep(FIRST_USAGE_WINDOW).await;
+            for id in first {
+                let r = match self.sample(&id).await {
+                    Sampled::Rate(u) => Ok(u),
+                    Sampled::First => Err("the container restarted while it was measured".into()),
+                    Sampled::Unmeasurable(why) => Err(why),
+                };
+                rates.insert(id, r);
+            }
+        }
+        let live: std::collections::HashSet<String> =
+            targets.iter().map(|t| t.3.clone()).chain([NODE_USAGE_KEY.to_owned()]).collect();
+        self.usage.retain(&live);
+        let mut pods: BTreeMap<(String, String), Vec<ContainerUsage>> = BTreeMap::new();
+        for (ns, pod, name, id) in targets {
+            let usage = rates
+                .remove(&id)
+                .unwrap_or_else(|| Err("no reading was taken".into()));
+            pods.entry((ns, pod)).or_default().push(ContainerUsage { name, usage });
+        }
+        pods.into_iter()
+            .map(|((namespace, name), containers)| PodUsage {
+                namespace,
+                name,
+                containers,
+            })
+            .collect()
+    }
+
+    /// This node's usage, or why it is unmeasurable.
+    ///
+    /// # Errors
+    ///
+    /// The reason the node cannot be measured.
+    pub async fn node_usage(&self) -> Result<crate::usage::Usage, String> {
+        let take = || match crate::usage::node_reading() {
+            crate::usage::Reading::Measured(c) => {
+                Ok(self
+                    .usage
+                    .observe(NODE_USAGE_KEY, Instant::now(), std::time::SystemTime::now(), c))
+            }
+            crate::usage::Reading::Unmeasurable(why) => Err(why),
+        };
+        if let Some(u) = take()? {
+            return Ok(u);
+        }
+        tokio::time::sleep(FIRST_USAGE_WINDOW).await;
+        take()?.ok_or_else(|| "the node's CPU counter went backwards".to_owned())
+    }
+
+    async fn sample(&self, container_id: &str) -> Sampled {
+        match self.backend.usage(container_id).await {
+            Ok(crate::usage::Reading::Measured(c)) => match self.usage.observe(
+                container_id,
+                Instant::now(),
+                std::time::SystemTime::now(),
+                c,
+            ) {
+                Some(u) => Sampled::Rate(u),
+                None => Sampled::First,
+            },
+            Ok(crate::usage::Reading::Unmeasurable(why)) => Sampled::Unmeasurable(why),
+            Err(e) => Sampled::Unmeasurable(e.to_string()),
+        }
     }
 
     /// Write a computed Pod `status` via the shared item-5 CAS primitive.

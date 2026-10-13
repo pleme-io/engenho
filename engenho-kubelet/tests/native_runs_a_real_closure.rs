@@ -663,3 +663,70 @@ async fn attach_reaches_a_native_containers_main_process() {
         .expect("logs");
     assert_eq!(logs, "to the main process\n", "the log saw it too");
 }
+
+/// ★ The log carries the time each line was written: it is CRI records on
+/// disk, `timestamps=true` prefixes each line with its RFC3339Nano stamp
+/// (k9s strips exactly that token), and `since` filters on it.
+#[tokio::test]
+async fn a_native_log_is_stamped_per_line_and_filtered_by_since() {
+    let coreutils = closure("nixpkgs#coreutils");
+    let logs_dir = std::env::temp_dir().join("engenho-native-e2e-stamps");
+    let backend = NativeBackend::new(Isolation::HostProcess, &logs_dir, Cgroups::Off);
+    let mut image = String::from("nix:");
+    image.push_str(&coreutils);
+    let mut s = spec(&image, &["printf", "first line\\nsecond line\\n"], &[]);
+    s.pod.name = "native-stamps".to_string();
+    let before = std::time::SystemTime::now();
+    let started = backend.start(&s).await.expect("a realised closure must start");
+    for _ in 0..100 {
+        let st = backend.status(&started.container_id).await.unwrap().unwrap();
+        if !st.is_running() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let stamped = backend
+        .logs(
+            &started.container_id,
+            &LogOptions {
+                timestamps: true,
+                ..LogOptions::default()
+            },
+        )
+        .await
+        .expect("logs must be readable");
+    let lines: Vec<&str> = stamped.lines().collect();
+    assert_eq!(lines.len(), 2, "{stamped:?}");
+    for (line, text) in lines.iter().zip(["first line", "second line"]) {
+        let (stamp, rest) = line.split_once(' ').expect("a stamp, a space, the text");
+        let at = engenho_types::time::parse_rfc3339_system_time(stamp)
+            .unwrap_or_else(|| panic!("{stamp:?} is RFC3339"));
+        assert!(at >= before - std::time::Duration::from_secs(1));
+        assert_eq!(rest, text, "the stamp is the first token and nothing else");
+    }
+
+    let plain = backend
+        .logs(&started.container_id, &LogOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(plain, "first line\nsecond line\n");
+
+    let later = backend
+        .logs(
+            &started.container_id,
+            &LogOptions {
+                since: Some(std::time::SystemTime::now() + std::time::Duration::from_secs(60)),
+                ..LogOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(later, "", "every line was written before `since`");
+
+    let on_disk = std::fs::read_to_string(logs_dir.join(&started.container_id)).unwrap();
+    assert!(
+        on_disk.lines().all(|l| l.contains(" stdout F ")),
+        "the file is CRI records: {on_disk:?}"
+    );
+}

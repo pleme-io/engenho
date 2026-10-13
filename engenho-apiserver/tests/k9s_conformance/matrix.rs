@@ -212,6 +212,14 @@ pub enum Expected {
     WatchEvent { event: &'static str },
     /// A followed log whose first chunk contains this text.
     FollowChunk { contains: &'static str },
+    /// 200 log text containing `contains` and never `absent`; with
+    /// `stamped`, every line opens with one RFC3339 token, a space, then the
+    /// line's own text (the token k9s strips).
+    Lines {
+        contains: &'static str,
+        absent: Option<&'static str>,
+        stamped: bool,
+    },
     /// 101 with this negotiated subprotocol.
     Switched { protocol: &'static str },
     /// 101 negotiating this protocol, then a SPDY port-forward session
@@ -227,8 +235,10 @@ pub enum Expected {
     },
 }
 
-/// How an [`Expected::Absent`] row degrades.
+/// How an [`Expected::Absent`] row degrades. Every shape stays, whether or
+/// not a row uses it today: the next gap found is a row, not new harness.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code, reason = "degrade shapes kept for the next Absent row")]
 pub enum Degrade {
     /// A 404 `Status`, and `group` is not in `/apis`.
     NotDiscovered { group: &'static str },
@@ -290,6 +300,10 @@ fn uncordon() -> Value {
 fn eviction() -> Value {
     json!({"apiVersion":"policy/v1","kind":"Eviction",
         "metadata":{"name":"doomed","namespace":NS}})
+}
+fn guarded_eviction() -> Value {
+    json!({"apiVersion":"policy/v1","kind":"Eviction",
+        "metadata":{"name":"guarded","namespace":NS}})
 }
 fn label_edit(v: &mut Value) {
     v["metadata"]["labels"]["edited-by"] = json!("k9s");
@@ -550,9 +564,62 @@ pub const ROWS: &[Row] = &[
             path: "/api/v1/namespaces/k9s/pods/web/log?container=main&sinceSeconds=300&tailLines=100&timestamps=true",
             accept: None,
         },
-        expect: Expected::Absent {
-            reason: "sinceSeconds is validated but not honoured: the native backend's log carries no per-line time, so every line is returned",
-            degrade: Degrade::Ignored { status: 200 },
+        expect: Expected::Lines {
+            contains: "main says hi",
+            absent: Some("old news"),
+            stamped: true,
+        },
+    },
+    Row {
+        action: K9sAction::LogsSince,
+        what: "sinceTime",
+        req: Req::Get {
+            path: "/api/v1/namespaces/k9s/pods/web/log?container=main&sinceTime=2000-01-01T00%3A00%3A00Z",
+            accept: None,
+        },
+        expect: Expected::Lines {
+            contains: "old news",
+            absent: None,
+            stamped: false,
+        },
+    },
+    Row {
+        action: K9sAction::Logs,
+        what: "timestamps prefix each line with one RFC3339 token",
+        req: Req::Get {
+            path: "/api/v1/namespaces/k9s/pods/web/log?container=main&tailLines=3&timestamps=true",
+            accept: None,
+        },
+        expect: Expected::Lines {
+            contains: "main says hi",
+            absent: None,
+            stamped: true,
+        },
+    },
+    Row {
+        action: K9sAction::Logs,
+        what: "no container: the default-container annotation",
+        req: Req::Get {
+            path: "/api/v1/namespaces/k9s/pods/web/log?tailLines=1",
+            accept: None,
+        },
+        expect: Expected::Lines {
+            contains: "main says hi",
+            absent: Some("sidecar"),
+            stamped: false,
+        },
+    },
+    Row {
+        action: K9sAction::Logs,
+        what: "no container, no annotation: the first in spec order",
+        req: Req::Get {
+            path: "/api/v1/namespaces/k9s/pods/multi/log?tailLines=1",
+            accept: None,
+        },
+        expect: Expected::Lines {
+            contains: "zeta speaks",
+            absent: None,
+            stamped: false,
         },
     },
     Row {
@@ -570,6 +637,17 @@ pub const ROWS: &[Row] = &[
         what: "exec over WebSocket v5",
         req: Req::Upgrade {
             path: "/api/v1/namespaces/k9s/pods/web/exec?command=sh&container=main&stdin=true&stdout=true&stderr=true&tty=true",
+            protocols: "v5.channel.k8s.io, v4.channel.k8s.io",
+        },
+        expect: Expected::Switched {
+            protocol: "v5.channel.k8s.io",
+        },
+    },
+    Row {
+        action: K9sAction::Shell,
+        what: "exec with no container: the first in spec order",
+        req: Req::Upgrade {
+            path: "/api/v1/namespaces/k9s/pods/multi/exec?command=sh&stdin=true&stdout=true&tty=true",
             protocols: "v5.channel.k8s.io, v4.channel.k8s.io",
         },
         expect: Expected::Switched {
@@ -703,12 +781,19 @@ pub const ROWS: &[Row] = &[
             path: "/api/v1/namespaces/k9s/pods/doomed/eviction",
             body: eviction,
         },
-        expect: Expected::Absent {
-            reason: "no pods/eviction subresource; the drain helper discovers that and deletes pods instead",
-            degrade: Degrade::NoSubresource {
-                subresource: "eviction",
-            },
+        expect: Expected::Object {
+            status: 201,
+            kind: "Status",
         },
+    },
+    Row {
+        action: K9sAction::Drain,
+        what: "pods/eviction refused by a spent disruption budget",
+        req: Req::Post {
+            path: "/api/v1/namespaces/k9s/pods/guarded/eviction",
+            body: guarded_eviction,
+        },
+        expect: Expected::Refused { status: 429 },
     },
     Row {
         action: K9sAction::Drain,
@@ -748,6 +833,30 @@ pub const ROWS: &[Row] = &[
         },
     },
     Row {
+        action: K9sAction::AccessReview,
+        what: "authorization.k8s.io/v1 discovered",
+        req: Req::Get {
+            path: "/apis/authorization.k8s.io/v1",
+            accept: None,
+        },
+        expect: Expected::Object {
+            status: 200,
+            kind: "APIResourceList",
+        },
+    },
+    Row {
+        action: K9sAction::AccessReview,
+        what: "OpenAPI v3 for kubectl create -f ssar.yaml",
+        req: Req::Get {
+            path: "/openapi/v3/apis/authorization.k8s.io/v1",
+            accept: None,
+        },
+        expect: Expected::Object {
+            status: 200,
+            kind: "",
+        },
+    },
+    Row {
         action: K9sAction::RulesReview,
         what: "rules in namespace",
         req: Req::Post {
@@ -767,12 +876,43 @@ pub const ROWS: &[Row] = &[
             path: "/apis/metrics.k8s.io/v1beta1/namespaces/k9s/pods",
             accept: None,
         },
-        expect: Expected::Absent {
-            reason: "no metrics.k8s.io; k9s checks discovery first and shows n/a",
-            degrade: Degrade::NotDiscovered {
-                group: "metrics.k8s.io",
-            },
+        expect: Expected::Object {
+            status: 200,
+            kind: "PodMetricsList",
         },
+    },
+    Row {
+        action: K9sAction::Metrics,
+        what: "metrics.k8s.io discovered",
+        req: Req::Get {
+            path: "/apis/metrics.k8s.io/v1beta1",
+            accept: None,
+        },
+        expect: Expected::Object {
+            status: 200,
+            kind: "APIResourceList",
+        },
+    },
+    Row {
+        action: K9sAction::Metrics,
+        what: "one pod's metrics",
+        req: Req::Get {
+            path: "/apis/metrics.k8s.io/v1beta1/namespaces/k9s/pods/web",
+            accept: None,
+        },
+        expect: Expected::Object {
+            status: 200,
+            kind: "PodMetrics",
+        },
+    },
+    Row {
+        action: K9sAction::Metrics,
+        what: "an unmeasurable pod is a 404, never zeros",
+        req: Req::Get {
+            path: "/apis/metrics.k8s.io/v1beta1/namespaces/k9s/pods/blind",
+            accept: None,
+        },
+        expect: Expected::Refused { status: 404 },
     },
     Row {
         action: K9sAction::Metrics,
@@ -781,11 +921,9 @@ pub const ROWS: &[Row] = &[
             path: "/apis/metrics.k8s.io/v1beta1/nodes",
             accept: None,
         },
-        expect: Expected::Absent {
-            reason: "no metrics.k8s.io",
-            degrade: Degrade::NotDiscovered {
-                group: "metrics.k8s.io",
-            },
+        expect: Expected::Object {
+            status: 200,
+            kind: "NodeMetricsList",
         },
     },
     // ── other views ──────────────────────────────────────────────────────

@@ -177,7 +177,7 @@ pub use owned_children::{OwnedChildrenReconciler, ParentGvk, ReconcileDelta};
 pub use owner::{
     OwnerReference, controlling_owner, is_owned_by, owner_ref_for, set_owner_reference,
 };
-pub use pdb::PodDisruptionBudgetController;
+pub use pdb::{PodDisruptionBudgetController, counts_healthy, pdb_selects};
 pub use plantio::{NodeResolver, PlantioController, StaticNodeResolver};
 pub use plantio_pipeline::{
     LedgerChoice, LedgerWrappers, NodeResolverChoice, PipelineConfig, PlantioPipeline,

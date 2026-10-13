@@ -1883,6 +1883,7 @@ fn resolve_subresource<'a>(
         "portforward" if h.subresources().contains(&Subresource::PortForward) => {
             Subresource::PortForward
         }
+        "eviction" if h.subresources().contains(&Subresource::Eviction) => Subresource::Eviction,
         other => {
             return Err(ApiError::NotFound(format!(
                 "the server could not find the requested resource: {} does not serve subresource {:?}",
@@ -1891,6 +1892,12 @@ fn resolve_subresource<'a>(
         }
     };
     Ok(Some(SubresourceTarget { subresource, name }))
+}
+
+fn eviction_verb_refusal(verb: &str) -> ApiError {
+    ApiError::BadRequest(format!(
+        "the eviction subresource supports create (POST) only, not {verb}"
+    ))
 }
 
 fn stream_verb_refusal(sub: Subresource, verb: &str) -> ApiError {
@@ -2142,6 +2149,9 @@ async fn do_get_log(
     query: &crate::pod_logs::LogQuery,
 ) -> Result<Response, ApiError> {
     query.admit(name)?;
+    let mut query = query.clone();
+    query.resolve_since(std::time::SystemTime::now());
+    let query = &query;
     if query.follow {
         return follow_log(h, ns, name, query).await;
     }
@@ -2169,8 +2179,13 @@ async fn follow_log(
         from_byte: None,
         ..query.clone()
     };
-    let text = h.logs(ns, name, &whole).await?;
-    let offset = text.len() as u64;
+    // The whole log, tailed here: a reader's cursor is only meaningful for
+    // the text it was asked for, and an untailed read is the one every
+    // reader's cursor agrees on.
+    let crate::pod_logs::LogChunk {
+        text,
+        cursor: offset,
+    } = h.log_chunk(ns, name, &whole).await?;
     let first = match query.tail_lines {
         Some(n) => crate::pod_logs::last_lines(&text, n),
         None => text,
@@ -2198,11 +2213,13 @@ async fn follow_log(
                 from_byte: Some(offset),
                 ..q.clone()
             };
-            match h.logs(ns.as_deref(), &name, &next).await {
-                Ok(more) if more.is_empty() => {}
+            match h.log_chunk(ns.as_deref(), &name, &next).await {
+                Ok(more) if more.text.is_empty() => {}
                 Ok(more) => {
-                    let offset = offset + more.len() as u64;
-                    return Some((Ok(bytes::Bytes::from(more)), (h, ns, name, q, offset, None)));
+                    return Some((
+                        Ok(bytes::Bytes::from(more.text)),
+                        (h, ns, name, q, more.cursor, None),
+                    ));
                 }
                 Err(_) => return None,
             }
@@ -2267,6 +2284,28 @@ async fn do_patch_scale(
     let (patch, patch_type) = decode_patch(headers, raw, &gvk)?;
     let v = h.patch_scale(ns, name, patch, patch_type).await?;
     Ok((StatusCode::OK, Json(v)).into_response())
+}
+
+/// POST `pods/<name>/eviction`: decode the policy/v1 `Eviction`, check its
+/// name names the pod in the path, and evict through the handler. Answers
+/// 201 with a `Status{status: Success}`, as upstream does.
+async fn do_eviction(
+    h: &Arc<dyn ResourceHandler>,
+    ns: Option<&str>,
+    name: &str,
+    headers: &HeaderMap,
+    raw: &Bytes,
+    user_info: &UserInfo,
+    dry_run: DryRun,
+) -> Result<Response, ApiError> {
+    let body = decode_write_body(headers, raw)?;
+    let eviction = crate::eviction::Eviction::from_body(&body, name)?;
+    h.evict(ns, name, &eviction, user_info, dry_run).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(crate::eviction::success_status(name)),
+    )
+        .into_response())
 }
 
 /// GET or POST with `Upgrade: websocket` on `pods/<name>/{exec,attach,portforward}`:
@@ -2343,6 +2382,7 @@ async fn resource_get_or_list(
             // last token because none is stored — the mint is the only copy
             // that ever exists. Typed BadRequest naming the verb, never an
             // empty 200 that reads as "this SA has no token".
+            Subresource::Eviction => Err(eviction_verb_refusal("GET")),
             Subresource::Token => Err(ApiError::BadRequest(
                 "the token subresource supports create (POST) only; there is no stored token to                  GET — a minted token is returned once, in the POST response, and never                  persisted"
                     .into(),
@@ -2421,6 +2461,25 @@ async fn resource_create(
             && let Some(kind) = PodStreamKind::of(subresource)
         {
             return do_pod_stream(&h, coords.namespace.as_deref(), name, kind, upgrade, &uri).await;
+        }
+        if let Some(SubresourceTarget {
+            subresource: Subresource::Eviction,
+            name,
+        }) = target
+        {
+            let mut warnings = Warnings::default();
+            subresource_directive(raw_directive, WriteOptions::Create, "eviction", &mut warnings)?;
+            let result = do_eviction(
+                &h,
+                coords.namespace.as_deref(),
+                name,
+                &headers,
+                &raw,
+                &user_info.0,
+                dry_run,
+            )
+            .await;
+            return Ok(warnings.attach(result));
         }
         if let Some(SubresourceTarget {
             subresource: Subresource::Token,
@@ -2512,6 +2571,7 @@ async fn resource_put(
         Some(sub @ (Subresource::Exec | Subresource::Attach | Subresource::PortForward)) => {
             Err(stream_verb_refusal(sub, "PUT"))
         }
+        Some(Subresource::Eviction) => Err(eviction_verb_refusal("PUT")),
         // PUT on the main object (no subresource) — the kubectl `replace` /
         // update verb. Store-backed handlers do a real optimistic-concurrency
         // replace; handlers that don't override `replace` keep the typed 400.
@@ -2582,6 +2642,7 @@ async fn resource_patch(
         Some(sub @ (Subresource::Exec | Subresource::Attach | Subresource::PortForward)) => {
             Err(stream_verb_refusal(sub, "PATCH"))
         }
+        Some(Subresource::Eviction) => Err(eviction_verb_refusal("PATCH")),
         None => {
             let mut border = Border::new(
                 Directive::parse(raw_directive, WriteOptions::Patch)?,

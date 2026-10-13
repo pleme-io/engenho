@@ -19,15 +19,17 @@ use crate::error::ApiError;
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct LogQuery {
     /// `?container=<name>` — which container's log (kubectl `-c`). `None` =
-    /// the pod's default (first) container.
+    /// the pod's default container
+    /// ([`engenho_types::pod::default_container`]).
     #[serde(default)]
     pub container: Option<String>,
     /// `?tailLines=<n>` — return only the last `n` lines (kubectl `--tail`).
     /// `None` = all lines.
     #[serde(default, rename = "tailLines")]
     pub tail_lines: Option<u32>,
-    /// `?timestamps=true` — prefix each line with an RFC3339 timestamp
-    /// (kubectl `--timestamps`). Default `false`.
+    /// `?timestamps=true` — prefix each line with the `RFC3339Nano` time it
+    /// was written (kubectl `--timestamps`, every k9s Logs view). Default
+    /// `false`.
     #[serde(default)]
     pub timestamps: bool,
     /// `?follow=true` — keep the response open and stream what is appended
@@ -43,10 +45,19 @@ pub struct LogQuery {
     /// `?limitBytes=<n>` — end the response after `n` bytes (k9s "head").
     #[serde(default, rename = "limitBytes")]
     pub limit_bytes: Option<u64>,
-    /// `?sinceSeconds=<n>` — validated (upstream's `>= 1`), not yet honoured:
-    /// the native log carries no per-line time.
+    /// `?sinceSeconds=<n>` — only lines written in the last `n` seconds
+    /// (k9s Logs view `2`..`6`, kubectl `--since`).
     #[serde(default, rename = "sinceSeconds")]
     pub since_seconds: Option<i64>,
+    /// `?sinceTime=<RFC3339>` — only lines written at or after it (kubectl
+    /// `--since-time`). At most one of this and `sinceSeconds`.
+    #[serde(default, rename = "sinceTime")]
+    pub since_time: Option<String>,
+    /// `sinceSeconds` / `sinceTime` resolved to an instant once, when the
+    /// request is admitted, so a follow filters against one fixed point.
+    #[serde(skip)]
+    pub since: Option<std::time::SystemTime>,
+    /// Where a follow resumes: the cursor the previous read returned.
     #[serde(skip)]
     pub from_byte: Option<u64>,
 }
@@ -57,7 +68,8 @@ impl LogQuery {
     /// # Errors
     ///
     /// [`ApiError::BadRequest`] for `previous=true` (no previous instance is
-    /// kept), a `sinceSeconds` below 1, or a `limitBytes` of 0.
+    /// kept), a `sinceSeconds` below 1, a `sinceTime` that is not RFC3339,
+    /// both of them at once, or a `limitBytes` of 0.
     pub fn admit(&self, pod: &str) -> Result<(), ApiError> {
         if self.previous {
             let container = self.container.as_deref().unwrap_or_default();
@@ -70,6 +82,18 @@ impl LogQuery {
                 "sinceSeconds: Invalid value: must be greater than 0".into(),
             ));
         }
+        if self.since_seconds.is_some() && self.since_time.is_some() {
+            return Err(ApiError::BadRequest(
+                "at most one of `sinceTime` or `sinceSeconds` may be specified".into(),
+            ));
+        }
+        if self.since_time.as_deref().is_some_and(|t| {
+            engenho_types::time::parse_rfc3339_system_time(t).is_none()
+        }) {
+            return Err(ApiError::BadRequest(
+                "sinceTime: Invalid value: must be an RFC3339 timestamp".into(),
+            ));
+        }
         if self.limit_bytes == Some(0) {
             return Err(ApiError::BadRequest(
                 "limitBytes: Invalid value: must be greater than 0".into(),
@@ -77,6 +101,29 @@ impl LogQuery {
         }
         Ok(())
     }
+}
+
+impl LogQuery {
+    /// Resolve `sinceSeconds` / `sinceTime` against `now` into
+    /// [`Self::since`]. Call once, after [`Self::admit`].
+    pub fn resolve_since(&mut self, now: std::time::SystemTime) {
+        self.since = match (self.since_seconds, self.since_time.as_deref()) {
+            (Some(secs), _) => u64::try_from(secs)
+                .ok()
+                .and_then(|s| now.checked_sub(std::time::Duration::from_secs(s))),
+            (None, Some(t)) => engenho_types::time::parse_rfc3339_system_time(t),
+            (None, None) => None,
+        };
+    }
+}
+
+/// One read of a Pod log: the text, and where a follow's next read resumes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogChunk {
+    /// The log text.
+    pub text: String,
+    /// Pass back as [`LogQuery::from_byte`] to read only what follows.
+    pub cursor: u64,
 }
 
 /// Cut `text` to at most `limit` bytes on a char boundary.
@@ -116,6 +163,28 @@ pub trait PodLogReader: Send + Sync {
         name: &str,
         query: &LogQuery,
     ) -> Result<String, ApiError>;
+
+    /// [`Self::read_pod_logs`] with the cursor a follow resumes from.
+    ///
+    /// The default treats the text as the stored bytes and `from_byte` as an
+    /// offset into them. A reader whose text is rendered (timestamps
+    /// prefixed, records parsed) overrides it, or a follow resumes at the
+    /// wrong place.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read_pod_logs`].
+    async fn read_pod_log_chunk(
+        &self,
+        namespace: &str,
+        name: &str,
+        query: &LogQuery,
+    ) -> Result<LogChunk, ApiError> {
+        let text = self.read_pod_logs(namespace, name, query).await?;
+        let cursor =
+            query.from_byte.unwrap_or(0) + u64::try_from(text.len()).unwrap_or(u64::MAX);
+        Ok(LogChunk { text, cursor })
+    }
 }
 
 #[must_use]

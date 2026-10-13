@@ -135,18 +135,21 @@ pub struct LogQuery {
 impl LogQuery {
     /// The backend options this query maps to.
     ///
-    /// `follow`, `previous` and `sinceSeconds` are accepted and IGNORED
-    /// rather than rejected, deliberately: `kubectl logs -f` should return
-    /// the log it can rather than fail outright, and every one of these is
-    /// additive — ignoring them yields a SUBSET of the right answer, never
-    /// a wrong one. That asymmetry is what makes ignoring safe here and
-    /// unsafe for a field selector.
+    /// `sinceSeconds` is resolved against the clock now. `follow` and
+    /// `previous` are accepted and IGNORED rather than rejected,
+    /// deliberately: `kubectl logs -f` should return the log it can rather
+    /// than fail outright, and both are additive — ignoring them yields a
+    /// SUBSET of the right answer, never a wrong one. That asymmetry is what
+    /// makes ignoring safe here and unsafe for a field selector.
     #[must_use]
     pub fn to_options(&self) -> LogOptions {
         LogOptions {
             tail: self.tail_lines,
             timestamps: self.timestamps,
             from_byte: None,
+            since: self.since_seconds.and_then(|s| {
+                std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(s))
+            }),
         }
     }
 }

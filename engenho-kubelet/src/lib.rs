@@ -47,6 +47,7 @@ pub mod closure_store;
 pub mod config_bridge;
 pub mod cri;
 pub mod cri_backend;
+pub mod cri_log;
 pub mod csi_materializer;
 mod env_ref;
 pub mod error;
@@ -80,6 +81,7 @@ pub mod pty;
 pub mod server;
 pub mod spdy;
 pub mod stream;
+pub mod usage;
 pub mod volume;
 
 pub use backend::{
@@ -99,7 +101,7 @@ pub use csi_materializer::{
     RegisteredDriver,
 };
 pub use error::KubeletError;
-pub use kubelet::{Kubelet, SaRefreshReport, TestClock};
+pub use kubelet::{ContainerUsage, Kubelet, PodUsage, SaRefreshReport, TestClock};
 pub use lifecycle::{
     ContainerObservation, ContainerState, ContainerStatusOut, DownAction, RestartPolicy,
     RunningAction, down_action, reconcile_pod_phase, running_action, starts_fresh,

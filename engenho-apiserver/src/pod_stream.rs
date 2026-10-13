@@ -39,9 +39,11 @@ impl PodStreamKind {
             Subresource::Exec => Some(Self::Exec),
             Subresource::Attach => Some(Self::Attach),
             Subresource::PortForward => Some(Self::PortForward),
-            Subresource::Status | Subresource::Scale | Subresource::Log | Subresource::Token => {
-                None
-            }
+            Subresource::Status
+            | Subresource::Scale
+            | Subresource::Log
+            | Subresource::Token
+            | Subresource::Eviction => None,
         }
     }
 
@@ -250,12 +252,13 @@ pub fn kubelet_authority_of_node(node: &serde_json::Value) -> Option<String> {
 }
 
 /// The container a request names, else the pod's
-/// `kubectl.kubernetes.io/default-container`, else its only container.
+/// `kubectl.kubernetes.io/default-container`, else its first container in
+/// spec order ([`engenho_types::pod::default_container`]).
 ///
 /// # Errors
 ///
-/// [`ApiError::BadRequest`] when the pod has several containers and nothing
-/// picks one, or the named one does not exist.
+/// [`ApiError::BadRequest`] when the pod has no containers, or the named one
+/// does not exist.
 pub fn choose_container(
     pod: &serde_json::Value,
     requested: Option<&str>,
@@ -291,23 +294,9 @@ pub fn choose_container(
             )))
         };
     }
-    if let Some(d) = pod
-        .pointer("/metadata/annotations/kubectl.kubernetes.io~1default-container")
-        .and_then(|v| v.as_str())
-        .filter(|d| names.contains(d))
-    {
-        return Ok(d.to_owned());
-    }
-    match names.as_slice() {
-        [only] => Ok((*only).to_owned()),
-        [] => Err(ApiError::BadRequest(format!(
-            "pod {pod_name} has no containers"
-        ))),
-        many => Err(ApiError::BadRequest(format!(
-            "a container name must be specified for pod {pod_name}, choose one of: [{}]",
-            many.join(" ")
-        ))),
-    }
+    engenho_types::pod::default_container(pod)
+        .map(str::to_owned)
+        .ok_or_else(|| ApiError::BadRequest(format!("pod {pod_name} has no containers")))
 }
 
 /// A client's stream handshake, taken off the request before the handler
@@ -758,10 +747,12 @@ mod tests {
             "spec": {"containers": [{"name": "a"}, {"name": "b"}]}});
         assert_eq!(choose_container(&two, None).unwrap(), "b");
         assert_eq!(choose_container(&two, Some("a")).unwrap(), "a");
-        let ambiguous = json!({"metadata": {"name": "p"},
-            "spec": {"containers": [{"name": "a"}, {"name": "b"}]}});
+        let unannotated = json!({"metadata": {"name": "p"},
+            "spec": {"containers": [{"name": "zz"}, {"name": "a"}]}});
+        assert_eq!(choose_container(&unannotated, None).unwrap(), "zz");
+        let empty = json!({"metadata": {"name": "p"}, "spec": {"containers": []}});
         assert!(matches!(
-            choose_container(&ambiguous, None),
+            choose_container(&empty, None),
             Err(ApiError::BadRequest(_))
         ));
     }

@@ -592,6 +592,7 @@ async fn a_streaming_subresource_is_probed_only_under_create() {
         lost(&report),
         [
             "User carol create pods/attach",
+            "User carol create pods/eviction",
             "User carol create pods/exec",
             "User carol create pods/portforward"
         ]

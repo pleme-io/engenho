@@ -568,6 +568,21 @@ impl Runtime {
             router_state_for_logs.register(pod_handler);
             info!("registered Pod /log handler (in-process kubelet log reader)");
         }
+        // 6c. metrics.k8s.io: PodMetrics and NodeMetrics, read from the
+        //     in-process kubelet's runtime. Registering them is what lists
+        //     the group in discovery, which k9s and `kubectl top` check first.
+        for kind in [
+            engenho_apiserver::resource_metrics::MetricsKind::Pod,
+            engenho_apiserver::resource_metrics::MetricsKind::Node,
+        ] {
+            router_state_for_logs.register(Arc::new(
+                engenho_apiserver::resource_metrics::MetricsHandler::new(
+                    kind,
+                    parts.metrics_reader(),
+                    store.clone(),
+                ),
+            ));
+        }
 
         Ok(Assembled {
             apiserver,
@@ -1354,15 +1369,31 @@ impl engenho_apiserver::PodLogReader for KubeletLogReader {
         name: &str,
         query: &engenho_apiserver::LogQuery,
     ) -> Result<String, engenho_apiserver::ApiError> {
+        Ok(self.read_pod_log_chunk(namespace, name, query).await?.text)
+    }
+
+    /// The kubelet backend's own cursor: a CRI record offset on the native
+    /// backend, a line count on podman.
+    async fn read_pod_log_chunk(
+        &self,
+        namespace: &str,
+        name: &str,
+        query: &engenho_apiserver::LogQuery,
+    ) -> Result<engenho_apiserver::LogChunk, engenho_apiserver::ApiError> {
         let opts = LogOptions {
             tail: query.tail_lines,
             timestamps: query.timestamps,
             from_byte: query.from_byte,
+            since: query.since,
         };
         self.kubelet
             .load_full()
-            .container_logs(namespace, name, query.container.as_deref(), &opts)
+            .container_log_read(namespace, name, query.container.as_deref(), &opts)
             .await
+            .map(|read| engenho_apiserver::LogChunk {
+                text: read.text,
+                cursor: read.cursor,
+            })
             .map_err(|e| match e.kind() {
                 // A pod not on this node / a missing container → a typed 404
                 // (the K8s "could not find the requested resource" shape).
@@ -1374,6 +1405,74 @@ impl engenho_apiserver::PodLogReader for KubeletLogReader {
                     "log read failed for pod {namespace}/{name}: {e}"
                 )),
             })
+    }
+}
+
+/// `metrics.k8s.io` read from the in-process kubelet: this node's pods and
+/// the node itself. Single-node scope, like the log reader.
+struct KubeletMetricsReader {
+    kubelet: KubeletSlot,
+}
+
+fn metrics_window(u: &engenho_kubelet::usage::Usage) -> engenho_apiserver::resource_metrics::Window {
+    engenho_apiserver::resource_metrics::Window {
+        timestamp: u.timestamp,
+        length: u.window,
+    }
+}
+
+#[async_trait::async_trait]
+impl engenho_apiserver::resource_metrics::ResourceMetricsReader for KubeletMetricsReader {
+    async fn pods(&self) -> Vec<engenho_apiserver::resource_metrics::PodSample> {
+        use engenho_apiserver::resource_metrics::{ContainerSample, PodSample};
+        let kubelet = self.kubelet.load_full();
+        kubelet
+            .pod_usage()
+            .await
+            .into_iter()
+            .map(|p| {
+                let mut window = None;
+                let mut containers = Vec::new();
+                let mut unmeasurable = None;
+                for c in p.containers {
+                    match c.usage {
+                        Ok(u) => {
+                            window.get_or_insert_with(|| metrics_window(&u));
+                            containers.push(ContainerSample {
+                                name: c.name,
+                                cpu_nanocores: u.cpu_nanocores,
+                                memory_bytes: u.memory_working_set_bytes,
+                            });
+                        }
+                        Err(why) => {
+                            unmeasurable.get_or_insert_with(|| [c.name.as_str(), ": ", &why].concat());
+                        }
+                    }
+                }
+                let usage = match (unmeasurable, window) {
+                    (Some(why), _) => Err(why),
+                    (None, Some(w)) => Ok((w, containers)),
+                    (None, None) => Err("the pod has no running container".to_owned()),
+                };
+                PodSample {
+                    namespace: p.namespace,
+                    name: p.name,
+                    usage,
+                }
+            })
+            .collect()
+    }
+
+    async fn nodes(&self) -> Vec<engenho_apiserver::resource_metrics::NodeSample> {
+        let kubelet = self.kubelet.load_full();
+        let usage = kubelet
+            .node_usage()
+            .await
+            .map(|u| (metrics_window(&u), u.cpu_nanocores, u.memory_working_set_bytes));
+        vec![engenho_apiserver::resource_metrics::NodeSample {
+            name: kubelet.node_name().to_owned(),
+            usage,
+        }]
     }
 }
 
@@ -3534,6 +3633,12 @@ impl Parts {
     }
 
     /// The Pod `/log` reader, which follows the kubelet through its slot.
+    fn metrics_reader(&self) -> Arc<KubeletMetricsReader> {
+        Arc::new(KubeletMetricsReader {
+            kubelet: self.kubelet.clone(),
+        })
+    }
+
     fn log_reader(&self) -> Arc<KubeletLogReader> {
         Arc::new(KubeletLogReader {
             kubelet: self.kubelet.clone(),

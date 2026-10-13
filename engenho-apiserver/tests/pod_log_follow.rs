@@ -50,6 +50,19 @@ async fn serve(log: Arc<GrowingLog>) -> ApiServer {
     );
     store.initialize_singleton().await.unwrap();
     assert!(store.wait_for_leadership(Duration::from_secs(3)).await);
+    // The pod is read for its default container: a request that names none
+    // is about the one the pod's spec picks.
+    store
+        .propose(engenho_store::command::ResourceCommand::Put {
+            key: engenho_store::ResourceKey::namespaced("", "v1", "Pod", "default", "p"),
+            value: serde_json::json!({"apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": "p", "namespace": "default"},
+                "spec": {"containers": [{"name": "c", "image": "i"}]}}),
+            expected: None,
+            reason: engenho_store::command::Reason::Operator,
+        })
+        .await
+        .unwrap();
     let descriptor = engenho_types::generated_v1_34::RESOURCE_CATALOG
         .iter()
         .find(|d| d.group.is_empty() && d.kind == "Pod")

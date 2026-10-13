@@ -45,6 +45,37 @@ use crate::reads::{DeclaresReads, Reads, gvk};
 use crate::selector::{matches_labels, selector_match_labels};
 use crate::status::{generation_of, pod_is_ready};
 
+/// How long an eviction's `status.disruptedPods` entry keeps its pod out of
+/// the healthy count — upstream's `DeletionTimeout`.
+pub const DISRUPTED_POD_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Whether `pdb` budgets `pod`: same namespace is the caller's to ensure;
+/// this is the selector test the controller counts with, so the eviction
+/// subresource and the controller can never disagree about which pods a
+/// budget covers. A PDB with no selector covers nothing.
+#[must_use]
+pub fn pdb_selects(pdb: &Value, pod: &Value) -> bool {
+    selector_match_labels(pdb).is_some_and(|sel| matches_labels(pod, sel))
+}
+
+/// Whether `pod` counts as healthy for a budget: Ready, not being deleted,
+/// and not named in the budget's `status.disruptedPods` within the last
+/// [`DISRUPTED_POD_TTL`] (evicted, not gone yet). Upstream's disruption
+/// controller counts the same way, so a pod an eviction just took is not
+/// counted back before it disappears, and a later pod reusing its name is.
+#[must_use]
+pub fn counts_healthy(pdb: &Value, pod: &Value) -> bool {
+    let name = pod.pointer("/metadata/name").and_then(Value::as_str);
+    let disrupted = name.is_some_and(|n| {
+        pdb.pointer("/status/disruptedPods")
+            .and_then(|m| m.get(n))
+            .and_then(Value::as_str)
+            .and_then(engenho_types::time::age_since_rfc3339)
+            .is_some_and(|age| age < DISRUPTED_POD_TTL)
+    });
+    pod_is_ready(pod) && pod.pointer("/metadata/deletionTimestamp").is_none() && !disrupted
+}
+
 /// The five status numbers a PDB reconcile computes. Carrying them in
 /// one typed struct keeps the "compute" step (pure, unit-testable) and
 /// the "did anything change?" comparison (idempotency) honest — a new
@@ -197,10 +228,10 @@ impl Controller for PodDisruptionBudgetController {
             // A null selector matches no pods (K8s convention); our
             // `selector_match_labels` returns None for an absent selector,
             // which we treat as "nothing to budget" and skip.
-            let Some(selector) = selector_match_labels(pdb_value) else {
+            if selector_match_labels(pdb_value).is_none() {
                 report.objects_skipped += 1;
                 continue;
-            };
+            }
             // A generation that is not an integer leaves this PDB's status
             // alone: `observedGeneration` would name a revision nobody can.
             let generation = match generation_of(pdb_value) {
@@ -215,16 +246,13 @@ impl Controller for PodDisruptionBudgetController {
             let pods = self.store.list("", "v1", "Pod", ns).await;
             let matching: Vec<&Value> = pods
                 .iter()
-                .filter_map(|(_, p)| {
-                    if matches_labels(p, selector) {
-                        Some(p)
-                    } else {
-                        None
-                    }
-                })
+                .filter_map(|(_, p)| pdb_selects(pdb_value, p).then_some(p))
                 .collect();
             let total = matching.len() as i64;
-            let healthy = matching.iter().filter(|p| pod_is_ready(p)).count() as i64;
+            let healthy = matching
+                .iter()
+                .filter(|p| counts_healthy(pdb_value, p))
+                .count() as i64;
 
             let desired = Self::compute_status(
                 Self::min_available(pdb_value),

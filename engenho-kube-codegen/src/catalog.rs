@@ -48,6 +48,9 @@ pub enum Subresource {
     Attach,
     /// `/portforward` — WebSocket stream relayed to the node kubelet.
     PortForward,
+    /// `/eviction` — POST a policy/v1 `Eviction`: delete the pod unless a
+    /// PodDisruptionBudget forbids it (429). Create-only, Pod-only.
+    Eviction,
 }
 
 /// One entry in the curated catalog: enough info to emit a typed
@@ -129,6 +132,7 @@ pub const KIND_CATALOG: &[KindEntry] = &[
             Subresource::Exec,
             Subresource::Attach,
             Subresource::PortForward,
+            Subresource::Eviction,
         ],
     },
     KindEntry {

@@ -274,8 +274,10 @@ mod tests {
     fn every_served_catalog_row_has_a_schema() {
         for d in engenho_types::generated_v1_34::RESOURCE_CATALOG {
             let found = row(d.group, d.version, d.kind).is_some();
+            let documented = !d.opaque
+                || engenho_types::openapi_v3::ROUTE_SERVED.contains(&(d.group, d.version));
             assert_eq!(
-                found, !d.opaque,
+                found, documented,
                 "{}/{} {}: a schema-backed row resolves, an opaque one does not",
                 d.group, d.version, d.kind
             );

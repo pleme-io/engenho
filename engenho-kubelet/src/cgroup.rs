@@ -504,6 +504,34 @@ impl CgroupTree {
         }
     }
 
+    /// What the leaf `name` has used: cumulative CPU time from `cpu.stat`
+    /// and the working set (`memory.current` less `inactive_file`, the
+    /// figure the kubelet and metrics-server report).
+    pub fn usage(&self, name: &str) -> Result<crate::usage::Cumulative, CgroupError> {
+        let dir = self.leaf(name);
+        let cpu = dir.join("cpu.stat");
+        let stat_field = |path: &Path, text: &str, field: &str| {
+            crate::usage::keyed_u64(text, field)
+                .ok_or_else(|| CgroupError::io(CgroupOp::Read, path, &io::Error::other(
+                    ["no ", field, " line"].concat(),
+                )))
+        };
+        let cpu_text = read(self.fs.as_ref(), &cpu)?;
+        let usage_usec = stat_field(&cpu, &cpu_text, "usage_usec")?;
+        let current_path = dir.join("memory.current");
+        let current = read(self.fs.as_ref(), &current_path)?;
+        let current = current.trim().parse::<u64>().map_err(|e| {
+            CgroupError::io(CgroupOp::Read, &current_path, &io::Error::other(e.to_string()))
+        })?;
+        let mem_stat = dir.join("memory.stat");
+        let mem_text = read(self.fs.as_ref(), &mem_stat)?;
+        let inactive = crate::usage::keyed_u64(&mem_text, "inactive_file").unwrap_or(0);
+        Ok(crate::usage::Cumulative {
+            cpu_ns: usage_usec.saturating_mul(1000),
+            memory_working_set_bytes: current.saturating_sub(inactive),
+        })
+    }
+
     pub fn release(&self, name: &str) -> Result<(), CgroupError> {
         let dir = self.leaf(name);
         match self.fs.remove_dir(&dir) {

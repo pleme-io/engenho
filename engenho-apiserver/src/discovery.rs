@@ -40,6 +40,9 @@ const VERBS: &[&str] = &[
 /// deletecollection-serving kind advertises it; `namespaces` / `bindings` /
 /// `componentstatuses` do not).
 fn base_verbs(h: &dyn ResourceHandler) -> Vec<String> {
+    if h.read_only() {
+        return vec!["get".to_string(), "list".to_string()];
+    }
     let mut verbs: Vec<String> = VERBS.iter().map(|v| (*v).to_string()).collect();
     if h.supports_delete_collection() {
         verbs.push("deletecollection".to_string());
@@ -246,6 +249,20 @@ fn subresource_row(h: &dyn ResourceHandler, sub: Subresource) -> APIResource {
         Subresource::Exec => stream_row(h, crate::pod_stream::PodStreamKind::Exec),
         Subresource::Attach => stream_row(h, crate::pod_stream::PodStreamKind::Attach),
         Subresource::PortForward => stream_row(h, crate::pod_stream::PodStreamKind::PortForward),
+        // `/eviction` is CREATE-ONLY and takes a policy/v1 Eviction: the row
+        // carries that GV, as upstream's does, so kubectl drain sends the
+        // right body.
+        Subresource::Eviction => APIResource {
+            name: format!("{}/eviction", h.plural()),
+            singular_name: String::new(),
+            namespaced: h.namespaced(),
+            kind: "Eviction".to_string(),
+            verbs: vec!["create".to_string()],
+            short_names: Vec::new(),
+            categories: Vec::new(),
+            group: Some("policy".to_string()),
+            version: Some("v1".to_string()),
+        },
     }
 }
 

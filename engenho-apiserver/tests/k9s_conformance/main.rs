@@ -12,7 +12,7 @@ mod matrix;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use engenho_apiserver::{
@@ -22,6 +22,10 @@ use engenho_apiserver::{
 };
 use engenho_kubelet::port_forward_spdy::client::Client;
 use engenho_kubelet::spdy::{Frame, RstStatus};
+use engenho_apiserver::resource_metrics::{
+    ContainerSample, MetricsHandler, MetricsKind, NodeSample, PodSample, ResourceMetricsReader,
+    Window,
+};
 use engenho_store::command::{Reason, ResourceCommand};
 use engenho_store::{InProcessRouter, ResourceKey, StoreMesh, default_config};
 use futures::{SinkExt, StreamExt};
@@ -39,10 +43,13 @@ const KUBELET_PROTOCOLS: &[&str] = &[
     "portforward.k8s.io",
 ];
 
-/// Per-container log text, with the kubelet's `/log` semantics.
+/// Per-container log lines, each with the time it was written, served
+/// with the kubelet's `/log` semantics: `since` drops what was written
+/// before it, `timestamps` prefixes each line with its RFC3339Nano stamp,
+/// `tailLines` keeps the last lines, and the cursor counts rendered bytes.
 #[derive(Default)]
 struct Logs {
-    text: Mutex<BTreeMap<String, String>>,
+    lines: Mutex<BTreeMap<String, Vec<(SystemTime, String)>>>,
     reads: AtomicUsize,
 }
 
@@ -56,8 +63,8 @@ impl PodLogReader for Logs {
     ) -> Result<String, ApiError> {
         self.reads.fetch_add(1, Ordering::SeqCst);
         let container = query.container.as_deref().unwrap_or("main");
-        let all = self
-            .text
+        let lines = self
+            .lines
             .lock()
             .map_err(|_| ApiError::Internal("poisoned".into()))?
             .get(&format!("{name}/{container}"))
@@ -65,6 +72,18 @@ impl PodLogReader for Logs {
             .ok_or_else(|| {
                 ApiError::NotFound(format!("container {container:?} not found in pod"))
             })?;
+        let mut all = String::new();
+        for (at, text) in lines {
+            if query.since.is_some_and(|since| at < since) {
+                continue;
+            }
+            if query.timestamps {
+                all.push_str(&engenho_types::time::system_time_to_rfc3339_nano(at).unwrap());
+                all.push(' ');
+            }
+            all.push_str(&text);
+            all.push('\n');
+        }
         let from = usize::try_from(query.from_byte.unwrap_or(0))
             .unwrap_or(usize::MAX)
             .min(all.len());
@@ -73,6 +92,54 @@ impl PodLogReader for Logs {
             Some(n) => engenho_apiserver::pod_logs::last_lines(rest, n),
             None => rest.to_owned(),
         })
+    }
+}
+
+/// Usage for every fixture pod but `blind`, which the runtime cannot
+/// measure; one node.
+struct Usage;
+
+#[async_trait]
+impl ResourceMetricsReader for Usage {
+    async fn pods(&self) -> Vec<PodSample> {
+        let window = Window {
+            timestamp: SystemTime::now(),
+            length: Duration::from_secs(1),
+        };
+        let measured = |name: &str| PodSample {
+            namespace: NS.into(),
+            name: name.into(),
+            usage: Ok((
+                window,
+                vec![ContainerSample {
+                    name: "main".into(),
+                    cpu_nanocores: 1_000_000,
+                    memory_bytes: 4 << 20,
+                }],
+            )),
+        };
+        vec![
+            measured("web"),
+            measured("multi"),
+            PodSample {
+                namespace: NS.into(),
+                name: "blind".into(),
+                usage: Err("this node has no cgroup v2 (macOS)".into()),
+            },
+        ]
+    }
+    async fn nodes(&self) -> Vec<NodeSample> {
+        vec![NodeSample {
+            name: "n1".into(),
+            usage: Ok((
+                Window {
+                    timestamp: SystemTime::now(),
+                    length: Duration::from_secs(1),
+                },
+                2_000_000,
+                64 << 20,
+            )),
+        }]
     }
 }
 
@@ -251,12 +318,27 @@ fn ns_key(group: &str, version: &str, kind: &str, name: &str) -> ResourceKey {
     ResourceKey::namespaced(group, version, kind, NS, name)
 }
 
+/// A running, Ready pod on `n1`. `web` names `main` its default container
+/// with a `sidecar` listed first; `multi` names none and lists `zeta` first.
 fn pod(name: &str) -> Value {
+    let (annotations, containers) = match name {
+        "web" => (
+            json!({"kubectl.kubernetes.io/default-container": "main"}),
+            json!([{"name":"sidecar","image":"busybox"},{"name":"main","image":"busybox"}]),
+        ),
+        "multi" => (
+            json!({}),
+            json!([{"name":"zeta","image":"busybox"},{"name":"alpha","image":"busybox"}]),
+        ),
+        _ => (json!({}), json!([{"name":"main","image":"busybox"}])),
+    };
     json!({"apiVersion":"v1","kind":"Pod",
-        "metadata":{"name":name,"namespace":NS,"uid":format!("uid-{name}")},
+        "metadata":{"name":name,"namespace":NS,"uid":format!("uid-{name}"),
+            "labels":{"app":name},"annotations":annotations},
         "spec":{"nodeName":"n1",
             "initContainers":[{"name":"init","image":"busybox"}],
-            "containers":[{"name":"main","image":"busybox"}]}})
+            "containers":containers},
+        "status":{"phase":"Running","conditions":[{"type":"Ready","status":"True"}]}})
 }
 
 async fn seed(store: &StoreMesh) {
@@ -272,9 +354,19 @@ async fn seed(store: &StoreMesh) {
         json!({"apiVersion":"v1","kind":"Node","metadata":{"name":"n1"},"spec":{}}),
     )
     .await;
-    for name in ["web", "victim", "doomed"] {
+    for name in ["web", "victim", "doomed", "multi", "guarded", "blind"] {
         put(store, ns_key("", "v1", "Pod", name), pod(name)).await;
     }
+    put(
+        store,
+        ns_key("policy", "v1", "PodDisruptionBudget", "guarded"),
+        json!({"apiVersion":"policy/v1","kind":"PodDisruptionBudget",
+            "metadata":{"name":"guarded","namespace":NS,"generation":1},
+            "spec":{"minAvailable":1,"selector":{"matchLabels":{"app":"guarded"}}},
+            "status":{"observedGeneration":1,"disruptionsAllowed":0,
+                "currentHealthy":1,"desiredHealthy":1,"expectedPods":1}}),
+    )
+    .await;
     for name in ["cfg", "doomed"] {
         put(
             store,
@@ -345,12 +437,15 @@ async fn cluster(test: &str) -> Cluster {
 
     let logs = Arc::new(Logs::default());
     {
-        let mut text = logs.text.lock().unwrap();
-        text.insert(
-            "web/main".into(),
-            "2026-10-13T12:00:00Z main says hi\n".repeat(400),
-        );
-        text.insert("web/init".into(), "2026-10-13T11:59:00Z init done\n".into());
+        let now = SystemTime::now();
+        let mut lines = logs.lines.lock().unwrap();
+        let mut main = vec![(now - Duration::from_secs(7200), "old news".to_owned())];
+        main.extend((0..50).map(|_| (now, "main says hi".to_owned())));
+        lines.insert("web/main".into(), main);
+        lines.insert("web/sidecar".into(), vec![(now, "sidecar chatter".into())]);
+        lines.insert("web/init".into(), vec![(now, "init done".into())]);
+        lines.insert("multi/zeta".into(), vec![(now, "zeta speaks".into())]);
+        lines.insert("multi/alpha".into(), vec![(now, "alpha speaks".into())]);
     }
     let descriptor = engenho_types::generated_v1_34::RESOURCE_CATALOG
         .iter()
@@ -364,8 +459,11 @@ async fn cluster(test: &str) -> Cluster {
                 real_kubelet: real_kubelet().await,
             })),
     );
-    let mut handlers = handlers_from_catalog(store);
+    let mut handlers = handlers_from_catalog(store.clone());
     handlers.push(pods);
+    for kind in [MetricsKind::Pod, MetricsKind::Node] {
+        handlers.push(Arc::new(MetricsHandler::new(kind, Arc::new(Usage), store.clone())));
+    }
     let server = ApiServer::start_with_state(
         "127.0.0.1:0".parse().unwrap(),
         RouterState::new(handlers),
@@ -535,6 +633,35 @@ async fn judge(
             } else {
                 Err(format!("refusal kind {}", v["kind"]))
             }
+        }
+        Expected::Lines {
+            contains,
+            absent,
+            stamped,
+        } => {
+            status_is(&resp, 200)?;
+            let t = resp.text().await.map_err(|e| e.to_string())?;
+            if !t.contains(contains) {
+                return Err(format!("text lacks {contains:?}: {t:.200}"));
+            }
+            if let Some(a) = absent
+                && t.contains(a)
+            {
+                return Err(format!("text carries {a:?}: {t:.200}"));
+            }
+            if stamped {
+                for line in t.lines() {
+                    let (stamp, rest) = line
+                        .split_once(' ')
+                        .ok_or_else(|| format!("unstamped line {line:?}"))?;
+                    if engenho_types::time::parse_rfc3339_system_time(stamp).is_none()
+                        || rest.starts_with(|c: char| c.is_ascii_digit())
+                    {
+                        return Err(format!("not one RFC3339 token then text: {line:?}"));
+                    }
+                }
+            }
+            Ok(())
         }
         Expected::Absent { degrade, .. } => match degrade {
             Degrade::Ignored { status } => status_is(&resp, status),
