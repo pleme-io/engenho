@@ -896,3 +896,48 @@ async fn an_app_container_never_starts_before_its_sidecar_has_started() {
 
     teardown(store, kubelet).await;
 }
+
+// ── An init container's log stays readable by name after it Succeeds ─────
+//
+// k9s opens a multi-container pod's Logs view by fanning out one follow per
+// container, init containers included. The in-process `/log` path looked only
+// at app containers, so `?container=<init>` was a 404 and k9s sat in its
+// retry loop on it (measured on ryn, pangea-operator's `pg-wait`, 2026-10-13).
+
+#[tokio::test]
+async fn a_finished_init_containers_log_is_readable_by_name() {
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    backend
+        .seed_log("default_p1_init-setup", "migrated\n")
+        .await;
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+    put_pod_with_init(
+        &store,
+        "p1",
+        "node-A",
+        "Always",
+        &[("setup", "img-setup")],
+        &[("web", "img-web")],
+    )
+    .await;
+    kubelet.tick().await.unwrap();
+    let init_id = id_for_spec_name(&backend, "default_p1_init-setup")
+        .await
+        .expect("init container tracked");
+    backend.set_exit(&init_id, 0).await;
+    kubelet.tick().await.unwrap();
+
+    let logs = kubelet
+        .container_logs(
+            "default",
+            "p1",
+            Some("setup"),
+            &engenho_kubelet::backend::LogOptions::all(),
+        )
+        .await
+        .expect("the init container is addressable by name");
+    assert_eq!(logs, "migrated\n");
+
+    teardown(store, kubelet).await;
+}

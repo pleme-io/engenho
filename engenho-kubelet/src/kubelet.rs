@@ -657,6 +657,18 @@ impl LocalPod {
     fn inits(&mut self) -> &mut BTreeMap<String, ContainerRecord> {
         &mut self.init_containers
     }
+
+    /// The record a `?container=<name>` selector addresses: an app container,
+    /// else an init container. Every by-name reader (logs, the kubelet API's
+    /// exec/attach) resolves through here, so an init container is addressable
+    /// everywhere upstream makes it addressable — k9s fans a pod's Logs view
+    /// out over its init containers too, and a 404 for one of them sent it
+    /// into a twenty-attempt retry loop.
+    fn container_named(&self, name: &str) -> Option<&ContainerRecord> {
+        self.containers
+            .get(name)
+            .or_else(|| self.init_containers.get(name))
+    }
 }
 
 /// The volume name the kubelet materializes a pod's `ServiceAccount`
@@ -5611,7 +5623,8 @@ impl Kubelet {
     /// `-c <container>` selector.
     ///
     /// Resolves the container's backend id from the local bookkeeping, then
-    /// asks the backend. `container` selects which container; `None` defaults
+    /// asks the backend. `container` selects an app or init container (see
+    /// [`LocalPod::container_named`]); `None` defaults
     /// to the FIRST container in the pod (deterministic — sorted by name in
     /// the BTreeMap; kubectl defaults to the first container in spec order, and
     /// for a single-container pod they coincide).
@@ -5637,8 +5650,7 @@ impl Kubelet {
         })?;
         let record = match container {
             Some(c) => lp
-                .containers
-                .get(c)
+                .container_named(c)
                 .ok_or_else(|| KubeletError::InvalidPod {
                     pod: format!("{namespace}/{name}"),
                     reason: format!("container {c:?} not found in pod"),
@@ -7208,11 +7220,9 @@ impl Kubelet {
     async fn container_id_of(&self, namespace: &str, pod: &str, container: &str) -> Option<String> {
         let key = ResourceKey::namespaced("", "v1", "Pod", namespace, pod);
         let local = self.local.lock().await;
-        let entry = local.get(&key)?;
-        entry
-            .containers
-            .get(container)
-            .or_else(|| entry.init_containers.get(container))
+        local
+            .get(&key)?
+            .container_named(container)
             .map(|r| r.container_id.clone())
     }
 
