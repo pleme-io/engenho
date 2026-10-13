@@ -15,7 +15,7 @@
 /// frame identically (binary, channel byte first).
 pub const SUBPROTOCOLS: [&str; 3] = [
     crate::exec_channel::SUBPROTOCOL_V4,
-    "portforward.k8s.io",
+    crate::port_forward_spdy::STREAM_PROTOCOL,
     "channel.k8s.io",
 ];
 

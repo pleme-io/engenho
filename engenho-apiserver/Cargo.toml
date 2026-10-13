@@ -88,3 +88,6 @@ tower = { workspace = true, features = ["util"] }
 http-body-util = "0.1"
 # The control plane's certificates, to prove the apiserver refuses them.
 engenho-control-types = { workspace = true, features = ["tls"] }
+# The real kubelet behind the relay, for the port-forward rows: a SPDY
+# session is only proven by the server that speaks it. A workspace crate.
+engenho-kubelet = { workspace = true }

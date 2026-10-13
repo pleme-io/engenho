@@ -22,8 +22,13 @@
 //! `/exec` and `/attach` speak `v5.channel.k8s.io` (and `v4`, kubectl's
 //! fallback) over WebSocket: stdin, a real pty for `-t` with resizes, the
 //! v5 close-stdin signal `kubectl cp` relies on, and the exit status as a
-//! `Status` on the error channel. `/portForward` speaks upstream's WebSocket
-//! port-forward protocol (`?ports=`, a data and an error channel per port).
+//! `Status` on the error channel. `/portForward` speaks SPDY/3.1
+//! `portforward.k8s.io` — tunnelled in a `SPDY/3.1+portforward.k8s.io`
+//! WebSocket (kubectl ≥ 1.31, k9s) or over a plain `Upgrade: SPDY/3.1`
+//! ([`crate::port_forward_spdy`]) — and upstream's WebSocket channel
+//! protocol (`?ports=`, a data and an error channel per port). exec and
+//! attach do not take SPDY: every client that falls back to it tried
+//! WebSocket v5 first, which is served.
 //! A runtime that cannot stream answers with a `Status` naming why, on the
 //! error channel, never with a session that hangs.
 
@@ -174,9 +179,18 @@ impl KubeletServer {
             // Upstream's own segment shapes: exec/attach take
             // {namespace}/{pod}/{container}, portForward takes
             // {namespace}/{pod}.
-            .route("/exec/:namespace/:pod/:container", get(exec))
-            .route("/attach/:namespace/:pod/:container", get(attach))
-            .route("/portForward/:namespace/:pod", get(port_forward))
+            // GET and POST, as upstream's kubelet registers them: a WebSocket
+            // upgrade is a GET, a SPDY upgrade is whatever the client sent
+            // (kubectl's is a POST).
+            .route("/exec/:namespace/:pod/:container", get(exec).post(exec))
+            .route(
+                "/attach/:namespace/:pod/:container",
+                get(attach).post(attach),
+            )
+            .route(
+                "/portForward/:namespace/:pod",
+                get(port_forward).post(port_forward),
+            )
             .with_state(self)
     }
 }
@@ -404,15 +418,42 @@ async fn pump_session(
     let _ = socket.close().await;
 }
 
-/// `kubectl port-forward` — one WebSocket, a data and an error channel per
-/// requested port, each dialled on the pod's address.
+/// `kubectl port-forward`, in each of the three shapes a client sends:
+///
+/// * a WebSocket offering `SPDY/3.1+portforward.k8s.io` — a SPDY session
+///   tunnelled in binary messages (kubectl ≥ 1.31, k9s 0.50);
+/// * a plain `Upgrade: SPDY/3.1` with `X-Stream-Protocol-Version:
+///   portforward.k8s.io` — their fallback, and every older client;
+/// * a WebSocket offering `portforward.k8s.io` / `v4.channel.k8s.io` — one
+///   data and one error channel per `?ports=` entry.
+///
+/// The SPDY shapes name their ports per stream, so `?ports=` is only read by
+/// the channel protocol.
 async fn port_forward(
     State(s): State<KubeletServer>,
     Path((namespace, pod)): Path<(String, String)>,
     RawQuery(raw): RawQuery,
     headers: axum::http::HeaderMap,
     ws: Option<WebSocketUpgrade>,
+    req: axum::extract::Request,
 ) -> axum::response::Response {
+    if is_spdy_upgrade(&headers) {
+        return spdy_upgrade(s, namespace, pod, &headers, req);
+    }
+    if offered(&headers)
+        .split(',')
+        .any(|p| p.trim() == crate::port_forward_spdy::TUNNEL_SUBPROTOCOL)
+    {
+        let Some(ws) = ws else {
+            return needs_upgrade("portForward", crate::port_forward_spdy::TUNNEL_SUBPROTOCOL);
+        };
+        return ws
+            .protocols([crate::port_forward_spdy::TUNNEL_SUBPROTOCOL])
+            .on_upgrade(move |socket| async move {
+                let target = forward_target(&s, namespace, pod).await;
+                tunnel_spdy(socket, target).await;
+            });
+    }
     let ports = match port_forward::parse_ports(raw.as_deref().unwrap_or("")) {
         Ok(p) => p,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
@@ -427,10 +468,126 @@ async fn port_forward(
     let Some(ws) = ws else {
         return needs_upgrade("portForward", &port_forward::SUBPROTOCOLS.join(" or "));
     };
-    ws.protocols([protocol]).on_upgrade(move |socket| async move {
-        let addr = s.api.pod_address(&namespace, &pod).await;
-        pump_port_forward(socket, &namespace, &pod, addr, &ports).await;
-    })
+    ws.protocols([protocol])
+        .on_upgrade(move |socket| async move {
+            let addr = s.api.pod_address(&namespace, &pod).await;
+            pump_port_forward(socket, &namespace, &pod, addr, &ports).await;
+        })
+}
+
+async fn forward_target(
+    s: &KubeletServer,
+    namespace: String,
+    pod: String,
+) -> crate::port_forward_spdy::ForwardTarget {
+    let addr = s.api.pod_address(&namespace, &pod).await;
+    crate::port_forward_spdy::ForwardTarget {
+        namespace,
+        pod,
+        addr,
+    }
+}
+
+/// Whether a request asks for a plain SPDY/3.1 upgrade.
+fn is_spdy_upgrade(headers: &axum::http::HeaderMap) -> bool {
+    let has = |name: axum::http::header::HeaderName, token: &str| {
+        headers.get_all(name).iter().any(|v| {
+            v.to_str()
+                .is_ok_and(|s| s.split(',').any(|t| t.trim().eq_ignore_ascii_case(token)))
+        })
+    };
+    has(axum::http::header::UPGRADE, crate::spdy::UPGRADE_TOKEN)
+        && has(axum::http::header::CONNECTION, "upgrade")
+}
+
+/// Upstream's `httpstream.Handshake` then `UpgradeResponse`: the client must
+/// offer `portforward.k8s.io` in `X-Stream-Protocol-Version` (403 naming the
+/// accepted versions otherwise); the answer is 101 echoing it.
+fn spdy_upgrade(
+    s: KubeletServer,
+    namespace: String,
+    pod: String,
+    headers: &axum::http::HeaderMap,
+    mut req: axum::extract::Request,
+) -> axum::response::Response {
+    use crate::port_forward_spdy::STREAM_PROTOCOL;
+    let offered_versions = headers
+        .get_all(engenho_types::stream_protocol::STREAM_PROTOCOL_HEADER)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|v| v.trim() == STREAM_PROTOCOL);
+    if !offered_versions {
+        return (
+            StatusCode::FORBIDDEN,
+            [(
+                engenho_types::stream_protocol::ACCEPTED_STREAM_PROTOCOLS_HEADER,
+                STREAM_PROTOCOL,
+            )],
+            format!(
+                "unable to upgrade: unable to negotiate protocol: server accepts [{STREAM_PROTOCOL}]"
+            ),
+        )
+            .into_response();
+    }
+    let on_upgrade = hyper::upgrade::on(&mut req);
+    tokio::spawn(async move {
+        match on_upgrade.await {
+            Ok(upgraded) => {
+                let target = forward_target(&s, namespace, pod).await;
+                crate::port_forward_spdy::serve_io(hyper_util::rt::TokioIo::new(upgraded), target)
+                    .await;
+            }
+            Err(e) => tracing::debug!(error = %e, "port-forward SPDY upgrade failed"),
+        }
+    });
+    (
+        StatusCode::SWITCHING_PROTOCOLS,
+        [
+            (axum::http::header::CONNECTION, "Upgrade"),
+            (axum::http::header::UPGRADE, crate::spdy::UPGRADE_TOKEN),
+            (
+                axum::http::header::HeaderName::from_static(
+                    engenho_types::stream_protocol::STREAM_PROTOCOL_HEADER,
+                ),
+                STREAM_PROTOCOL,
+            ),
+        ],
+    )
+        .into_response()
+}
+
+/// A SPDY session carried in a WebSocket's binary messages: each message is
+/// the next run of bytes, with no relation to frame boundaries.
+async fn tunnel_spdy(socket: WebSocket, target: crate::port_forward_spdy::ForwardTarget) {
+    use futures_util::{SinkExt as _, StreamExt as _};
+    let (mut sink, mut stream) = socket.split();
+    let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(64);
+    let reader = tokio::spawn(async move {
+        while let Some(Ok(msg)) = stream.next().await {
+            match msg {
+                Message::Binary(b) => {
+                    if in_tx.send(b).await.is_err() {
+                        return;
+                    }
+                }
+                Message::Close(_) => return,
+                Message::Text(_) | Message::Ping(_) | Message::Pong(_) => {}
+            }
+        }
+    });
+    let writer = tokio::spawn(async move {
+        while let Some(bytes) = out_rx.recv().await {
+            if sink.send(Message::Binary(bytes)).await.is_err() {
+                return;
+            }
+        }
+        let _ = sink.close().await;
+    });
+    crate::port_forward_spdy::serve(in_rx, out_tx, target).await;
+    let _ = writer.await;
+    reader.abort();
 }
 
 /// Carry every port's TCP stream over the socket until each has closed.
@@ -480,9 +637,8 @@ async fn pump_port_forward(
             }
             Err(reason) => {
                 writers.push(None);
-                let msg = format!(
-                    "error forwarding port {port} to pod {namespace}/{pod}: {reason}"
-                );
+                let msg =
+                    format!("error forwarding port {port} to pod {namespace}/{pod}: {reason}");
                 if socket
                     .send(Message::Binary(port_forward::frame(error, msg.as_bytes())))
                     .await

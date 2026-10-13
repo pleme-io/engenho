@@ -81,6 +81,7 @@ pub mod pod;
 pub mod primitives;
 pub mod spec_int;
 pub mod state_class;
+pub mod stream_protocol;
 pub mod time;
 pub mod translator;
 pub mod watch;

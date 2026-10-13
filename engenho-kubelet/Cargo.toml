@@ -40,6 +40,13 @@ http-body-util     = { workspace = true }
 # already pin (single closure).
 base64             = "0.22"
 rustix             = { version = "1", features = ["fs", "param", "pty", "termios", "process"] }
+# SPDY/3 header blocks are zlib with a preset dictionary. Pure Rust, already
+# in the lock under flate2; its low-level inflate takes a pre-filled window,
+# which is how the dictionary is supplied (src/spdy/header_zlib.rs).
+miniz_oxide        = "0.8"
+# Splits the port-forward tunnel's WebSocket into a reader and a writer task
+# (src/server.rs); already in the lock as axum's own ws dependency.
+futures-util       = "0.3"
 
 engenho-types       = { workspace = true }
 engenho-store       = { workspace = true }
@@ -59,10 +66,9 @@ proptest = "1"
 # pump tests cannot see a wiring bug — a handler that never upgrades, a
 # subprotocol never echoed back, a frame sent as text instead of binary —
 # and every one of those presents to a user as a hang, not an error.
-# Both are already in the lock as axum's own ws dependencies, so this
+# It is already in the lock as one of axum's own ws dependencies, so this
 # costs no new third-party code.
 tokio-tungstenite = "0.24"
-futures-util = "0.3"
 # Upstream prober rows (Kubernetes v1.34.0) and the harness that runs them:
 # tests/oracle_prober.rs. Dev-only, a workspace path crate: no new third-party
 # code.

@@ -384,11 +384,15 @@ async fn spdy_and_writes_are_refused_with_a_reason() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 400);
+    assert_eq!(
+        resp.status(),
+        403,
+        "upstream's answer to an unnegotiated SPDY upgrade"
+    );
     let body: serde_json::Value = resp.json().await.unwrap();
     let message = body["message"].as_str().unwrap();
     assert!(message.contains("WebSocket only"), "{message}");
-    assert!(message.contains("SPDY is not supported"), "{message}");
+    assert!(message.contains("portforward.k8s.io"), "{message}");
     assert!(message.contains("1.31"), "{message}");
 
     for method in [

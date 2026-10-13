@@ -194,6 +194,9 @@ pub enum Req {
         path: &'static str,
         protocols: &'static str,
     },
+    /// A plain `Upgrade: SPDY/3.1` offering `X-Stream-Protocol-Version:
+    /// portforward.k8s.io`.
+    SpdyUpgrade { path: &'static str },
 }
 
 /// What upstream answers, and so what engenho must answer.
@@ -211,6 +214,10 @@ pub enum Expected {
     FollowChunk { contains: &'static str },
     /// 101 with this negotiated subprotocol.
     Switched { protocol: &'static str },
+    /// 101 negotiating this protocol, then a SPDY port-forward session
+    /// through the relay and a real engenho kubelet carries bytes to a TCP
+    /// echo listener and back.
+    Forwarded { protocol: &'static str },
     /// Not served. The row asserts the graceful-degradation answer k9s needs
     /// (absent from discovery, a clean 404 / refusal), and the reason is the
     /// gap's ledger entry.
@@ -587,25 +594,29 @@ pub const ROWS: &[Row] = &[
             path: "/api/v1/namespaces/k9s/pods/web/portforward",
             protocols: "SPDY/3.1+portforward.k8s.io",
         },
-        expect: Expected::Absent {
-            reason: "k9s's port-forward dialer speaks SPDY tunnelled in WebSocket (then plain SPDY); engenho relays only portforward.k8s.io WebSocket channels",
-            degrade: Degrade::NoUpgrade {
-                protocol: "SPDY/3.1+portforward.k8s.io",
-            },
+        expect: Expected::Forwarded {
+            protocol: "SPDY/3.1+portforward.k8s.io",
+        },
+    },
+    Row {
+        action: K9sAction::PortForward,
+        what: "plain SPDY fallback",
+        req: Req::SpdyUpgrade {
+            path: "/api/v1/namespaces/k9s/pods/web/portforward",
+        },
+        expect: Expected::Forwarded {
+            protocol: "portforward.k8s.io",
         },
     },
     Row {
         action: K9sAction::Benchmark,
-        what: "benchmark needs a port-forward",
+        what: "benchmark rides on a port-forward",
         req: Req::Upgrade {
             path: "/api/v1/namespaces/k9s/pods/web/portforward",
             protocols: "SPDY/3.1+portforward.k8s.io",
         },
-        expect: Expected::Absent {
-            reason: "rides on the port-forward gap",
-            degrade: Degrade::NoUpgrade {
-                protocol: "SPDY/3.1+portforward.k8s.io",
-            },
+        expect: Expected::Forwarded {
+            protocol: "SPDY/3.1+portforward.k8s.io",
         },
     },
     // ── workload mutations ───────────────────────────────────────────────

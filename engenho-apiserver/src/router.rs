@@ -2280,6 +2280,12 @@ async fn do_pod_stream(
     uri: &axum::http::Uri,
 ) -> Result<Response, ApiError> {
     let upgrade = upgrade.map_err(|r| crate::pod_stream::websocket_only(kind, r))?;
+    if upgrade.is_spdy() && kind != PodStreamKind::PortForward {
+        return Err(crate::pod_stream::websocket_only(
+            kind,
+            UpgradeRefusal::SpdyStreamProtocol,
+        ));
+    }
     let query = uri.query().unwrap_or_default();
     let Query(pairs) = Query::<Vec<(String, String)>>::try_from_uri(uri)
         .map_err(|e| ApiError::BadRequest(format!("malformed query: {e}")))?;

@@ -10,6 +10,7 @@ use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use engenho_types::generated_v1_34::Subresource;
+use engenho_types::stream_protocol;
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use hyper_util::rt::TokioIo;
 use tokio_tungstenite::WebSocketStream;
@@ -309,17 +310,30 @@ pub fn choose_container(
     }
 }
 
-/// A client WebSocket handshake, taken off the request before the handler
-/// runs. Absent when the request is not `Upgrade: websocket`.
+/// A client's stream handshake, taken off the request before the handler
+/// runs: a WebSocket upgrade, or — for port-forward — a plain SPDY/3.1
+/// upgrade. Absent when the request upgrades to neither.
 pub struct StreamUpgrade {
     on_upgrade: hyper::upgrade::OnUpgrade,
-    key: HeaderValue,
+    transport: Transport,
     protocols: Vec<String>,
+}
+
+/// What the client upgraded to.
+#[derive(Debug, Clone)]
+enum Transport {
+    /// RFC 6455, answered with the key's accept hash.
+    WebSocket { key: HeaderValue },
+    /// `Upgrade: SPDY/3.1` offering `portforward.k8s.io`. The kubelet side is
+    /// the same SPDY session tunnelled in a WebSocket, so the relay only
+    /// moves bytes between a raw stream and binary messages.
+    Spdy,
 }
 
 impl std::fmt::Debug for StreamUpgrade {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StreamUpgrade")
+            .field("transport", &self.transport)
             .field("protocols", &self.protocols)
             .finish_non_exhaustive()
     }
@@ -329,6 +343,8 @@ impl std::fmt::Debug for StreamUpgrade {
 pub enum UpgradeRefusal {
     NotWebSocket,
     BadHandshake,
+    /// A SPDY upgrade that does not offer `portforward.k8s.io`.
+    SpdyStreamProtocol,
 }
 
 impl IntoResponse for UpgradeRefusal {
@@ -342,6 +358,20 @@ impl<S: Send + Sync> FromRequestParts<S> for StreamUpgrade {
     type Rejection = UpgradeRefusal;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        if is_spdy_upgrade(&parts.headers) {
+            if !offers_port_forward(&parts.headers) {
+                return Err(UpgradeRefusal::SpdyStreamProtocol);
+            }
+            let on_upgrade = parts
+                .extensions
+                .remove::<hyper::upgrade::OnUpgrade>()
+                .ok_or(UpgradeRefusal::BadHandshake)?;
+            return Ok(Self {
+                on_upgrade,
+                transport: Transport::Spdy,
+                protocols: vec![stream_protocol::SPDY_PORT_FORWARD_TUNNEL.to_owned()],
+            });
+        }
         if !is_websocket_upgrade(&parts.headers) {
             return Err(UpgradeRefusal::NotWebSocket);
         }
@@ -363,64 +393,171 @@ impl<S: Send + Sync> FromRequestParts<S> for StreamUpgrade {
             .ok_or(UpgradeRefusal::BadHandshake)?;
         Ok(Self {
             on_upgrade,
-            key,
+            transport: Transport::WebSocket { key },
             protocols: offered_protocols(&parts.headers),
         })
     }
 }
 
 impl StreamUpgrade {
+    /// The subprotocols to offer the kubelet: the client's own, or for a SPDY
+    /// upgrade the tunnel that carries the same session.
     #[must_use]
     pub fn protocols(&self) -> &[String] {
         &self.protocols
     }
 
-    /// Answer 101 with the subprotocol the kubelet chose, then relay frames
-    /// between the client and `upstream` until either side closes.
+    /// Whether the client upgraded to plain SPDY.
+    #[must_use]
+    pub const fn is_spdy(&self) -> bool {
+        matches!(self.transport, Transport::Spdy)
+    }
+
+    /// Answer 101 with what the kubelet chose, then relay between the client
+    /// and `upstream` until either side closes.
     #[must_use]
     pub fn relay(self, upstream: PodStreamUpstream) -> Response {
-        let mut response = StatusCode::SWITCHING_PROTOCOLS.into_response();
-        let headers = response.headers_mut();
-        headers.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
-        headers.insert(header::CONNECTION, HeaderValue::from_static("Upgrade"));
-        if let Ok(accept) = HeaderValue::from_str(&derive_accept_key(self.key.as_bytes())) {
-            headers.insert(header::SEC_WEBSOCKET_ACCEPT, accept);
+        match self.transport {
+            Transport::WebSocket { key } => relay_websocket(self.on_upgrade, &key, upstream),
+            Transport::Spdy => relay_spdy(self.on_upgrade, upstream),
         }
-        if let Some(p) = upstream
-            .protocol
-            .as_deref()
-            .and_then(|p| HeaderValue::from_str(p).ok())
-        {
-            headers.insert(header::SEC_WEBSOCKET_PROTOCOL, p);
-        }
-        let on_upgrade = self.on_upgrade;
-        tokio::spawn(async move {
-            match on_upgrade.await {
-                Ok(upgraded) => {
-                    let client = WebSocketStream::from_raw_socket(
-                        TokioIo::new(upgraded),
-                        Role::Server,
-                        None,
-                    )
-                    .await;
-                    pump(client, upstream.frames).await;
-                }
-                Err(e) => tracing::warn!(error = %e, "pod stream upgrade failed"),
-            }
-        });
-        response
     }
+}
+
+fn relay_websocket(
+    on_upgrade: hyper::upgrade::OnUpgrade,
+    key: &HeaderValue,
+    upstream: PodStreamUpstream,
+) -> Response {
+    let mut response = StatusCode::SWITCHING_PROTOCOLS.into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+    headers.insert(header::CONNECTION, HeaderValue::from_static("Upgrade"));
+    if let Ok(accept) = HeaderValue::from_str(&derive_accept_key(key.as_bytes())) {
+        headers.insert(header::SEC_WEBSOCKET_ACCEPT, accept);
+    }
+    if let Some(p) = upstream
+        .protocol
+        .as_deref()
+        .and_then(|p| HeaderValue::from_str(p).ok())
+    {
+        headers.insert(header::SEC_WEBSOCKET_PROTOCOL, p);
+    }
+    tokio::spawn(async move {
+        match on_upgrade.await {
+            Ok(upgraded) => {
+                let client =
+                    WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, None)
+                        .await;
+                pump(client, upstream.frames).await;
+            }
+            Err(e) => tracing::warn!(error = %e, "pod stream upgrade failed"),
+        }
+    });
+    response
+}
+
+/// A plain SPDY client against a kubelet that answered the tunnel: 101 with
+/// upstream's SPDY headers, then the client's bytes become binary messages
+/// and the kubelet's binary messages become bytes.
+fn relay_spdy(on_upgrade: hyper::upgrade::OnUpgrade, upstream: PodStreamUpstream) -> Response {
+    if upstream.protocol.as_deref() != Some(stream_protocol::SPDY_PORT_FORWARD_TUNNEL) {
+        return ApiError::ServiceUnavailable(format!(
+            "pods/portforward over SPDY: the kubelet negotiated {:?}, not {}",
+            upstream.protocol,
+            stream_protocol::SPDY_PORT_FORWARD_TUNNEL
+        ))
+        .into_response();
+    }
+    let mut response = StatusCode::SWITCHING_PROTOCOLS.into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::CONNECTION, HeaderValue::from_static("Upgrade"));
+    headers.insert(
+        header::UPGRADE,
+        HeaderValue::from_static(stream_protocol::SPDY_31),
+    );
+    headers.insert(
+        header::HeaderName::from_static(stream_protocol::STREAM_PROTOCOL_HEADER),
+        HeaderValue::from_static(stream_protocol::PORT_FORWARD),
+    );
+    tokio::spawn(async move {
+        match on_upgrade.await {
+            Ok(upgraded) => pump_bytes(TokioIo::new(upgraded), upstream.frames).await,
+            Err(e) => tracing::warn!(error = %e, "pod stream SPDY upgrade failed"),
+        }
+    });
+    response
+}
+
+/// Move bytes between a raw client stream and the kubelet's binary messages
+/// until either side ends.
+async fn pump_bytes<T, U>(client: T, upstream: U)
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin,
+    U: FrameDuplex,
+{
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let (mut client_rx, mut client_tx) = tokio::io::split(client);
+    let (mut up_tx, mut up_rx) = upstream.split();
+    let mut buf = vec![0u8; 32 * 1024];
+    loop {
+        tokio::select! {
+            n = client_rx.read(&mut buf) => match n {
+                Ok(0) | Err(_) => {
+                    let _ = up_tx.close().await;
+                    drain(&mut up_rx).await;
+                    return;
+                }
+                Ok(n) => {
+                    if up_tx.send(Message::Binary(buf[..n].to_vec())).await.is_err() {
+                        return;
+                    }
+                }
+            },
+            m = up_rx.next() => match m {
+                Some(Ok(Message::Binary(b))) => {
+                    if client_tx.write_all(&b).await.is_err() || client_tx.flush().await.is_err() {
+                        let _ = up_tx.close().await;
+                        return;
+                    }
+                }
+                Some(Ok(Message::Close(_)) | Err(_)) | None => {
+                    let _ = client_tx.shutdown().await;
+                    return;
+                }
+                Some(Ok(_)) => {}
+            },
+        }
+    }
+}
+
+/// Whether a request asks for a plain SPDY/3.1 upgrade.
+#[must_use]
+pub fn is_spdy_upgrade(headers: &HeaderMap) -> bool {
+    has_token(headers, header::UPGRADE, stream_protocol::SPDY_31)
+        && has_token(headers, header::CONNECTION, "upgrade")
+}
+
+fn offers_port_forward(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(stream_protocol::STREAM_PROTOCOL_HEADER)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .any(|p| p.trim() == stream_protocol::PORT_FORWARD)
+}
+
+fn has_token(headers: &HeaderMap, name: header::HeaderName, token: &str) -> bool {
+    headers.get_all(name).iter().any(|v| {
+        v.to_str()
+            .is_ok_and(|s| s.split(',').any(|t| t.trim().eq_ignore_ascii_case(token)))
+    })
 }
 
 #[must_use]
 pub fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
-    let has_token = |name: header::HeaderName, token: &str| {
-        headers.get_all(name).iter().any(|v| {
-            v.to_str()
-                .is_ok_and(|s| s.split(',').any(|t| t.trim().eq_ignore_ascii_case(token)))
-        })
-    };
-    has_token(header::UPGRADE, "websocket") && has_token(header::CONNECTION, "upgrade")
+    has_token(headers, header::UPGRADE, "websocket")
+        && has_token(headers, header::CONNECTION, "upgrade")
 }
 
 fn offered_protocols(headers: &HeaderMap) -> Vec<String> {
@@ -435,20 +572,27 @@ fn offered_protocols(headers: &HeaderMap) -> Vec<String> {
         .collect()
 }
 
-/// The refusal for a streaming request that is not a WebSocket upgrade
-/// (SPDY, or a plain request).
+/// The refusal for a streaming request that upgrades to nothing this
+/// apiserver relays.
 #[must_use]
 pub fn websocket_only(kind: PodStreamKind, refusal: UpgradeRefusal) -> ApiError {
     let sub = kind.subresource();
     match refusal {
         UpgradeRefusal::NotWebSocket => ApiError::BadRequest(format!(
-            "pods/{sub} is served over WebSocket only (Upgrade: websocket, v5.channel.k8s.io / \
-             v4.channel.k8s.io / portforward.k8s.io); SPDY is not supported. kubectl >= 1.31 \
-             uses WebSocket by default"
+            "pods/{sub} is served over WebSocket (Upgrade: websocket, v5.channel.k8s.io / \
+             v4.channel.k8s.io / portforward.k8s.io / SPDY/3.1+portforward.k8s.io), and \
+             pods/portforward also over Upgrade: SPDY/3.1. kubectl >= 1.31 uses WebSocket by \
+             default"
         )),
         UpgradeRefusal::BadHandshake => ApiError::BadRequest(format!(
             "pods/{sub}: malformed WebSocket handshake (Sec-WebSocket-Key and \
              Sec-WebSocket-Version: 13 are required)"
+        )),
+        UpgradeRefusal::SpdyStreamProtocol => ApiError::Forbidden(format!(
+            "pods/{sub}: unable to upgrade: unable to negotiate protocol: a SPDY upgrade must \
+             offer {} in X-Stream-Protocol-Version; exec and attach are served over WebSocket \
+             only (kubectl >= 1.31 uses it by default)",
+            stream_protocol::PORT_FORWARD
         )),
     }
 }

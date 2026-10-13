@@ -16,10 +16,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use engenho_apiserver::{
-    ApiError, ApiServer, LogQuery, PodLogReader, PodStreamProxy, PodStreamTarget,
+    ApiError, ApiServer, LogQuery, PodLogReader, PodStreamKind, PodStreamProxy, PodStreamTarget,
     PodStreamUpstream, ResourceHandler, RouterState, StoreBackedHandler, dial_kubelet,
     handlers_from_catalog,
 };
+use engenho_kubelet::port_forward_spdy::client::Client;
+use engenho_kubelet::spdy::{Frame, RstStatus};
 use engenho_store::command::{Reason, ResourceCommand};
 use engenho_store::{InProcessRouter, ResourceKey, StoreMesh, default_config};
 use futures::{SinkExt, StreamExt};
@@ -74,16 +76,113 @@ impl PodLogReader for Logs {
     }
 }
 
-/// Every pod is on `n1`, served by the fake kubelet.
+/// Every pod is on `n1`. exec and attach reach the echoing fake kubelet;
+/// port-forward reaches a real engenho kubelet, because a SPDY session is
+/// only proven against the server that speaks it.
 struct OneNode {
     kubelet: String,
+    real_kubelet: String,
 }
 
 #[async_trait]
 impl PodStreamProxy for OneNode {
     async fn open(&self, target: &PodStreamTarget) -> Result<PodStreamUpstream, ApiError> {
-        dial_kubelet(&self.kubelet, target).await
+        match target.kind {
+            PodStreamKind::PortForward => dial_kubelet(&self.real_kubelet, target).await,
+            PodStreamKind::Exec | PodStreamKind::Attach => {
+                dial_kubelet(&self.kubelet, target).await
+            }
+        }
     }
+}
+
+/// The engenho kubelet's API with every pod on loopback: port-forward is the
+/// only verb routed to it.
+struct LoopbackPods;
+
+#[async_trait]
+impl engenho_kubelet::server::KubeletApi for LoopbackPods {
+    async fn container_logs(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &engenho_kubelet::backend::LogOptions,
+    ) -> Result<String, String> {
+        Err("not routed here".into())
+    }
+    async fn pods(&self) -> Value {
+        json!({})
+    }
+    async fn running_pods(&self) -> Value {
+        json!({})
+    }
+    async fn exec(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &[String],
+    ) -> Result<engenho_kubelet::backend::ExecOutcome, String> {
+        Err("not routed here".into())
+    }
+    async fn exec_stream(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &engenho_kubelet::stream::StreamRequest,
+    ) -> Result<engenho_kubelet::stream::StreamSession, String> {
+        Err("not routed here".into())
+    }
+    async fn attach(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &engenho_kubelet::stream::StreamRequest,
+    ) -> Result<engenho_kubelet::stream::StreamSession, String> {
+        Err("not routed here".into())
+    }
+    async fn pod_address(&self, _: &str, _: &str) -> Result<std::net::IpAddr, String> {
+        Ok(std::net::IpAddr::from([127, 0, 0, 1]))
+    }
+}
+
+/// A real engenho kubelet on loopback; its `host:port`.
+async fn real_kubelet() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let app = engenho_kubelet::server::KubeletServer::new(Arc::new(LoopbackPods)).routes();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    addr
+}
+
+/// A TCP echo listener on loopback: the forwarded pod port. Reports each
+/// connection's end on `ended`.
+async fn echo_listener() -> (u16, Arc<AtomicUsize>) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = echo.local_addr().unwrap().port();
+    let ended = Arc::new(AtomicUsize::new(0));
+    let seen = ended.clone();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = echo.accept().await {
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = s.read(&mut buf).await {
+                    if n == 0 || s.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+                seen.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+    });
+    (port, ended)
 }
 
 /// A kubelet that accepts exactly the engenho kubelet's subprotocols and
@@ -218,6 +317,9 @@ async fn seed(store: &StoreMesh) {
 struct Cluster {
     server: ApiServer,
     logs: Arc<Logs>,
+    /// The forwarded pod port's echo listener, and how many of its
+    /// connections have ended.
+    echo: (u16, Arc<AtomicUsize>),
 }
 
 impl Cluster {
@@ -259,6 +361,7 @@ async fn cluster(test: &str) -> Cluster {
             .with_log_reader(logs.clone())
             .with_stream_proxy(Arc::new(OneNode {
                 kubelet: fake_kubelet().await,
+                real_kubelet: real_kubelet().await,
             })),
     );
     let mut handlers = handlers_from_catalog(store);
@@ -270,7 +373,11 @@ async fn cluster(test: &str) -> Cluster {
     )
     .await
     .unwrap();
-    Cluster { server, logs }
+    Cluster {
+        server,
+        logs,
+        echo: echo_listener().await,
+    }
 }
 
 const PER_REQUEST: Duration = Duration::from_secs(5);
@@ -280,6 +387,16 @@ const PER_REQUEST: Duration = Duration::from_secs(5);
 async fn run(c: &Cluster, http: &reqwest::Client, row: &Row) -> Result<(), String> {
     match (row.req, row.expect) {
         (Req::Upgrade { path, protocols }, expect) => upgrade(c, path, protocols, expect).await,
+        (Req::SpdyUpgrade { path }, Expected::Forwarded { protocol }) => {
+            let (mut client, head) = spdy_client(c, path).await?;
+            let lower = head.to_ascii_lowercase();
+            if !lower.contains(&format!("x-stream-protocol-version: {protocol}"))
+                || !lower.contains("upgrade: spdy/3.1")
+            {
+                return Err(format!("101 without the SPDY handshake headers: {head}"));
+            }
+            round_trip(&mut client, c.echo.0, b"k9s says hi over plain spdy").await
+        }
         (Req::Watch { path }, Expected::WatchEvent { event }) => {
             let mut resp = send(http.get(c.url(path))).await?;
             let first = first_line(&mut resp).await?;
@@ -366,7 +483,7 @@ async fn request(
             edit(&mut v);
             http.put(c.url(path)).json(&v)
         }
-        Req::Watch { .. } | Req::Follow { .. } | Req::Upgrade { .. } => {
+        Req::Watch { .. } | Req::Follow { .. } | Req::Upgrade { .. } | Req::SpdyUpgrade { .. } => {
             return Err("streaming request routed to the plain runner".into());
         }
     };
@@ -462,9 +579,10 @@ async fn judge(
             }
             Degrade::NoUpgrade { .. } => Err("NoUpgrade on a plain request".into()),
         },
-        Expected::WatchEvent { .. } | Expected::FollowChunk { .. } | Expected::Switched { .. } => {
-            Err("streaming expectation on a plain request".into())
-        }
+        Expected::WatchEvent { .. }
+        | Expected::FollowChunk { .. }
+        | Expected::Switched { .. }
+        | Expected::Forwarded { .. } => Err("streaming expectation on a plain request".into()),
     }
 }
 
@@ -500,6 +618,22 @@ async fn upgrade(c: &Cluster, path: &str, protocols: &str, expect: Expected) -> 
                 Some(Ok(Message::Binary(b))) if b == b"\x00ping" => Ok(()),
                 other => Err(format!("relay returned {other:?}")),
             }
+        }
+        (Ok((ws, resp)), Expected::Forwarded { protocol }) => {
+            let chosen = resp
+                .headers()
+                .get("sec-websocket-protocol")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            if chosen != protocol {
+                return Err(format!("negotiated {chosen:?}, want {protocol}"));
+            }
+            round_trip(
+                &mut tunnel_client(ws),
+                c.echo.0,
+                b"k9s says hi through the tunnel",
+            )
+            .await
         }
         (
             Err(tungstenite::Error::Http(resp)),
@@ -543,6 +677,229 @@ async fn upgrade(c: &Cluster, path: &str, protocols: &str, expect: Expected) -> 
         ) => Err(format!("not a clean HTTP refusal: {e}")),
         (Err(e), _) => Err(e.to_string()),
         (Ok(_), other) => Err(format!("101 where {other:?} was expected")),
+    }
+}
+
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// A SPDY client over a `SPDY/3.1+portforward.k8s.io` WebSocket.
+fn tunnel_client(ws: Ws) -> Client {
+    let (sink, stream) = ws.split();
+    let read = stream.filter_map(|m| async move {
+        match m {
+            Ok(Message::Binary(b)) => Some(b),
+            _ => None,
+        }
+    });
+    let write =
+        sink.with(|b: Vec<u8>| async move { Ok::<_, tungstenite::Error>(Message::Binary(b)) });
+    Client::over_messages(Box::pin(read), Box::pin(write))
+}
+
+/// A tunnel client on `path` through the apiserver.
+async fn tunnel(c: &Cluster, path: &str) -> Client {
+    let mut req = format!("ws://{}{path}", c.server.local_addr())
+        .into_client_request()
+        .unwrap();
+    req.headers_mut().insert(
+        "sec-websocket-protocol",
+        HeaderValue::from_static("SPDY/3.1+portforward.k8s.io"),
+    );
+    let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    tunnel_client(ws)
+}
+
+/// A plain SPDY client on `path` through the apiserver, and the 101's head.
+async fn spdy_client(c: &Cluster, path: &str) -> Result<(Client, String), String> {
+    let tcp = tokio::net::TcpStream::connect(c.server.local_addr())
+        .await
+        .map_err(|e| e.to_string())?;
+    tokio::time::timeout(
+        PER_REQUEST,
+        Client::upgrade(tcp, path, "portforward.k8s.io"),
+    )
+    .await
+    .map_err(|_| "no upgrade answer in time".to_owned())?
+    .map_err(|e| e.to_string())
+}
+
+/// Every frame until `done` holds for one, within [`PER_REQUEST`].
+async fn frames_until(
+    client: &mut Client,
+    mut done: impl FnMut(&Frame) -> bool,
+) -> Result<Vec<Frame>, String> {
+    let mut seen = Vec::new();
+    let read = async {
+        while let Some(f) = client.recv().await.map_err(|e| e.to_string())? {
+            let stop = done(&f);
+            seen.push(f);
+            if stop {
+                return Ok(());
+            }
+        }
+        Err("the session closed early".to_owned())
+    };
+    tokio::time::timeout(PER_REQUEST, read)
+        .await
+        .map_err(|_| "no such frame in time".to_owned())??;
+    Ok(seen)
+}
+
+/// Read until `stream` has carried `want`.
+async fn echoed(client: &mut Client, stream: u32, want: &[u8]) -> Result<(), String> {
+    let mut got = Vec::new();
+    frames_until(client, |f| {
+        if let Frame::Data {
+            stream: s, data, ..
+        } = f
+            && *s == stream
+        {
+            got.extend_from_slice(data);
+        }
+        got.windows(want.len()).any(|w| w == want)
+    })
+    .await
+    .map(drop)
+}
+
+async fn send_data(client: &mut Client, stream: u32, data: &[u8]) -> Result<(), String> {
+    client
+        .send(&Frame::Data {
+            stream,
+            fin: false,
+            data: data.to_vec(),
+        })
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Forward one connection to `port` and see `payload` come back.
+async fn round_trip(client: &mut Client, port: u16, payload: &[u8]) -> Result<(), String> {
+    let f = tokio::time::timeout(PER_REQUEST, client.forward(port, "0"))
+        .await
+        .map_err(|_| "no stream replies in time".to_owned())?
+        .map_err(|e| e.to_string())?;
+    send_data(client, f.data, payload).await?;
+    echoed(client, f.data, payload).await
+}
+
+fn is_fin(f: &Frame, stream: u32) -> bool {
+    matches!(f, Frame::Data { stream: s, fin: true, .. } if *s == stream)
+}
+
+const PORT_FORWARD: &str = "/api/v1/namespaces/k9s/pods/web/portforward";
+
+/// Several ports on one session through the relay, then a refused port,
+/// whose error stream names it while the others keep forwarding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn port_forward_carries_several_ports_and_reports_a_refused_one() {
+    let c = cluster("k9s-pf-ports").await;
+    let (other, _) = echo_listener().await;
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    for mut client in [
+        tunnel(&c, PORT_FORWARD).await,
+        spdy_client(&c, PORT_FORWARD).await.unwrap().0,
+    ] {
+        let a = client.forward(c.echo.0, "0").await.unwrap();
+        let b = client.forward(other, "1").await.unwrap();
+        send_data(&mut client, a.data, b"to the first")
+            .await
+            .unwrap();
+        send_data(&mut client, b.data, b"to the second")
+            .await
+            .unwrap();
+        let (mut got_a, mut got_b) = (Vec::new(), Vec::new());
+        frames_until(&mut client, |f| {
+            if let Frame::Data { stream, data, .. } = f {
+                if *stream == a.data {
+                    got_a.extend_from_slice(data);
+                } else if *stream == b.data {
+                    got_b.extend_from_slice(data);
+                }
+            }
+            got_a == b"to the first" && got_b == b"to the second"
+        })
+        .await
+        .unwrap();
+
+        let refused = client.forward(closed, "2").await.unwrap();
+        let (mut reset, mut error_fin) = (false, false);
+        let frames = frames_until(&mut client, |f| {
+            reset |= matches!(f, Frame::RstStream { stream, .. } if *stream == refused.data);
+            error_fin |= is_fin(f, refused.error);
+            reset && error_fin
+        })
+        .await
+        .unwrap();
+        let message: Vec<u8> = frames
+            .iter()
+            .filter_map(|f| match f {
+                Frame::Data { stream, data, .. } if *stream == refused.error => Some(data.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        let message = String::from_utf8_lossy(&message);
+        assert!(
+            message.contains("error forwarding port") && message.contains(&closed.to_string()),
+            "{message}"
+        );
+        send_data(&mut client, a.data, b"still forwarding")
+            .await
+            .unwrap();
+        echoed(&mut client, a.data, b"still forwarding")
+            .await
+            .unwrap();
+    }
+}
+
+/// A client RST_STREAM on the data stream closes the pod connection and the
+/// error stream still ends, so client-go's wait on it returns; hanging up the
+/// tunnel closes every pod connection it carried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn port_forward_reset_and_hangup_close_the_pod_connections() {
+    let c = cluster("k9s-pf-close").await;
+    let ended = &c.echo.1;
+    let mut client = tunnel(&c, PORT_FORWARD).await;
+    let f = client.forward(c.echo.0, "0").await.unwrap();
+    send_data(&mut client, f.data, b"x").await.unwrap();
+    echoed(&mut client, f.data, b"x").await.unwrap();
+    client
+        .send(&Frame::RstStream {
+            stream: f.data,
+            status: RstStatus::Cancel,
+        })
+        .await
+        .unwrap();
+    frames_until(&mut client, |fr| is_fin(fr, f.error))
+        .await
+        .unwrap();
+    wait_for(
+        || ended.load(Ordering::SeqCst) == 1,
+        "the reset pod connection to close",
+    )
+    .await;
+
+    let g = client.forward(c.echo.0, "1").await.unwrap();
+    send_data(&mut client, g.data, b"y").await.unwrap();
+    echoed(&mut client, g.data, b"y").await.unwrap();
+    drop(client);
+    wait_for(
+        || ended.load(Ordering::SeqCst) == 2,
+        "hanging up to close the pod connection",
+    )
+    .await;
+}
+
+async fn wait_for(cond: impl Fn() -> bool, what: &str) {
+    let deadline = std::time::Instant::now() + PER_REQUEST;
+    while !cond() {
+        assert!(std::time::Instant::now() < deadline, "waited for {what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 

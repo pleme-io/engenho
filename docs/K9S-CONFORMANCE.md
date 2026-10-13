@@ -16,6 +16,10 @@ Turning an `Absent` row into a served one is the way a gap closes.
 Beyond the rows, the suite holds what no single request shows: 40 watches and
 40 log follows multiplexed on one HTTP/2 connection, all delivering, other
 requests still prompt beside them, and cancelled follows no longer polling.
+Port-forward runs through the relay into a real engenho kubelet and a TCP
+echo listener: several ports on one session, a refused port reported on its
+error stream while the others keep forwarding, and a client reset or hang-up
+closing the pod connection — over both the WebSocket tunnel and plain SPDY.
 
 ## Where the matrix came from
 
@@ -30,7 +34,13 @@ terminal, `--logFile` at debug level). Shapes worth knowing:
   with backoff on error.
 - Head mode is `limitBytes=5000` without follow; `1m`..`1h` are `sinceSeconds`.
 - Shell runs `kubectl exec` (WebSocket v5); port-forward dials SPDY tunnelled
-  in WebSocket (`SPDY/3.1+portforward.k8s.io`), then plain SPDY.
+  in WebSocket (`SPDY/3.1+portforward.k8s.io`), then plain SPDY. Both are
+  served (2026-10-13): the kubelet speaks SPDY/3.1 (`engenho-kubelet/src/spdy`),
+  the apiserver relays the tunnel byte for byte and turns a plain SPDY upgrade
+  into the same tunnel. Checked by hand with kubectl 1.34.3 against the
+  suite's cluster: the tunnel, `KUBECTL_PORT_FORWARD_WEBSOCKETS=false`, two
+  ports at once, a 300 KB round trip (past SPDY's 64 KiB initial window,
+  which upstream's peer never credits), and a refused port's error.
 - Drain uses kubectl's drain helper: eviction when discovery lists
   `pods/eviction`, delete otherwise.
 - CPU/MEM columns appear only when discovery lists `metrics.k8s.io`.
@@ -47,7 +57,6 @@ back to init containers; the two lookups had drifted. One resolver,
 ## Known gaps
 
 Each is an `Absent` row with its reason: `sinceSeconds` (validated, not
-honoured), port-forward and its benchmark (no SPDY or SPDY-over-WebSocket),
-`pods/eviction`, `metrics.k8s.io`, `events.k8s.io/v1`. Not yet a row: the
+honoured), `pods/eviction`, `metrics.k8s.io`, `events.k8s.io/v1`. Not yet a row: the
 native backend ignores `timestamps=true`, so k9s strips the first word of
 each line as if it were a timestamp.

@@ -21,6 +21,16 @@
 //!   S8 attach reaches a running container's stdin and stdout
 //!   S9 port-forward relays bytes to a TCP listener, and a refused dial is
 //!      an error-channel message, not a dropped session
+//!   S10 SPDY tunnelled in a `SPDY/3.1+portforward.k8s.io` WebSocket (what
+//!      kubectl ≥ 1.31 and k9s send) forwards several ports at once, and a
+//!      refused port is an error-stream message plus a reset data stream
+//!   S11 a plain `Upgrade: SPDY/3.1` (their fallback) answers 101 with the
+//!      negotiated stream protocol and forwards; PING is echoed
+//!   S12 the pod's EOF is a FIN on the data stream then on the error
+//!      stream; a client RST_STREAM drops the pod connection and still ends
+//!      the error stream
+//!   S13 a SPDY upgrade without `portforward.k8s.io` is a 403 naming it, and
+//!      a stream without a port is refused, not paired
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -146,16 +156,13 @@ async fn serve(log_dir: &std::path::Path) -> u16 {
     port
 }
 
-type Ws = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn connect(uri: &str, protocol: &str) -> (String, Ws) {
     let mut req = uri.into_client_request().expect("request");
-    req.headers_mut().insert(
-        "sec-websocket-protocol",
-        protocol.parse().expect("header"),
-    );
+    req.headers_mut()
+        .insert("sec-websocket-protocol", protocol.parse().expect("header"));
     let (ws, response) = tokio_tungstenite::connect_async(req)
         .await
         .expect("handshake");
@@ -265,7 +272,9 @@ async fn s5_stdin_reaches_cat_and_the_v5_close_signal_ends_it() {
     let dir = tempfile::tempdir().expect("tmp");
     let port = serve(dir.path()).await;
     let (_, mut ws) = connect(
-        &format!("ws://127.0.0.1:{port}/exec/default/p/c?command=cat&stdin=true&stdout=true&stderr=true"),
+        &format!(
+            "ws://127.0.0.1:{port}/exec/default/p/c?command=cat&stdin=true&stdout=true&stderr=true"
+        ),
         "v5.channel.k8s.io",
     )
     .await;
@@ -273,9 +282,15 @@ async fn s5_stdin_reaches_cat_and_the_v5_close_signal_ends_it() {
         .await
         .expect("stdin");
     read_until(&mut ws, 1, b"hello cat\n").await;
-    ws.send(Message::Binary(vec![255, 0])).await.expect("close stdin");
+    ws.send(Message::Binary(vec![255, 0]))
+        .await
+        .expect("close stdin");
     let rest = drain(&mut ws).await;
-    assert_eq!(status_of(&rest)["status"], "Success", "cat saw EOF and exited 0");
+    assert_eq!(
+        status_of(&rest)["status"],
+        "Success",
+        "cat saw EOF and exited 0"
+    );
 }
 
 #[tokio::test]
@@ -314,7 +329,9 @@ async fn s7_a_tty_session_is_sized_by_the_resize_channel() {
     .await
     .expect("resize");
     tokio::time::sleep(Duration::from_millis(300)).await;
-    ws.send(Message::Binary(vec![0, b'\n'])).await.expect("enter");
+    ws.send(Message::Binary(vec![0, b'\n']))
+        .await
+        .expect("enter");
     let got = drain(&mut ws).await;
     assert!(
         joined(&got, 1).contains("33 101"),
@@ -344,37 +361,24 @@ async fn s8_attach_reaches_a_running_containers_stdin_and_stdout() {
     read_until(&mut ws, 1, b"ping\n").await;
     // stdinOnce: closing this attacher's stdin closes the container's, cat
     // exits, its output ends, and the attach ends with Success.
-    ws.send(Message::Binary(vec![255, 0])).await.expect("close stdin");
+    ws.send(Message::Binary(vec![255, 0]))
+        .await
+        .expect("close stdin");
     let rest = drain(&mut ws).await;
     assert_eq!(status_of(&rest)["status"], "Success");
     let log = std::fs::read_to_string(dir.path().join("cat.log")).expect("log");
-    assert!(log.contains("ping"), "the log saw what the attacher saw: {log:?}");
+    assert!(
+        log.contains("ping"),
+        "the log saw what the attacher saw: {log:?}"
+    );
 }
 
 #[tokio::test]
 async fn s9_port_forward_relays_bytes_and_reports_a_refused_dial() {
     let dir = tempfile::tempdir().expect("tmp");
     let port = serve(dir.path()).await;
-    let echo = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("echo bind");
-    let echo_port = echo.local_addr().expect("addr").port();
-    tokio::spawn(async move {
-        while let Ok((mut s, _)) = echo.accept().await {
-            tokio::spawn(async move {
-                let mut buf = [0u8; 1024];
-                while let Ok(n) = s.read(&mut buf).await {
-                    if n == 0 || s.write_all(&buf[..n]).await.is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-    });
-    let closed = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        l.local_addr().expect("addr").port()
-    };
+    let echo_port = echo_listener().await;
+    let closed = closed_port();
 
     let (negotiated, mut ws) = connect(
         &format!("ws://127.0.0.1:{port}/portForward/default/p?ports={echo_port},{closed}"),
@@ -391,8 +395,16 @@ async fn s9_port_forward_relays_bytes_and_reports_a_refused_dial() {
         }
     }
     let [lo, hi] = echo_port.to_le_bytes();
-    assert_eq!(opening[0], vec![0, lo, hi], "data channel opens with its port");
-    assert_eq!(opening[1], vec![1, lo, hi], "error channel opens with its port");
+    assert_eq!(
+        opening[0],
+        vec![0, lo, hi],
+        "data channel opens with its port"
+    );
+    assert_eq!(
+        opening[1],
+        vec![1, lo, hi],
+        "error channel opens with its port"
+    );
     let [clo, chi] = closed.to_le_bytes();
     assert_eq!(opening[2], vec![2, clo, chi]);
     assert_eq!(opening[3], vec![3, clo, chi]);
@@ -403,8 +415,288 @@ async fn s9_port_forward_relays_bytes_and_reports_a_refused_dial() {
         "the refusal names the port"
     );
 
-    ws.send(Message::Binary([&[0u8][..], b"through the tunnel"].concat()))
-        .await
-        .expect("data");
+    ws.send(Message::Binary(
+        [&[0u8][..], b"through the tunnel"].concat(),
+    ))
+    .await
+    .expect("data");
     read_until(&mut ws, 0, b"through the tunnel").await;
+}
+
+/// An echo listener on loopback; its port.
+async fn echo_listener() -> u16 {
+    let echo = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("echo bind");
+    let echo_port = echo.local_addr().expect("addr").port();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = echo.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                while let Ok(n) = s.read(&mut buf).await {
+                    if n == 0 || s.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    echo_port
+}
+
+/// A loopback port nothing listens on.
+fn closed_port() -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    l.local_addr().expect("addr").port()
+}
+
+use engenho_kubelet::port_forward_spdy::TUNNEL_SUBPROTOCOL;
+use engenho_kubelet::port_forward_spdy::client::Client;
+use engenho_kubelet::spdy::{Frame, RstStatus};
+
+/// A SPDY client over a tunnel WebSocket.
+fn tunnel_client(ws: Ws) -> Client {
+    let (sink, stream) = ws.split();
+    let read = stream.filter_map(|m| async move {
+        match m {
+            Ok(Message::Binary(b)) => Some(b),
+            _ => None,
+        }
+    });
+    let write = sink.with(|b: Vec<u8>| async move {
+        Ok::<_, tokio_tungstenite::tungstenite::Error>(Message::Binary(b))
+    });
+    Client::over_messages(Box::pin(read), Box::pin(write))
+}
+
+/// Every frame until `done` holds for one, with a deadline.
+async fn frames_until(c: &mut Client, mut done: impl FnMut(&Frame) -> bool) -> Vec<Frame> {
+    let mut seen = Vec::new();
+    let read = async {
+        while let Some(f) = c.recv().await.expect("frames decode") {
+            let stop = done(&f);
+            seen.push(f);
+            if stop {
+                return;
+            }
+        }
+        panic!("the session closed early after {seen:?}");
+    };
+    tokio::time::timeout(Duration::from_secs(10), read)
+        .await
+        .expect("the expected frame arrived within the deadline");
+    seen
+}
+
+/// The bytes `stream` carried in `frames`.
+fn payload(frames: &[Frame], stream: u32) -> Vec<u8> {
+    frames
+        .iter()
+        .filter_map(|f| match f {
+            Frame::Data {
+                stream: s, data, ..
+            } if *s == stream => Some(data.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+fn is_fin(f: &Frame, stream: u32) -> bool {
+    matches!(f, Frame::Data { stream: s, fin: true, .. } if *s == stream)
+}
+
+/// Read until `stream` has carried `want`.
+async fn echoed(c: &mut Client, stream: u32, want: &[u8]) {
+    let mut got = Vec::new();
+    frames_until(c, |f| {
+        if let Frame::Data {
+            stream: s, data, ..
+        } = f
+            && *s == stream
+        {
+            got.extend_from_slice(data);
+        }
+        got.windows(want.len()).any(|w| w == want)
+    })
+    .await;
+}
+
+async fn send_data(c: &mut Client, stream: u32, data: &[u8]) {
+    c.send(&Frame::Data {
+        stream,
+        fin: false,
+        data: data.to_vec(),
+    })
+    .await
+    .expect("send");
+}
+
+#[tokio::test]
+async fn s10_spdy_tunnelled_in_a_websocket_forwards_several_ports() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let port = serve(dir.path()).await;
+    let (a, b, closed) = (echo_listener().await, echo_listener().await, closed_port());
+    let (negotiated, ws) = connect(
+        &format!("ws://127.0.0.1:{port}/portForward/default/p"),
+        TUNNEL_SUBPROTOCOL,
+    )
+    .await;
+    assert_eq!(
+        negotiated, TUNNEL_SUBPROTOCOL,
+        "no ?ports= needed: SPDY names them per stream"
+    );
+    let mut c = tunnel_client(ws);
+
+    let fa = c.forward(a, "0").await.expect("forward a");
+    let fb = c.forward(b, "1").await.expect("forward b");
+    send_data(&mut c, fa.data, b"to a").await;
+    send_data(&mut c, fb.data, b"to b").await;
+    echoed(&mut c, fa.data, b"to a").await;
+    echoed(&mut c, fb.data, b"to b").await;
+
+    let fc = c
+        .forward(closed, "2")
+        .await
+        .expect("streams open before the dial");
+    let (mut reset, mut error_fin) = (false, false);
+    let frames = frames_until(&mut c, |f| {
+        reset |= matches!(f, Frame::RstStream { stream, .. } if *stream == fc.data);
+        error_fin |= is_fin(f, fc.error);
+        reset && error_fin
+    })
+    .await;
+    let message = String::from_utf8_lossy(&payload(&frames, fc.error)).into_owned();
+    assert!(
+        message.contains("error forwarding port") && message.contains(&closed.to_string()),
+        "{message:?}"
+    );
+
+    send_data(&mut c, fa.data, b"still up").await;
+    echoed(&mut c, fa.data, b"still up").await;
+}
+
+#[tokio::test]
+async fn s11_a_plain_spdy_upgrade_forwards_and_echoes_ping() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let port = serve(dir.path()).await;
+    let echo = echo_listener().await;
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+    let (mut c, head) = Client::upgrade(tcp, "/portForward/default/p", "portforward.k8s.io")
+        .await
+        .expect("101");
+    let lower = head.to_ascii_lowercase();
+    assert!(lower.contains("upgrade: spdy/3.1"), "{head}");
+    assert!(
+        lower.contains("x-stream-protocol-version: portforward.k8s.io"),
+        "{head}"
+    );
+
+    c.send(&Frame::Ping { id: 1 }).await.expect("ping");
+    frames_until(&mut c, |f| *f == Frame::Ping { id: 1 }).await;
+    let f = c.forward(echo, "0").await.expect("forward");
+    send_data(&mut c, f.data, b"over plain spdy").await;
+    echoed(&mut c, f.data, b"over plain spdy").await;
+}
+
+#[tokio::test]
+async fn s12_pod_eof_fins_both_streams_and_a_reset_drops_the_pod_connection() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let port = serve(dir.path()).await;
+    let says_bye = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let bye_port = says_bye.local_addr().expect("addr").port();
+    let held = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let held_port = held.local_addr().expect("addr").port();
+    let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (mut s, _) = says_bye.accept().await.expect("accept");
+        s.write_all(b"bye").await.expect("write");
+    });
+    tokio::spawn(async move {
+        let (mut s, _) = held.accept().await.expect("accept");
+        let mut buf = [0u8; 64];
+        while s.read(&mut buf).await.is_ok_and(|n| n > 0) {}
+        let _ = dropped_tx.send(());
+    });
+    let (_, ws) = connect(
+        &format!("ws://127.0.0.1:{port}/portForward/default/p"),
+        TUNNEL_SUBPROTOCOL,
+    )
+    .await;
+    let mut c = tunnel_client(ws);
+
+    let f = c.forward(bye_port, "0").await.expect("forward");
+    let mut data_fin = false;
+    let frames = frames_until(&mut c, |fr| {
+        data_fin |= is_fin(fr, f.data);
+        is_fin(fr, f.error)
+    })
+    .await;
+    assert!(
+        data_fin,
+        "the data stream FINs before the error stream: {frames:?}"
+    );
+    assert_eq!(payload(&frames, f.data), b"bye");
+    assert!(
+        payload(&frames, f.error).is_empty(),
+        "success leaves the error stream empty"
+    );
+
+    let g = c.forward(held_port, "1").await.expect("forward");
+    c.send(&Frame::RstStream {
+        stream: g.data,
+        status: RstStatus::Cancel,
+    })
+    .await
+    .expect("reset");
+    tokio::time::timeout(Duration::from_secs(10), dropped_rx)
+        .await
+        .expect("the pod connection is dropped on reset")
+        .expect("signal");
+    let frames = frames_until(&mut c, |fr| is_fin(fr, g.error)).await;
+    assert!(
+        !frames.iter().any(|fr| is_fin(fr, g.data)),
+        "nothing more is sent on a reset stream: {frames:?}"
+    );
+}
+
+#[tokio::test]
+async fn s13_an_unnegotiated_upgrade_and_a_portless_stream_are_refused() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let port = serve(dir.path()).await;
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+    let head = Client::upgrade(tcp, "/portForward/default/p", "channel.k8s.io")
+        .await
+        .expect_err("not negotiated")
+        .to_string();
+    assert!(head.contains("HTTP/1.1 403"), "{head}");
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("x-accepted-stream-protocol-versions: portforward.k8s.io"),
+        "{head}"
+    );
+
+    let (_, ws) = connect(
+        &format!("ws://127.0.0.1:{port}/portForward/default/p"),
+        TUNNEL_SUBPROTOCOL,
+    )
+    .await;
+    let mut c = tunnel_client(ws);
+    let refused = c.open("data", "", "0").await.expect_err("no port");
+    assert!(refused.to_string().contains("RefusedStream"), "{refused}");
+    let echo = echo_listener().await;
+    let f = c
+        .forward(echo, "1")
+        .await
+        .expect("the session survives a refusal");
+    send_data(&mut c, f.data, b"ok").await;
+    echoed(&mut c, f.data, b"ok").await;
 }
