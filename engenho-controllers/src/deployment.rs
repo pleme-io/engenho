@@ -290,14 +290,138 @@ impl OwnedChildrenReconciler for DeploymentController {
             }
         }
         let updated = replicas;
+        let desired = REPLICAS.read(d_value).ok()?;
+        let current_rs = current_replicaset(&template, owned_rs_after).and_then(|(_, rs)| rs.name());
+        let conditions = conditions(
+            d_value,
+            Counts {
+                desired,
+                replicas,
+                updated,
+                available,
+            },
+            current_rs,
+            &engenho_types::time::now_rfc3339_utc(),
+        );
         Some(json!({
             "replicas": replicas,
             "readyReplicas": ready,
             "availableReplicas": available,
             "updatedReplicas": updated,
             "observedGeneration": observed_generation,
+            "conditions": conditions,
         }))
     }
+}
+
+#[derive(Clone, Copy)]
+struct Counts {
+    desired: i64,
+    replicas: i64,
+    updated: i64,
+    available: i64,
+}
+
+fn scaled(value: Option<&Value>, total: i64, round_up: bool, default_percent: i64) -> i64 {
+    let percent = match value {
+        Some(Value::Number(n)) => return n.as_i64().unwrap_or(0).max(0),
+        Some(Value::String(s)) => s
+            .strip_suffix('%')
+            .and_then(|p| p.parse::<i64>().ok())
+            .unwrap_or(default_percent),
+        _ => default_percent,
+    };
+    let numer = percent.saturating_mul(total);
+    if round_up {
+        numer.div_euclid(100) + i64::from(numer.rem_euclid(100) != 0)
+    } else {
+        numer.div_euclid(100)
+    }
+}
+
+fn max_unavailable(d: &Value, desired: i64) -> i64 {
+    let strategy = d.pointer("/spec/strategy");
+    let recreate = strategy
+        .and_then(|s| s.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|t| t == "Recreate");
+    if recreate || desired == 0 {
+        return 0;
+    }
+    let rolling = strategy.and_then(|s| s.get("rollingUpdate"));
+    let surge = scaled(rolling.and_then(|r| r.get("maxSurge")), desired, true, 25);
+    let mut unavailable = scaled(rolling.and_then(|r| r.get("maxUnavailable")), desired, false, 25);
+    if surge == 0 && unavailable == 0 {
+        unavailable = 1;
+    }
+    unavailable.min(desired)
+}
+
+fn conditions(d: &Value, counts: Counts, current_rs: Option<&str>, now: &str) -> Vec<Value> {
+    let prior = d
+        .pointer("/status/conditions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let carried = |kind: &str, status: &str, reason: &str, message: String| {
+        let old = prior.iter().find(|c| c["type"] == kind);
+        if let Some(old) = old
+            && old["status"] == status
+            && old["reason"] == reason
+        {
+            return old.clone();
+        }
+        let since = old
+            .filter(|o| o["status"] == status)
+            .and_then(|o| o.get("lastTransitionTime"))
+            .cloned()
+            .unwrap_or_else(|| Value::String(now.to_string()));
+        json!({
+            "type": kind,
+            "status": status,
+            "lastUpdateTime": now,
+            "lastTransitionTime": since,
+            "reason": reason,
+            "message": message,
+        })
+    };
+    let mut out = Vec::new();
+    if counts.available >= counts.desired - max_unavailable(d, counts.desired) {
+        out.push(carried(
+            "Available",
+            "True",
+            "MinimumReplicasAvailable",
+            "Deployment has minimum availability.".to_string(),
+        ));
+    } else {
+        out.push(carried(
+            "Available",
+            "False",
+            "MinimumReplicasUnavailable",
+            "Deployment does not have minimum availability.".to_string(),
+        ));
+    }
+    if let Some(rs) = current_rs {
+        let complete = counts.updated == counts.desired
+            && counts.replicas == counts.desired
+            && counts.available == counts.desired;
+        out.push(if complete {
+            carried(
+                "Progressing",
+                "True",
+                "NewReplicaSetAvailable",
+                format!("ReplicaSet {rs:?} has successfully progressed."),
+            )
+        } else {
+            carried(
+                "Progressing",
+                "True",
+                "ReplicaSetUpdated",
+                format!("ReplicaSet {rs:?} is progressing."),
+            )
+        });
+    }
+    out
 }
 
 /// Whether `rs` runs `template`: its own `spec.template`, normalized,
@@ -440,6 +564,19 @@ mod tests {
         ];
         let t = NormalizedTemplate::of(&web("web:1"));
         assert_eq!(name_of(current_replicaset(&t, &owned)), Some("web-bbbb"));
+    }
+
+    #[test]
+    fn max_unavailable_resolves_as_upstreams_fenceposts() {
+        let rolling = |ru: Value| json!({"spec": {"strategy": {"type": "RollingUpdate", "rollingUpdate": ru}}});
+        assert_eq!(max_unavailable(&json!({"spec": {}}), 2), 0);
+        assert_eq!(max_unavailable(&json!({"spec": {}}), 4), 1);
+        assert_eq!(max_unavailable(&json!({"spec": {}}), 10), 2);
+        assert_eq!(max_unavailable(&rolling(json!({"maxSurge": 0, "maxUnavailable": 0})), 3), 1);
+        assert_eq!(max_unavailable(&rolling(json!({"maxUnavailable": 9})), 3), 3);
+        assert_eq!(max_unavailable(&rolling(json!({"maxUnavailable": "50%"})), 3), 1);
+        assert_eq!(max_unavailable(&json!({"spec": {"strategy": {"type": "Recreate"}}}), 3), 0);
+        assert_eq!(max_unavailable(&json!({"spec": {}}), 0), 0);
     }
 
     #[test]

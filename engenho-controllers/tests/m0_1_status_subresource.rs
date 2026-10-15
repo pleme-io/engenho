@@ -266,6 +266,88 @@ async fn deployment_status_aggregates_replicaset_status() {
     teardown(store).await;
 }
 
+fn condition<'a>(dep: &'a Value, kind: &str) -> &'a Value {
+    dep["status"]["conditions"]
+        .as_array()
+        .and_then(|c| c.iter().find(|c| c["type"] == kind))
+        .unwrap_or_else(|| panic!("no {kind} condition in {}", dep["status"]))
+}
+
+#[tokio::test]
+async fn deployment_reports_progressing_and_available_as_upstream_does() {
+    let store = boot_store().await;
+    let dep_key = ResourceKey::namespaced("apps", "v1", "Deployment", "default", "web");
+    let dep_uid = put_and_uid(
+        &store,
+        &dep_key,
+        json!({
+            "kind": "Deployment", "apiVersion": "apps/v1",
+            "metadata": {"name": "web"},
+            "spec": {
+                "replicas": 2,
+                "selector": {"matchLabels": {"app": "web"}},
+                "template": {"metadata": {"labels": {"app": "web"}}, "spec": {}}
+            }
+        }),
+    )
+    .await;
+    let dc = DeploymentController::new(store.clone(), Some("default".into()));
+    let rc = ReplicaSetController::new(store.clone(), Some("default".into()));
+    dc.tick().await.unwrap();
+    rc.tick().await.unwrap();
+    dc.tick().await.unwrap();
+
+    let dep = store.get(&dep_key).await.unwrap();
+    let rs_list = store.list("apps", "v1", "ReplicaSet", Some("default")).await;
+    let (_, rs) = rs_list
+        .iter()
+        .find(|(_, r)| is_owned_by(r, &dep_uid))
+        .expect("RS owned by deployment");
+    let rs_name = rs["metadata"]["name"].as_str().unwrap().to_string();
+    let rs_uid = rs["metadata"]["uid"].as_str().unwrap().to_string();
+    assert_eq!(condition(&dep, "Available")["status"], "False");
+    assert_eq!(condition(&dep, "Available")["reason"], "MinimumReplicasUnavailable");
+    assert_eq!(condition(&dep, "Progressing")["status"], "True");
+    assert_eq!(condition(&dep, "Progressing")["reason"], "ReplicaSetUpdated");
+    assert_eq!(
+        condition(&dep, "Progressing")["message"],
+        format!("ReplicaSet \"{rs_name}\" is progressing.")
+    );
+    let progressing_since = condition(&dep, "Progressing")["lastTransitionTime"].clone();
+    assert!(progressing_since.is_string());
+
+    assert_eq!(mark_owned_pods_ready(&store, &rs_uid).await, 2);
+    rc.tick().await.unwrap();
+    dc.tick().await.unwrap();
+    let dep = store.get(&dep_key).await.unwrap();
+    assert_eq!(condition(&dep, "Available")["status"], "True");
+    assert_eq!(condition(&dep, "Available")["reason"], "MinimumReplicasAvailable");
+    assert_eq!(condition(&dep, "Available")["message"], "Deployment has minimum availability.");
+    assert_eq!(condition(&dep, "Progressing")["status"], "True");
+    assert_eq!(condition(&dep, "Progressing")["reason"], "NewReplicaSetAvailable");
+    assert_eq!(
+        condition(&dep, "Progressing")["message"],
+        format!("ReplicaSet \"{rs_name}\" has successfully progressed.")
+    );
+    assert_eq!(
+        condition(&dep, "Progressing")["lastTransitionTime"],
+        progressing_since,
+        "the status stayed True, so the transition time is kept"
+    );
+
+    let rv = dep["metadata"]["resourceVersion"].clone();
+    dc.tick().await.unwrap();
+    assert_eq!(
+        store.get(&dep_key).await.unwrap()["metadata"]["resourceVersion"],
+        rv,
+        "an unchanged condition is not rewritten"
+    );
+
+    drop(dc);
+    drop(rc);
+    teardown(store).await;
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // StatefulSet: ordinal pods → replicas/ready status
 // ──────────────────────────────────────────────────────────────────────
