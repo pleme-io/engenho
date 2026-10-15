@@ -842,6 +842,12 @@ pub trait ContainerRuntime: Send + Sync {
     /// Stable identifier for telemetry.
     fn name(&self) -> &'static str;
 
+    /// This runtime's own version, when it can state one without asking a
+    /// daemon.
+    fn version(&self) -> Option<String> {
+        None
+    }
+
     /// Whether this runtime can hand back a container a previous kubelet
     /// process started. See [`Readoption`]. Required, not defaulted: a new
     /// backend must say which it is.

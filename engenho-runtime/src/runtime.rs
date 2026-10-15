@@ -355,7 +355,9 @@ impl Runtime {
         //    restart never undoes a cordon, a taint or an operator's label.
         rec.enter(BootPhase::RegisterNode)?;
         let node_name = &boot.node_name;
-        let host = HostOwned::measured(node_name).advertising(advertised);
+        let host = HostOwned::measured(node_name)
+            .advertising(advertised)
+            .reporting(engenho_kubelet::node_info::measured(backend.as_ref()));
         register_node(store, node_name, &host).await?;
         rec.enter(BootPhase::SeedCluster)?;
 

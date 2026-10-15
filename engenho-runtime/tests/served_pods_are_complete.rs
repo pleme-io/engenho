@@ -313,3 +313,45 @@ async fn every_pod_a_client_is_served_is_a_complete_pod() {
         findings.0.join("\n  ")
     );
 }
+
+#[tokio::test]
+async fn the_served_node_reports_the_node_info_its_host_measured() {
+    let tmp = tempfile::tempdir().unwrap();
+    let backend: Arc<dyn ContainerRuntime> = Arc::new(FakeBackend::new());
+    let rt = Runtime::start_with_backend(config(tmp.path()), backend)
+        .await
+        .expect("runtime boots");
+    let client = admin_client(tmp.path());
+    let base = ["http://", &rt.local_addr().to_string()].concat();
+    let node = get_json(
+        &client,
+        &[base.as_str(), "/api/v1/nodes/node-A"].concat(),
+        None,
+    )
+    .await;
+    let info = &node["status"]["nodeInfo"];
+    let field = |name: &str| info[name].as_str().unwrap_or_default().to_owned();
+    assert!(
+        field("kubeletVersion").starts_with(engenho_types::KUBE_VERSION),
+        "{node}"
+    );
+    for name in ["architecture", "operatingSystem", "kernelVersion"] {
+        assert!(
+            !field(name).is_empty(),
+            "nodeInfo.{name} is measurable: {node}"
+        );
+    }
+    assert_eq!(
+        field("operatingSystem"),
+        node["metadata"]["labels"]["kubernetes.io/os"]
+            .as_str()
+            .unwrap_or_default()
+    );
+    assert_eq!(
+        field("architecture"),
+        node["metadata"]["labels"]["kubernetes.io/arch"]
+            .as_str()
+            .unwrap_or_default()
+    );
+    assert_eq!(field("kubeProxyVersion"), "", "{node}");
+}

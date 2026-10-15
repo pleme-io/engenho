@@ -39,7 +39,7 @@ http-body-util     = { workspace = true }
 # writing the materialized files. Same 0.22 line the apiserver + kube-client
 # already pin (single closure).
 base64             = "0.22"
-rustix             = { version = "1", features = ["fs", "param", "pty", "termios", "process"] }
+rustix             = { version = "1", features = ["fs", "param", "pty", "termios", "process", "system"] }
 # SPDY/3 header blocks are zlib with a preset dictionary. Pure Rust, already
 # in the lock under flate2; its low-level inflate takes a pre-filled window,
 # which is how the dictionary is supplied (src/spdy/header_zlib.rs).

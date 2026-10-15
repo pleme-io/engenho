@@ -57,6 +57,7 @@ pub mod image_source;
 pub mod kubelet;
 pub mod lifecycle;
 pub mod native_backend;
+pub mod node_info;
 /// Publishing the node `Ready` condition with a precondition (T1.3b).
 /// Node lease + readiness derivation.
 ///

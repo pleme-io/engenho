@@ -55,11 +55,13 @@ use std::collections::BTreeMap;
 
 use engenho_controllers::status::resource_version_of;
 use engenho_controllers::{Effect, Refusal, node_lease};
+use engenho_kubelet::node_info::{kube_arch, kube_os};
 use engenho_store::command::{Reason, ResourceCommand, TxnCompare, TxnOp};
 use engenho_store::{ResourceKey, ResourceValue, StoreMesh};
 use engenho_types::generated_v1_34::core_v1::Node;
 use engenho_types::generated_v1_34::types::{
-    DaemonEndpoint, NodeAddress, NodeDaemonEndpoints, NodeSpec, NodeStatus, Quantity,
+    DaemonEndpoint, NodeAddress, NodeDaemonEndpoints, NodeSpec, NodeStatus, NodeSystemInfo,
+    Quantity,
 };
 use engenho_types::kind::KubeResource;
 use engenho_types::meta::ObjectMeta;
@@ -153,11 +155,12 @@ pub(crate) enum Registered {
 /// that requests cpu/memory), so a Node without them leaves every pod that
 /// declares a request Pending forever. They are the host's measured
 /// logical-CPU count and total memory.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct HostOwned {
     labels: BTreeMap<String, String>,
     resources: BTreeMap<String, Quantity>,
     endpoint: Option<KubeletEndpointFields>,
+    node_info: Option<NodeSystemInfo>,
 }
 
 /// Where this node's kubelet can be reached: `status.addresses` and
@@ -275,6 +278,11 @@ impl HostOwned {
         self
     }
 
+    pub(crate) fn reporting(mut self, node_info: NodeSystemInfo) -> Self {
+        self.node_info = Some(node_info);
+        self
+    }
+
     /// These fields plus where the kubelet listens.
     pub(crate) fn reachable_at(mut self, endpoint: KubeletEndpointFields) -> Self {
         self.endpoint = Some(endpoint);
@@ -291,6 +299,7 @@ impl HostOwned {
                 ("memory".to_owned(), Quantity(memory)),
             ]),
             endpoint: None,
+            node_info: None,
         }
     }
 
@@ -316,6 +325,7 @@ impl HostOwned {
                     .endpoint
                     .as_ref()
                     .map(KubeletEndpointFields::typed_endpoints),
+                node_info: self.node_info.clone(),
                 ..NodeStatus::default()
             }),
         }
@@ -374,7 +384,10 @@ impl HostOwned {
             .endpoint
             .as_ref()
             .is_none_or(|e| e.is_current_on(status));
-        labels_current && resources_current && endpoint_current
+        let node_info_current = self.node_info.as_ref().is_none_or(|info| {
+            serde_json::to_value(info).ok().as_ref() == status.and_then(|s| s.get("nodeInfo"))
+        });
+        labels_current && resources_current && endpoint_current && node_info_current
     }
 }
 
@@ -476,46 +489,6 @@ fn refused(node: &str, refusal: Refusal) -> RuntimeError {
     .into()
 }
 
-/// Kubernetes' `kubernetes.io/arch` label speaks Go's `GOARCH`, not Rust's
-/// `std::env::consts::ARCH`.
-///
-/// The two disagree on exactly the values that matter here: Rust says
-/// `aarch64` and `x86_64` where Kubernetes says `arm64` and `amd64`. This
-/// is the difference between a label that works and a label that looks
-/// right and matches nothing — the reference pangea Postgres carries
-/// `nodeSelector: {kubernetes.io/arch: arm64}`, and against an `aarch64`
-/// label the scheduler's `NodeSelector` filter (T5.7, an exact match)
-/// rejects the node with `NodeSelectorMismatch`. Registration re-asserts the
-/// label on every boot, so the pod stays Pending for good, with a
-/// correct-looking label visible in `kubectl get node -o yaml`.
-///
-/// Unknown architectures pass through verbatim rather than guessing: a
-/// wrong-but-plausible label is worse than an unfamiliar one, because it
-/// matches a selector that meant something else.
-#[must_use]
-fn kube_arch() -> &'static str {
-    match std::env::consts::ARCH {
-        "aarch64" => "arm64",
-        "x86_64" => "amd64",
-        "arm" => "arm",
-        "powerpc64" => "ppc64le",
-        "s390x" => "s390x",
-        other => other,
-    }
-}
-
-/// The `kubernetes.io/os` label, in Go's `GOOS` vocabulary.
-///
-/// Rust says `macos`; Kubernetes says `darwin`. Same failure mode as
-/// [`kube_arch`].
-#[must_use]
-fn kube_os() -> &'static str {
-    match std::env::consts::OS {
-        "macos" => "darwin",
-        other => other,
-    }
-}
-
 /// The well-known labels upstream's kubelet self-applies at registration.
 ///
 /// Without these, `metadata.labels` is ABSENT — not sparse (measured on the
@@ -547,7 +520,8 @@ fn well_known_node_labels(node_name: &str) -> BTreeMap<String, String> {
 
 #[cfg(test)]
 mod node_label_tests {
-    use super::{kube_arch, kube_os, well_known_node_labels};
+    use super::well_known_node_labels;
+    use engenho_kubelet::node_info::{kube_arch, kube_os};
 
     /// The labels speak Go's vocabulary, not Rust's.
     ///
@@ -821,7 +795,7 @@ mod registration_tests {
         let n = node(&store).await;
         assert_eq!(
             n["metadata"]["labels"]["kubernetes.io/arch"],
-            super::kube_arch(),
+            engenho_kubelet::node_info::kube_arch(),
             "{n}"
         );
         assert_eq!(n["status"]["capacity"]["cpu"], "8", "{n}");

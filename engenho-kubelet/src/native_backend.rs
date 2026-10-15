@@ -879,6 +879,10 @@ impl ContainerRuntime for NativeBackend {
         "native"
     }
 
+    fn version(&self) -> Option<String> {
+        Some(env!("CARGO_PKG_VERSION").to_owned())
+    }
+
     /// A native workload is a child process tracked in this backend's
     /// in-memory table; a new kubelet process starts with an empty table and
     /// no handle on what the old one spawned.
@@ -1637,6 +1641,12 @@ mod tests {
     fn gap_the_next_backend_adopts_a_running_native_workload() {
         let b = NativeBackend::new(Isolation::HostProcess, "/tmp/nb-test-logs", Cgroups::Off);
         assert_eq!(b.readoption(), Readoption::AdoptsRunning);
+    }
+
+    #[test]
+    fn a_native_runtime_states_engenhos_release_as_its_version() {
+        let b = NativeBackend::new(Isolation::HostProcess, "/tmp/nb-test-logs", Cgroups::Off);
+        assert_eq!(b.version(), Some(env!("CARGO_PKG_VERSION").to_owned()));
     }
 
     /// ★ The floor under the kubelet's closure store: a closure that is not
