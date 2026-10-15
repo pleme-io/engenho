@@ -15,11 +15,16 @@
 //!   * owned_pods = pods with controller-ref UID matching
 //!   * succeeded = pods with status.phase == "Succeeded"
 //!   * if succeeded >= completions → mark Job complete (no-op)
+//!   * else if failed > `spec.backoffLimit` (default 6) → mark Job Failed
+//!     (`BackoffLimitExceeded`), create nothing
 //!   * else if active_pods < parallelism → create more
 //!
 //! ## CronJob reconcile rule
 //!
 //! Each tick, for every CronJob:
+//!   * delete finished Jobs beyond `successfulJobsHistoryLimit` (default 3)
+//!     and `failedJobsHistoryLimit` (default 1), oldest first — suspended
+//!     or not
 //!   * skip when `spec.suspend == true`
 //!   * parse `spec.schedule` (a 5-field cron expression); a malformed
 //!     schedule is a typed skip, never a panic
@@ -36,10 +41,9 @@
 //!     owner-referenced back to the CronJob + labelled
 //!   * patch `status.lastScheduleTime` + `status.active`
 //!
-//! Deferred (named typed follow-ups): history GC
-//! (`successfulJobsHistoryLimit` / `failedJobsHistoryLimit`),
-//! timezone-aware schedules (`spec.timeZone` — evaluated against UTC),
-//! and the missed-start catch-up bound beyond a single run.
+//! Deferred (named typed follow-ups): timezone-aware schedules
+//! (`spec.timeZone` — evaluated against UTC), and the missed-start
+//! catch-up bound beyond a single run.
 
 use std::sync::Arc;
 
@@ -74,6 +78,14 @@ pub const COMPLETIONS: DefaultedInt = DefaultedInt::new(&["spec", "completions"]
 
 /// `batch/v1` `spec.parallelism`, defaulted to 1.
 pub const PARALLELISM: DefaultedInt = DefaultedInt::new(&["spec", "parallelism"], 1);
+
+pub const BACKOFF_LIMIT: DefaultedInt = DefaultedInt::new(&["spec", "backoffLimit"], 6);
+
+pub const SUCCESSFUL_JOBS_HISTORY_LIMIT: DefaultedInt =
+    DefaultedInt::new(&["spec", "successfulJobsHistoryLimit"], 3);
+
+pub const FAILED_JOBS_HISTORY_LIMIT: DefaultedInt =
+    DefaultedInt::new(&["spec", "failedJobsHistoryLimit"], 1);
 
 /// `batch/v1` `CronJob` `spec.startingDeadlineSeconds`: absent means no
 /// deadline, so it has no default to read as.
@@ -198,8 +210,9 @@ impl OwnedChildrenReconciler for JobController {
         // A count that is not an integer fails this Job (an Event on it)
         // with no pod created — never the default's count. Read before
         // any early return, so `compute_status` never meets one.
-        let completions = COMPLETIONS.read(job_value)?.max(0) as usize;
-        let parallelism = PARALLELISM.read(job_value)?.max(0) as usize;
+        let completions = COMPLETIONS.read_count(job_value)?;
+        let parallelism = PARALLELISM.read_count(job_value)?;
+        let backoff_limit = BACKOFF_LIMIT.read_count(job_value)?;
         let Some(owner_ref) = owner_ref_for(job_value, "batch/v1", "Job") else {
             return Ok(ReconcileDelta::none());
         };
@@ -219,6 +232,14 @@ impl OwnedChildrenReconciler for JobController {
 
         // Already complete → no pods to create.
         if succeeded >= completions {
+            return Ok(ReconcileDelta::none());
+        }
+
+        let failed = owned
+            .iter()
+            .filter(|(_, p)| Self::pod_phase_is(p, "Failed"))
+            .count();
+        if failed > backoff_limit {
             return Ok(ReconcileDelta::none());
         }
 
@@ -275,10 +296,12 @@ impl OwnedChildrenReconciler for JobController {
         // A malformed count already failed this Job in `reconcile_one`
         // (with its Event), so the blanket never gets here with one; no
         // status is written from a count nobody declared.
-        let Ok(completions) = COMPLETIONS.read(job_value) else {
+        let Ok(completions) = COMPLETIONS.read_count(job_value) else {
             return None;
         };
-        let completions = completions.max(0) as usize;
+        let Ok(backoff_limit) = BACKOFF_LIMIT.read_count(job_value) else {
+            return None;
+        };
         let succeeded_now = owned_now
             .iter()
             .filter(|(_, p)| Self::pod_phase_is(p, "Succeeded"))
@@ -303,6 +326,13 @@ impl OwnedChildrenReconciler for JobController {
             desired_status["conditions"] = json!([{
                 "type": "Complete",
                 "status": "True",
+            }]);
+        } else if failed_now > backoff_limit {
+            desired_status["conditions"] = json!([{
+                "type": "Failed",
+                "status": "True",
+                "reason": "BackoffLimitExceeded",
+                "message": "Job has reached the specified backoff limit",
             }]);
         }
         Some(desired_status)
@@ -488,7 +518,7 @@ impl DeclaresReads for CronJobController {
 impl From<CronTickOutcome> for ObjectOutcome {
     fn from(outcome: CronTickOutcome) -> Self {
         match outcome {
-            CronTickOutcome::Fired(effect) => Self::from(effect),
+            CronTickOutcome::Fired(effect) | CronTickOutcome::Pruned(effect) => Self::from(effect),
             CronTickOutcome::Skipped => Self::SKIPPED,
             CronTickOutcome::NotDue => Self::Unchanged,
         }
@@ -505,13 +535,67 @@ enum CronTickOutcome {
     Skipped,
     /// No scheduled slot has come due since the anchor: a no-op.
     NotDue,
+    Pruned(Effect),
+}
+
+impl CronTickOutcome {
+    fn after(self, pruned: Effect) -> Self {
+        match (self, pruned) {
+            (Self::Fired(fired), pruned) => Self::Fired(pruned.and(fired)),
+            (outcome, Effect::Unchanged) => outcome,
+            (_, pruned) => Self::Pruned(pruned),
+        }
+    }
 }
 
 impl CronJobController {
+    async fn reconcile_one_cronjob(
+        &self,
+        cj_key: &ResourceKey,
+        cj_value: &Value,
+        now: u64,
+    ) -> Result<CronTickOutcome, ControllerError> {
+        let pruned = self.prune_history(cj_key, cj_value).await?;
+        Ok(self.fire(cj_key, cj_value, now).await?.after(pruned))
+    }
+
+    async fn prune_history(
+        &self,
+        cj_key: &ResourceKey,
+        cj_value: &Value,
+    ) -> Result<Effect, ControllerError> {
+        let successful_limit = SUCCESSFUL_JOBS_HISTORY_LIMIT.read_count(cj_value)?;
+        let failed_limit = FAILED_JOBS_HISTORY_LIMIT.read_count(cj_value)?;
+        let cj_uid = cj_value
+            .get("metadata")
+            .and_then(|m| m.get("uid"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let job_ns = cj_key.namespace.as_deref().unwrap_or("default");
+        let owned = self.owned_jobs(cj_uid, job_ns).await;
+        let mut pruned = Effect::Unchanged;
+        for (condition, limit) in [("Complete", successful_limit), ("Failed", failed_limit)] {
+            let mut finished: Vec<&(ResourceKey, Value)> = owned
+                .iter()
+                .filter(|(_, job)| job_condition_is_true(job, condition) && !job.is_terminating())
+                .collect();
+            finished.sort_by_key(|(key, job)| (creation_unix(job), key.name.clone()));
+            let excess = finished.len().saturating_sub(limit);
+            for (key, _) in finished.into_iter().take(excess) {
+                let applied = self
+                    .store
+                    .propose(ResourceCommand::delete(key.clone(), Reason::Controller))
+                    .await?;
+                pruned = pruned.and(Effect::of(applied.op));
+            }
+        }
+        Ok(pruned)
+    }
+
     /// Reconcile a single CronJob at `now` (unix seconds). Pure decision
     /// logic + store writes; returns the typed [`CronTickOutcome`] so
     /// [`Self::tick`] stays a thin aggregator.
-    async fn reconcile_one_cronjob(
+    async fn fire(
         &self,
         cj_key: &ResourceKey,
         cj_value: &Value,
@@ -696,16 +780,27 @@ fn most_recent_due(schedule: &crate::cron::CronSchedule, anchor: u64, now: u64) 
 /// Is this Job in a terminal state (a `Complete` or `Failed` condition is
 /// True)? Used by the concurrency policy to decide what counts as active.
 fn job_is_terminal(job: &Value) -> bool {
+    job_condition_is_true(job, "Complete") || job_condition_is_true(job, "Failed")
+}
+
+fn job_condition_is_true(job: &Value, condition: &str) -> bool {
     job.get("status")
         .and_then(|s| s.get("conditions"))
         .and_then(Value::as_array)
         .is_some_and(|conds| {
             conds.iter().any(|c| {
-                let t = c.get("type").and_then(Value::as_str);
-                let s = c.get("status").and_then(Value::as_str);
-                matches!(t, Some("Complete" | "Failed")) && s == Some("True")
+                c.get("type").and_then(Value::as_str) == Some(condition)
+                    && c.get("status").and_then(Value::as_str) == Some("True")
             })
         })
+}
+
+fn creation_unix(object: &Value) -> Option<u64> {
+    object
+        .get("metadata")
+        .and_then(|m| m.get("creationTimestamp"))
+        .and_then(Value::as_str)
+        .and_then(parse_rfc3339_unix)
 }
 
 /// Is `child` controller-owned by an object with uid `owner_uid`?
@@ -1339,5 +1434,228 @@ mod tests {
             job["metadata"]["labels"],
             json!({"engenho.io/cronjob": "n"})
         );
+    }
+
+    fn job_with_backoff(backoff_limit: Option<i64>) -> Value {
+        let mut job = json!({
+            "kind": "Job", "apiVersion": "batch/v1",
+            "metadata": {"name": "flaky", "namespace": "default", "uid": "flaky-uid"},
+            "spec": {"template": {"spec": {"containers": [{"image": "alpine"}]}}}
+        });
+        if let Some(limit) = backoff_limit {
+            job["spec"]["backoffLimit"] = json!(limit);
+        }
+        job
+    }
+
+    fn pods_in_phase(phase: &str, count: usize) -> Vec<(ResourceKey, Value)> {
+        (0..count)
+            .map(|i| {
+                let name = format!("flaky-{i}");
+                (
+                    ResourceKey::namespaced("", "v1", "Pod", "default", &name),
+                    json!({"metadata": {"name": name}, "status": {"phase": phase}}),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn job_backoff_limit_defaults_to_6() {
+        assert_eq!(BACKOFF_LIMIT.read(&json!({"spec": {}})), Ok(6));
+    }
+
+    #[tokio::test]
+    async fn a_pod_that_always_fails_stops_at_backoff_limit_plus_one() {
+        let store = test_store("job-backoff").await;
+        let c = JobController::new(store, None);
+        let job = job_with_backoff(Some(3));
+
+        let retry = c
+            .reconcile_one(&job, &pods_in_phase("Failed", 3))
+            .await
+            .unwrap();
+        assert_eq!(
+            retry.commands.len(),
+            1,
+            "within the limit a failed pod is replaced"
+        );
+
+        let exhausted = pods_in_phase("Failed", 4);
+        let stop = c.reconcile_one(&job, &exhausted).await.unwrap();
+        assert!(
+            stop.commands.is_empty(),
+            "backoffLimit + 1 failures create nothing"
+        );
+
+        let status = c.compute_status(&job, &exhausted, 1).unwrap();
+        assert_eq!(status["failed"], json!(4));
+        assert_eq!(status["conditions"][0]["type"], json!("Failed"));
+        assert_eq!(
+            status["conditions"][0]["reason"],
+            json!("BackoffLimitExceeded")
+        );
+        assert!(job_is_terminal(&json!({"status": status})));
+    }
+
+    #[tokio::test]
+    async fn an_absent_backoff_limit_stops_after_seven_failures() {
+        let store = test_store("job-backoff-default").await;
+        let c = JobController::new(store, None);
+        let job = job_with_backoff(None);
+        assert_eq!(
+            c.reconcile_one(&job, &pods_in_phase("Failed", 6))
+                .await
+                .unwrap()
+                .commands
+                .len(),
+            1
+        );
+        assert!(
+            c.reconcile_one(&job, &pods_in_phase("Failed", 7))
+                .await
+                .unwrap()
+                .commands
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_pod_under_the_limit_leaves_status_without_a_condition() {
+        let store = test_store("job-backoff-under").await;
+        let c = JobController::new(store, None);
+        let job = job_with_backoff(Some(3));
+        let status = c
+            .compute_status(&job, &pods_in_phase("Failed", 2), 1)
+            .unwrap();
+        assert!(status.get("conditions").is_none(), "{status}");
+    }
+
+    fn finished_job(name: &str, created: u64, condition: &str) -> Value {
+        json!({
+            "kind": "Job", "apiVersion": "batch/v1",
+            "metadata": {
+                "name": name, "namespace": "default",
+                "creationTimestamp": unix_to_rfc3339(created),
+                "ownerReferences": [{"uid": "every-uid", "controller": true}]
+            },
+            "status": {"conditions": [{"type": condition, "status": "True"}]}
+        })
+    }
+
+    async fn seed_history(store: &StoreMesh, complete: u64, failed: u64) {
+        for i in 0..complete {
+            let name = format!("every-ok-{i}");
+            put(
+                store,
+                ResourceKey::namespaced("batch", "v1", "Job", "default", &name),
+                finished_job(&name, 1_000 + i, "Complete"),
+            )
+            .await;
+        }
+        for i in 0..failed {
+            let name = format!("every-bad-{i}");
+            put(
+                store,
+                ResourceKey::namespaced("batch", "v1", "Job", "default", &name),
+                finished_job(&name, 2_000 + i, "Failed"),
+            )
+            .await;
+        }
+    }
+
+    async fn job_names(store: &StoreMesh) -> Vec<String> {
+        let mut names: Vec<String> = list_jobs(store)
+            .await
+            .into_iter()
+            .map(|(k, _)| k.name)
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn n_plus_three_finished_runs_leave_the_history_limits() {
+        let store = test_store("cronjob-history").await;
+        let mut cj = cronjob_value("every", "* * * * *", 100);
+        cj["spec"]["successfulJobsHistoryLimit"] = json!(3);
+        cj["spec"]["failedJobsHistoryLimit"] = json!(3);
+        put(
+            &store,
+            ResourceKey::namespaced("batch", "v1", "CronJob", "default", "every"),
+            cj,
+        )
+        .await;
+        seed_history(&store, 6, 6).await;
+        put(
+            &store,
+            ResourceKey::namespaced("batch", "v1", "Job", "default", "every-running"),
+            json!({
+                "kind": "Job", "apiVersion": "batch/v1",
+                "metadata": {"name": "every-running", "namespace": "default",
+                    "ownerReferences": [{"uid": "every-uid", "controller": true}]},
+                "status": {"active": 1}
+            }),
+        )
+        .await;
+
+        let c = CronJobController::new(store.clone(), Arc::new(FrozenClock::at(110_000)), None);
+        let out = c.tick().await.unwrap();
+        assert_eq!(
+            out.objects_changed, 1,
+            "pruning changes the CronJob's history"
+        );
+        assert_eq!(
+            job_names(&store).await,
+            [
+                "every-bad-3",
+                "every-bad-4",
+                "every-bad-5",
+                "every-ok-3",
+                "every-ok-4",
+                "every-ok-5",
+                "every-running"
+            ],
+            "the newest finished runs are kept and an active Job is never pruned"
+        );
+
+        let again = c.tick().await.unwrap();
+        assert_eq!(again.objects_changed, 0, "a pruned history is a fixpoint");
+    }
+
+    #[tokio::test]
+    async fn absent_history_limits_keep_three_successful_and_one_failed() {
+        let store = test_store("cronjob-history-default").await;
+        put(
+            &store,
+            ResourceKey::namespaced("batch", "v1", "CronJob", "default", "every"),
+            cronjob_value("every", "* * * * *", 100),
+        )
+        .await;
+        seed_history(&store, 5, 4).await;
+        let c = CronJobController::new(store.clone(), Arc::new(FrozenClock::at(110_000)), None);
+        c.tick().await.unwrap();
+        assert_eq!(
+            job_names(&store).await,
+            ["every-bad-3", "every-ok-2", "every-ok-3", "every-ok-4"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_suspended_cronjob_still_prunes_its_history() {
+        let store = test_store("cronjob-history-suspended").await;
+        let mut cj = cronjob_value("every", "* * * * *", 0);
+        cj["spec"]["suspend"] = json!(true);
+        put(
+            &store,
+            ResourceKey::namespaced("batch", "v1", "CronJob", "default", "every"),
+            cj,
+        )
+        .await;
+        seed_history(&store, 0, 3).await;
+        let c = CronJobController::new(store.clone(), Arc::new(FrozenClock::at(600_000)), None);
+        let out = c.tick().await.unwrap();
+        assert_eq!(out.objects_changed, 1);
+        assert_eq!(job_names(&store).await, ["every-bad-2"]);
     }
 }

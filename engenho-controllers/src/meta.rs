@@ -179,6 +179,14 @@ impl DefaultedInt {
     pub fn read(self, object: &Value) -> Result<i64, ShapeError> {
         Ok(int_at(object, self.path)?.unwrap_or(self.absent))
     }
+
+    /// # Errors
+    ///
+    /// [`ShapeError::NotAnInteger`] when the field holds anything else.
+    pub fn read_count(self, object: &Value) -> Result<usize, ShapeError> {
+        self.read(object)
+            .map(|n| usize::try_from(n.max(0)).unwrap_or(usize::MAX))
+    }
 }
 
 /// The integer at `path` in `object`, in its three states: `Ok(None)`
