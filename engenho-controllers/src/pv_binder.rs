@@ -329,21 +329,23 @@ impl PvBinderController {
         self
     }
 
-    /// A PVC's `status.phase`, defaulting to `"Pending"` when unset (a freshly
+    /// A PVC's `status.phase`, defaulting to `"Pending"` when unset or empty (a freshly
     /// created PVC has no status yet — it is Pending by definition).
     fn pvc_phase(pvc: &Value) -> &str {
         pvc.get("status")
             .and_then(|s| s.get("phase"))
             .and_then(|p| p.as_str())
+            .filter(|p| !p.is_empty())
             .unwrap_or("Pending")
     }
 
-    /// A PV's `status.phase`, defaulting to `"Available"` when unset (a fresh
+    /// A PV's `status.phase`, defaulting to `"Available"` when unset or empty (a fresh
     /// PV with no status is available to bind).
     fn pv_phase(pv: &Value) -> &str {
         pv.get("status")
             .and_then(|s| s.get("phase"))
             .and_then(|p| p.as_str())
+            .filter(|p| !p.is_empty())
             .unwrap_or("Available")
     }
 
@@ -1440,7 +1442,48 @@ mod tests {
         });
     }
 
+    #[test]
+    fn an_empty_phase_is_the_unset_phase() {
+        let empty = json!({"status": {"phase": ""}});
+        assert_eq!(PvBinderController::pvc_phase(&empty), "Pending");
+        assert_eq!(PvBinderController::pv_phase(&empty), "Available");
+    }
+
     // ── live-store binding tests ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_claim_created_with_an_empty_phase_binds() {
+        let store = live_store().await;
+        put_op(
+            &store,
+            pvc_key("ns1", "claim"),
+            json!({"apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                   "metadata": {"name": "claim", "namespace": "ns1", "uid": "claim-uid"},
+                   "spec": {"accessModes": ["ReadWriteOnce"],
+                            "resources": {"requests": {"storage": "1Gi"}},
+                            "storageClassName": "manual"},
+                   "status": {"phase": ""}}),
+        )
+        .await;
+        put_op(
+            &store,
+            pv_key("vol-a"),
+            json!({"apiVersion": "v1", "kind": "PersistentVolume",
+                   "metadata": {"name": "vol-a"},
+                   "spec": {"capacity": {"storage": "5Gi"},
+                            "accessModes": ["ReadWriteOnce"],
+                            "storageClassName": "manual",
+                            "hostPath": {"path": "/mnt/a"}},
+                   "status": {"phase": ""}}),
+        )
+        .await;
+
+        binder(store.clone()).tick().await.unwrap();
+
+        assert_eq!(phase(&store, "claim").await, "Bound");
+        let pv = store.get(&pv_key("vol-a")).await.unwrap();
+        assert_eq!(pv["status"]["phase"], "Bound");
+    }
 
     #[tokio::test]
     async fn pending_pvc_binds_to_matching_pv_bidirectionally() {

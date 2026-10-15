@@ -47,6 +47,25 @@ pub fn stamp_creation_timestamp(body: &mut Value, now: &str) -> bool {
     }
 }
 
+pub fn stamp_claim_phase(body: &mut Value) {
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    let status = obj
+        .entry("status".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !status.is_object() {
+        *status = Value::Object(Map::new());
+    }
+    if let Some(status) = status.as_object_mut()
+        && status
+            .get("phase")
+            .is_none_or(|p| p.is_null() || p.as_str() == Some(""))
+    {
+        status.insert("phase".to_string(), Value::String("Pending".to_string()));
+    }
+}
+
 pub fn stamp_namespace_defaults(body: &mut Value) {
     const KUBERNETES_FINALIZER: &str = "kubernetes";
     const NAME_LABEL: &str = "kubernetes.io/metadata.name";
@@ -118,6 +137,7 @@ pub fn stamp_born(
         match kind {
             "Pod" => crate::pod::stamp_birth_status(body),
             "Namespace" => stamp_namespace_defaults(body),
+            "PersistentVolumeClaim" => stamp_claim_phase(body),
             _ => {}
         }
     }
@@ -177,6 +197,21 @@ mod tests {
         stamp_born("", "Pod", "p", Some("default"), &mut pod, NOW);
         assert_eq!(pod["status"]["phase"], "Pending");
         assert_eq!(pod["status"]["qosClass"], "BestEffort");
+    }
+
+    #[test]
+    fn a_born_claim_is_pending() {
+        for status in [None, Some(json!({})), Some(json!({"phase": ""}))] {
+            let mut body = json!({"metadata": {"name": "data"}, "spec": {}});
+            if let Some(status) = &status {
+                body["status"] = status.clone();
+            }
+            stamp_born("", "PersistentVolumeClaim", "data", None, &mut body, NOW);
+            assert_eq!(body["status"]["phase"], "Pending", "{status:?}");
+        }
+        let mut bound = json!({"metadata": {"name": "data"}, "status": {"phase": "Bound"}});
+        stamp_born("", "PersistentVolumeClaim", "data", None, &mut bound, NOW);
+        assert_eq!(bound["status"]["phase"], "Bound");
     }
 
     #[test]
