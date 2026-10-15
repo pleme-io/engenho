@@ -27,7 +27,7 @@ async fn put_event(store: &StoreMesh, name: &str, age: chrono::Duration) {
     let value = json!({
         "apiVersion": "v1",
         "kind": "Event",
-        "metadata": {"name": name, "namespace": "default"},
+        "metadata": {"name": name, "namespace": "default", "creationTimestamp": stamp},
         "involvedObject": {"kind": "Pod", "namespace": "default", "name": "p"},
         "reason": "BackOff",
         "firstTimestamp": stamp,

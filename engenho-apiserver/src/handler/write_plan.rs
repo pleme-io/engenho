@@ -90,8 +90,7 @@ use engenho_types::patch::PatchType;
 
 use super::{
     ResourceHandler, StoreBackedHandler, admission_request, inject_type_meta,
-    preserve_immutable_meta, preserve_status, stamp_creation_timestamp, stamp_namespace,
-    stamp_namespace_create_defaults,
+    preserve_immutable_meta, preserve_status, stamp_namespace,
 };
 use crate::error::ApiError;
 use crate::field_validation::{KindRef, PatchFields};
@@ -728,16 +727,14 @@ impl StoreBackedHandler {
         }
         match lifecycle {
             Lifecycle::Create => {
-                stamp_creation_timestamp(candidate, now);
-                // Upstream's namespace-lifecycle plugin seeds these; engenho
-                // stamps them so a Namespace is born Active, with the
-                // `kubernetes` finalizer its deletion cascade waits on.
-                if self.kind == "Namespace" {
-                    stamp_namespace_create_defaults(candidate);
-                }
-                if self.group.is_empty() && self.kind == "Pod" {
-                    engenho_types::pod::stamp_birth_status(candidate);
-                }
+                engenho_types::birth::stamp_born(
+                    &self.group,
+                    &self.kind,
+                    name,
+                    namespace,
+                    candidate,
+                    now,
+                );
             }
             Lifecycle::Update { prior, .. } => {
                 preserve_immutable_meta(candidate, prior);

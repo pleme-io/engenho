@@ -40,7 +40,7 @@ const KNOWN_DIVERGENCES: &[&str] = &[
     //    `MissingVerb:v1/configmaps:update:k3s` signature is intentionally
     //    absent from this baseline — the ratchet would go RED if it regressed.
     // ── D2. Namespace server-side defaulting — IRONED OUT.
-    //    `stamp_namespace_create_defaults` now seeds the `kubernetes`
+    //    `engenho_types::birth::stamp_namespace_defaults` now seeds the `kubernetes`
     //    finalizer on `spec.finalizers` (not metadata.finalizers) and adds
     //    the `kubernetes.io/metadata.name` auto-label, matching
     //    kube-apiserver. The old `MissingDefault:.spec` /

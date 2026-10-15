@@ -707,9 +707,10 @@ async fn invalid_probe_skips_pod_never_a_fake_pass() {
     );
     // No fake Running status written.
     let pod = store.get(&pod_key("p1")).await.unwrap();
-    assert!(
-        pod.get("status").and_then(|s| s.get("phase")).is_none(),
-        "skipped pod has no Running status (never a fake pass)"
+    assert_eq!(
+        pod.pointer("/status/phase").and_then(|p| p.as_str()),
+        Some("Pending"),
+        "a skipped pod keeps the phase it was born with, never a fake Running"
     );
 
     teardown(store, kubelet).await;

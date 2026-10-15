@@ -1150,6 +1150,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_job_a_cronjob_creates_is_born_with_its_server_owned_metadata() {
+        let store = test_store("cronjob-born").await;
+        put(
+            &store,
+            ResourceKey::namespaced("batch", "v1", "CronJob", "default", "every"),
+            cronjob_value("every", "* * * * *", 0),
+        )
+        .await;
+        let c = CronJobController::new(store.clone(), Arc::new(FrozenClock::at(120_000)), None);
+        c.tick().await.unwrap();
+        let jobs = list_jobs(&store).await;
+        assert_eq!(jobs.len(), 1);
+        let job = &jobs[0].1;
+        assert!(
+            job["metadata"]["creationTimestamp"]
+                .as_str()
+                .is_some_and(|t| parse_rfc3339_unix(t).is_some()),
+            "{job}"
+        );
+        assert_eq!(job["metadata"]["namespace"], "default", "{job}");
+        assert!(job["metadata"]["uid"].is_string(), "{job}");
+        assert!(job["metadata"]["generation"].is_number(), "{job}");
+    }
+
+    #[tokio::test]
     async fn cronjob_not_due_yet_creates_nothing() {
         let store = test_store("cronjob-notdue").await;
         put(

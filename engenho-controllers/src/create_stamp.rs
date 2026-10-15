@@ -3,7 +3,7 @@
 //! ## The compat gap this closes
 //!
 //! The apiserver HTTP boundary stamps `metadata.creationTimestamp` on
-//! every kubectl-created object (`handler::stamp_creation_timestamp`),
+//! every kubectl-created object (`engenho_types::birth::stamp_born`),
 //! so `kubectl get <kind>` renders a real `AGE`. But objects a
 //! CONTROLLER creates — ReplicaSets (from the Deployment controller),
 //! Pods (from the ReplicaSet/StatefulSet/Job controllers), Endpoints
@@ -27,7 +27,9 @@
 //! IS that leader boundary: a reconcile proposes through the leader's
 //! `StoreMesh::propose`, exactly once per delta, BEFORE the command is
 //! replicated. So the clock read here is the controller-family analogue
-//! of `handler::stamp_creation_timestamp`.
+//! of the apiserver's `engenho_types::birth::stamp_born`. Since 2026-10-15
+//! `StoreMesh::propose` also runs that stamp on every `Put` of an absent key,
+//! so a controller that skips this one still writes a born object.
 //!
 //! ## The `Clock` seam (unit-test determinism)
 //!
@@ -65,20 +67,7 @@ pub fn wall_clock() -> String {
     engenho_types::time::now_rfc3339_utc()
 }
 
-/// `true` iff the `metadata.creationTimestamp` slot is effectively UNSET —
-/// absent, JSON `null`, an empty string, OR an empty object `{}`. Byte-for-
-/// byte the same predicate the apiserver boundary uses
-/// (`handler::creation_timestamp_is_unset`): the empty-object case matters
-/// because a protobuf-decoded zero `metav1.Time` is `{}`.
-#[must_use]
-pub fn creation_timestamp_is_unset(slot: Option<&Value>) -> bool {
-    match slot {
-        None | Some(Value::Null) => true,
-        Some(Value::String(s)) => s.is_empty(),
-        Some(Value::Object(m)) => m.is_empty(),
-        _ => false,
-    }
-}
+pub use engenho_types::birth::creation_timestamp_is_unset;
 
 /// Inject `metadata.creationTimestamp` from `clock()` into `value`, IFF the
 /// slot is currently unset. Idempotent: an object that already carries a
@@ -89,21 +78,9 @@ pub fn creation_timestamp_is_unset(slot: Option<&Value>) -> bool {
 /// Returns `true` iff a stamp was applied (a fresh create), `false` iff the
 /// slot was already set (no-op).
 pub fn stamp_create_timestamp(value: &mut Value, clock: CreateClock) -> bool {
-    let Some(obj) = value.as_object_mut() else {
-        return false;
-    };
-    let metadata = obj
-        .entry("metadata".to_string())
-        .or_insert_with(|| serde_json::json!({}));
-    let Some(meta_obj) = metadata.as_object_mut() else {
-        return false;
-    };
-    if creation_timestamp_is_unset(meta_obj.get("creationTimestamp")) {
-        meta_obj.insert("creationTimestamp".to_string(), Value::String(clock()));
-        true
-    } else {
-        false
-    }
+    value.is_object()
+        && creation_timestamp_is_unset(value.pointer("/metadata/creationTimestamp"))
+        && engenho_types::birth::stamp_creation_timestamp(value, &clock())
 }
 
 #[cfg(test)]

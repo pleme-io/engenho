@@ -14,7 +14,7 @@ use openraft::raft::ClientWriteResponse;
 use openraft::{BasicNode, Config, Raft};
 use tokio::sync::mpsc;
 
-use crate::command::{LoggedCommand, ResourceCommand};
+use crate::command::{LoggedCommand, ResourceCommand, TxnOp};
 use crate::fjall_store::{FjallStore, Flushed, ImageTripwire};
 use crate::network::{InProcessRouter, RpcRequest};
 use crate::owned_task::{OwnedTask, TaskStop};
@@ -417,13 +417,44 @@ impl StoreMesh {
     /// Every proposal is logged under [`crate::command::ApplySemantics::CURRENT`]:
     /// an identical `Put` or `Patch` comes back
     /// [`crate::ResourceOp::Unchanged`] with the revision untouched.
-    pub async fn propose(&self, cmd: ResourceCommand) -> Result<ApplyResult, StoreError> {
+    pub async fn propose(&self, mut cmd: ResourceCommand) -> Result<ApplyResult, StoreError> {
+        self.stamp_births(&mut cmd).await;
         let resp: ClientWriteResponse<TypeConfig> = self
             .raft
             .client_write(LoggedCommand::proposed(cmd))
             .await
             .map_err(|e| StoreError::ClientWriteFailed(e.to_string()))?;
         Ok(resp.data)
+    }
+
+    async fn stamp_births(&self, cmd: &mut ResourceCommand) {
+        let now = engenho_types::time::now_rfc3339_utc();
+        match cmd {
+            ResourceCommand::Put { key, value, .. } => self.stamp_birth(key, value, &now).await,
+            ResourceCommand::Txn {
+                success, failure, ..
+            } => {
+                for op in success.iter_mut().chain(failure.iter_mut()) {
+                    if let TxnOp::Put { key, value } = op {
+                        self.stamp_birth(key, value, &now).await;
+                    }
+                }
+            }
+            ResourceCommand::Patch { .. } | ResourceCommand::Delete { .. } => {}
+        }
+    }
+
+    async fn stamp_birth(&self, key: &ResourceKey, value: &mut ResourceValue, now: &str) {
+        if self.get(key).await.is_none() {
+            engenho_types::birth::stamp_born(
+                &key.group,
+                &key.kind,
+                &key.name,
+                key.namespace.as_deref(),
+                value,
+                now,
+            );
+        }
     }
 
     /// Read a single resource by typed key — synchronous catalog

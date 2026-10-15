@@ -2060,24 +2060,9 @@ async fn boot_store(boot: &BootConfig) -> Result<(Arc<StoreMesh>, BootKind), Run
 /// body from the typed RFC3339 boundary render — the non-handler seeders
 /// (and node registration's create path) route through this so every born
 /// object, including the self-registered Node, carries a real
-/// creationTimestamp. Mirrors the apiserver handler's
-/// `stamp_creation_timestamp`.
+/// creationTimestamp, through `engenho_types::birth`, the one stamp.
 pub(crate) fn stamp_creation_timestamp_value(body: &mut serde_json::Value) {
-    if let Some(obj) = body.as_object_mut() {
-        let metadata = obj
-            .entry("metadata".to_string())
-            .or_insert_with(|| serde_json::json!({}));
-        if let Some(meta_obj) = metadata.as_object_mut() {
-            let absent = !meta_obj.contains_key("creationTimestamp")
-                || meta_obj.get("creationTimestamp") == Some(&serde_json::Value::Null);
-            if absent {
-                meta_obj.insert(
-                    "creationTimestamp".to_string(),
-                    serde_json::Value::String(engenho_types::time::now_rfc3339_utc()),
-                );
-            }
-        }
-    }
+    engenho_types::birth::stamp_creation_timestamp(body, &engenho_types::time::now_rfc3339_utc());
 }
 
 /// The RBAC group + version every seed key carries.

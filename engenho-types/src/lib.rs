@@ -60,6 +60,7 @@
 pub mod api;
 pub mod api_face;
 pub mod auth;
+pub mod birth;
 pub mod client;
 pub mod consistency_tier;
 pub mod curated_enums;
