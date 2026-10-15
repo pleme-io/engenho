@@ -1749,7 +1749,8 @@ fn metadata_mut(
 
 /// Stamp the identity the store owns on `value`, shared by the Put and
 /// server-side-apply paths: `uid` preserved from the prior object, else kept
-/// from the body, else minted deterministically from key + `create_revision`;
+/// from the body, else minted deterministically from key + `create_revision`
+/// (an empty or null `uid` is no `uid`, as upstream's decode reads it);
 /// `creationTimestamp` preserved from the prior object when it has one (a
 /// K8s create-time, IMMUTABLE field, like uid — a re-Put that dropped it must
 /// not lose it; a first create keeps whatever the boundary-stamped body
@@ -1768,9 +1769,10 @@ fn stamp_identity(
         return;
     };
     let prior_meta = prior_value.and_then(|v| v.get("metadata"));
-    if let Some(prior_uid) = prior_meta.and_then(|m| m.get("uid")) {
+    let set = |uid: &serde_json::Value| !(uid.is_null() || uid.as_str() == Some(""));
+    if let Some(prior_uid) = prior_meta.and_then(|m| m.get("uid")).filter(|u| set(u)) {
         meta_obj.insert("uid".to_string(), prior_uid.clone());
-    } else if !meta_obj.contains_key("uid") {
+    } else if !meta_obj.get("uid").is_some_and(set) {
         let uid = mint_uid(&key.label(), create_revision);
         meta_obj.insert("uid".to_string(), serde_json::Value::String(uid));
     }
@@ -3092,6 +3094,23 @@ mod a_revision_means_a_change {
         assert_eq!(stored["metadata"]["uid"], uid);
         assert_eq!(stored["metadata"]["creationTimestamp"], T1);
         assert_eq!(rv(&cat, &cm("a")), "2");
+    }
+
+    #[test]
+    fn an_empty_uid_is_no_uid_and_is_minted() {
+        let mut cat = ResourceCatalog::default();
+        step(
+            &mut cat,
+            &put(&cm("a"), json!({"metadata": {"name": "a", "uid": ""}, "data": {"k": "v"}})),
+        );
+        let minted = cat.get(&cm("a")).unwrap()["metadata"]["uid"].clone();
+        assert!(!minted.as_str().unwrap_or("").is_empty(), "{minted}");
+
+        step(
+            &mut cat,
+            &put(&cm("a"), json!({"metadata": {"name": "a", "uid": ""}, "data": {"k": "w"}})),
+        );
+        assert_eq!(cat.get(&cm("a")).unwrap()["metadata"]["uid"], minted);
     }
 
     #[test]

@@ -2088,12 +2088,13 @@ mod tests {
         assert_eq!(pv["spec"]["claimRef"]["uid"], "uid-data");
     }
 
-    /// A claim whose uid is missing, or cannot name a volume or a directory,
-    /// stays Pending: no PV, no directory, and the sweep's note says which.
+    /// A claim whose uid cannot name a volume or a directory stays Pending:
+    /// no PV, no directory, and the sweep's note says which. A null uid
+    /// cannot reach the store (it mints one), so `UidAbsent` is
+    /// `ClaimUid::of`'s own case.
     #[tokio::test]
     async fn a_claim_with_no_usable_uid_stays_pending_with_a_typed_reason() {
         for (uid, gap) in [
-            (Value::Null, NoVolumeIdentity::UidAbsent),
             (json!("../../escape"), NoVolumeIdentity::UidMalformed),
             (json!(12), NoVolumeIdentity::UidMalformed),
         ] {

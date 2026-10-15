@@ -36,7 +36,8 @@
 //! 7. create-only refusals: the name's format, `NamespaceLifecycle`;
 //! 8. default → validate → CRD-schema default → CRD-schema validate;
 //! 9. admission, as CREATE or UPDATE by lifecycle, over the whole candidate;
-//! 10. server-owned fields: namespace, name; on create the timestamp and the
+//! 10. server-owned fields: namespace, name; on create the timestamp, a uid
+//!     the store mints (a client-sent one is dropped), and the
 //!     Namespace lifecycle stamps; on update `uid`/`creationTimestamp`/
 //!     `deletionTimestamp`, `.status` on a status-bearing kind, and a
 //!     Service's allocated cluster IP;
@@ -727,6 +728,9 @@ impl StoreBackedHandler {
         }
         match lifecycle {
             Lifecycle::Create => {
+                if let Some(meta) = candidate.get_mut("metadata").and_then(Value::as_object_mut) {
+                    meta.remove("uid");
+                }
                 engenho_types::birth::stamp_born(
                     &self.group,
                     &self.kind,

@@ -75,8 +75,8 @@ use serde_json::{Map, Value};
 /// per-controller accessors this trait replaces.
 pub trait ObjectMeta {
     /// `metadata.uid` — the object's stable identity. `None` when the
-    /// field is absent (a freshly minted object the apiserver has not
-    /// stamped yet).
+    /// field is absent or empty (a freshly minted object the apiserver has
+    /// not stamped yet; an empty uid is no uid).
     fn uid(&self) -> Option<&str>;
 
     /// `metadata.name` — the object's name. `None` when absent.
@@ -112,6 +112,7 @@ impl ObjectMeta for Value {
         self.get("metadata")
             .and_then(|m| m.get("uid"))
             .and_then(|u| u.as_str())
+            .filter(|u| !u.is_empty())
     }
 
     fn name(&self) -> Option<&str> {

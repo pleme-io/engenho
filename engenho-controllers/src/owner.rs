@@ -92,7 +92,8 @@ pub fn set_owner_reference(
 }
 
 /// Read the controlling owner of `child` (the ownerRef with
-/// controller=true) if any.
+/// controller=true) if any. A controller ref with an empty uid names no
+/// object, so it is no owner.
 #[must_use]
 pub fn controlling_owner(child: &Value) -> Option<OwnerReference> {
     child
@@ -106,7 +107,9 @@ pub fn controlling_owner(child: &Value) -> Option<OwnerReference> {
                     .and_then(|c| c.as_bool())
                     .unwrap_or(false);
                 if is_ctrl {
-                    serde_json::from_value::<OwnerReference>(r.clone()).ok()
+                    serde_json::from_value::<OwnerReference>(r.clone())
+                        .ok()
+                        .filter(|o| !o.uid.is_empty())
                 } else {
                     None
                 }
@@ -216,6 +219,18 @@ mod tests {
             }
         });
         assert!(controlling_owner(&pod).is_none());
+    }
+
+    #[test]
+    fn an_empty_uid_neither_owns_nor_is_owned() {
+        let parent = json!({"metadata": {"name": "web", "uid": ""}});
+        assert!(owner_ref_for(&parent, "apps/v1", "Deployment").is_none());
+        let rs = json!({"metadata": {"name": "web-abc", "ownerReferences": [
+            {"apiVersion": "apps/v1", "kind": "Deployment", "name": "web",
+             "uid": "", "controller": true}
+        ]}});
+        assert!(controlling_owner(&rs).is_none());
+        assert!(!is_owned_by(&rs, ""));
     }
 
     #[test]
