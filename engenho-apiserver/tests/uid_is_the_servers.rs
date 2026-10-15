@@ -47,7 +47,9 @@ fn deployment(name: &str, uid: Option<&str>) -> Value {
 
 async fn create(addr: &str, client: &reqwest::Client, body: &Value) -> Value {
     let resp = client
-        .post(format!("http://{addr}/apis/apps/v1/namespaces/default/deployments"))
+        .post(format!(
+            "http://{addr}/apis/apps/v1/namespaces/default/deployments"
+        ))
         .json(body)
         .send()
         .await
@@ -80,7 +82,10 @@ async fn a_create_whose_body_carries_an_empty_uid_is_given_one() {
     let client = reqwest::Client::new();
     let created = create(&addr, &client, &deployment("empty", Some(""))).await;
     assert!(!uid_of(&created).is_empty(), "{}", created["metadata"]);
-    assert_eq!(uid_of(&get(&addr, &client, "empty").await), uid_of(&created));
+    assert_eq!(
+        uid_of(&get(&addr, &client, "empty").await),
+        uid_of(&created)
+    );
     server.shutdown().await.unwrap();
 }
 

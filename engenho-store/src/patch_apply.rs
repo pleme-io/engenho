@@ -1230,7 +1230,12 @@ mod tests {
             out["metadata"]["finalizers"],
             json!(["apps.victoriametrics.com/finalizer"])
         );
-        assert!(out["metadata"].as_object().unwrap().contains_key("ownerReferences"));
+        assert!(
+            out["metadata"]
+                .as_object()
+                .unwrap()
+                .contains_key("ownerReferences")
+        );
     }
 
     #[test]
@@ -1298,7 +1303,12 @@ mod tests {
             }],
         )
         .unwrap_err();
-        assert_eq!(err, PatchError::JsonPointer { path: String::new() });
+        assert_eq!(
+            err,
+            PatchError::JsonPointer {
+                path: String::new()
+            }
+        );
     }
 
     #[test]

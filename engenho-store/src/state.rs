@@ -3101,14 +3101,20 @@ mod a_revision_means_a_change {
         let mut cat = ResourceCatalog::default();
         step(
             &mut cat,
-            &put(&cm("a"), json!({"metadata": {"name": "a", "uid": ""}, "data": {"k": "v"}})),
+            &put(
+                &cm("a"),
+                json!({"metadata": {"name": "a", "uid": ""}, "data": {"k": "v"}}),
+            ),
         );
         let minted = cat.get(&cm("a")).unwrap()["metadata"]["uid"].clone();
         assert!(!minted.as_str().unwrap_or("").is_empty(), "{minted}");
 
         step(
             &mut cat,
-            &put(&cm("a"), json!({"metadata": {"name": "a", "uid": ""}, "data": {"k": "w"}})),
+            &put(
+                &cm("a"),
+                json!({"metadata": {"name": "a", "uid": ""}, "data": {"k": "w"}}),
+            ),
         );
         assert_eq!(cat.get(&cm("a")).unwrap()["metadata"]["uid"], minted);
     }

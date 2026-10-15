@@ -46,7 +46,12 @@ async fn a_cluster_role_named_with_colons_is_created_and_served() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::CREATED, "{}", resp.text().await.unwrap());
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CREATED,
+        "{}",
+        resp.text().await.unwrap()
+    );
     let got: serde_json::Value = client
         .get(format!("{base}/{name}"))
         .send()
@@ -70,7 +75,9 @@ async fn a_cluster_role_named_with_colons_is_created_and_served() {
     assert_eq!(resp.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
 
     let resp = client
-        .post(format!("http://{addr}/api/v1/namespaces/default/configmaps"))
+        .post(format!(
+            "http://{addr}/api/v1/namespaces/default/configmaps"
+        ))
         .json(&json!({ "apiVersion": "v1", "kind": "ConfigMap", "metadata": { "name": "a:b" } }))
         .send()
         .await

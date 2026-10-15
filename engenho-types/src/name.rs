@@ -340,7 +340,10 @@ mod tests {
                 assert_eq!(e.to_string(), why, "{kind} {bad:?}");
             }
         }
-        assert_eq!(NameRule::for_kind("example.com", "Role"), NameRule::Subdomain);
+        assert_eq!(
+            NameRule::for_kind("example.com", "Role"),
+            NameRule::Subdomain
+        );
         assert!(ResourceName::parse_for_kind("a:b", "", "ConfigMap").is_err());
     }
 

@@ -291,7 +291,8 @@ impl OwnedChildrenReconciler for DeploymentController {
         }
         let updated = replicas;
         let desired = REPLICAS.read(d_value).ok()?;
-        let current_rs = current_replicaset(&template, owned_rs_after).and_then(|(_, rs)| rs.name());
+        let current_rs =
+            current_replicaset(&template, owned_rs_after).and_then(|(_, rs)| rs.name());
         let conditions = conditions(
             d_value,
             Counts {
@@ -350,7 +351,12 @@ fn max_unavailable(d: &Value, desired: i64) -> i64 {
     }
     let rolling = strategy.and_then(|s| s.get("rollingUpdate"));
     let surge = scaled(rolling.and_then(|r| r.get("maxSurge")), desired, true, 25);
-    let mut unavailable = scaled(rolling.and_then(|r| r.get("maxUnavailable")), desired, false, 25);
+    let mut unavailable = scaled(
+        rolling.and_then(|r| r.get("maxUnavailable")),
+        desired,
+        false,
+        25,
+    );
     if surge == 0 && unavailable == 0 {
         unavailable = 1;
     }
@@ -572,10 +578,22 @@ mod tests {
         assert_eq!(max_unavailable(&json!({"spec": {}}), 2), 0);
         assert_eq!(max_unavailable(&json!({"spec": {}}), 4), 1);
         assert_eq!(max_unavailable(&json!({"spec": {}}), 10), 2);
-        assert_eq!(max_unavailable(&rolling(json!({"maxSurge": 0, "maxUnavailable": 0})), 3), 1);
-        assert_eq!(max_unavailable(&rolling(json!({"maxUnavailable": 9})), 3), 3);
-        assert_eq!(max_unavailable(&rolling(json!({"maxUnavailable": "50%"})), 3), 1);
-        assert_eq!(max_unavailable(&json!({"spec": {"strategy": {"type": "Recreate"}}}), 3), 0);
+        assert_eq!(
+            max_unavailable(&rolling(json!({"maxSurge": 0, "maxUnavailable": 0})), 3),
+            1
+        );
+        assert_eq!(
+            max_unavailable(&rolling(json!({"maxUnavailable": 9})), 3),
+            3
+        );
+        assert_eq!(
+            max_unavailable(&rolling(json!({"maxUnavailable": "50%"})), 3),
+            1
+        );
+        assert_eq!(
+            max_unavailable(&json!({"spec": {"strategy": {"type": "Recreate"}}}), 3),
+            0
+        );
         assert_eq!(max_unavailable(&json!({"spec": {}}), 0), 0);
     }
 

@@ -298,7 +298,9 @@ async fn deployment_reports_progressing_and_available_as_upstream_does() {
     dc.tick().await.unwrap();
 
     let dep = store.get(&dep_key).await.unwrap();
-    let rs_list = store.list("apps", "v1", "ReplicaSet", Some("default")).await;
+    let rs_list = store
+        .list("apps", "v1", "ReplicaSet", Some("default"))
+        .await;
     let (_, rs) = rs_list
         .iter()
         .find(|(_, r)| is_owned_by(r, &dep_uid))
@@ -306,9 +308,15 @@ async fn deployment_reports_progressing_and_available_as_upstream_does() {
     let rs_name = rs["metadata"]["name"].as_str().unwrap().to_string();
     let rs_uid = rs["metadata"]["uid"].as_str().unwrap().to_string();
     assert_eq!(condition(&dep, "Available")["status"], "False");
-    assert_eq!(condition(&dep, "Available")["reason"], "MinimumReplicasUnavailable");
+    assert_eq!(
+        condition(&dep, "Available")["reason"],
+        "MinimumReplicasUnavailable"
+    );
     assert_eq!(condition(&dep, "Progressing")["status"], "True");
-    assert_eq!(condition(&dep, "Progressing")["reason"], "ReplicaSetUpdated");
+    assert_eq!(
+        condition(&dep, "Progressing")["reason"],
+        "ReplicaSetUpdated"
+    );
     assert_eq!(
         condition(&dep, "Progressing")["message"],
         format!("ReplicaSet \"{rs_name}\" is progressing.")
@@ -321,10 +329,19 @@ async fn deployment_reports_progressing_and_available_as_upstream_does() {
     dc.tick().await.unwrap();
     let dep = store.get(&dep_key).await.unwrap();
     assert_eq!(condition(&dep, "Available")["status"], "True");
-    assert_eq!(condition(&dep, "Available")["reason"], "MinimumReplicasAvailable");
-    assert_eq!(condition(&dep, "Available")["message"], "Deployment has minimum availability.");
+    assert_eq!(
+        condition(&dep, "Available")["reason"],
+        "MinimumReplicasAvailable"
+    );
+    assert_eq!(
+        condition(&dep, "Available")["message"],
+        "Deployment has minimum availability."
+    );
     assert_eq!(condition(&dep, "Progressing")["status"], "True");
-    assert_eq!(condition(&dep, "Progressing")["reason"], "NewReplicaSetAvailable");
+    assert_eq!(
+        condition(&dep, "Progressing")["reason"],
+        "NewReplicaSetAvailable"
+    );
     assert_eq!(
         condition(&dep, "Progressing")["message"],
         format!("ReplicaSet \"{rs_name}\" has successfully progressed.")

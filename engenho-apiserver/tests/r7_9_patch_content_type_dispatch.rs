@@ -330,7 +330,12 @@ async fn the_victoriametrics_operator_patches_apply_to_absent_keys() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::OK, "{}", resp.text().await.unwrap());
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "{}",
+        resp.text().await.unwrap()
+    );
 
     let resp = client
         .patch(format!("{url}/status"))
@@ -339,7 +344,12 @@ async fn the_victoriametrics_operator_patches_apply_to_absent_keys() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), reqwest::StatusCode::OK, "{}", resp.text().await.unwrap());
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "{}",
+        resp.text().await.unwrap()
+    );
 
     let got = get_deploy(&addr, &client).await;
     assert_eq!(
