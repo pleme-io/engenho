@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use engenho_config::{
     ClusterConfig, ConsistencyConfig, ConsistencyTierKind, ControllerEnable, ControllersConfig,
-    DatapathMode, EngenhoConfig, Fabric, KubeconfigVisibility, KubeletBackendKind,
+    DatapathMode, EngenhoConfig, Fabric, HealthReasons, KubeconfigVisibility, KubeletBackendKind,
     LegacyTeiaSection, NativeCgroups, NetworkingConfig, RevoadaConfig, RuntimeConfig,
     SchedulerConfig, TlsConfig, TopologyConfig, TopologyStrategyKind,
 };
@@ -73,6 +73,7 @@ pub(crate) struct BootConfig {
     /// is handed the backend it drives.
     pub(crate) kubelet_backend: KubeletBackendKind,
     pub(crate) native_cgroups: NativeCgroups,
+    pub(crate) health_reasons: HealthReasons,
     /// `runtime.podman_binary`, read with `kubelet_backend`.
     pub(crate) podman_binary: Option<String>,
     /// `runtime.host_path_allowlist`.
@@ -164,6 +165,7 @@ impl BootConfig {
             etcd_listen_addr,
             kubelet_backend,
             native_cgroups,
+            health_reasons,
             podman_binary,
             host_path_allowlist,
             node_manifests_dir,
@@ -186,6 +188,7 @@ impl BootConfig {
             etcd_listen_addr: etcd_listen_addr.clone(),
             kubelet_backend: *kubelet_backend,
             native_cgroups: *native_cgroups,
+            health_reasons: *health_reasons,
             podman_binary: podman_binary.clone(),
             host_path_allowlist: host_path_allowlist.clone(),
             node_manifests_dir: node_manifests_dir.clone(),

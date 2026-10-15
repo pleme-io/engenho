@@ -141,6 +141,7 @@ pub struct RouterState {
     /// How long `/readyz` waits for the linearizable store read.
     /// Defaults to [`crate::health::DEFAULT_STORE_READ_TIMEOUT`].
     pub readyz_store_read_timeout: std::time::Duration,
+    pub health_reasons: crate::health::FailureReasons,
     /// What `/metrics` renders the store revision, panic count, reconcile
     /// counts and last-tick timestamps from.
     ///
@@ -177,6 +178,7 @@ impl RouterState {
             // are absent until the runtime installs its sources.
             liveness: None,
             readyz_store_read_timeout: crate::health::DEFAULT_STORE_READ_TIMEOUT,
+            health_reasons: crate::health::FailureReasons::default(),
             metrics_source: None,
             api_face: engenho_types::ApiFace::VENDORED,
         }
@@ -201,6 +203,12 @@ impl RouterState {
     #[must_use]
     pub fn with_readyz_store_read_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.readyz_store_read_timeout = timeout;
+        self
+    }
+
+    #[must_use]
+    pub fn with_health_reasons(mut self, reasons: crate::health::FailureReasons) -> Self {
+        self.health_reasons = reasons;
         self
     }
 

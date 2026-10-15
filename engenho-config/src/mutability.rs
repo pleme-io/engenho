@@ -256,6 +256,7 @@ fn build() -> Vec<LeafSpec> {
         etcd_listen_addr => listeners,
         kubelet_backend => restart,
         native_cgroups => restart,
+        health_reasons => restart,
         podman_binary => restart,
         host_path_allowlist => restart,
         node_manifests_dir => restart,

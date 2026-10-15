@@ -288,6 +288,12 @@ in
         entirely client-side. Switching between them does not migrate, restart
         or orphan anything.
       '';
+      healthReasons = optional (types.enum [ "named" "withheld" ]) ''
+        What a failing `/livez`, `/healthz` or `/readyz` check says in the
+        body. `named` (engenho's default): `[-]<check> failed: <reason>`.
+        `withheld`: upstream's `[-]<check> failed: reason withheld`, with
+        the reason only in the daemon's log.
+      '';
       nativeCgroups = optional (types.enum [ "delegated" "off" ]) ''
         How the `native` backend enforces a container's `resources` on Linux.
 
@@ -589,6 +595,7 @@ in
       remote_kubeconfig_publish_path = cfg.runtime.remoteKubeconfigPublishPath;
         kubelet_backend = cfg.runtime.kubeletBackend;
         native_cgroups = cfg.runtime.nativeCgroups;
+        health_reasons = cfg.runtime.healthReasons;
         host_path_allowlist = cfg.runtime.hostPathAllowlist;
         node_manifests_dir = cfg.runtime.nodeManifestsDir;
         # DERIVED, never a second hand-list: an explicit `podmanBinary` wins,

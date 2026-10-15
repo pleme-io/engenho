@@ -142,8 +142,8 @@ pub use networking::{DatapathMode, NetworkingConfig, ResolvedDatapath, parse_ipv
 pub use node_local::{ListenerAddrRejection, LoopbackAddr, NodeLocalListener};
 pub use revoada::{RevoadaConfig, TopologyConfig, TopologyStrategyKind};
 pub use runtime::{
-    DEFAULT_NODE_MANIFESTS_DIR, KubeconfigVisibility, KubeletBackendKind, KubeletBackendRefusal,
-    NativeCgroups, RuntimeConfig,
+    DEFAULT_NODE_MANIFESTS_DIR, HealthReasons, KubeconfigVisibility, KubeletBackendKind,
+    KubeletBackendRefusal, NativeCgroups, RuntimeConfig,
 };
 pub use scheduler::{SchedulerConfig, SchedulerStrategyKind};
 pub use teia::TeiaConfig;

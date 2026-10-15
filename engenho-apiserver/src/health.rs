@@ -34,8 +34,12 @@
 //! passing endpoint answers `ok`, or with `?verbose` one `[+]<check> ok`
 //! line per check and `<endpoint> check passed`; a failing one always
 //! answers 500 with every line, `[-]<check> failed: reason withheld` for
-//! the failures, and `<endpoint> check failed`. The reason is withheld from
-//! the body because these paths are pre-authz; it goes to the log.
+//! the failures, and `<endpoint> check failed`. Upstream withholds the reason
+//! from the body because these paths are pre-authz; it goes to the log.
+//! [`FailureReasons::Named`] puts it in the body as `[-]<check> failed:
+//! <reason>` instead, so an operator reading `/readyz?verbose` sees why
+//! (`runtime.health_reasons`); [`FailureReasons::Withheld`] keeps upstream's
+//! body.
 //!
 //! Tier: "unwired or empty never renders ok" is structural in [`gather`],
 //! the only producer of a [`Report`]. Whether the runtime's source reflects
@@ -232,7 +236,15 @@ impl Endpoint {
     }
 }
 
-/// Why one check failed. Logged, never put in the (pre-authz) body.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FailureReasons {
+    #[default]
+    Withheld,
+    Named,
+}
+
+/// Why one check failed. Logged, and put in the body only under
+/// [`FailureReasons::Named`].
 #[derive(Debug, thiserror::Error)]
 pub enum CheckFailure {
     /// No [`LivenessSource`] is installed in this server.
@@ -313,23 +325,28 @@ impl Report {
     /// The response body: `ok` for a pass without `?verbose`, otherwise
     /// every check line and the verdict line. A failure is always verbose.
     #[must_use]
-    pub fn body(&self, verbose: bool) -> String {
+    pub fn body(&self, verbose: bool, reasons: FailureReasons) -> String {
         if self.passed() && !verbose {
             return String::from("ok");
         }
-        VerboseBody(self).to_string()
+        VerboseBody(self, reasons).to_string()
     }
 }
 
 /// Upstream's verbose body: one `[+]`/`[-]` line per check, then the verdict.
-struct VerboseBody<'a>(&'a Report);
+struct VerboseBody<'a>(&'a Report, FailureReasons);
 
 impl fmt::Display for VerboseBody<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for check in &self.0.checks {
-            match check.verdict {
-                Ok(()) => writeln!(f, "[+]{} ok", check.name)?,
-                Err(_) => writeln!(f, "[-]{} failed: reason withheld", check.name)?,
+            match (&check.verdict, self.1) {
+                (Ok(()), _) => writeln!(f, "[+]{} ok", check.name)?,
+                (Err(_), FailureReasons::Withheld) => {
+                    writeln!(f, "[-]{} failed: reason withheld", check.name)?;
+                }
+                (Err(why), FailureReasons::Named) => {
+                    writeln!(f, "[-]{} failed: {why}", check.name)?;
+                }
             }
         }
         let outcome = if self.0.passed() { "passed" } else { "failed" };
@@ -454,7 +471,7 @@ async fn serve(endpoint: Endpoint, state: &RouterState, query: Option<&str>) -> 
             (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
         ],
-        report.body(wants_verbose(query)),
+        report.body(wants_verbose(query), state.health_reasons),
     )
         .into_response()
 }
@@ -795,6 +812,35 @@ mod tests {
             "{body}"
         );
         assert!(body.contains("[+]store ok\n"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn named_reasons_put_why_a_check_failed_in_the_body() {
+        let app = crate::router::build(
+            RouterState::new(vec![])
+                .with_liveness_source(Arc::new(
+                    FixedLiveness::new(vec![
+                        child("deployment", Liveness::Alive),
+                        child("kubelet", Liveness::Unknown),
+                    ])
+                    .with_store_read(FixedStoreRead::Hangs),
+                ))
+                .with_readyz_store_read_timeout(Duration::from_millis(50))
+                .with_health_reasons(FailureReasons::Named),
+        );
+        let (status, body) = get(&app, "/readyz?verbose").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            body.starts_with("[-]store failed: store read did not answer within 50ms\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("[-]kubelet failed: never observed since it was spawned\n"),
+            "{body}"
+        );
+        assert!(body.contains("[+]deployment ok\n"), "{body}");
+        assert!(!body.contains("reason withheld"), "{body}");
+        assert!(body.ends_with("readyz check failed\n"), "{body}");
     }
 
     #[tokio::test]

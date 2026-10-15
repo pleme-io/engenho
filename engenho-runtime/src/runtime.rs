@@ -483,7 +483,15 @@ impl Runtime {
         // (T2.8). Installed here with the ledger, before any clone, for the
         // same reason.
         .with_liveness_source(health.clone())
-        .with_metrics_source(health.clone());
+        .with_metrics_source(health.clone())
+        .with_health_reasons(match boot.health_reasons {
+            engenho_config::HealthReasons::Named => {
+                engenho_apiserver::health::FailureReasons::Named
+            }
+            engenho_config::HealthReasons::Withheld => {
+                engenho_apiserver::health::FailureReasons::Withheld
+            }
+        });
         // The minting half, from the SAME key the authenticator verifies with.
         // Without it RBAC is decorative: the authorizer, the Roles and the
         // bindings all work, but nothing can present a non-admin identity to
