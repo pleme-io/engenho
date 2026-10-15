@@ -270,6 +270,7 @@ mod tests {
             // subresource surface — false keeps them at the old behaviour.
             serves_status: false,
             schema,
+            printer_columns: Vec::new(),
         }
     }
 

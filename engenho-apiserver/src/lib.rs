@@ -52,6 +52,7 @@ pub mod pki_files;
 pub mod pki_inventory;
 pub mod pod_logs;
 pub mod pod_stream;
+pub mod printer;
 pub mod proto_transcode;
 pub mod resource_metrics;
 pub mod router;

@@ -142,6 +142,8 @@ pub struct CrdVersion {
     /// as-is via `--validate=false`).
     #[serde(default)]
     pub schema: Value,
+    #[serde(default, rename = "additionalPrinterColumns")]
+    pub additional_printer_columns: Vec<Value>,
 }
 
 /// The typed `spec` of a CustomResourceDefinition — the parse border the
@@ -197,6 +199,8 @@ pub struct CrdEntry {
     pub serves_status: bool,
     /// The opaque openAPIV3Schema for this version (validation DEFERRED).
     pub schema: Value,
+    #[serde(default)]
+    pub printer_columns: Vec<Value>,
 }
 
 impl CrdEntry {
@@ -291,6 +295,7 @@ pub struct CrdHandlerSpec {
     /// everything. That exact off-by-one-level made the first cut of this
     /// enforcement a no-op.
     pub schema: Value,
+    pub printer_columns: Vec<Value>,
 }
 
 impl From<&CrdEntry> for CrdHandlerSpec {
@@ -312,6 +317,7 @@ impl From<&CrdEntry> for CrdHandlerSpec {
                 .get("openAPIV3Schema")
                 .cloned()
                 .unwrap_or(Value::Null),
+            printer_columns: e.printer_columns.clone(),
         }
     }
 }
@@ -399,6 +405,7 @@ impl CrdController {
                     .as_ref()
                     .is_some_and(|sr| sr.status.is_some()),
                 schema: v.schema.clone(),
+                printer_columns: v.additional_printer_columns.clone(),
             })
             .collect()
     }

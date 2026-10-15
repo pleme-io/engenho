@@ -1191,6 +1191,7 @@ fn decode_patch(
 fn render_list(
     codec: ResponseCodec,
     gvk: &Gvk,
+    printer: &crate::printer::Printer,
     value: serde_json::Value,
 ) -> Result<Response, ApiError> {
     // ── ★ A LIST IS ENCODED AS `<Kind>List`, NOT AS `<Kind>` ──────────────
@@ -1219,19 +1220,21 @@ fn render_list(
             k
         },
     };
-    render_object(codec, &list_gvk, StatusCode::OK, value)
+    render_object(codec, &list_gvk, printer, StatusCode::OK, value)
 }
 
 fn render_object(
     codec: ResponseCodec,
     gvk: &Gvk,
+    printer: &crate::printer::Printer,
     status: StatusCode,
     value: serde_json::Value,
 ) -> Result<Response, ApiError> {
     match codec {
         ResponseCodec::Json => Ok((status, Json(value)).into_response()),
         ResponseCodec::Table(include) => {
-            let table = crate::table::to_table(&value, include);
+            let table =
+                crate::table::to_table(&value, include, printer, chrono::Utc::now().timestamp());
             Ok((status, Json(table)).into_response())
         }
         ResponseCodec::PartialMetadata => {
@@ -1292,7 +1295,7 @@ async fn do_get(
     codec: ResponseCodec,
 ) -> Result<Response, ApiError> {
     let v = h.get(ns, name).await?;
-    render_object(codec, &handler_gvk(h), StatusCode::OK, v)
+    render_object(codec, &handler_gvk(h), &h.printer(), StatusCode::OK, v)
 }
 
 async fn do_create(
@@ -1307,7 +1310,7 @@ async fn do_create(
     let body = decode_object_body(h, headers, raw, border)?;
     let v = h.create(ns, body, user_info, dry_run).await?;
     let codec = ResponseCodec::from_headers(headers)?;
-    render_object(codec, &handler_gvk(h), StatusCode::CREATED, v)
+    render_object(codec, &handler_gvk(h), &h.printer(), StatusCode::CREATED, v)
 }
 
 #[allow(clippy::too_many_arguments)] // the request, its target, and its border
@@ -1324,7 +1327,7 @@ async fn do_replace(
     let body = decode_object_body(h, headers, raw, border)?;
     let v = h.replace(ns, name, body, user_info, dry_run).await?;
     let codec = ResponseCodec::from_headers(headers)?;
-    render_object(codec, &handler_gvk(h), StatusCode::OK, v)
+    render_object(codec, &handler_gvk(h), &h.printer(), StatusCode::OK, v)
 }
 
 #[allow(clippy::too_many_arguments)] // the request, its target, and its border
@@ -1392,7 +1395,7 @@ async fn do_patch(
     // the existing patch path (kubectl apply --server-side accepts both, and
     // the read-back object carries the committed state either way).
     let codec = ResponseCodec::from_headers(headers)?;
-    render_object(codec, &gvk, StatusCode::OK, v)
+    render_object(codec, &gvk, &h.printer(), StatusCode::OK, v)
 }
 
 async fn do_delete(
@@ -1425,9 +1428,15 @@ async fn do_delete(
     // to conformance: the conformance DELETE always targets an existing
     // object (object path → protobuf works).
     if is_status_value(&obj) {
-        return render_object(ResponseCodec::Json, &handler_gvk(h), StatusCode::OK, obj);
+        return render_object(
+            ResponseCodec::Json,
+            &handler_gvk(h),
+            &h.printer(),
+            StatusCode::OK,
+            obj,
+        );
     }
-    render_object(codec, &handler_gvk(h), StatusCode::OK, obj)
+    render_object(codec, &handler_gvk(h), &h.printer(), StatusCode::OK, obj)
 }
 
 /// `true` iff `v` is a `kind: "Status"` envelope — the meta/v1 Status that
@@ -1502,6 +1511,7 @@ async fn do_list_or_watch(
             render_list(
                 codec,
                 &handler_gvk(&h),
+                &h.printer(),
                 h.list_response(items, rv, cont, remaining),
             )
         } else {
@@ -1509,6 +1519,7 @@ async fn do_list_or_watch(
             render_list(
                 codec,
                 &handler_gvk(&h),
+                &h.printer(),
                 h.list_response(items, rv, None, None),
             )
         }
@@ -2092,7 +2103,7 @@ async fn do_get_status(
     codec: ResponseCodec,
 ) -> Result<Response, ApiError> {
     let v = h.get_status(ns, name).await?;
-    render_object(codec, &handler_gvk(h), StatusCode::OK, v)
+    render_object(codec, &handler_gvk(h), &h.printer(), StatusCode::OK, v)
 }
 
 async fn do_put_status(
@@ -2105,7 +2116,7 @@ async fn do_put_status(
     let body = decode_write_body(headers, raw)?;
     let v = h.put_status(ns, name, body).await?;
     let codec = ResponseCodec::from_headers(headers)?;
-    render_object(codec, &handler_gvk(h), StatusCode::OK, v)
+    render_object(codec, &handler_gvk(h), &h.printer(), StatusCode::OK, v)
 }
 
 async fn do_patch_status(
@@ -2119,7 +2130,7 @@ async fn do_patch_status(
     let (patch, patch_type) = decode_patch(headers, raw, &gvk)?;
     let v = h.patch_status(ns, name, patch, patch_type).await?;
     let codec = ResponseCodec::from_headers(headers)?;
-    render_object(codec, &gvk, StatusCode::OK, v)
+    render_object(codec, &gvk, &h.printer(), StatusCode::OK, v)
 }
 
 async fn do_get_scale(

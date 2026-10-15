@@ -47,6 +47,10 @@ pub trait ResourceHandler: Send + Sync + 'static {
     fn plural(&self) -> &str;
     fn namespaced(&self) -> bool;
 
+    fn printer(&self) -> crate::printer::Printer {
+        crate::printer::Printer::for_kind(self.group(), self.kind())
+    }
+
     /// kubectl short-name aliases for this kind (e.g. `["deploy"]`).
     /// Pure registration metadata flowing into discovery `shortNames`,
     /// which is how `kubectl get deploy` resolves to `deployments`.
@@ -547,6 +551,7 @@ pub struct StoreBackedHandler {
     /// this unset for a custom resource means accepting data every downstream
     /// controller was written to assume impossible.
     crd_schema: Option<Arc<serde_json::Value>>,
+    printer: Option<crate::printer::Printer>,
     /// Optional in-process Pod-log reader (the kubelet adapter). `None` for
     /// every kind except Pod (and for Pod when no kubelet is wired — tests /
     /// apiserver-only). When `Some`, the Pod handler's `logs` override
@@ -590,6 +595,7 @@ impl StoreBackedHandler {
             admission: None,
             namespace_lifecycle: false,
             crd_schema: None,
+            printer: None,
             log_reader: None,
             stream_proxy: None,
             bookmark_every: WATCH_BOOKMARK_EVERY,
@@ -672,6 +678,12 @@ impl StoreBackedHandler {
     #[must_use]
     pub fn with_namespace_lifecycle(mut self) -> Self {
         self.namespace_lifecycle = true;
+        self
+    }
+
+    #[must_use]
+    pub fn with_printer_columns(mut self, columns: &[serde_json::Value]) -> Self {
+        self.printer = Some(crate::printer::Printer::for_crd(columns));
         self
     }
 
@@ -799,6 +811,11 @@ impl ResourceHandler for StoreBackedHandler {
     }
     fn namespaced(&self) -> bool {
         self.namespaced
+    }
+    fn printer(&self) -> crate::printer::Printer {
+        self.printer
+            .clone()
+            .unwrap_or_else(|| crate::printer::Printer::for_kind(&self.group, &self.kind))
     }
     fn short_names(&self) -> &[&str] {
         self.short_names
@@ -1887,6 +1904,7 @@ impl DynamicHandlerSink for RouterHandlerSink {
             // CrdHandlerSpec so the handler can reject a CR that violates the
             // types its author declared.
             .with_crd_schema(spec.schema.clone())
+            .with_printer_columns(&spec.printer_columns)
             // A dynamically-registered CR lives in a namespace like anything
             // else, so the same NamespaceLifecycle rule applies.
             .with_namespace_lifecycle(),
