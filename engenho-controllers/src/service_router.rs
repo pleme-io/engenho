@@ -168,6 +168,32 @@ pub trait ServiceRouter: Send + Sync {
     ///
     /// [`RouterError::Backend`] on backend inspection failure.
     async fn list(&self) -> Result<BTreeMap<String, ServiceRoute>, RouterError>;
+
+    /// Make the installed routes exactly `desired`, returning how many
+    /// routes changed. The default upserts what differs and removes what is
+    /// no longer desired; a backend that owns a shared table (iptables'
+    /// `KUBE-SERVICES`) rewrites it whole instead.
+    ///
+    /// # Errors
+    ///
+    /// [`RouterError::Backend`] on host failure.
+    async fn sync(&self, desired: &BTreeMap<String, ServiceRoute>) -> Result<usize, RouterError> {
+        let installed = self.list().await?;
+        let mut changed = 0;
+        for (id, route) in desired {
+            if installed.get(id) != Some(route) {
+                self.upsert(route).await?;
+                changed += 1;
+            }
+        }
+        for id in installed.keys() {
+            if !desired.contains_key(id) {
+                self.remove(id).await?;
+                changed += 1;
+            }
+        }
+        Ok(changed)
+    }
 }
 
 // =================================================================
@@ -290,6 +316,10 @@ pub struct IptablesRouter {
 struct IptablesState {
     /// Routes the router has installed.
     routes: BTreeMap<String, ServiceRoute>,
+    /// Whether this process has rewritten the root chain yet. Until it has,
+    /// the chain may hold a previous process's jumps, so the first sync runs
+    /// even when no route changed.
+    synced: bool,
 }
 
 impl Default for IptablesRouter {
@@ -345,27 +375,95 @@ impl IptablesRouter {
     /// no `format!()` of iptables syntax).
     #[must_use]
     pub fn render_script(route: &ServiceRoute) -> String {
-        use engenho_types::egress::IptablesScript;
-        let chain_svc = chain_name("KUBE-SVC", &route.service_id);
-        let mut script = IptablesScript::new();
-        script.table("nat").chain(&chain_svc);
+        let one = [(route.service_id.clone(), route.clone())]
+            .into_iter()
+            .collect();
+        Self::render_sync_script(&one, &BTreeMap::new())
+    }
+
+    fn port_key(route: &ServiceRoute, port: &PortMap) -> String {
+        let mut key = route.service_id.clone();
+        key.push('/');
+        key.push_str(&port.protocol.to_lowercase());
+        key.push('/');
+        key.push_str(&port.service_port.to_string());
+        key
+    }
+
+    fn svc_chain(route: &ServiceRoute, port: &PortMap) -> String {
+        chain_name("KUBE-SVC", &Self::port_key(route, port))
+    }
+
+    fn sep_chain(route: &ServiceRoute, port: &PortMap, pod_ip: &str) -> String {
+        let mut key = Self::port_key(route, port);
+        key.push('/');
+        key.push_str(pod_ip);
+        chain_name("KUBE-SEP", &key)
+    }
+
+    /// Every chain `route` owns: one `KUBE-SVC` per port and one
+    /// `KUBE-SEP` per port and endpoint.
+    #[must_use]
+    pub fn chains_of(route: &ServiceRoute) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
         for port in &route.ports {
-            let proto = port.protocol.to_lowercase();
-            // Hit the per-service chain from KUBE-SERVICES.
-            script.jump_to_service_chain(&route.cluster_ip, &proto, port.service_port, &chain_svc);
-            // For each pod IP, install a per-endpoint chain.
-            for (i, pod_ip) in route.endpoints.iter().enumerate() {
-                let chain_ep =
-                    chain_name("KUBE-SEP", &format!("{}-{}-{i}", route.service_id, pod_ip));
-                script.chain(&chain_ep);
-                // Round-robin via statistic mode random; first endpoint
-                // gets 1/N, second 1/(N-1) etc.
-                let remaining = route.endpoints.len() - i;
-                let probability = 1.0 / (remaining as f64);
-                script.statistic_jump(&chain_svc, probability, &chain_ep);
-                // The endpoint chain DNATs to the pod.
-                script.dnat(&chain_ep, &proto, pod_ip, port.target_port);
+            out.insert(Self::svc_chain(route, port));
+            for pod_ip in &route.endpoints {
+                out.insert(Self::sep_chain(route, port, pod_ip));
             }
+        }
+        out
+    }
+
+    /// The whole nat datapath for `desired`, as kube-proxy writes it: the
+    /// root chain is declared (so `iptables-restore --noflush` flushes and
+    /// refills it), every desired chain is declared and filled, and every
+    /// chain only `installed` owned is flushed and deleted. A Service whose
+    /// address moved or that was deleted therefore leaves no jump behind,
+    /// and each port has its own chains, so a port only ever reaches its
+    /// own target port.
+    #[must_use]
+    pub fn render_sync_script(
+        desired: &BTreeMap<String, ServiceRoute>,
+        installed: &BTreeMap<String, ServiceRoute>,
+    ) -> String {
+        use engenho_types::egress::IptablesScript;
+        let mut script = IptablesScript::new();
+        script.table("nat").chain(Self::ROOT_CHAIN);
+        let mut kept = BTreeSet::new();
+        for route in desired.values() {
+            for port in &route.ports {
+                let proto = port.protocol.to_lowercase();
+                let chain_svc = Self::svc_chain(route, port);
+                script.chain(&chain_svc);
+                kept.insert(chain_svc.clone());
+                script.jump_to_service_chain(
+                    &route.cluster_ip,
+                    &proto,
+                    port.service_port,
+                    &chain_svc,
+                );
+                for (i, pod_ip) in route.endpoints.iter().enumerate() {
+                    let chain_ep = Self::sep_chain(route, port, pod_ip);
+                    script.chain(&chain_ep);
+                    kept.insert(chain_ep.clone());
+                    let remaining = route.endpoints.len() - i;
+                    let probability = 1.0 / (remaining as f64);
+                    script.statistic_jump(&chain_svc, probability, &chain_ep);
+                    script.dnat(&chain_ep, &proto, pod_ip, port.target_port);
+                }
+            }
+        }
+        let retired: BTreeSet<String> = installed
+            .values()
+            .flat_map(Self::chains_of)
+            .filter(|c| !kept.contains(c))
+            .collect();
+        for chain in &retired {
+            script.chain(chain);
+        }
+        for chain in &retired {
+            script.delete_chain(chain);
         }
         script.commit();
         script.to_string()
@@ -469,63 +567,6 @@ impl IptablesRouter {
         Ok(())
     }
 
-    /// argv deleting ONE jump for this route+port from the root chain.
-    /// Pure so the `-D` spec can be asserted equal to the `-A` the script
-    /// renders — they are the same bytes or the delete silently matches
-    /// nothing.
-    #[must_use]
-    pub fn jump_delete_argv(
-        cluster_ip: &str,
-        protocol: &str,
-        dport: u16,
-        chain_svc: &str,
-    ) -> Vec<String> {
-        use engenho_types::egress::IptablesScript;
-        let mut argv = vec![
-            "-t".to_string(),
-            "nat".to_string(),
-            "-D".to_string(),
-            Self::ROOT_CHAIN.to_string(),
-        ];
-        argv.extend(IptablesScript::service_jump_spec(
-            cluster_ip, protocol, dport, chain_svc,
-        ));
-        argv
-    }
-
-    /// Delete EVERY existing jump for this route from the root chain.
-    ///
-    /// The root chain is shared by all Services, so it can never be declared
-    /// (and therefore flushed) in a per-route restore script without wiping
-    /// the other Services' jumps. Measured on rio 2026-09-15: applying the
-    /// same script twice through `iptables-restore --noflush` left ONE rule
-    /// in a chain the script declares and TWO in a chain it does not — so
-    /// without this the node grows a duplicate jump per resync, forever.
-    ///
-    /// Loops until the delete fails, which both prevents a new duplicate and
-    /// heals a node that already accumulated them.
-    async fn prune_jumps(&self, route: &ServiceRoute) -> Result<(), RouterError> {
-        let chain_svc = chain_name("KUBE-SVC", &route.service_id);
-        for port in &route.ports {
-            let argv = Self::jump_delete_argv(
-                &route.cluster_ip,
-                &port.protocol.to_lowercase(),
-                port.service_port,
-                &chain_svc,
-            );
-            // Bounded: an unbounded loop here would wedge the reconciler
-            // (★★ reconciler liveness) if iptables ever reported success
-            // without deleting anything.
-            for _ in 0..MAX_DUPLICATE_JUMPS {
-                let (ok, _) = self.control(&argv).await?;
-                if !ok {
-                    break;
-                }
-            }
-        }
-        Ok(())
-    }
-
     async fn run_restore(&self, script: &str) -> Result<(), RouterError> {
         use std::process::Stdio;
         let mut cmd = tokio::process::Command::new(&self.binary);
@@ -563,12 +604,6 @@ impl IptablesRouter {
     }
 }
 
-/// Upper bound on how many duplicate jumps `prune_jumps` will delete for one
-/// port before giving up. Generous against any plausible accumulation, finite
-/// so a backend that reported success without deleting cannot wedge the
-/// reconciler in an unbounded loop.
-const MAX_DUPLICATE_JUMPS: usize = 64;
-
 /// Hash a free-form id to a 12-char iptables-chain-safe suffix.
 fn chain_name(prefix: &str, key: &str) -> String {
     let hash = blake3::hash(key.as_bytes());
@@ -595,39 +630,41 @@ impl ServiceRouter for IptablesRouter {
         if route.service_id.is_empty() {
             return Err(RouterError::InvalidRoute("empty service_id".into()));
         }
-        // Order is load-bearing: the root chain must exist before the
-        // script appends into it, and the stale jumps must go before the
-        // script adds the fresh one.
-        self.ensure_root_chain().await?;
-        self.prune_jumps(route).await?;
-        let script = Self::render_script(route);
-        self.run_restore(&script).await?;
-        let mut state = self.inner.lock().await;
-        state.routes.insert(route.service_id.clone(), route.clone());
-        Ok(())
+        let mut desired = self.list().await?;
+        desired.insert(route.service_id.clone(), route.clone());
+        self.sync(&desired).await.map(|_| ())
     }
 
     async fn remove(&self, service_id: &str) -> Result<(), RouterError> {
-        use engenho_types::egress::IptablesScript;
-        let chain_svc = chain_name("KUBE-SVC", service_id);
-        // Flush + delete the per-service chain — typed script, no
-        // `format!()` of iptables syntax (★★ TYPED EMISSION).
-        let mut script = IptablesScript::new();
-        script
-            .table("nat")
-            .chain(&chain_svc)
-            .flush(&chain_svc)
-            .delete_chain(&chain_svc)
-            .commit();
-        // Errors on remove are tolerated when the chain is already gone.
-        let _ = self.run_restore(&script.to_string()).await;
-        let mut state = self.inner.lock().await;
-        state.routes.remove(service_id);
-        Ok(())
+        let mut desired = self.list().await?;
+        desired.remove(service_id);
+        self.sync(&desired).await.map(|_| ())
     }
 
     async fn list(&self) -> Result<BTreeMap<String, ServiceRoute>, RouterError> {
         Ok(self.inner.lock().await.routes.clone())
+    }
+
+    async fn sync(&self, desired: &BTreeMap<String, ServiceRoute>) -> Result<usize, RouterError> {
+        let mut state = self.inner.lock().await;
+        let changed = desired
+            .iter()
+            .filter(|(id, route)| state.routes.get(*id) != Some(*route))
+            .count()
+            + state
+                .routes
+                .keys()
+                .filter(|id| !desired.contains_key(*id))
+                .count();
+        if changed == 0 && state.synced {
+            return Ok(0);
+        }
+        self.ensure_root_chain().await?;
+        self.run_restore(&Self::render_sync_script(desired, &state.routes))
+            .await?;
+        state.routes = desired.clone();
+        state.synced = true;
+        Ok(changed)
     }
 }
 
@@ -824,11 +861,14 @@ impl ServiceRoutingController {
         endpoints: Option<&serde_json::Value>,
         service_id: &str,
     ) -> Option<ServiceRoute> {
-        let cluster_ip = service
-            .get("spec")
+        let spec = service.get("spec");
+        if spec.and_then(|s| s.get("type")).and_then(|t| t.as_str()) == Some("ExternalName") {
+            return None;
+        }
+        let cluster_ip = spec
             .and_then(|s| s.get("clusterIP"))
             .and_then(|c| c.as_str())
-            .unwrap_or("")
+            .filter(|c| c.parse::<std::net::Ipv4Addr>().is_ok())?
             .to_string();
         let ports = service
             .get("spec")
@@ -871,7 +911,9 @@ impl ServiceRoutingController {
                             .into_iter()
                             .flatten()
                     })
-                    .filter_map(|addr| addr.get("ip").and_then(|i| i.as_str()).map(String::from))
+                    .filter_map(|addr| addr.get("ip").and_then(|i| i.as_str()))
+                    .filter(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok())
+                    .map(String::from)
                     .collect()
             })
             .unwrap_or_default();
@@ -970,29 +1012,13 @@ impl Controller for ServiceRoutingController {
             })
             .collect();
 
-        let installed = self
+        let changed = self
             .backend
-            .list()
+            .sync(&desired)
             .await
             .map_err(|e| ControllerError::Internal(e.to_string()))?;
-
-        // Upserts: in desired but not installed identically. A backend
-        // error ends the tick uncounted; only a call that returned Ok is a
-        // change.
-        for (id, route) in &desired {
-            if installed.get(id) != Some(route) {
-                let applied = Effect::applied(self.backend.upsert(route).await)
-                    .map_err(|e| ControllerError::Internal(e.to_string()))?;
-                report.record(applied);
-            }
-        }
-        // Removes: in installed but not in desired.
-        for id in installed.keys() {
-            if !desired.contains_key(id) {
-                let applied = Effect::applied(self.backend.remove(id).await)
-                    .map_err(|e| ControllerError::Internal(e.to_string()))?;
-                report.record(applied);
-            }
+        for _ in 0..changed {
+            report.record(Effect::answered(true));
         }
         Ok(report.into())
     }
@@ -1237,6 +1263,125 @@ mod tests {
         assert_eq!(err.kind(), "invalid_route");
     }
 
+    fn route(id: &str, ip: &str, ports: &[(u16, u16)], endpoints: &[&str]) -> ServiceRoute {
+        ServiceRoute {
+            service_id: id.into(),
+            cluster_ip: ip.into(),
+            ports: ports
+                .iter()
+                .map(|(service_port, target_port)| PortMap {
+                    name: service_port.to_string(),
+                    service_port: *service_port,
+                    target_port: *target_port,
+                    protocol: "TCP".into(),
+                })
+                .collect(),
+            endpoints: endpoints.iter().map(|e| (*e).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_service_without_a_virtual_ip_has_no_route() {
+        for spec in [
+            json!({"clusterIP": "None", "ports": [{"port": 9093}]}),
+            json!({"clusterIP": "", "ports": [{"port": 80}]}),
+            json!({"type": "ExternalName", "externalName": "example.com", "ports": [{"port": 80}]}),
+        ] {
+            let svc = json!({"metadata": {"name": "s"}, "spec": spec});
+            assert!(
+                ServiceRoutingController::build_route(&svc, None, "ns/s").is_none(),
+                "{svc}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_sync_script_rebuilds_kube_services_so_no_stale_jump_survives() {
+        let before = route(
+            "monitoring/vmsingle-rio",
+            "10.97.0.10",
+            &[(8429, 8429)],
+            &["10.89.0.9"],
+        );
+        let after = route(
+            "monitoring/vmsingle-rio",
+            "10.97.0.13",
+            &[(8429, 8429)],
+            &["10.89.0.166"],
+        );
+        let gone = route(
+            "monitoring/old",
+            "10.97.0.9",
+            &[(8080, 8080)],
+            &["10.89.0.5"],
+        );
+        let desired: BTreeMap<String, ServiceRoute> = [(after.service_id.clone(), after.clone())]
+            .into_iter()
+            .collect();
+        let installed: BTreeMap<String, ServiceRoute> = [
+            (before.service_id.clone(), before.clone()),
+            (gone.service_id.clone(), gone.clone()),
+        ]
+        .into_iter()
+        .collect();
+        let script = IptablesRouter::render_sync_script(&desired, &installed);
+        assert!(script.contains(":KUBE-SERVICES - [0:0]\n"), "{script}");
+        assert!(script.contains("-A KUBE-SERVICES -d 10.97.0.13/32 -p tcp --dport 8429"));
+        assert!(!script.contains("10.97.0.10"), "{script}");
+        assert!(!script.contains("-d 10.97.0.9/32"), "{script}");
+        assert!(script.contains("DNAT --to-destination 10.89.0.166:8429"));
+        for chain in IptablesRouter::chains_of(&gone) {
+            assert!(
+                script.contains(&format!("-X {chain}\n")),
+                "{chain} not deleted"
+            );
+        }
+        for chain in IptablesRouter::chains_of(&after) {
+            assert!(
+                !script.contains(&format!("-X {chain}\n")),
+                "{chain} deleted"
+            );
+        }
+    }
+
+    #[test]
+    fn each_service_port_reaches_only_its_own_target_port() {
+        let r = route(
+            "monitoring/operator",
+            "10.97.0.11",
+            &[(8080, 8080), (9443, 9443)],
+            &["10.89.0.121"],
+        );
+        let one: BTreeMap<String, ServiceRoute> = [(r.service_id.clone(), r)].into_iter().collect();
+        let script = IptablesRouter::render_sync_script(&one, &BTreeMap::new());
+        let chain_of = |port: &str| {
+            script
+                .lines()
+                .find(|l| {
+                    l.starts_with("-A KUBE-SERVICES") && l.contains(&format!("--dport {port} "))
+                })
+                .and_then(|l| l.rsplit(' ').next())
+                .unwrap()
+                .to_string()
+        };
+        let (http, webhook) = (chain_of("8080"), chain_of("9443"));
+        assert_ne!(http, webhook);
+        let reaches = |svc_chain: &str| -> Vec<String> {
+            let seps: Vec<String> = script
+                .lines()
+                .filter(|l| l.starts_with(&format!("-A {svc_chain} ")))
+                .filter_map(|l| l.rsplit(' ').next().map(str::to_string))
+                .collect();
+            script
+                .lines()
+                .filter(|l| seps.iter().any(|s| l.starts_with(&format!("-A {s} "))))
+                .filter_map(|l| l.rsplit(' ').next().map(str::to_string))
+                .collect()
+        };
+        assert_eq!(reaches(&http), ["10.89.0.121:8080"]);
+        assert_eq!(reaches(&webhook), ["10.89.0.121:9443"]);
+    }
+
     #[test]
     fn iptables_router_render_script_contains_chains() {
         let route = ServiceRoute {
@@ -1259,41 +1404,6 @@ mod tests {
         assert!(script.contains("DNAT --to-destination 10.42.0.1:9898"));
         assert!(script.contains("DNAT --to-destination 10.42.0.2:9898"));
         assert!(script.contains("-m statistic --mode random"));
-    }
-
-    /// The delete must be byte-identical to the append, or pruning removes
-    /// nothing and reports success — a duplicate-cleanup that looks like a
-    /// fix while the duplicates keep accumulating. Derived from one source
-    /// (`service_jump_spec`); this proves the two consumers agree.
-    #[test]
-    fn the_prune_delete_matches_the_rule_the_script_appends() {
-        // The chain name is DERIVED, exactly as prune_jumps derives it — a
-        // literal here would test a rule the router never writes.
-        let chain_svc = chain_name("KUBE-SVC", "ns/svc");
-        let argv = IptablesRouter::jump_delete_argv("10.96.5.1", "tcp", 80, &chain_svc);
-        assert_eq!(argv[0..4], ["-t", "nat", "-D", "KUBE-SERVICES"]);
-        let rendered = argv[4..].join(" ");
-        let route = ServiceRoute {
-            service_id: "ns/svc".into(),
-            cluster_ip: "10.96.5.1".into(),
-            ports: vec![PortMap {
-                name: "http".into(),
-                service_port: 80,
-                target_port: 8080,
-                protocol: "TCP".into(),
-            }],
-            endpoints: ["10.244.0.5".to_string()].into_iter().collect(),
-        };
-        let script = IptablesRouter::render_script(&route);
-        let appended = script
-            .lines()
-            .find(|l| l.starts_with("-A KUBE-SERVICES "))
-            .expect("the script must append a jump");
-        assert_eq!(
-            appended.trim_start_matches("-A KUBE-SERVICES "),
-            rendered,
-            "the -D spec and the -A spec have drifted"
-        );
     }
 
     /// The root chain and its hooks are engenho's to create. A node that
