@@ -62,7 +62,8 @@ use crate::lifecycle::{
 use crate::lifecycle::{DownAction, DownOutcome, RunningAction};
 use crate::pod_volume::{
     MountSource, PodVolumeSource, PodmanVolumeMaterializer, VolumeMaterializer, VolumeResolveError,
-    VolumeTeardown, container_mounts, pod_volumes, teardown_obligation, teardowns_of,
+    VolumeTeardown, container_mounts, pod_volumes, prepare_sub_paths, teardown_obligation,
+    teardowns_of,
 };
 use crate::probe::{
     BlindCause, BlindNotice, ContainerProbes, PodLifecycle, ProbeHandler, ProbeKind, ProbeRuntime,
@@ -3917,7 +3918,9 @@ impl Kubelet {
             // start). A container with no volumeMounts gets `mounts: vec![]`
             // → identical argv to before this brick.
             if let Some(cjson) = Self::container_json(value, &cname) {
-                match container_mounts(cjson, &resolved) {
+                match container_mounts(cjson, &resolved)
+                    .and_then(|mounts| prepare_sub_paths(&mounts).map(|()| mounts))
+                {
                     Ok(mut mounts) => {
                         // Append the projected ServiceAccount credentials.
                         // Upstream's admission injects a `kube-api-access-*`
@@ -3935,7 +3938,7 @@ impl Kubelet {
                             pod = %key.label(),
                             container = %cname,
                             error = %e,
-                            "skipping pod: container references an undeclared volume"
+                            "skipping pod: a container's volume mounts cannot be prepared"
                         );
                         report.objects_skipped += 1;
                         return Ok(());
@@ -5066,8 +5069,9 @@ impl Kubelet {
         // ClusterIP map as the app containers.
         spec.host_add = cluster_ip_hosts.to_vec();
         if let Some(cjson) = Self::container_json_in(value, "initContainers", cname) {
-            spec.mounts =
-                container_mounts(cjson, resolved).map_err(|e| KubeletError::InvalidPod {
+            spec.mounts = container_mounts(cjson, resolved)
+                .and_then(|mounts| prepare_sub_paths(&mounts).map(|()| mounts))
+                .map_err(|e| KubeletError::InvalidPod {
                     pod: cname.to_string(),
                     reason: format!("init container volume: {e}"),
                 })?;

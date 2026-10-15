@@ -1525,6 +1525,65 @@ pub fn container_mounts(
     Ok(out)
 }
 
+/// Create each mount's `subPath` inside its volume when it is missing, as
+/// upstream's kubelet does before it starts a container (`makeMounts`:
+/// `SafeMakeDir(subPath, volumePath, perm)`, `perm` the volume root's own
+/// mode), so `subPath: alertmanager-db` on a fresh emptyDir is a directory
+/// rather than a path the runtime cannot stat.
+///
+/// Only a volume whose root is a directory on this host is touched; a root
+/// that lives elsewhere (a podman machine guest) is left to the runtime. An
+/// existing subPath, file or directory, is left as it is.
+///
+/// # Errors
+///
+/// [`VolumeResolveError::Materialize`] for a subPath that climbs out of its
+/// volume (`..`) or a directory that cannot be created.
+pub fn prepare_sub_paths(mounts: &[ResolvedMount]) -> Result<(), VolumeResolveError> {
+    for m in mounts {
+        let Some(sub) = m.sub_path.as_deref() else {
+            continue;
+        };
+        let BindSource::Path(root) = m.source.bind_source() else {
+            continue;
+        };
+        let rel = Path::new(sub.trim_start_matches('/'));
+        if rel
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err(VolumeResolveError::Materialize(format!(
+                "subPath {sub:?} must be a relative path inside its volume"
+            )));
+        }
+        let Ok(root_meta) = std::fs::metadata(root) else {
+            continue;
+        };
+        if !root_meta.is_dir() {
+            continue;
+        }
+        let mut at = root.to_path_buf();
+        for part in rel.components() {
+            at.push(part);
+            if std::fs::symlink_metadata(&at).is_ok() {
+                continue;
+            }
+            std::fs::create_dir(&at).map_err(|e| {
+                VolumeResolveError::Materialize(format!("mkdir {}: {e}", at.display()))
+            })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = root_meta.permissions().mode() & 0o7777;
+                std::fs::set_permissions(&at, std::fs::Permissions::from_mode(mode)).map_err(
+                    |e| VolumeResolveError::Materialize(format!("chmod {}: {e}", at.display())),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 // =================================================================
 // PodmanVolumeMaterializer — the real host-side materializer
 // =================================================================
@@ -2834,6 +2893,56 @@ mod tests {
             "kubelet creates every emptyDir 0777; a runAsUser pod cannot write otherwise"
         );
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_sub_path_missing_from_its_volume_is_created_with_the_volumes_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "engenho-subpath-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::write(root.join("config.yaml"), b"k: v").unwrap();
+        let mount = |sub: &str| ResolvedMount {
+            source: MountSource::EmptyDirHostDir(root.clone()),
+            mount_path: "/data".into(),
+            read_only: false,
+            sub_path: Some(sub.into()),
+        };
+
+        prepare_sub_paths(&[
+            mount("alertmanager-db"),
+            mount("nested/deeper"),
+            mount("config.yaml"),
+        ])
+        .unwrap();
+
+        for dir in ["alertmanager-db", "nested", "nested/deeper"] {
+            let meta = std::fs::metadata(root.join(dir)).unwrap();
+            assert!(meta.is_dir(), "{dir}");
+            assert_eq!(meta.permissions().mode() & 0o777, 0o777, "{dir}");
+        }
+        assert!(
+            std::fs::metadata(root.join("config.yaml"))
+                .unwrap()
+                .is_file()
+        );
+
+        assert!(prepare_sub_paths(&[mount("../escape")]).is_err());
+        assert!(!root.parent().unwrap().join("escape").exists());
+
+        let elsewhere = ResolvedMount {
+            source: MountSource::EmptyDirHostDir(root.join("not-on-this-host")),
+            ..mount("x")
+        };
+        prepare_sub_paths(&[elsewhere]).unwrap();
+        assert!(!root.join("not-on-this-host").exists());
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// The whole defect in one assertion: a mountpoint reported by a REMOTE
