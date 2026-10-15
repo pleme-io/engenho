@@ -11,7 +11,7 @@
 //! that case-folds. Upstream rejects all of them at admission with `422
 //! Invalid`, and every client is written against that promise.
 //!
-//! ## Two rules, not one
+//! ## Three rules, not one
 //!
 //! Upstream applies **DNS-1123 subdomain** to most resources and the stricter
 //! **DNS-1123 label** to those whose names become DNS labels in their own
@@ -24,6 +24,7 @@
 //! |---|---|---|---|
 //! | [`NameRule::Label`] | 63 | `[a-z0-9-]`, must start+end alphanumeric | Namespace, Service |
 //! | [`NameRule::Subdomain`] | 253 | `[a-z0-9-.]`, each dot-separated part a label | Pod, ConfigMap, … |
+//! | [`NameRule::PathSegment`] | none | anything but `.`/`..`, no `/` or `%` | Role, ClusterRole, RoleBinding, ClusterRoleBinding |
 //!
 //! ## Tier honesty
 //!
@@ -47,6 +48,10 @@ pub enum NameRule {
     /// DNS-1123 **subdomain** — ≤253 chars, dot-separated labels. The default
     /// for most kinds.
     Subdomain,
+    /// A REST path segment — anything but `.` and `..`, with no `/` or `%`.
+    /// Upstream's `ValidateRBACName` (`path.IsValidPathSegmentName`), so the
+    /// four RBAC kinds can be named `system:controller:…`.
+    PathSegment,
 }
 
 impl NameRule {
@@ -56,21 +61,26 @@ impl NameRule {
     /// call site cannot pick the wrong strictness. The label-ruled set is
     /// small and closed; everything else is subdomain.
     #[must_use]
-    pub fn for_kind(kind: &str) -> Self {
-        match kind {
+    pub fn for_kind(group: &str, kind: &str) -> Self {
+        match (group, kind) {
             // A Namespace is a DNS segment in every in-cluster hostname; a
             // Service is the leftmost label of its cluster DNS name.
-            "Namespace" | "Service" => Self::Label,
+            ("", "Namespace" | "Service") => Self::Label,
+            (
+                "rbac.authorization.k8s.io",
+                "Role" | "ClusterRole" | "RoleBinding" | "ClusterRoleBinding",
+            ) => Self::PathSegment,
             _ => Self::Subdomain,
         }
     }
 
-    /// The maximum length this rule permits.
+    /// The maximum length this rule permits; a path segment has none.
     #[must_use]
-    pub fn max_len(self) -> usize {
+    pub fn max_len(self) -> Option<usize> {
         match self {
-            Self::Label => 63,
-            Self::Subdomain => 253,
+            Self::Label => Some(63),
+            Self::Subdomain => Some(253),
+            Self::PathSegment => None,
         }
     }
 }
@@ -98,6 +108,16 @@ pub enum NameError {
     /// A dot appeared where the rule forbids one (label rule), or an empty
     /// dot-separated part appeared (subdomain rule).
     BadDotting,
+    /// A path-segment name that is `.` or `..`.
+    Reserved {
+        /// The name.
+        name: &'static str,
+    },
+    /// A path-segment name containing `/` or `%`.
+    IllegalSubstring {
+        /// The substring.
+        part: &'static str,
+    },
 }
 
 impl fmt::Display for NameError {
@@ -117,6 +137,8 @@ impl fmt::Display for NameError {
                 "name must start and end with a lowercase alphanumeric character"
             ),
             Self::BadDotting => write!(f, "name has an empty or misplaced '.' separated part"),
+            Self::Reserved { name } => write!(f, "may not be '{name}'"),
+            Self::IllegalSubstring { part } => write!(f, "may not contain '{part}'"),
         }
     }
 }
@@ -137,10 +159,15 @@ impl ResourceName {
         if name.is_empty() {
             return Err(NameError::Empty);
         }
-        if name.len() > rule.max_len() {
+        if rule == NameRule::PathSegment {
+            return Self::parse_path_segment(name);
+        }
+        if let Some(max) = rule.max_len()
+            && name.len() > max
+        {
             return Err(NameError::TooLong {
                 len: name.len(),
-                max: rule.max_len(),
+                max,
             });
         }
 
@@ -171,12 +198,26 @@ impl ResourceName {
         Ok(Self(name.to_string()))
     }
 
-    /// Validate against the rule upstream applies to `kind`.
+    fn parse_path_segment(name: &str) -> Result<Self, NameError> {
+        for reserved in [".", ".."] {
+            if name == reserved {
+                return Err(NameError::Reserved { name: reserved });
+            }
+        }
+        for part in ["/", "%"] {
+            if name.contains(part) {
+                return Err(NameError::IllegalSubstring { part });
+            }
+        }
+        Ok(Self(name.to_string()))
+    }
+
+    /// Validate against the rule upstream applies to `kind` in `group`.
     ///
     /// # Errors
     /// Returns the typed [`NameError`] describing the first violation.
-    pub fn parse_for_kind(name: &str, kind: &str) -> Result<Self, NameError> {
-        Self::parse(name, NameRule::for_kind(kind))
+    pub fn parse_for_kind(name: &str, group: &str, kind: &str) -> Result<Self, NameError> {
+        Self::parse(name, NameRule::for_kind(group, kind))
     }
 
     /// The validated name.
@@ -264,13 +305,43 @@ mod tests {
     /// The rule is chosen by KIND so a call site cannot pick wrong.
     #[test]
     fn kinds_that_become_dns_labels_get_the_strict_rule() {
-        assert_eq!(NameRule::for_kind("Namespace"), NameRule::Label);
-        assert_eq!(NameRule::for_kind("Service"), NameRule::Label);
-        assert_eq!(NameRule::for_kind("Pod"), NameRule::Subdomain);
-        assert_eq!(NameRule::for_kind("ConfigMap"), NameRule::Subdomain);
+        assert_eq!(NameRule::for_kind("", "Namespace"), NameRule::Label);
+        assert_eq!(NameRule::for_kind("", "Service"), NameRule::Label);
+        assert_eq!(NameRule::for_kind("", "Pod"), NameRule::Subdomain);
+        assert_eq!(NameRule::for_kind("", "ConfigMap"), NameRule::Subdomain);
         // A Pod may carry dots; a Namespace may not.
-        assert!(ResourceName::parse_for_kind("a.b", "Pod").is_ok());
-        assert!(ResourceName::parse_for_kind("a.b", "Namespace").is_err());
+        assert!(ResourceName::parse_for_kind("a.b", "", "Pod").is_ok());
+        assert!(ResourceName::parse_for_kind("a.b", "", "Namespace").is_err());
+    }
+
+    #[test]
+    fn rbac_names_are_path_segments_as_upstream_validates_them() {
+        const RBAC: &str = "rbac.authorization.k8s.io";
+        for kind in ["Role", "ClusterRole", "RoleBinding", "ClusterRoleBinding"] {
+            assert_eq!(NameRule::for_kind(RBAC, kind), NameRule::PathSegment);
+            for good in [
+                "monitoring:monitoring:vmagent-rio",
+                "system:controller:Bootstrap_Signer",
+                "...",
+            ] {
+                assert!(
+                    ResourceName::parse_for_kind(good, RBAC, kind).is_ok(),
+                    "{kind} {good:?}"
+                );
+            }
+            for (bad, why) in [
+                (".", "may not be '.'"),
+                ("..", "may not be '..'"),
+                ("a/b", "may not contain '/'"),
+                ("a%b", "may not contain '%'"),
+                ("", "name must not be empty"),
+            ] {
+                let e = ResourceName::parse_for_kind(bad, RBAC, kind).unwrap_err();
+                assert_eq!(e.to_string(), why, "{kind} {bad:?}");
+            }
+        }
+        assert_eq!(NameRule::for_kind("example.com", "Role"), NameRule::Subdomain);
+        assert!(ResourceName::parse_for_kind("a:b", "", "ConfigMap").is_err());
     }
 
     /// Errors render through Display, never format!()-composed free text.

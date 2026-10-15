@@ -621,10 +621,11 @@ impl StoreBackedHandler {
         // Measured 2026-08-28: `UPPERCASE`, `has spaces`, `-leading-dash`,
         // `has_underscore` and a 64-char name were all accepted with 201. The
         // rule is chosen by KIND (Namespace/Service take the stricter DNS-1123
-        // LABEL), so a call site cannot pick the wrong strictness. 422, not
+        // LABEL, the RBAC kinds a path segment), so a call site cannot pick
+        // the wrong strictness. 422, not
         // 400: client-go's `IsInvalid` keys on it, and a permanently invalid
         // object must not look transient.
-        if let Err(e) = ResourceName::parse_for_kind(name, &self.kind) {
+        if let Err(e) = ResourceName::parse_for_kind(name, &self.group, &self.kind) {
             return Err(WriteRefusal::Invalid(ObjectInvalid {
                 kind: self.kind.clone(),
                 name: name.to_string(),
