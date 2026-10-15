@@ -73,6 +73,7 @@ driver_names!(
     CsiRegistrar,
     CniStatus,
     NodeManifests,
+    NodeLifecycle,
     Kubelet,
 );
 

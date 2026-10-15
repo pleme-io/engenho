@@ -5,14 +5,15 @@
 //!
 //! Before T1.3d the strategy judged readiness from `status.conditions` as
 //! stored, and it had two "assume schedulable" arms: a node with no
-//! conditions, and a node with no `Ready` condition. The stored condition is
-//! the one value the apiserver refuses to serve.
-//! [`engenho_controllers::node_lease::project_ready_condition`] replaces it on
-//! every Node read with the condition the node's Lease implies, because a
-//! kubelet that wedges leaves `Ready=True` standing (on rio: three days, every
-//! pod Pending, node Ready). So `kubectl get node` said `Unknown` while the
-//! scheduler kept placing pods on the node. And a node nobody had ever heard
-//! from was schedulable outright.
+//! conditions, and a node with no `Ready` condition. A kubelet that wedges
+//! leaves `Ready=True` standing (on rio: three days, every pod Pending, node
+//! Ready) until something writes `Unknown`; since 2026-10-15 the
+//! node-lifecycle controller does, one tick after the Lease goes stale. The
+//! scheduler does not wait for that write: it derives the condition from the
+//! Lease itself, in memory, with
+//! [`engenho_controllers::node_lease::project_ready_condition`], so a node
+//! nobody has heard from is never schedulable on the strength of a stored
+//! value.
 //!
 //! [`ObservedNode`] has one constructor, [`ObservedNode::project`], and it runs
 //! that same projection. The Filter stage ([`crate::filter`]) judges only

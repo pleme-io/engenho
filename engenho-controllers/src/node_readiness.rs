@@ -1,7 +1,27 @@
-//! Publishing this node's `Ready` condition WITHOUT undoing anyone else's
-//! write to the Node (T1.3b).
+//! Publishing a node's `Ready` condition as a store write, WITHOUT undoing
+//! anyone else's write to the Node (T1.3b).
 //!
-//! ── ★ THE DEFECT THIS CLOSES ──────────────────────────────────────────────
+//! ── ★ THE ONE WRITER OF `Ready` ───────────────────────────────────────────
+//! The condition reaches a client only through a committed write: a write
+//! bumps `metadata.resourceVersion` and fans a `MODIFIED` to every watcher,
+//! so an informer keyed on the revision sees each transition. Two callers
+//! share this module and nothing else writes the condition:
+//!
+//!   * the kubelet, for its own node, every tick (it also refreshes the
+//!     heartbeat every [`REPORT_FREQUENCY`], as upstream's kubelet posts
+//!     status at least every `nodeStatusReportFrequency`);
+//!   * the node-lifecycle controller ([`crate::node_lifecycle`]), for every
+//!     Node, so a node whose kubelet wedged or whose process died is moved to
+//!     `Unknown` by a process that is still running.
+//!
+//! Until 2026-10-15 the apiserver re-derived the condition on every GET and
+//! LIST instead. That served content that changed under one
+//! `resourceVersion` (measured on ryn: three reads 12 s apart, one revision,
+//! three heartbeats; a LIST reading `NotReady` and a GET reading `Ready` at
+//! the same revision), so no watch cache ever saw a heartbeat or a Ready
+//! transition.
+//!
+//! ── ★ THE DEFECT THE PRECONDITION CLOSES ──────────────────────────────────
 //! The kubelet read the whole Node, merged its `Ready` condition in, and wrote
 //! the whole Node back with no precondition. Anything that committed between
 //! that read and that write — `kubectl cordon` setting `spec.unschedulable`,
@@ -22,9 +42,9 @@
 //! delay a readiness publish by a tick but can never be overwritten by one.
 //!
 //! The condition itself comes from
-//! [`engenho_controllers::node_lease::project_ready_condition`] — the same
-//! derivation the apiserver applies at read time — so the value the kubelet
-//! writes and the value a reader is served cannot be computed two ways.
+//! [`crate::node_lease::project_ready_condition`], the one derivation of
+//! `Ready` from a Lease, so the kubelet and the lifecycle controller cannot
+//! compute it two ways.
 //!
 //! ── ★ TIER, STATED ────────────────────────────────────────────────────────
 //! A stale write being refused is enforced by the store's CAS, identically on
@@ -33,8 +53,11 @@
 //! revision), not a crate-wide type: another module holding the store can
 //! still issue an unconditional Node `Put`.
 
-use engenho_controllers::node_lease::{find_ready_condition, project_ready_condition};
-use engenho_controllers::status::resource_version_of;
+use std::time::Duration;
+
+use crate::effect::Effect;
+use crate::node_lease::{find_ready_condition, project_ready_condition};
+use crate::status::resource_version_of;
 use engenho_store::{
     ResourceKey, ResourceValue, StoreError, StoreMesh,
     command::{Reason, ResourceCommand, ResourceOp},
@@ -42,20 +65,22 @@ use engenho_store::{
 };
 use serde_json::Value;
 
+pub const REPORT_FREQUENCY: Duration = Duration::from_secs(5 * 60);
+
 /// A Node as read from the store, paired with the revision it was read at.
 ///
 /// Every Node write in this module takes one of these, and the write's
 /// precondition is `revision` — so what was written is always what was
 /// derived from, or nothing.
 #[derive(Debug, Clone)]
-pub(crate) struct ObservedNode {
+pub struct ObservedNode {
     value: ResourceValue,
     revision: Revision,
 }
 
 /// Why a Node could not be observed at a revision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Unobservable {
+pub enum Unobservable {
     /// No object at the key: registration has not landed, or the Node was
     /// deleted.
     Absent,
@@ -73,7 +98,7 @@ impl ObservedNode {
     ///
     /// [`Unobservable::Unversioned`] when `metadata.resourceVersion` is
     /// absent or not a revision.
-    pub(crate) fn from_stored(value: ResourceValue) -> Result<Self, Unobservable> {
+    pub fn from_stored(value: ResourceValue) -> Result<Self, Unobservable> {
         let revision = resource_version_of(&value).ok_or(Unobservable::Unversioned)?;
         Ok(Self { value, revision })
     }
@@ -84,7 +109,7 @@ impl ObservedNode {
     ///
     /// [`Unobservable::Absent`] when there is no object at `key`;
     /// [`Unobservable::Unversioned`] as for [`Self::from_stored`].
-    pub(crate) async fn read(store: &StoreMesh, key: &ResourceKey) -> Result<Self, Unobservable> {
+    pub async fn read(store: &StoreMesh, key: &ResourceKey) -> Result<Self, Unobservable> {
         let value = store.get(key).await.ok_or(Unobservable::Absent)?;
         Self::from_stored(value)
     }
@@ -93,7 +118,7 @@ impl ObservedNode {
 /// What one readiness publish did. Each arm is a fact the publish observed;
 /// none is inferred from another.
 #[derive(Debug)]
-pub(crate) enum ReadinessPublish {
+pub enum ReadinessPublish {
     /// The derived condition committed. `retried` is true when the first write
     /// lost to a concurrent one and the re-derived write committed instead.
     /// `condition` is the `Ready` condition as written.
@@ -102,10 +127,13 @@ pub(crate) enum ReadinessPublish {
         retried: bool,
         /// The `Ready` condition that was written.
         condition: Value,
+        /// What the store did with the write.
+        effect: Effect,
     },
     /// The stored `Ready` condition already carries the derived status and
-    /// reason. Nothing was proposed: `lastHeartbeatTime` moves every tick, so
-    /// writing on it would grow the journal without bound on an idle cluster.
+    /// reason, and its heartbeat is younger than the refresh interval the
+    /// caller asked for. Nothing was proposed: writing on every tick would
+    /// grow the journal without bound on an idle cluster.
     Unchanged,
     /// There is no Node at the key. It is never created here: a Node deleted
     /// between the read and the write stays deleted.
@@ -134,7 +162,7 @@ impl From<Unobservable> for ReadinessPublish {
 
 /// One CAS attempt, before the retry decision.
 enum Attempt {
-    Written(Value),
+    Written(Value, Effect),
     Unchanged,
     Malformed,
     Lost,
@@ -147,7 +175,11 @@ impl Attempt {
     /// remains.
     fn settled(self, retried: bool) -> Option<ReadinessPublish> {
         match self {
-            Self::Written(condition) => Some(ReadinessPublish::Published { retried, condition }),
+            Self::Written(condition, effect) => Some(ReadinessPublish::Published {
+                retried,
+                condition,
+                effect,
+            }),
             Self::Unchanged => Some(ReadinessPublish::Unchanged),
             Self::Malformed => Some(ReadinessPublish::Malformed),
             Self::Failed(e) => Some(ReadinessPublish::Store(e)),
@@ -161,15 +193,18 @@ impl Attempt {
 /// concurrent write got there first.
 ///
 /// `lease` is this node's Lease as read from the store (`None` when it has
-/// none); `now` stamps `lastHeartbeatTime`.
-pub(crate) async fn publish_ready(
+/// none); `now` stamps `lastHeartbeatTime`. `refresh` is how old a stored
+/// heartbeat may grow before an unchanged condition is written again; `None`
+/// writes only on a change of status or reason.
+pub async fn publish_ready(
     store: &StoreMesh,
     key: &ResourceKey,
     lease: Option<&ResourceValue>,
     now: &str,
+    refresh: Option<Duration>,
 ) -> ReadinessPublish {
     match ObservedNode::read(store, key).await {
-        Ok(observed) => publish_ready_onto(store, key, observed, lease, now).await,
+        Ok(observed) => publish_ready_onto(store, key, observed, lease, now, refresh).await,
         Err(why) => why.into(),
     }
 }
@@ -179,14 +214,15 @@ pub(crate) async fn publish_ready(
 /// The seam exists so the race is testable: a caller may hand in an
 /// observation that a concurrent write has since superseded, which is exactly
 /// what happens when a cordon lands between the read and the write.
-pub(crate) async fn publish_ready_onto(
+pub async fn publish_ready_onto(
     store: &StoreMesh,
     key: &ResourceKey,
     observed: ObservedNode,
     lease: Option<&ResourceValue>,
     now: &str,
+    refresh: Option<Duration>,
 ) -> ReadinessPublish {
-    if let Some(done) = attempt(store, key, &observed, lease, now)
+    if let Some(done) = attempt(store, key, &observed, lease, now, refresh)
         .await
         .settled(false)
     {
@@ -197,7 +233,7 @@ pub(crate) async fn publish_ready_onto(
         Ok(fresh) => fresh,
         Err(why) => return why.into(),
     };
-    attempt(store, key, &fresh, lease, now)
+    attempt(store, key, &fresh, lease, now, refresh)
         .await
         .settled(true)
         .unwrap_or(ReadinessPublish::Contended)
@@ -210,6 +246,7 @@ async fn attempt(
     observed: &ObservedNode,
     lease: Option<&ResourceValue>,
     now: &str,
+    refresh: Option<Duration>,
 ) -> Attempt {
     let mut desired = observed.value.clone();
     project_ready_condition(&mut desired, lease, now);
@@ -219,11 +256,10 @@ async fn attempt(
         return Attempt::Malformed;
     };
 
-    // Only what an operator acts on counts as a change; see
-    // [`ReadinessPublish::Unchanged`].
     let unchanged = find_ready_condition(&observed.value).is_some_and(|previous| {
         previous.get("status") == condition.get("status")
             && previous.get("reason") == condition.get("reason")
+            && !heartbeat_due(previous, refresh)
     });
     if unchanged {
         return Attempt::Unchanged;
@@ -239,9 +275,20 @@ async fn attempt(
         .await
     {
         Ok(applied) if applied.op == ResourceOp::Conflict => Attempt::Lost,
-        Ok(_) => Attempt::Written(condition),
+        Ok(applied) => Attempt::Written(condition, Effect::of(applied.op)),
         Err(e) => Attempt::Failed(e),
     }
+}
+
+fn heartbeat_due(previous: &Value, refresh: Option<Duration>) -> bool {
+    let Some(refresh) = refresh else {
+        return false;
+    };
+    previous
+        .get("lastHeartbeatTime")
+        .and_then(Value::as_str)
+        .and_then(engenho_types::time::age_since_rfc3339)
+        .is_none_or(|age| age >= refresh)
 }
 
 #[cfg(test)]
@@ -249,7 +296,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use engenho_controllers::node_lease::lease_value;
+    use crate::node_lease::lease_value;
     use engenho_store::{InProcessRouter, default_config};
     use serde_json::json;
 
@@ -348,6 +395,7 @@ mod tests {
             stale,
             Some(&lease),
             &engenho_types::time::now_rfc3339_utc(),
+            None,
         )
         .await;
 
@@ -402,6 +450,7 @@ mod tests {
             stale,
             Some(&lease),
             &engenho_types::time::now_rfc3339_utc(),
+            None,
         )
         .await;
 
@@ -428,6 +477,7 @@ mod tests {
             &node_key(),
             Some(&lease),
             &engenho_types::time::now_rfc3339_utc(),
+            None,
         )
         .await;
         assert!(
@@ -443,6 +493,7 @@ mod tests {
             &node_key(),
             Some(&lease),
             &engenho_types::time::now_rfc3339_utc(),
+            None,
         )
         .await;
         assert!(matches!(second, ReadinessPublish::Unchanged), "{second:?}");
@@ -460,6 +511,7 @@ mod tests {
             &node_key(),
             Some(&lease),
             &engenho_types::time::now_rfc3339_utc(),
+            None,
         )
         .await;
         assert!(matches!(outcome, ReadinessPublish::NoNode), "{outcome:?}");
@@ -467,6 +519,68 @@ mod tests {
             store.get(&node_key()).await.is_none(),
             "registration creates Nodes; a readiness publish never does"
         );
+        shutdown(store).await;
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_condition_is_written_again_once_its_heartbeat_is_due() {
+        let store = boot("readiness-heartbeat-refresh").await;
+        seed_node(&store).await;
+        let lease = fresh_lease();
+        let now = engenho_types::time::now_rfc3339_utc();
+        let first = publish_ready(&store, &node_key(), Some(&lease), &now, None).await;
+        assert!(
+            matches!(first, ReadinessPublish::Published { .. }),
+            "{first:?}"
+        );
+
+        let held = store.current_revision().await;
+        let young = publish_ready(
+            &store,
+            &node_key(),
+            Some(&lease),
+            &now,
+            Some(REPORT_FREQUENCY),
+        )
+        .await;
+        assert!(matches!(young, ReadinessPublish::Unchanged), "{young:?}");
+        assert_eq!(store.current_revision().await, held);
+
+        let mut node = store.get(&node_key()).await.unwrap();
+        for c in node["status"]["conditions"].as_array_mut().unwrap() {
+            if c["type"] == "Ready" {
+                c["lastHeartbeatTime"] = serde_json::json!("2020-01-01T00:00:00Z");
+            }
+        }
+        store
+            .propose(ResourceCommand::Put {
+                key: node_key(),
+                value: node,
+                expected: None,
+                reason: Reason::Operator,
+            })
+            .await
+            .unwrap();
+        let stale_rv = resource_version_of(&store.get(&node_key()).await.unwrap()).unwrap();
+
+        let due = publish_ready(
+            &store,
+            &node_key(),
+            Some(&lease),
+            &now,
+            Some(REPORT_FREQUENCY),
+        )
+        .await;
+        assert!(matches!(due, ReadinessPublish::Published { .. }), "{due:?}");
+        let node = store.get(&node_key()).await.unwrap();
+        let ready = find_ready_condition(&node).unwrap();
+        assert_eq!(ready["lastHeartbeatTime"], now.as_str(), "{node}");
+        assert_ne!(
+            resource_version_of(&node).unwrap(),
+            stale_rv,
+            "a moved heartbeat is a new revision: {node}"
+        );
+
         shutdown(store).await;
     }
 

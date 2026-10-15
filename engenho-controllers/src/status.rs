@@ -572,4 +572,70 @@ mod tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn a_pod_status_write_is_a_new_revision_and_a_modified_event() {
+        use engenho_store::command::{Reason, ResourceCommand};
+        use engenho_store::{
+            InProcessRouter, StoreMesh, WatchEventKind, WatchOpts, WatchSignal, default_config,
+        };
+
+        let store = StoreMesh::start(
+            1,
+            "in-process://1".into(),
+            InProcessRouter::new(),
+            default_config("pod-status-revision").unwrap(),
+        )
+        .await
+        .unwrap();
+        store.initialize_singleton().await.unwrap();
+        assert!(
+            store
+                .wait_for_leadership(std::time::Duration::from_secs(3))
+                .await
+        );
+        let key = ResourceKey::namespaced("", "v1", "Pod", "default", "p");
+        store
+            .propose(ResourceCommand::put(
+                key.clone(),
+                serde_json::json!({"metadata": {"name": "p", "namespace": "default"},
+                    "spec": {"containers": [{"name": "c", "image": "i"}]},
+                    "status": {"phase": "Pending", "qosClass": "BestEffort"}}),
+                Reason::Operator,
+            ))
+            .await
+            .unwrap();
+        let pod = store.get(&key).await.unwrap();
+        let mut watch = store
+            .watch_from(WatchOpts::from_revision(store.current_revision().await))
+            .await
+            .unwrap();
+        let running = serde_json::json!({"phase": "Running", "qosClass": "BestEffort"});
+        assert!(
+            write_status_cas(&store, &key, &pod, &running)
+                .await
+                .unwrap()
+                .changed()
+        );
+        let after = store.get(&key).await.unwrap();
+        assert!(
+            resource_version_of(&after) > resource_version_of(&pod),
+            "{after}"
+        );
+        let Some(Ok(WatchSignal::Event(event))) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), watch.next())
+                .await
+                .unwrap()
+        else {
+            panic!("no event for a pod status write");
+        };
+        assert_eq!(event.kind, WatchEventKind::Modified);
+        assert_eq!(event.object["status"]["phase"], "Running");
+        assert!(matches!(
+            write_status_cas(&store, &key, &after, &running)
+                .await
+                .unwrap(),
+            StatusWriteOutcome::NoChange
+        ));
+    }
 }

@@ -1029,6 +1029,7 @@ components:
         - csi_registrar
         - cni_status
         - node_manifests
+        - node_lifecycle
         - kubelet
     ChildName:
       type: string
@@ -1055,6 +1056,7 @@ components:
         - csi_registrar
         - cni_status
         - node_manifests
+        - node_lifecycle
         - kubelet
         - kubelet_http
         - etcd_facade

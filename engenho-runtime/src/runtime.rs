@@ -3925,6 +3925,10 @@ impl Parts {
                     self.router.clone(),
                 ),
             ),
+            Driver::NodeLifecycle => self.watch(
+                driver,
+                engenho_controllers::node_lifecycle::NodeLifecycleController::new(store.clone()),
+            ),
             // Kubelet: bound Pod → container via the backend.
             Driver::Kubelet => self.watch(
                 driver,
@@ -4668,12 +4672,12 @@ mod tests {
         // converging that kind), so the arithmetic here is the tripwire.
         // Moving it is correct ONLY alongside an intentional change to the
         // driver set — which is what added served_capability, then
-        // volume_snapshot (19 → 20), then pvc_protection (20 → 21, W9), and
-        // now node_manifests (21 → 22).
+        // volume_snapshot (19 → 20), then pvc_protection (20 → 21, W9),
+        // node_manifests (21 → 22), and node_lifecycle (22 → 23).
         // Every driver in the catalog is on in this config, so it is also the
         // catalog's size.
-        assert_eq!(running_drivers(&rt), 22);
-        assert_eq!(Driver::ALL.len(), 22);
+        assert_eq!(running_drivers(&rt), 23);
+        assert_eq!(Driver::ALL.len(), 23);
         rt.shutdown().await.unwrap();
     }
 
@@ -5027,7 +5031,7 @@ mod tests {
         let mut cfg = ephemeral_test_config();
         cfg.controllers.enable.service_routing = false;
         let rt = Runtime::start(cfg).await.unwrap();
-        assert_eq!(running_drivers(&rt), 21);
+        assert_eq!(running_drivers(&rt), 22);
         assert!(
             rt.children()
                 .get(Child::Driver(Driver::ServiceRouting))
@@ -5100,6 +5104,7 @@ mod tests {
             )],
             Driver::CniStatus => vec![file!("engenho-controllers/src/cni_status.rs")],
             Driver::NodeManifests => vec![file!("engenho-runtime/src/node_manifests.rs")],
+            Driver::NodeLifecycle => vec![file!("engenho-controllers/src/node_lifecycle.rs")],
             Driver::Kubelet => vec![file!("engenho-kubelet/src/kubelet.rs")],
         }
     }

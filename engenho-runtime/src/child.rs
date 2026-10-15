@@ -122,6 +122,7 @@ engenho_controllers::closed_enum! {
         CsiRegistrar,
         CniStatus,
         NodeManifests,
+        NodeLifecycle,
         Kubelet,
     }
 }
@@ -178,6 +179,7 @@ impl Driver {
             Self::CsiRegistrar => "csi-registrar",
             Self::CniStatus => "cni-status",
             Self::NodeManifests => "node-manifests",
+            Self::NodeLifecycle => "node-lifecycle",
             Self::Kubelet => "kubelet",
         }
     }
@@ -201,6 +203,7 @@ impl Driver {
             | Self::PvcProtection
             | Self::ServedCapability
             | Self::CniStatus
+            | Self::NodeLifecycle
             // Its only memory is a skip cache; losing it costs one full pass.
             | Self::NodeManifests => TickState::Stateless,
             // The `local` pod map lives across ticks.
@@ -249,6 +252,7 @@ impl Driver {
             | Self::CsiRegistrar
             | Self::CniStatus
             | Self::NodeManifests
+            | Self::NodeLifecycle
             | Self::Kubelet => None,
         }
     }
@@ -560,6 +564,7 @@ impl Child {
                 | Driver::ServedCapability
                 | Driver::CniStatus
                 | Driver::NodeManifests
+                | Driver::NodeLifecycle
                 | Driver::Scheduler
                 | Driver::NetworkPolicy => Respawn::Rebuild,
                 Driver::Kubelet => {

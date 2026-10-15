@@ -47,8 +47,8 @@
 //! This deviates from upstream on purpose. Upstream's lease controller
 //! renews whenever the kubelet process runs, and reports the PLEG health
 //! check on the Node's Ready condition. engenho's Lease is the only input to
-//! its readiness projection (the apiserver's read of a Node, the scheduler's
-//! `NodeReady` filter), so it must carry progress, not just presence.
+//! its readiness projection (the node-lifecycle driver's write, the
+//! scheduler's `NodeReady` filter), so it must carry progress, not just presence.
 //!
 //! ## Tier
 //!
@@ -70,8 +70,9 @@
 //!   method), so the runtime builds the lease over
 //!   [`RuntimeHealthSource::Unobserved`], and it renews by the kubelet alone,
 //!   as before W8. It logs that once. See [`crate::runtime_health`].
-//! * A dead engenho process renews nothing and publishes nothing; saying so
-//!   takes a peer reading the lease (`pending-node-lifecycle-controller`).
+//! * A dead engenho process renews nothing and publishes nothing; its peers'
+//!   node-lifecycle driver ([`engenho_controllers::node_lifecycle`]) reads
+//!   the stale lease and writes `Unknown`.
 //!
 //! [`GRACE_PERIOD`]: engenho_controllers::node_lease::GRACE_PERIOD
 //! [`RENEW_INTERVAL`]: engenho_controllers::node_lease::RENEW_INTERVAL

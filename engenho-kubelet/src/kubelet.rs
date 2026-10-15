@@ -1223,21 +1223,24 @@ impl Kubelet {
     ///
     /// ── ★ WHAT IT STILL CANNOT DO, NAMED RATHER THAN IMPLIED ──────────────
     /// A node whose engenho process is DEAD writes neither the lease nor the
-    /// condition, so its last-published value stands. Detecting that requires a
-    /// different actor reading the lease — upstream's node-lifecycle-controller,
-    /// which is a separate process precisely because a dead kubelet cannot
-    /// report its own death. `pending-node-lifecycle-controller`: on a
-    /// multi-node engenho (`engenho-revoada` carries the membership layer)
-    /// peers can judge each other's leases; single-node cannot, and no amount
-    /// of code here changes that.
+    /// condition. The node-lifecycle controller
+    /// ([`engenho_controllers::node_lifecycle`]) reads every Node's Lease and
+    /// writes `Unknown` once it is stale: on this node when only the kubelet
+    /// wedged, on a peer when the whole process died. A single-node engenho
+    /// whose process is dead serves no reads, so nobody is told otherwise.
     ///
     /// ── ★ WHY THE WRITE CARRIES A PRECONDITION (T1.3b) ────────────────────
     /// The publish rewrites the WHOLE Node. Written unconditionally, it
     /// reverted anything that committed between its read and its write — a
-    /// cordon, a taint, a label. [`crate::node_readiness`] writes at the
-    /// revision it read and, on a lost race, re-reads and re-derives once.
+    /// cordon, a taint, a label. [`engenho_controllers::node_readiness`]
+    /// writes at the revision it read and, on a lost race, re-reads and
+    /// re-derives once. An unchanged condition is written again every
+    /// [`engenho_controllers::node_readiness::REPORT_FREQUENCY`], so the
+    /// heartbeat moves only with a new revision.
     async fn publish_node_readiness(&self) {
-        use crate::node_readiness::{ReadinessPublish, publish_ready};
+        use engenho_controllers::node_readiness::{
+            REPORT_FREQUENCY, ReadinessPublish, publish_ready,
+        };
 
         // The heartbeat AS THE STORE HAS IT — absent when never written or lost.
         let lease = self
@@ -1251,10 +1254,13 @@ impl Kubelet {
             &node_key,
             lease.as_ref(),
             &engenho_types::time::now_rfc3339_utc(),
+            Some(REPORT_FREQUENCY),
         )
         .await
         {
-            ReadinessPublish::Published { retried, condition } => {
+            ReadinessPublish::Published {
+                retried, condition, ..
+            } => {
                 let field = |name: &str| condition.get(name).and_then(Value::as_str);
                 info!(
                     node = %self.node_name,
