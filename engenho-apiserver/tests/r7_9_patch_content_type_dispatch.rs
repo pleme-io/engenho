@@ -312,3 +312,45 @@ async fn server_side_apply_content_type_merges_and_records_ownership() {
     );
     server.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn the_victoriametrics_operator_patches_apply_to_absent_keys() {
+    let (_s, server) = boot().await;
+    let addr = server.local_addr().to_string();
+    let client = reqwest::Client::new();
+    seed_two_container_deploy(&addr, &client).await;
+    let url = format!("http://{addr}/apis/apps/v1/namespaces/default/deployments/web");
+
+    let resp = client
+        .patch(&url)
+        .header("Content-Type", "application/json-patch+json")
+        .body(
+            r#"[{"op":"replace","path":"/metadata/finalizers","value":["apps.victoriametrics.com/finalizer"]},{"op":"replace","path":"/metadata/ownerReferences","value":null}]"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "{}", resp.text().await.unwrap());
+
+    let resp = client
+        .patch(format!("{url}/status"))
+        .header("Content-Type", "application/json-patch+json")
+        .body(r#"[{"op":"replace","path":"/status","value":{"observedGeneration":1}}]"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "{}", resp.text().await.unwrap());
+
+    let got = get_deploy(&addr, &client).await;
+    assert_eq!(
+        got["metadata"]["finalizers"],
+        serde_json::json!(["apps.victoriametrics.com/finalizer"])
+    );
+    assert!(
+        got["metadata"].get("ownerReferences").is_none(),
+        "a null ownerReferences is dropped, as upstream's decode drops it: {}",
+        got["metadata"]
+    );
+    assert_eq!(got["status"]["observedGeneration"], 1);
+    server.shutdown().await.unwrap();
+}

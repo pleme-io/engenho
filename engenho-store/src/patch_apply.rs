@@ -195,8 +195,9 @@ pub enum PatchError {
     /// total — but reserved so a future stricter merge has a typed home).
     #[error("merge patch failed: {0}")]
     RfcMerge(String),
-    /// An RFC 6902 JSON-Pointer resolution failed — `remove`/`replace` on a
-    /// path that doesn't exist, or a malformed pointer.
+    /// An RFC 6902 JSON-Pointer resolution failed — `remove` of an absent
+    /// location, `replace` under an absent parent or past an array end, or a
+    /// malformed pointer.
     #[error("json patch: bad pointer {path:?}")]
     JsonPointer { path: String },
     /// An RFC 6902 `test` op compared unequal — the WHOLE document is
@@ -377,12 +378,7 @@ fn apply_one_op(doc: &mut Value, op: &JsonPatchOp) -> Result<(), PatchError> {
     match op {
         JsonPatchOp::Add { path, value } => pointer_add(doc, path, value.clone()),
         JsonPatchOp::Remove { path } => pointer_remove(doc, path).map(|_| ()),
-        JsonPatchOp::Replace { path, value } => {
-            // RFC 6902: replace fails if the target location does not exist.
-            pointer_get(doc, path).ok_or_else(|| PatchError::JsonPointer { path: path.clone() })?;
-            pointer_remove(doc, path)?;
-            pointer_add(doc, path, value.clone())
-        }
+        JsonPatchOp::Replace { path, value } => pointer_replace(doc, path, value.clone()),
         JsonPatchOp::Copy { from, path } => {
             let v = pointer_get(doc, from)
                 .ok_or_else(|| PatchError::JsonPointer { path: from.clone() })?
@@ -490,6 +486,43 @@ fn pointer_add(doc: &mut Value, path: &str, value: Value) -> Result<(), PatchErr
         _ => Err(PatchError::JsonPointer {
             path: path.to_string(),
         }),
+    }
+}
+
+fn pointer_replace(doc: &mut Value, path: &str, value: Value) -> Result<(), PatchError> {
+    let bad = || PatchError::JsonPointer {
+        path: path.to_string(),
+    };
+    let tokens = pointer_tokens(path);
+    let Some((last, parents)) = tokens.split_last() else {
+        if !(value.is_object() || value.is_array()) {
+            return Err(bad());
+        }
+        *doc = value;
+        return Ok(());
+    };
+    let mut cur = doc;
+    for t in parents {
+        cur = match cur {
+            Value::Object(m) => m.get_mut(t).ok_or_else(bad)?,
+            Value::Array(a) => {
+                let idx: usize = t.parse().map_err(|_| bad())?;
+                a.get_mut(idx).ok_or_else(bad)?
+            }
+            _ => return Err(bad()),
+        };
+    }
+    match cur {
+        Value::Object(m) => {
+            m.insert(last.clone(), value);
+            Ok(())
+        }
+        Value::Array(a) => {
+            let idx: usize = last.parse().map_err(|_| bad())?;
+            *a.get_mut(idx).ok_or_else(bad)? = value;
+            Ok(())
+        }
+        _ => Err(bad()),
     }
 }
 
@@ -1173,11 +1206,39 @@ mod tests {
     }
 
     #[test]
-    fn json_replace_missing_pointer_errors() {
+    fn json_replace_of_an_absent_object_key_sets_it_as_upstream_does() {
+        let out = json_patch(
+            json!({"metadata": {"name": "vmsingle-rio"}}),
+            vec![
+                JsonPatchOp::Replace {
+                    path: "/status".into(),
+                    value: json!({"updateStatus": "operational"}),
+                },
+                JsonPatchOp::Replace {
+                    path: "/metadata/finalizers".into(),
+                    value: json!(["apps.victoriametrics.com/finalizer"]),
+                },
+                JsonPatchOp::Replace {
+                    path: "/metadata/ownerReferences".into(),
+                    value: Value::Null,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(out["status"], json!({"updateStatus": "operational"}));
+        assert_eq!(
+            out["metadata"]["finalizers"],
+            json!(["apps.victoriametrics.com/finalizer"])
+        );
+        assert!(out["metadata"].as_object().unwrap().contains_key("ownerReferences"));
+    }
+
+    #[test]
+    fn json_replace_under_an_absent_parent_errors() {
         let err = json_patch(
             json!({"a": 1}),
             vec![JsonPatchOp::Replace {
-                path: "/nope".into(),
+                path: "/status/updateStatus".into(),
                 value: json!(2),
             }],
         )
@@ -1185,9 +1246,59 @@ mod tests {
         assert_eq!(
             err,
             PatchError::JsonPointer {
-                path: "/nope".into()
+                path: "/status/updateStatus".into()
             }
         );
+    }
+
+    #[test]
+    fn json_replace_past_the_end_of_an_array_errors() {
+        for path in ["/l/2", "/l/-"] {
+            let err = json_patch(
+                json!({"l": [1, 2]}),
+                vec![JsonPatchOp::Replace {
+                    path: path.into(),
+                    value: json!(3),
+                }],
+            )
+            .unwrap_err();
+            assert_eq!(err, PatchError::JsonPointer { path: path.into() });
+        }
+    }
+
+    #[test]
+    fn json_replace_of_an_array_element_overwrites_it_in_place() {
+        let out = json_patch(
+            json!({"l": [1, 2, 3]}),
+            vec![JsonPatchOp::Replace {
+                path: "/l/1".into(),
+                value: json!(9),
+            }],
+        )
+        .unwrap();
+        assert_eq!(out["l"], json!([1, 9, 3]));
+    }
+
+    #[test]
+    fn json_replace_of_the_whole_document_takes_only_an_object_or_array() {
+        let out = json_patch(
+            json!({"a": 1}),
+            vec![JsonPatchOp::Replace {
+                path: String::new(),
+                value: json!({"b": 2}),
+            }],
+        )
+        .unwrap();
+        assert_eq!(out, json!({"b": 2}));
+        let err = json_patch(
+            json!({"a": 1}),
+            vec![JsonPatchOp::Replace {
+                path: String::new(),
+                value: json!(2),
+            }],
+        )
+        .unwrap_err();
+        assert_eq!(err, PatchError::JsonPointer { path: String::new() });
     }
 
     #[test]
