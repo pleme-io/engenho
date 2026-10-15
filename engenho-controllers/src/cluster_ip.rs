@@ -24,8 +24,12 @@
 //! allocation **restart-persistent + collision-free by construction**:
 //! every allocation reseeds the in-use set from the live Service set, so
 //! a freshly-restarted process recomputes the held VIPs from the durable
-//! store rather than from a lost in-memory counter. There is no separate
-//! allocation ledger to drift — the Services ARE the ledger.
+//! store rather than from a lost in-memory counter. The Services are the
+//! ledger; the one addition is the short-lived set of VIPs this process has
+//! granted to creates that have not committed yet, held under one lock so
+//! concurrent creates (Helm creates a chart's Services in parallel) cannot
+//! all draw the same lowest free VIP. A grant leaves that set when its
+//! Service appears in the store, or after [`GRANT_TTL`] if it never does.
 //!
 //! ## Rules (upstream parity)
 //!
@@ -43,8 +47,9 @@
 //!
 //! [`Deny`]: crate::admission::AdmissionDecision::Deny
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use engenho_config::parse_ipv4_cidr;
@@ -351,7 +356,15 @@ pub struct ClusterIpDefaultingWebhook {
     cidr: String,
     /// The live-VIP source (reseeded per allocation).
     source: Arc<dyn ServiceIpSource>,
+    /// VIPs handed out and not yet seen on a stored Service, with when.
+    /// Reviews run under this lock, so two creates in flight at once
+    /// cannot both draw the lowest free VIP before either commits.
+    granted: tokio::sync::Mutex<BTreeMap<String, Instant>>,
+    /// How long a grant holds its VIP without appearing in the store.
+    grant_ttl: Duration,
 }
+
+const GRANT_TTL: Duration = Duration::from_secs(120);
 
 impl ClusterIpDefaultingWebhook {
     /// New webhook over `cidr` reading live VIPs from `source`.
@@ -360,7 +373,17 @@ impl ClusterIpDefaultingWebhook {
         Self {
             cidr: cidr.into(),
             source,
+            granted: tokio::sync::Mutex::new(BTreeMap::new()),
+            grant_ttl: GRANT_TTL,
         }
+    }
+
+    /// The same webhook with grants held for `ttl` instead of
+    /// [`GRANT_TTL`].
+    #[must_use]
+    pub fn with_grant_ttl(mut self, ttl: Duration) -> Self {
+        self.grant_ttl = ttl;
+        self
     }
 
     /// Whether `key` names a core/v1 Service.
@@ -405,8 +428,11 @@ impl AdmissionWebhook for ClusterIpDefaultingWebhook {
                 return Err(AdmissionError::Backend(e.to_string()));
             }
         };
-        for ip in self.source.held_cluster_ips().await {
-            allocator.reserve(&ip);
+        let mut granted = self.granted.lock().await;
+        let held: BTreeSet<String> = self.source.held_cluster_ips().await.into_iter().collect();
+        granted.retain(|ip, at| !held.contains(ip) && at.elapsed() < self.grant_ttl);
+        for ip in held.iter().chain(granted.keys()) {
+            allocator.reserve(ip);
         }
 
         let vip = match allocator.allocate() {
@@ -417,6 +443,8 @@ impl AdmissionWebhook for ClusterIpDefaultingWebhook {
                 return Ok(AdmissionDecision::Deny(e.to_string()));
             }
         };
+        granted.insert(vip.clone(), Instant::now());
+        drop(granted);
 
         // Stamp the VIP onto a clone of the proposed object: spec.clusterIP
         // (legacy single) + spec.clusterIPs[0] (dual-stack-aware list).
@@ -744,6 +772,47 @@ mod tests {
             }
             other => panic!("expected Mutate, got {other:?}"),
         }
+    }
+
+    fn vip_of(decision: AdmissionDecision) -> String {
+        match decision {
+            AdmissionDecision::Mutate(v) => v["spec"]["clusterIP"].as_str().unwrap().to_string(),
+            other => panic!("expected Mutate, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_creates_never_share_a_vip_before_any_of_them_commits() {
+        let source = Arc::new(StaticServiceIpSource::new(vec![]));
+        let wh = Arc::new(ClusterIpDefaultingWebhook::new("10.97.0.0/16", source));
+        let reviews = ["grafana", "kube-state-metrics", "operator"].map(|name| {
+            let wh = wh.clone();
+            tokio::spawn(async move {
+                let req = svc_request(json!({
+                    "kind": "Service", "apiVersion": "v1",
+                    "metadata": {"name": name}, "spec": {"ports": [{"port": 80}]}
+                }));
+                vip_of(wh.review(&req).await.unwrap())
+            })
+        });
+        let mut vips = BTreeSet::new();
+        for r in reviews {
+            vips.insert(r.await.unwrap());
+        }
+        assert_eq!(vips.len(), 3, "{vips:?}");
+    }
+
+    #[tokio::test]
+    async fn a_grant_that_never_committed_returns_to_the_pool_after_its_ttl() {
+        let source = Arc::new(StaticServiceIpSource::new(vec![]));
+        let wh = ClusterIpDefaultingWebhook::new("10.97.0.0/16", source)
+            .with_grant_ttl(std::time::Duration::ZERO);
+        let req = svc_request(json!({
+            "kind": "Service", "apiVersion": "v1",
+            "metadata": {"name": "a"}, "spec": {"ports": [{"port": 80}]}
+        }));
+        assert_eq!(vip_of(wh.review(&req).await.unwrap()), "10.97.0.1");
+        assert_eq!(vip_of(wh.review(&req).await.unwrap()), "10.97.0.1");
     }
 
     #[test]
