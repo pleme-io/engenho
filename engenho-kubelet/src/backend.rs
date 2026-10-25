@@ -925,6 +925,17 @@ pub trait ContainerRuntime: Send + Sync {
         self.readoption()
     }
 
+    /// Stop every container this runtime adopted from an earlier process
+    /// that no pod in `bound_pods` (pod uids bound to this node) has claimed
+    /// by starting it. A runtime that adopts nothing has nothing to release.
+    async fn release_unclaimed(
+        &self,
+        bound_pods: &std::collections::BTreeSet<String>,
+    ) -> Result<(), KubeletError> {
+        let _ = bound_pods;
+        Ok(())
+    }
+
     #[allow(missing_docs)]
     fn resource_enforcement(&self) -> crate::cgroup::ResourceEnforcement;
 

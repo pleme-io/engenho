@@ -2712,6 +2712,14 @@ impl Controller for Kubelet {
         let mut soonest_requeue: Option<Duration> = None;
         self.cleanup_orphans(&bound, &mut report, &mut soonest_requeue)
             .await;
+        let bound_uids: BTreeSet<String> = bound
+            .values()
+            .filter_map(|p| p.pointer("/metadata/uid").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect();
+        if let Err(e) = self.backend.release_unclaimed(&bound_uids).await {
+            warn!(error = %e, "adopted containers no pod claims were not released");
+        }
 
         // ── CLOSURE ROOTS. Level-triggered from the pods bound here, so a
         // daemon restart neither loses a root nor leaks one.

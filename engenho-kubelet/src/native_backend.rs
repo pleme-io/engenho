@@ -33,7 +33,17 @@
 //! ran workloads unconfined while reporting success is the exact failure shape
 //! this crate keeps finding.
 //!
-//! ## ★ Why a restart cannot run a workload twice ([`Readoption::Cannot`])
+//! ## ★ Why a restart cannot run a workload twice
+//!
+//! Two lifetimes, chosen by `runtime.native_workloads`
+//! ([`WorkloadLifetime`]). Under `outlive` (Linux) a workload survives the
+//! daemon: it is recorded on disk by its pid, start time and boot
+//! ([`crate::native_survival`]), the daemon's unit stops only the daemon
+//! (`KillMode=process`, asserted by `flake.nix`), and the next backend adopts
+//! the same process ([`Readoption::AdoptsRunning`]); one process per id still
+//! holds, because an adopted record occupies its id until it is claimed,
+//! replaced or stopped. What follows is the `bound` lifetime
+//! ([`Readoption::Cannot`]).
 //!
 //! A workload is a child of THIS process, tracked in an in-memory table. A
 //! new backend — a new daemon process, or a new runtime booted inside the same
@@ -83,6 +93,7 @@ use crate::cgroup::{
 use crate::cri::{ExitDisposition, RunState};
 use crate::error::KubeletError;
 use crate::image_source::ImageSource;
+use crate::native_survival::{Handle, Projection, Record, Store, WorkloadLifetime};
 use crate::pod_volume::BindSource;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -171,6 +182,13 @@ pub enum NativeError {
     ResourcesUnenforceable(Unenforceable),
     #[allow(missing_docs)]
     RunAs { field: &'static str, value: i64 },
+    /// The record of an outliving workload could not be kept.
+    Survival {
+        /// The state directory or record concerned.
+        path: PathBuf,
+        /// What the filesystem said.
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for NativeError {
@@ -265,6 +283,11 @@ impl std::fmt::Display for NativeError {
                 "securityContext.{field} is {value}, which is not an id this \
                  host can run a process as"
             ),
+            Self::Survival { path, detail } => write!(
+                f,
+                "cannot keep the record of an outliving workload at {}: {detail}",
+                path.display()
+            ),
         }
     }
 }
@@ -335,6 +358,9 @@ struct NativeContainer {
     stdio: crate::stream::AttachPoint,
     /// One per stream framer: `true` once its last record is on disk.
     log_written: Vec<tokio::sync::watch::Receiver<bool>>,
+    pumps: Vec<tokio::task::AbortHandle>,
+    recorded: Option<Arc<Store>>,
+    unclaimed: Option<Box<Record>>,
 }
 
 #[derive(Debug)]
@@ -417,6 +443,10 @@ enum Process {
     /// exit look like `None`, which a kubelet reads as "still running"
     /// forever.
     Live(tokio::process::Child),
+    /// Started by an earlier backend and adopted by this one through a
+    /// pidfd. Its parent is not this process, so it is never reaped here and
+    /// its exit status cannot be read.
+    Adopted(Handle),
     /// Handed to its termination task, which holds the `Child` until it has
     /// reaped it. Still alive as far as anyone may assume.
     Terminating(Termination),
@@ -446,13 +476,16 @@ enum Reaped {
     /// The wait itself failed, which leaves nothing to wait on: the pid is no
     /// longer this process's child to reap. Gone, and how is not known.
     Unobservable,
+    /// An adopted process exited and its own parent reaped it. Gone, and how
+    /// is not known.
+    Elsewhere,
 }
 
 impl Reaped {
     fn run_state(self) -> RunState {
         match self {
             Self::Status(status) => run_state_of(Some(status)),
-            Self::Unobservable => RunState::Unknown,
+            Self::Unobservable | Self::Elsewhere => RunState::Unknown,
         }
     }
 }
@@ -485,6 +518,18 @@ impl Termination {
             _task: task,
         }
     }
+
+    fn adopted(handle: Handle, grace: Duration) -> Self {
+        let (tx, verdict) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            crate::native_survival::terminate(handle, grace).await;
+            let _ = tx.send(Reaped::Elsewhere);
+        });
+        Self {
+            verdict,
+            _task: task,
+        }
+    }
 }
 
 /// The command a workload is spawned from: `program` with `args`, the declared
@@ -501,13 +546,14 @@ fn workload_command<'a>(
     program: &Path,
     args: impl IntoIterator<Item = &'a String>,
     env: &std::collections::BTreeMap<String, String>,
+    kill_on_drop: bool,
 ) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args);
     cmd.env_clear();
     cmd.envs(env);
     cmd.stdin(std::process::Stdio::null());
-    cmd.kill_on_drop(true);
+    cmd.kill_on_drop(kill_on_drop);
     cmd
 }
 
@@ -524,12 +570,12 @@ fn wire_stdio(
     declared: crate::backend::ContainerStdio,
     log: std::fs::File,
     log_err: std::fs::File,
-) -> std::io::Result<crate::stream::AttachPoint> {
+) -> std::io::Result<Wired> {
     use crate::stream::{AttachPoint, fanout, pump_resizes, pump_writer, tee};
     let (out_feed, stdout) = fanout();
     if let Some(pty) = pty {
         let master = pty.into_master()?;
-        tee(
+        let pump = tee(
             tokio::fs::File::from_std(master.reader),
             tokio::fs::File::from_std(log),
             out_feed,
@@ -538,31 +584,152 @@ fn wire_stdio(
         let stdin = declared
             .stdin
             .then(|| pump_writer(tokio::fs::File::from_std(master.writer)));
-        return Ok(AttachPoint {
-            stdout,
-            stderr: None,
-            stdin: Arc::new(tokio::sync::Mutex::new(stdin)),
-            stdin_once: declared.stdin_once,
-            resize: Some(pump_resizes(master.resizer)),
+        return Ok(Wired {
+            point: AttachPoint {
+                stdout,
+                stderr: None,
+                stdin: Arc::new(tokio::sync::Mutex::new(stdin)),
+                stdin_once: declared.stdin_once,
+                resize: Some(pump_resizes(master.resizer)),
+            },
+            pumps: vec![pump],
         });
     }
     let (err_feed, stderr) = fanout();
+    let mut pumps = Vec::new();
     match child.stdout.take() {
-        Some(r) => tee(r, tokio::fs::File::from_std(log), out_feed),
+        Some(r) => pumps.push(tee(r, tokio::fs::File::from_std(log), out_feed)),
         None => drop(out_feed),
     }
     match child.stderr.take() {
-        Some(r) => tee(r, tokio::fs::File::from_std(log_err), err_feed),
+        Some(r) => pumps.push(tee(r, tokio::fs::File::from_std(log_err), err_feed)),
         None => drop(err_feed),
     }
     let stdin = child.stdin.take().map(pump_writer);
-    Ok(AttachPoint {
-        stdout,
-        stderr: Some(stderr),
-        stdin: Arc::new(tokio::sync::Mutex::new(stdin)),
-        stdin_once: declared.stdin_once,
-        resize: None,
+    Ok(Wired {
+        point: AttachPoint {
+            stdout,
+            stderr: Some(stderr),
+            stdin: Arc::new(tokio::sync::Mutex::new(stdin)),
+            stdin_once: declared.stdin_once,
+            resize: None,
+        },
+        pumps,
     })
+}
+
+fn wire_fifos(
+    fifos: crate::native_survival::Fifos,
+    declared: crate::backend::ContainerStdio,
+    log: std::fs::File,
+    log_err: std::fs::File,
+) -> std::io::Result<Wired> {
+    use crate::stream::{AttachPoint, fanout, tee};
+    use tokio::net::unix::pipe::Receiver;
+    let out = Receiver::from_file(fifos.stdout)?;
+    let err = Receiver::from_file(fifos.stderr)?;
+    let (out_feed, stdout) = fanout();
+    let (err_feed, stderr) = fanout();
+    Ok(Wired {
+        point: AttachPoint {
+            stdout,
+            stderr: Some(stderr),
+            stdin: Arc::new(tokio::sync::Mutex::new(None)),
+            stdin_once: declared.stdin_once,
+            resize: None,
+        },
+        pumps: vec![
+            tee(out, tokio::fs::File::from_std(log), out_feed),
+            tee(err, tokio::fs::File::from_std(log_err), err_feed),
+        ],
+    })
+}
+
+struct Wired {
+    point: crate::stream::AttachPoint,
+    pumps: Vec<tokio::task::AbortHandle>,
+}
+
+fn claim(
+    state: &mut HashMap<String, NativeContainer>,
+    id: &str,
+    spec: &ContainerSpec,
+) -> Result<Option<ContainerStatus>, NativeError> {
+    let Some(previous) = state.get_mut(id) else {
+        return Ok(None);
+    };
+    previous.settle(id)?;
+    if previous.is_reaped() {
+        return Ok(None);
+    }
+    if let Some(record) = previous.unclaimed.take() {
+        if record.runs(spec) {
+            tracing::info!(container = %id, pid = record.pid, "a running native workload is claimed by its pod");
+            return Ok(Some(ContainerStatus {
+                container_id: id.to_string(),
+                state: RunState::Running,
+                pod_ip: Some(HOST_NETWORK_POD_IP.to_string()),
+            }));
+        }
+        tracing::info!(container = %id, pid = record.pid, "an adopted native workload runs another spec or pod; it is replaced");
+        if let Some(adopted) = state.remove(id) {
+            state.insert(id.to_string(), adopted.stopping());
+        }
+    }
+    Err(NativeError::NotReaped { id: id.to_string() })
+}
+
+fn abandon(
+    store: &Store,
+    id: &str,
+    mut child: tokio::process::Child,
+    wired: &Wired,
+    leaf: Option<Leaf>,
+) {
+    for pump in &wired.pumps {
+        pump.abort();
+    }
+    if let Err(kill) = child.start_kill() {
+        tracing::warn!(container = %id, error = %kill, "a workload whose record could not be kept was not killed");
+    }
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
+    if let Some(leaf) = leaf {
+        leaf.release();
+    }
+    store.forget(id);
+}
+
+fn detached_stdio() -> crate::stream::AttachPoint {
+    let (feed, stdout) = crate::stream::fanout();
+    drop(feed);
+    crate::stream::AttachPoint {
+        stdout,
+        stderr: None,
+        stdin: Arc::new(tokio::sync::Mutex::new(None)),
+        stdin_once: false,
+        resize: None,
+    }
+}
+
+type FramedLog = (
+    std::fs::File,
+    std::fs::File,
+    Vec<tokio::sync::watch::Receiver<bool>>,
+);
+
+fn append_log(path: &Path) -> std::io::Result<FramedLog> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    let shared = Arc::new(std::sync::Mutex::new(file));
+    let (log, out_written) =
+        crate::cri_log::framed_sink(Arc::clone(&shared), crate::cri_log::LogStream::Stdout)?;
+    let (log_err, err_written) =
+        crate::cri_log::framed_sink(shared, crate::cri_log::LogStream::Stderr)?;
+    Ok((log, log_err, vec![out_written, err_written]))
 }
 
 /// Stop `child`: `SIGTERM`, `SIGKILL` once `grace` has passed, then reap.
@@ -609,6 +776,7 @@ impl NativeContainer {
                     detail: e.to_string(),
                 })?
                 .map(Reaped::Status),
+            Process::Adopted(handle) => handle.exited().then_some(Reaped::Elsewhere),
             Process::Terminating(t) => match t.verdict.try_recv() {
                 Ok(reaped) => Some(reaped),
                 Err(oneshot::error::TryRecvError::Empty) => None,
@@ -623,6 +791,9 @@ impl NativeContainer {
             if let Some(leaf) = self.leaf.take() {
                 leaf.release();
             }
+            if let Some(store) = self.recorded.take() {
+                store.forget(id);
+            }
         }
         Ok(())
     }
@@ -631,7 +802,7 @@ impl NativeContainer {
     /// terminated is still running: nothing has reaped it.
     fn run_state(&self) -> RunState {
         match &self.process {
-            Process::Live(_) | Process::Terminating(_) => RunState::Running,
+            Process::Live(_) | Process::Adopted(_) | Process::Terminating(_) => RunState::Running,
             Process::Reaped(reaped) => reaped.run_state(),
         }
     }
@@ -645,6 +816,9 @@ impl NativeContainer {
     fn stopping(self) -> Self {
         let process = match self.process {
             Process::Live(child) => Process::Terminating(Termination::spawn(child, self.grace)),
+            Process::Adopted(handle) => {
+                Process::Terminating(Termination::adopted(handle, self.grace))
+            }
             other => other,
         };
         Self { process, ..self }
@@ -657,6 +831,23 @@ pub struct NativeBackend {
     log_dir: PathBuf,
     cgroups: Cgroups,
     state: Arc<Mutex<HashMap<String, NativeContainer>>>,
+    survival: Option<Arc<Store>>,
+}
+
+impl Drop for NativeBackend {
+    fn drop(&mut self) {
+        if self.survival.is_none() {
+            return;
+        }
+        let Ok(state) = self.state.lock() else {
+            return;
+        };
+        for container in state.values() {
+            for pump in &container.pumps {
+                pump.abort();
+            }
+        }
+    }
 }
 
 /// The address a native container answers on.
@@ -699,6 +890,190 @@ impl NativeBackend {
             log_dir: log_dir.into(),
             cgroups,
             state: Arc::new(Mutex::new(HashMap::new())),
+            survival: None,
+        }
+    }
+
+    /// This backend with `lifetime`. Under [`WorkloadLifetime::Outlive`] it
+    /// takes back, before it returns, every workload an earlier backend
+    /// recorded in `state` whose process is still the one that backend
+    /// started; ends every recorded process it cannot serve (a terminal or
+    /// stdin it held); and kills what runs in a cgroup leaf no record names.
+    /// It must be called inside a tokio runtime.
+    ///
+    /// # Errors
+    /// [`NativeError::Survival`] when the state directory cannot be created
+    /// or read.
+    pub fn with_lifetime(mut self, lifetime: WorkloadLifetime) -> Result<Self, NativeError> {
+        let WorkloadLifetime::Outlive { state } = lifetime else {
+            self.survival = None;
+            return Ok(self);
+        };
+        let store = Store::open(state.clone()).map_err(|e| NativeError::Survival {
+            path: state.clone(),
+            detail: e.to_string(),
+        })?;
+        let store = Arc::new(store);
+        self.survival = Some(Arc::clone(&store));
+        let records = store.records().map_err(|e| NativeError::Survival {
+            path: state,
+            detail: e.to_string(),
+        })?;
+        let mut adopted = HashMap::new();
+        for (path, read) in records {
+            match read {
+                Ok(record) => {
+                    if let Some(container) = self.readopt(&store, record.clone()) {
+                        adopted.insert(record.id, container);
+                    }
+                }
+                Err(detail) => {
+                    tracing::warn!(path = %path.display(), %detail, "an unreadable native workload record is discarded");
+                    Store::discard(&path);
+                }
+            }
+        }
+        self.kill_unrecorded(&adopted);
+        tracing::info!(
+            adopted = adopted.len(),
+            "native workloads outlive the daemon; those still running are adopted"
+        );
+        self.state
+            .lock()
+            .map_err(|_| NativeError::StatePoisoned)?
+            .extend(adopted);
+        Ok(self)
+    }
+
+    fn readopt(&self, store: &Arc<Store>, record: Record) -> Option<NativeContainer> {
+        let Some(handle) = Handle::of(&record) else {
+            tracing::info!(container = %record.id, pid = record.pid, "a recorded native workload is no longer running; its record is dropped");
+            store.forget(&record.id);
+            return None;
+        };
+        let leaf = record.leaf.clone().and_then(|name| match &self.cgroups {
+            Cgroups::Delegated(tree) => Some(Leaf {
+                tree: Arc::clone(tree),
+                name,
+            }),
+            _ => None,
+        });
+        let grace = record.grace();
+        let stopped = |handle: Handle, leaf: Option<Leaf>| NativeContainer {
+            log_path: record.log_path.clone(),
+            program: record.program.clone(),
+            grace,
+            process: Process::Terminating(Termination::adopted(handle, grace)),
+            leaf,
+            stdio: detached_stdio(),
+            log_written: Vec::new(),
+            pumps: Vec::new(),
+            recorded: Some(Arc::clone(store)),
+            unclaimed: None,
+        };
+        if !record.adoptable {
+            tracing::warn!(container = %record.id, pid = record.pid, "a native workload with a terminal or stdin outlived its daemon and cannot be served; it is stopped");
+            return Some(stopped(handle, leaf));
+        }
+        let wired = store.readers(&record.id).and_then(|fifos| {
+            let (log, log_err, written) = append_log(&record.log_path)?;
+            Ok((
+                wire_fifos(
+                    fifos,
+                    crate::backend::ContainerStdio::default(),
+                    log,
+                    log_err,
+                )?,
+                written,
+            ))
+        });
+        let (wired, log_written) = match wired {
+            Ok(found) => found,
+            Err(e) => {
+                tracing::warn!(container = %record.id, error = %e, "an outliving native workload's output cannot be reopened; it is stopped");
+                return Some(stopped(handle, leaf));
+            }
+        };
+        tracing::info!(container = %record.id, pid = record.pid, "adopted a native workload a previous daemon started");
+        Some(NativeContainer {
+            log_path: record.log_path.clone(),
+            program: record.program.clone(),
+            grace,
+            process: Process::Adopted(handle),
+            leaf,
+            stdio: wired.point,
+            log_written,
+            pumps: wired.pumps,
+            recorded: Some(Arc::clone(store)),
+            unclaimed: Some(Box::new(record)),
+        })
+    }
+
+    fn record(
+        store: &Store,
+        spec: &ContainerSpec,
+        id: &str,
+        pid: u32,
+        program: &Path,
+        log_path: &Path,
+        leaf: Option<&Leaf>,
+    ) -> Result<(), NativeError> {
+        let kept = |e: std::io::Error| NativeError::Survival {
+            path: log_path.to_path_buf(),
+            detail: e.to_string(),
+        };
+        let seen = crate::native_survival::identity(pid).map_err(kept)?;
+        store
+            .write(&Record {
+                id: id.to_string(),
+                pod_uid: spec.pod.uid.clone(),
+                spec: serde_json::to_value(Projection::of(spec))
+                    .map_err(|e| kept(std::io::Error::other(e)))?,
+                pid,
+                start_ticks: seen.start_ticks,
+                boot_id: seen.boot_id,
+                program: program.to_path_buf(),
+                log_path: log_path.to_path_buf(),
+                grace_ms: u64::try_from(spec.termination_grace.duration().as_millis())
+                    .unwrap_or(u64::MAX),
+                leaf: leaf.map(|l| l.name.clone()),
+                adoptable: !spec.stdio.tty && !spec.stdio.stdin,
+            })
+            .map_err(kept)?;
+        Ok(())
+    }
+
+    fn kill_unrecorded(&self, adopted: &HashMap<String, NativeContainer>) {
+        let Cgroups::Delegated(tree) = &self.cgroups else {
+            return;
+        };
+        let leaves = match tree.leaves() {
+            Ok(leaves) => leaves,
+            Err(e) => {
+                tracing::warn!(error = %e, "the workload leaves cannot be listed; an unrecorded survivor would go unnoticed");
+                return;
+            }
+        };
+        let claimed: std::collections::HashSet<&str> = adopted
+            .values()
+            .filter_map(|c| c.leaf.as_ref().map(|l| l.name.as_str()))
+            .collect();
+        for name in leaves {
+            if claimed.contains(name.as_str()) {
+                continue;
+            }
+            match tree.occupants(&name) {
+                Ok(pids) if pids.is_empty() => {}
+                Ok(pids) => {
+                    tracing::warn!(leaf = %name, ?pids, "processes no record names run in a workload leaf; they are killed before anything starts");
+                    if let Err(e) = tree.kill(&name) {
+                        tracing::warn!(leaf = %name, error = %e, "an unrecorded workload leaf could not be killed");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(leaf = %name, error = %e, "a workload leaf's processes cannot be read");
+                }
+            }
         }
     }
 
@@ -887,7 +1262,38 @@ impl ContainerRuntime for NativeBackend {
     /// in-memory table; a new kubelet process starts with an empty table and
     /// no handle on what the old one spawned.
     fn readoption(&self) -> Readoption {
-        Readoption::Cannot
+        if self.survival.is_some() {
+            Readoption::AdoptsRunning
+        } else {
+            Readoption::Cannot
+        }
+    }
+
+    async fn release_unclaimed(
+        &self,
+        bound_pods: &std::collections::BTreeSet<String>,
+    ) -> Result<(), KubeletError> {
+        if bound_pods.is_empty() {
+            return Ok(());
+        }
+        let mut guard = self.state.lock().map_err(|_| NativeError::StatePoisoned)?;
+        let unbound: Vec<String> = guard
+            .iter()
+            .filter(|(_, c)| {
+                c.unclaimed
+                    .as_ref()
+                    .is_some_and(|r| !bound_pods.contains(&r.pod_uid))
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in unbound {
+            if let Some(mut container) = guard.remove(&id) {
+                tracing::info!(container = %id, "an adopted native workload belongs to no pod bound here; it is stopped");
+                container.unclaimed = None;
+                guard.insert(id, container.stopping());
+            }
+        }
+        Ok(())
     }
 
     fn resource_enforcement(&self) -> ResourceEnforcement {
@@ -910,12 +1316,13 @@ impl ContainerRuntime for NativeBackend {
         // start beside it is two copies of the workload. Checked before the
         // log is opened, because opening it truncates that run's log.
         let mut state = self.state.lock().map_err(|_| NativeError::StatePoisoned)?;
-        if let Some(previous) = state.get_mut(&id) {
-            previous.settle(&id)?;
-            if !previous.is_reaped() {
-                return Err(NativeError::NotReaped { id }.into());
-            }
+        if let Some(claimed) = claim(&mut state, &id, spec)? {
+            return Ok(claimed);
         }
+        let outliving = self
+            .survival
+            .as_ref()
+            .filter(|_| !spec.stdio.tty && !spec.stdio.stdin);
         std::fs::create_dir_all(&self.log_dir).map_err(|e| NativeError::VolumePath {
             path: self.log_dir.clone(),
             detail: e.to_string(),
@@ -937,8 +1344,26 @@ impl ContainerRuntime for NativeBackend {
         let (log, out_written) = framed(crate::cri_log::LogStream::Stdout)?;
         let (log_err, err_written) = framed(crate::cri_log::LogStream::Stderr)?;
 
-        let mut cmd = workload_command(&program, argv.iter().skip(1), &spec.env);
-        let pty = if spec.stdio.tty {
+        let mut cmd = workload_command(
+            &program,
+            argv.iter().skip(1),
+            &spec.env,
+            self.survival.is_none() || outliving.is_none(),
+        );
+        let mut fifos = None;
+        let pty = if let Some(store) = outliving {
+            let writers = store.writers(&id).map_err(|e| NativeError::Survival {
+                path: log_path.clone(),
+                detail: e.to_string(),
+            })?;
+            fifos = Some(store.readers(&id).map_err(|e| NativeError::Survival {
+                path: log_path.clone(),
+                detail: e.to_string(),
+            })?);
+            cmd.stdout(writers.stdout);
+            cmd.stderr(writers.stderr);
+            None
+        } else if spec.stdio.tty {
             let pty = crate::pty::Pty::open().map_err(|e| NativeError::Spawn {
                 program: program.clone(),
                 detail: e.to_string(),
@@ -989,8 +1414,12 @@ impl ContainerRuntime for NativeBackend {
         };
         let pid = child.id();
         let mut child = child;
-        let stdio = match wire_stdio(&mut child, pty, spec.stdio, log, log_err) {
-            Ok(stdio) => stdio,
+        let wired = match fifos {
+            Some(fifos) => wire_fifos(fifos, spec.stdio, log, log_err),
+            None => wire_stdio(&mut child, pty, spec.stdio, log, log_err),
+        };
+        let wired = match wired {
+            Ok(wired) => wired,
             Err(e) => {
                 drop(child);
                 if let Some(leaf) = leaf {
@@ -1004,6 +1433,17 @@ impl ContainerRuntime for NativeBackend {
             }
         };
 
+        let recorded = match (&self.survival, pid) {
+            (Some(store), Some(pid)) => {
+                let kept = Self::record(store, spec, &id, pid, &program, &log_path, leaf.as_ref());
+                if let Err(e) = kept {
+                    abandon(store, &id, child, &wired, leaf);
+                    return Err(e.into());
+                }
+                Some(Arc::clone(store))
+            }
+            _ => None,
+        };
         state.insert(
             id.clone(),
             NativeContainer {
@@ -1012,8 +1452,11 @@ impl ContainerRuntime for NativeBackend {
                 grace: spec.termination_grace.duration(),
                 process: Process::Live(child),
                 leaf,
-                stdio,
+                stdio: wired.point,
                 log_written: vec![out_written, err_written],
+                pumps: wired.pumps,
+                recorded,
+                unclaimed: None,
             },
         );
         drop(state);
@@ -1608,6 +2051,7 @@ mod tests {
             Path::new("/bin/sh"),
             args.iter(),
             &std::collections::BTreeMap::new(),
+            true,
         );
         cmd.stdout(std::process::Stdio::piped());
         let mut child = cmd.spawn().expect("spawn /bin/sh");
@@ -1628,18 +2072,21 @@ mod tests {
             .expect("read to EOF");
     }
 
-    /// Gap (docs/QUALIFICATION.md row 13): a native workload does not
-    /// survive a daemon restart. `KillMode=control-group` (Linux) and the
-    /// launchd job's process group (macOS) end it with the daemon, and the
-    /// next backend cannot find it, so every restart — every release — takes
-    /// every native workload down at once. The destination: the workload
-    /// outlives the daemon (its own unit or process group, recorded on disk by
-    /// pod uid) and the next backend adopts it by identity. The kubelet reads
-    /// exactly this answer to decide adopt-or-start.
     #[test]
-    #[ignore = "gap: docs/QUALIFICATION.md row 13 (native workloads are not re-adopted across a daemon restart)"]
-    fn gap_the_next_backend_adopts_a_running_native_workload() {
+    fn a_bound_backend_cannot_readopt() {
         let b = NativeBackend::new(Isolation::HostProcess, "/tmp/nb-test-logs", Cgroups::Off);
+        assert_eq!(b.readoption(), Readoption::Cannot);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_outliving_backend_adopts_running_workloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = NativeBackend::new(Isolation::HostProcess, "/tmp/nb-test-logs", Cgroups::Off)
+            .with_lifetime(WorkloadLifetime::Outlive {
+                state: dir.path().join("native"),
+            })
+            .expect("a writable state directory");
         assert_eq!(b.readoption(), Readoption::AdoptsRunning);
     }
 
@@ -1861,6 +2308,7 @@ mod tests {
             Path::new("/bin/sh"),
             args.iter(),
             &std::collections::BTreeMap::new(),
+            true,
         );
         join_on_exec(&mut cmd, file);
         let status = cmd.spawn().unwrap().wait().await.unwrap();
