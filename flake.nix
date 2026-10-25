@@ -247,34 +247,30 @@
         withShikumiConfig = true;
         shikumiDefaults = { };
 
-        # ── ★ KillMode=control-group is LOAD-BEARING on Linux ─────────────
-        # The native backend (engenho-kubelet/src/native_backend.rs) runs a
-        # pod as a child process of the daemon and cannot re-adopt one after
-        # a restart (`Readoption::Cannot`). What keeps a daemon restart from
-        # leaving a second copy of every native workload running is systemd
-        # killing the WHOLE cgroup when the daemon's unit stops — which is
-        # KillMode=control-group, substrate's mkNixOSService default. Under
-        # `process` or `none`, a restarted engenho would start every pod a
-        # second time beside the orphaned first copy (two Postgres on one
-        # data directory). The default is not enough: a later
-        # `mkForce "process"` anywhere in the fleet would change it silently,
-        # so evaluation refuses it.
         extraNixosConfigFn = { cfg, lib, config, ... }:
           let
             runtime = cfg.config.runtime;
-            nativeDelegated = runtime.kubeletBackend == "native" && runtime.nativeCgroups != "off";
+            native = runtime.kubeletBackend == "native";
+            nativeDelegated = native && runtime.nativeCgroups != "off";
+            outlive = native && runtime.nativeWorkloads == "outlive";
+            killMode = if outlive then "process" else "control-group";
             serviceConfig = config.systemd.services.engenho-daemon.serviceConfig;
           in
           lib.mkIf (cfg.daemon.enable or false) {
-            systemd.services.engenho-daemon.serviceConfig.Delegate = lib.mkIf nativeDelegated "yes";
+            systemd.services.engenho-daemon.serviceConfig = {
+              Delegate = lib.mkIf nativeDelegated "yes";
+              KillMode = lib.mkIf outlive (lib.mkOverride 90 "process");
+              DelegateSubgroup = lib.mkIf (outlive && nativeDelegated) "supervisor";
+            };
             assertions = [
               {
-                assertion = (serviceConfig.KillMode or null) == "control-group";
+                assertion = (serviceConfig.KillMode or null) == killMode;
                 message = ''
                   services.engenho: systemd.services.engenho-daemon must keep
-                  KillMode=control-group. engenho's native backend cannot re-adopt
-                  the workloads a previous daemon spawned, so only the cgroup kill
-                  on stop keeps a restart from running every native pod twice.
+                  KillMode=${killMode} while services.engenho.config.runtime.nativeWorkloads
+                  is ${if outlive then "outlive" else "bound"}. Under `bound` only the
+                  cgroup kill on stop keeps a restart from running every native pod
+                  twice; under `outlive` the workloads must survive the daemon's stop.
                 '';
               }
               {
@@ -386,6 +382,11 @@
           };
         } // lib.optionalAttrs (system == "x86_64-linux") {
           native-cgroups-vm = import ./nix/tests/native-cgroups-vm.nix {
+            pkgs = pkgsFor system;
+            module = self.nixosModules.engenho;
+            package = self.packages.${system}.default;
+          };
+          native-outlive-vm = import ./nix/tests/native-outlive-vm.nix {
             pkgs = pkgsFor system;
             module = self.nixosModules.engenho;
             package = self.packages.${system}.default;

@@ -146,6 +146,24 @@ pub enum NativeCgroups {
     Off,
 }
 
+/// Whether a `native` workload's process outlives the daemon that started it.
+///
+/// `Bound`: a workload ends with the daemon (its unit's `KillMode=control-group`
+/// on Linux, launchd's process group on macOS), and the next daemon starts it
+/// again. `Outlive`: the daemon's unit stops only the daemon
+/// (`KillMode=process`), each workload is recorded on disk with the identity
+/// of its process, and the next daemon adopts every recorded workload whose
+/// process is still the one it started. Linux only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeWorkloads {
+    /// A workload ends with the daemon.
+    #[default]
+    Bound,
+    /// A workload outlives the daemon and is adopted by the next one.
+    Outlive,
+}
+
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -360,6 +378,9 @@ pub struct RuntimeConfig {
     pub native_cgroups: NativeCgroups,
     #[allow(missing_docs)]
     #[serde(default)]
+    pub native_workloads: NativeWorkloads,
+    #[allow(missing_docs)]
+    #[serde(default)]
     pub health_reasons: HealthReasons,
     /// Optional explicit podman binary path.
     ///
@@ -423,6 +444,7 @@ impl TieredConfig for RuntimeConfig {
             etcd_listen_addr: String::new(),
             kubelet_backend: KubeletBackendKind::Fake,
             native_cgroups: NativeCgroups::Off,
+            native_workloads: NativeWorkloads::Bound,
             health_reasons: HealthReasons::Withheld,
             podman_binary: None,
             host_path_allowlist: Vec::new(),
@@ -487,6 +509,7 @@ impl TieredConfig for RuntimeConfig {
             // overridden on every node to be correct.
             kubelet_backend: KubeletBackendKind::PodmanApi,
             native_cgroups: NativeCgroups::Delegated,
+            native_workloads: NativeWorkloads::Bound,
             health_reasons: HealthReasons::Named,
             podman_binary: None,
             host_path_allowlist: Vec::new(),
@@ -549,6 +572,7 @@ impl TieredConfig for RuntimeConfig {
             },
             kubelet_backend: self.kubelet_backend,
             native_cgroups: self.native_cgroups,
+            native_workloads: self.native_workloads,
             health_reasons: self.health_reasons,
             // No "unset" sentinel on an enum whose safe arm is also a
             // meaningful value, so the overlay's value wins — same rule as
@@ -843,6 +867,7 @@ mod tests {
             etcd_listen_addr: String::new(),
             kubelet_backend: KubeletBackendKind::Fake,
             native_cgroups: NativeCgroups::Off,
+            native_workloads: NativeWorkloads::Bound,
             health_reasons: HealthReasons::Withheld,
             podman_binary: None,
             host_path_allowlist: Vec::new(),
@@ -1271,6 +1296,50 @@ mod native_cgroups_tests {
         assert!(
             EngenhoConfig::from_yaml_with_defaults("runtime:\n  native_cgroups: on\n").is_err(),
             "an unknown arm must not fall back to a default"
+        );
+    }
+}
+
+#[cfg(test)]
+mod native_workloads_tests {
+    use super::NativeWorkloads;
+    use crate::EngenhoConfig;
+    use shikumi::TieredConfig;
+
+    #[test]
+    fn a_config_that_does_not_name_it_binds_workloads_to_the_daemon() {
+        let cfg = EngenhoConfig::from_yaml_with_defaults("runtime:\n  kubelet_backend: native\n")
+            .expect("parses");
+        assert_eq!(cfg.runtime.native_workloads, NativeWorkloads::Bound);
+        assert_eq!(
+            super::RuntimeConfig::prescribed_default().native_workloads,
+            NativeWorkloads::Bound
+        );
+    }
+
+    #[test]
+    fn each_wire_name_reads_back_as_its_variant() {
+        for (wire, want) in [
+            ("bound", NativeWorkloads::Bound),
+            ("outlive", NativeWorkloads::Outlive),
+        ] {
+            let yaml = format!("runtime:\n  kubelet_backend: native\n  native_workloads: {wire}\n");
+            let cfg = EngenhoConfig::from_yaml_with_defaults(&yaml)
+                .unwrap_or_else(|e| panic!("`{wire}` must parse: {e}"));
+            assert_eq!(cfg.runtime.native_workloads, want);
+            assert_eq!(
+                serde_json::to_string(&want).unwrap(),
+                format!("\"{wire}\""),
+                "nix/typed-config.nix renders exactly these names"
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_outside_the_two_is_refused_at_parse() {
+        assert!(
+            EngenhoConfig::from_yaml_with_defaults("runtime:\n  native_workloads: detached\n")
+                .is_err()
         );
     }
 }

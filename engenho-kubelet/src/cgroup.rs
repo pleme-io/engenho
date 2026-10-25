@@ -16,6 +16,7 @@ pub const SELF_CGROUP: &str = "/proc/self/cgroup";
 pub const SUPERVISOR: &str = "supervisor";
 pub const WORKLOADS: &str = "workloads";
 pub const PROCS: &str = "cgroup.procs";
+pub const KILL: &str = "cgroup.kill";
 pub const CONTROLLERS: &str = "cgroup.controllers";
 pub const SUBTREE_CONTROL: &str = "cgroup.subtree_control";
 pub const DELEGATION_MARKERS: [&str; 2] = ["user.delegate", "trusted.delegate"];
@@ -537,6 +538,22 @@ impl CgroupTree {
             cpu_ns: usage_usec.saturating_mul(1000),
             memory_working_set_bytes: current.saturating_sub(inactive),
         })
+    }
+
+    pub fn leaves(&self) -> Result<Vec<String>, CgroupError> {
+        subdirs(self.fs.as_ref(), &self.workloads())
+    }
+
+    pub fn occupants(&self, name: &str) -> Result<Vec<u32>, CgroupError> {
+        let text = read(self.fs.as_ref(), &self.leaf(name).join(PROCS))?;
+        Ok(text
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .collect())
+    }
+
+    pub fn kill(&self, name: &str) -> Result<(), CgroupError> {
+        write(self.fs.as_ref(), &self.leaf(name).join(KILL), "1")
     }
 
     pub fn release(&self, name: &str) -> Result<(), CgroupError> {

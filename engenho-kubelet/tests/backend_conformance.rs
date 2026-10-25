@@ -659,8 +659,9 @@ fn evaluate_refusal(kind: KubeletBackendKind, names: &[CriGap]) -> Verdict {
             Ok(rt) => return violates(format!("{constructor} built `{}`", rt.name())),
         }
     }
-    let missing = match refused {
-        BackendRefused::CriIncomplete { missing } => missing,
+    let missing = match &refused {
+        BackendRefused::CriIncomplete { missing } => *missing,
+        other => return violates(format!("refused for a reason that names no gap: `{other}`")),
     };
     for gap in names {
         if !missing.contains(*gap) {
