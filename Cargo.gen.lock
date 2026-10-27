@@ -2,7 +2,7 @@
   "schema_version": 2,
   "cargo_lock_sha256": "3024881a227ff8b35c44e289a7f330bd2a7910702d3036f901855a5a5aa66449",
   "manifest_sha256": {
-    "Cargo.toml": "561123d6436bae4ef2ba347b114f642535836d042b8b846ba360fe7df28ed1d2",
+    "Cargo.toml": "ed7825e0b48edfd5934f3eb872d335fd1819797e289607289b0924ccbb4fcc9c",
     "engenho-apiserver/Cargo.toml": "aeef436a3f47aed782c0701805f9932fd99f4bbcd98ca03a2a7f3fff97b544d5",
     "engenho-cluster-config-render/Cargo.toml": "5f5f6d40c2b9a572f18418d12e568412517972684259f34a9aa3d34de0a5dc8c",
     "engenho-cluster-config/Cargo.toml": "49d8ea7131956ec2d6323ae41968f624fab66bbbbca1afbb0537b2327a683391",
