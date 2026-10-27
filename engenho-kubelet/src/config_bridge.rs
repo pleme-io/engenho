@@ -70,10 +70,20 @@ pub enum BackendRefused {
 /// whatever principal the daemon has, and a path it cannot write would turn
 /// every container start into a failure at the log-file step.
 fn native_log_dir() -> std::path::PathBuf {
-    std::env::var_os("ENGENHO_NATIVE_LOG_DIR").map_or_else(
+    log_dir("ENGENHO_NATIVE_LOG_DIR", "containers")
+}
+
+/// Where the wasm backend keeps component logs, by the same rule.
+fn wasm_log_dir() -> std::path::PathBuf {
+    log_dir("ENGENHO_WASM_LOG_DIR", "wasm")
+}
+
+fn log_dir(var: &str, leaf: &str) -> std::path::PathBuf {
+    std::env::var_os(var).map_or_else(
         || {
             let mut p = dirs_home();
-            p.push(".local/share/engenho/containers");
+            p.push(".local/share/engenho");
+            p.push(leaf);
             p
         },
         std::path::PathBuf::from,
@@ -223,7 +233,12 @@ pub fn make_container_runtime_on_node(
             crate::cgroup::Cgroups::select(native_cgroups),
         )),
     };
-    Ok(runtime)
+    Ok(Arc::new(
+        crate::runtime_class::RuntimeClassRouter::new(runtime).with_class(
+            crate::wasm_backend::WASM_RUNTIME_CLASS,
+            Arc::new(crate::wasm_backend::WasmBackend::new(wasm_log_dir(), false)),
+        ),
+    ))
 }
 
 #[cfg(test)]

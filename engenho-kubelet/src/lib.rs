@@ -15,7 +15,11 @@
 //!       * [`backend::PodmanBackend`] — shell-out to `podman` for local Mac/Linux
 //!       * [`cri_backend::CriBackend`] — CRI over gRPC; refused at
 //!         construction while [`cri_backend::UNSUPPORTED`] is non-empty
-//!       * (future) `RunwasiBackend`
+//!       * [`podman_api::PodmanApiBackend`] — podman over its API socket
+//!       * [`native_backend::NativeBackend`] — host processes out of nix closures
+//!       * [`wasm_backend::WasmBackend`] — WASI preview 2 components on
+//!         `tatara-wasm`, for pods whose `runtimeClassName` is `wasm`;
+//!         [`runtime_class::RuntimeClassRouter`] routes each pod by its class
 //!
 //! ## Reconcile loop
 //!
@@ -78,11 +82,13 @@ pub mod port_forward;
 pub mod port_forward_spdy;
 pub mod probe;
 pub mod pty;
+pub mod runtime_class;
 pub mod server;
 pub mod spdy;
 pub mod stream;
 pub mod usage;
 pub mod volume;
+pub mod wasm_backend;
 
 pub use backend::{
     ContainerRuntime, ContainerStatus, ExecOutcome, FakeBackend, FakeExecFault, FakeNetProber,

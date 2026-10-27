@@ -273,8 +273,9 @@ Defined ─hash▶ Hashed ─build▶ Built ─nar▶ Realised ─put_realisatio
 **States:** `Unscheduled → Scheduled → PendingMaterialization →
 Materializing → Running → Terminating → Terminated`, with
 `MaterializationFailed → (retry) PendingMaterialization`. Driven by the
-`ContainerRuntime` trait (`start/status/stop/remove`); `FakeBackend`
-today, youki/containerd/runwasi/cloud-hypervisor planned. On `Running`,
+`ContainerRuntime` trait (`start/status/stop/remove`); fake, podman,
+podman API, native and wasm (`WasmBackend`, `runtimeClassName: wasm`) backends
+today, youki/containerd/cloud-hypervisor planned. On `Running`,
 kubelet patches `status.phase=Running` + `Ready=True` + `podIP`, which
 ④/⑨ observe (EndpointsController). **Maturity:** start path implemented;
 `stop`/probes/init-containers/volumes/graceful-termination pending.

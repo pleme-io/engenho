@@ -2,7 +2,8 @@
 //!
 //! The substrate's `ContainerRuntime` trait is THE seam between
 //! kubelet (substrate-side) + the host's actual container runner
-//! (podman, containerd via CRI, runwasi for wasm). Backend impls
+//! (podman, containerd via CRI, host processes, wasm components on
+//! tatara-wasm). Backend impls
 //! receive a typed `ContainerSpec` + return a typed
 //! `ContainerStatus`.
 
@@ -571,6 +572,68 @@ pub struct ContainerSpec {
     /// The container's `stdin`, `stdinOnce` and `tty`: what `kubectl attach`
     /// reaches. Default (all off) is the common case and changes nothing.
     pub stdio: ContainerStdio,
+    /// The pod's `runtimeClassName` and the pod facts a class runtime decides
+    /// on. `None` for a pod that names no class: it runs on the node's
+    /// default runtime exactly as before.
+    #[serde(default)]
+    pub runtime_class: Option<RuntimeClassRequest>,
+}
+
+/// A pod's `spec.runtimeClassName`, with the facts a class runtime reads that
+/// [`ContainerSpec`] does not otherwise carry.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeClassRequest {
+    /// `spec.runtimeClassName`.
+    pub name: String,
+    /// `spec.restartPolicy`, `Always` when absent.
+    pub restart_policy: String,
+    /// `metadata.annotations`.
+    pub annotations: BTreeMap<String, String>,
+    /// This container's declared `ports[].containerPort`.
+    pub ports: Vec<u16>,
+    /// `spec.activeDeadlineSeconds`.
+    pub active_deadline_seconds: Option<i64>,
+}
+
+impl RuntimeClassRequest {
+    /// Read the request off a pod and one of its containers; `None` when the
+    /// pod names no runtime class.
+    #[must_use]
+    pub fn of_pod(pod: &serde_json::Value, container: &serde_json::Value) -> Option<Self> {
+        let name = pod.pointer("/spec/runtimeClassName")?.as_str()?.to_string();
+        let annotations = pod
+            .pointer("/metadata/annotations")
+            .and_then(serde_json::Value::as_object)
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let ports = container
+            .get("ports")
+            .and_then(serde_json::Value::as_array)
+            .map(|ps| {
+                ps.iter()
+                    .filter_map(|p| p.get("containerPort")?.as_u64())
+                    .filter_map(|p| u16::try_from(p).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(Self {
+            name,
+            restart_policy: pod
+                .pointer("/spec/restartPolicy")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Always")
+                .to_string(),
+            annotations,
+            ports,
+            active_deadline_seconds: pod
+                .pointer("/spec/activeDeadlineSeconds")
+                .and_then(serde_json::Value::as_i64),
+        })
+    }
 }
 
 /// A container's declared stdio: `spec.containers[i].{stdin,stdinOnce,tty}`.
@@ -3368,6 +3431,7 @@ mod tests {
             // Stop-time only; no argv carries it.
             termination_grace: TerminationGrace::default(),
             stdio: ContainerStdio::default(),
+            runtime_class: None,
             // No Pod identity: these argv tests construct a spec directly, not
             // through the Pod path, and a backend that needs identity must
             // check `is_present()` rather than assume it.

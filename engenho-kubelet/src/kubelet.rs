@@ -1896,6 +1896,7 @@ impl Kubelet {
                         container_name: cname.clone(),
                         init: optional,
                     },
+                    runtime_class: crate::backend::RuntimeClassRequest::of_pod(pod, c),
                 },
             ));
         }

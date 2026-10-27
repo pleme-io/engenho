@@ -2037,6 +2037,7 @@ mod tests {
             init_kind: crate::lifecycle::InitKind::Regular,
             termination_grace: crate::backend::TerminationGrace::default(),
             stdio: crate::backend::ContainerStdio::default(),
+            runtime_class: None,
         };
         let req = create_request(&spec, Some("engenho-net"));
 

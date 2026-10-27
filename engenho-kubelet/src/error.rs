@@ -68,6 +68,19 @@ pub enum KubeletError {
         /// Why, in words an operator can act on.
         reason: &'static str,
     },
+
+    /// The pod names a `runtimeClassName` this node does not serve. Refused
+    /// rather than run on the default runtime, which would silently ignore
+    /// the class the pod asked for.
+    #[error("pod {pod}: runtimeClassName {class} is not served on this node (served: {served:?})")]
+    RuntimeClassUnknown {
+        /// Pod's namespace/name label.
+        pod: String,
+        /// The class it named.
+        class: String,
+        /// The classes this node serves.
+        served: Vec<String>,
+    },
 }
 
 engenho_substrate::impl_error_kind! {
@@ -79,6 +92,7 @@ engenho_substrate::impl_error_kind! {
         { NotReaped { .. } } => "not_reaped",
         (VolumeTeardown(_)) => "volume_teardown",
         { StreamUnsupported { .. } } => "stream_unsupported",
+        { RuntimeClassUnknown { .. } } => "runtime_class_unknown",
     }
 }
 

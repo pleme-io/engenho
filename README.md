@@ -39,7 +39,8 @@ with no caller. The ledger names all of it.
 > is the engine that runs the land (terreno). Resource catalog generated
 > from upstream OpenAPI v3 via `kube-forge` (Pillar 12). Caixa M2/M3
 > slots reconciled natively without Helm. Secrets flow through cofre.
-> Pods can be OCI containers OR tatara tlisp programs via `runwasi`. The
+> Pods can be OCI containers OR WASI preview 2 components
+> (`runtimeClassName: wasm`, engenho-kubelet's `WasmBackend`). The
 > destination doc —
 > [`pleme-io/theory/ENGENHO.md`](https://github.com/pleme-io/theory/blob/main/ENGENHO.md)
 > — is canonical; read it before touching anything load-bearing.

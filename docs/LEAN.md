@@ -46,7 +46,7 @@ proved at scale.
 | **DNS** | (consume) | CoreDNS as a Deployment in engenho clusters | DNS is not the runtime; it's a workload. |
 | **Pod sandbox (microVM mode)** | `engenho-vm-runtime` | **cloud-hypervisor** (Rust VMM, ~50K LoC vs QEMU's 2M LoC) | Kata-style microVM pods become a RuntimeClass. cloud-hypervisor is the Rust VMM. firecracker for ephemeral workloads. |
 | **kasou-VM (macOS dev)** | (consume) | `kasou` (Apple Virtualization.framework wrapper) | macOS operator dev path; production goes through cloud-hypervisor. |
-| **WASI workloads** | `engenho-runtime-class-wasi` | `runwasi` containerd shim | runwasi runs WASI modules as pods under containerd. Engenho registers it as a RuntimeClass. |
+| **WASI workloads** | engenho-kubelet `WasmBackend` (shipped) | `runwasi` containerd shim | runwasi runs WASI modules as pods under containerd. Engenho runs WASI preview 2 components in the kubelet on `tatara-wasm`, for `runtimeClassName: wasm`, with no shim. |
 | **Cluster lifecycle** | `engenho-bootstrap` (reference impl) | `kikai` as the **operator-side cluster lifecycle daemon** | kikai owns the on-disk state + bringup/teardown ergonomics; engenho-bootstrap is the in-cluster lifecycle hooks. |
 | **TLS** | (consume) | `rustls` everywhere | No OpenSSL. |
 | **Attestation chain** | `engenho-tameshi-bridge` (per-pod receipt emission) | `tameshi` + `sekiban` + `kensa` | Every pod is a continuously-attested theorem (Pillar 11 + Viggy Method). |
@@ -82,7 +82,7 @@ skips — is the M0.4 ship gate per ENGENHO.md §XIII.
 | Watch streams | engenho-watch over SSE; behavior matches etcd's resource-version semantics (kine pattern). |
 | Controllers (Deployment / ReplicaSet / StatefulSet / DaemonSet) | engenho-controllers via shigoto. |
 | Scheduler (PreFilter / Filter / Score) | engenho-scheduler with typed predicate/priority plugins. |
-| kubelet (Pod lifecycle / CRI / exec / port-forward) | engenho-kubelet over youki for OCI, cloud-hypervisor for microVM RuntimeClass, runwasi for WASI RuntimeClass. |
+| kubelet (Pod lifecycle / CRI / exec / port-forward) | engenho-kubelet over youki for OCI, cloud-hypervisor for microVM RuntimeClass, the in-process `WasmBackend` (tatara-wasm) for the `wasm` RuntimeClass. |
 | Auth (RBAC / TokenReview / SubjectAccessReview) | engenho-authn integrates with cofre + saguão for fleet identity; standard RBAC types in engenho-types. |
 | Volumes (HostPath / EmptyDir / PVC / CSI) | engenho-csi-bridge; in-tree volume plugins explicitly NOT shipped (k3s lean precedent). |
 | Storage (PV / PVC / StorageClass) | engenho-store handles CR side; CSI drivers (longhorn, openebs) handle dataplane. |
@@ -104,7 +104,7 @@ vendored OpenAPI source on both client (engenho-types) and server
 | M0.2 | engenho-controllers (Deployment + ReplicaSet via shigoto); engenho-scheduler (default policy); kubelet over youki | ~40% (controllers + scheduler + CRI) |
 | M0.3 | sekiban admission integration; cofre secret materialization; kensa attestation gates; CSI bridge | ~60% (compliance + storage) |
 | M0.4 | CNCF Certified Kubernetes Software Conformance v1.34, zero skips | 100% |
-| M0.5 | engenho-vm-runtime (cloud-hypervisor RuntimeClass); runwasi RuntimeClass for tatara workloads; cilium CNI integration | beyond conformance |
+| M0.5 | engenho-vm-runtime (cloud-hypervisor RuntimeClass); wasm RuntimeClass (shipped: `WasmBackend`); cilium CNI integration | beyond conformance |
 
 ## References — read these next
 

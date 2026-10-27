@@ -10,7 +10,7 @@ homepage.workspace = true
 readme.workspace = true
 categories.workspace = true
 keywords.workspace = true
-description = "engenho-kubelet — the missing piece between 'Pod object in the store' and 'container running on host'. Per-node controller that watches Pods bound to its node + materializes containers via a pluggable ContainerRuntime backend (PodmanBackend / CriBackend / RunwasiBackend / FakeBackend for tests)."
+description = "engenho-kubelet — the missing piece between 'Pod object in the store' and 'container running on host'. Per-node controller that watches Pods bound to its node + materializes containers via a pluggable ContainerRuntime backend (PodmanBackend / PodmanApiBackend / CriBackend / NativeBackend / WasmBackend / FakeBackend for tests)."
 
 [dependencies]
 engenho-csi   = { workspace = true }
@@ -47,6 +47,8 @@ miniz_oxide        = "0.8"
 # Splits the port-forward tunnel's WebSocket into a reader and a writer task
 # (src/server.rs); already in the lock as axum's own ws dependency.
 futures-util       = "0.3"
+tatara-wasm        = { version = "0.2.828", features = ["wasi-http"] }
+blue-lang-host     = { git = "https://github.com/pleme-io/blue" }
 
 engenho-types       = { workspace = true }
 engenho-store       = { workspace = true }
@@ -60,6 +62,7 @@ tonic-prost-build = "0.14"
 
 [dev-dependencies]
 tempfile = "3"
+tatara-wasm = { version = "0.2.828", features = ["wasi-http", "fixtures"] }
 engenho-csi = { workspace = true, features = ["test-driver"] }
 proptest = "1"
 # A REAL client for the one test that opens an actual socket. The pure

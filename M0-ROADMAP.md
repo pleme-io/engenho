@@ -18,7 +18,8 @@ engenho replaces k3s not by porting Go but by inverting it:
 - **RUST-NATIVE, ONE BINARY** — ~30–50 MB, no vendored Go, no kine, no external
   etcd; kubectl/etcd-v3/CRI/CNI/Gateway **wire-compatible**; every subsystem a
   daemon supervised under tatara `defguest`. Pods are OCI containers OR
-  tlisp/wasm programs (runwasi RuntimeClass).
+  WASI preview 2 components (`runtimeClassName: wasm`, run in-process by
+  engenho-kubelet's `WasmBackend` on `tatara-wasm`; no runwasi, no shim).
 - **DISTRIBUTED-BY-DESIGN** — engenho-revoada is a four-layer attested fabric;
   Kubernetes is ONE face of it. This is the axis where engenho **surpasses** k3s.
 
@@ -186,8 +187,11 @@ reuse is wanted — not needed to ship M0.0). What actually landed:
   fix watch/RBAC/discovery edge cases; PR to `cncf/k8s-conformance`.
 - ship-gate workflow (generated from pleme-actions) spins a 3-node kasou+kikai
   cluster, asserts `skips==0 && failures==0`, tameshi-receipts + lacre-signs.
-- M5: runwasi RuntimeClass — `runtimeClassName=tlisp` runs as WASI in wasmtime,
-  seeing the cluster's typed env.
+- M5: wasm RuntimeClass — shipped 2026-10-27 as engenho-kubelet's
+  `WasmBackend`: `runtimeClassName: wasm` runs a WASI preview 2 component
+  (wasi:cli/run, or wasi:http/proxy served on its declared port) on
+  `tatara-wasm`'s wasmtime host; grant, supervision and exec-probe answers are
+  decided by the embedded `kidou` blue bidama; an unknown class is refused.
 - **GATE:** zero skips; CNCF submission accepted — **first non-Go certified
   distribution**; engenho promoted to fleet default; rio cutover complete.
 
