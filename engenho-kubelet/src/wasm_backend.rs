@@ -28,8 +28,8 @@ use tatara_wasm::{
 use tokio::sync::oneshot;
 
 use crate::backend::{
-    ContainerRuntime, ContainerSpec, ContainerStatus, ExecOutcome, LogOptions, LogRead,
-    Readoption, RuntimeClassRequest,
+    ContainerRuntime, ContainerSpec, ContainerStatus, ExecOutcome, LogOptions, LogRead, Readoption,
+    RuntimeClassRequest,
 };
 use crate::cgroup::{NotEnforced, ResourceEnforcement};
 use crate::cri::{ExitDisposition, RunState};
@@ -363,7 +363,10 @@ impl PodLog {
     }
 
     fn note(&self, text: &str) {
-        self.write(GuestStream::Stderr, ["wasm: ", text, "\n"].concat().as_bytes());
+        self.write(
+            GuestStream::Stderr,
+            ["wasm: ", text, "\n"].concat().as_bytes(),
+        );
     }
 }
 
@@ -434,17 +437,20 @@ impl WasmBackend {
     }
 
     fn kidou(&self) -> Result<Kidou, KubeletError> {
-        self.kidou
-            .get_or_init(Kidou::start)
-            .clone()
-            .map_err(|e| KubeletError::Backend(format!("wasm: the kidou program did not load: {e}")))
+        self.kidou.get_or_init(Kidou::start).clone().map_err(|e| {
+            KubeletError::Backend(format!("wasm: the kidou program did not load: {e}"))
+        })
     }
 
     fn poisoned() -> KubeletError {
         KubeletError::Backend("wasm: container table lock poisoned".to_string())
     }
 
-    fn spawn_of(spec: &ContainerSpec, id: &str, admission: &Admission) -> Result<WasmSpawn, String> {
+    fn spawn_of(
+        spec: &ContainerSpec,
+        id: &str,
+        admission: &Admission,
+    ) -> Result<WasmSpawn, String> {
         let component = admission
             .component
             .clone()
@@ -460,7 +466,10 @@ impl WasmBackend {
         let mut argv = vec![spec.pod.container_name.clone()];
         argv.extend(spec.argv());
         let env = if grant.env {
-            spec.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+            spec.env
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
         } else {
             Vec::new()
         };
@@ -610,11 +619,14 @@ impl ContainerRuntime for WasmBackend {
     #[allow(clippy::too_many_lines)]
     async fn start(&self, spec: &ContainerSpec) -> Result<ContainerStatus, KubeletError> {
         let pod = format!("{}/{}", spec.pod.namespace, spec.pod.name);
-        let request = spec.runtime_class.clone().unwrap_or_else(|| RuntimeClassRequest {
-            name: WASM_RUNTIME_CLASS.to_string(),
-            restart_policy: "Always".to_string(),
-            ..RuntimeClassRequest::default()
-        });
+        let request = spec
+            .runtime_class
+            .clone()
+            .unwrap_or_else(|| RuntimeClassRequest {
+                name: WASM_RUNTIME_CLASS.to_string(),
+                restart_policy: "Always".to_string(),
+                ..RuntimeClassRequest::default()
+            });
         let unparseable = spec.resources.unparseable();
         if !unparseable.is_empty() {
             return Err(KubeletError::InvalidPod {
@@ -649,9 +661,10 @@ impl ContainerRuntime for WasmBackend {
         std::fs::create_dir_all(&self.log_dir).map_err(|e| {
             KubeletError::Backend(format!("wasm: log dir {}: {e}", self.log_dir.display()))
         })?;
-        let log = Arc::new(PodLog::create(self.log_dir.join(&id)).map_err(|e| {
-            KubeletError::Backend(format!("wasm: log for {id}: {e}"))
-        })?);
+        let log = Arc::new(
+            PodLog::create(self.log_dir.join(&id))
+                .map_err(|e| KubeletError::Backend(format!("wasm: log for {id}: {e}")))?,
+        );
         for withheld in &admission.withheld {
             log.note(&["withheld: ", withheld].concat());
         }
@@ -743,9 +756,8 @@ impl ContainerRuntime for WasmBackend {
             (c.log.path.clone(), c.supervisor.is_finished())
         };
         let from = opts.from_byte.unwrap_or(0);
-        let bytes = Self::read_from(&path, from).map_err(|e| {
-            KubeletError::Backend(format!("wasm: log {}: {e}", path.display()))
-        })?;
+        let bytes = Self::read_from(&path, from)
+            .map_err(|e| KubeletError::Backend(format!("wasm: log {}: {e}", path.display())))?;
         let rendered = crate::cri_log::render(&bytes, opts.render(), ended);
         Ok(LogRead {
             text: rendered.text,

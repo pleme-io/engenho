@@ -15,10 +15,10 @@ use engenho_kubelet::backend::{
 };
 use engenho_kubelet::cri::{ExitDisposition, RunState};
 use engenho_kubelet::error::KubeletError;
-use engenho_kubelet::probe::{run_handler, ProbeKind, ProbeObservation, ProbeSpec};
+use engenho_kubelet::probe::{ProbeKind, ProbeObservation, ProbeSpec, run_handler};
 use engenho_kubelet::runtime_class::RuntimeClassRouter;
-use engenho_kubelet::wasm_backend::{WasmBackend, WASM_RUNTIME_CLASS};
-use serde_json::{json, Value};
+use engenho_kubelet::wasm_backend::{WASM_RUNTIME_CLASS, WasmBackend};
+use serde_json::{Value, json};
 
 struct Pod {
     _dir: tempfile::TempDir,
@@ -89,7 +89,14 @@ async fn probe(p: &Pod, kind: ProbeKind, id: &str) -> ProbeObservation {
     let spec = ProbeSpec::from_container(kind, &p.container)
         .expect("the probe parses")
         .expect("the probe is declared");
-    run_handler(&spec, &p.router, &TokioNetProber::new(), id, Some("127.0.0.1")).await
+    run_handler(
+        &spec,
+        &p.router,
+        &TokioNetProber::new(),
+        id,
+        Some("127.0.0.1"),
+    )
+    .await
 }
 
 async fn until<F, Fut>(what: &str, mut check: F)
@@ -111,7 +118,12 @@ async fn log(p: &Pod, id: &str) -> String {
 }
 
 async fn state(p: &Pod, id: &str) -> RunState {
-    p.router.status(id).await.expect("status").expect("tracked").state
+    p.router
+        .status(id)
+        .await
+        .expect("status")
+        .expect("tracked")
+        .state
 }
 
 fn get(port: u16, path: &str) -> std::io::Result<String> {
@@ -133,16 +145,25 @@ async fn a_wasm_pod_starts_logs_answers_probes_restarts_after_a_crash_and_stops(
     let id = started.container_id.clone();
     assert_eq!(started.state, RunState::Running);
     assert_eq!(started.pod_ip.as_deref(), Some("127.0.0.1"));
-    assert!(p.default.events().await.is_empty(), "the wasm pod reached the default runtime");
+    assert!(
+        p.default.events().await.is_empty(),
+        "the wasm pod reached the default runtime"
+    );
 
     until("the readiness probe passes", || async {
         probe(&p, ProbeKind::Readiness, &id).await == ProbeObservation::Success
     })
     .await;
-    assert_eq!(probe(&p, ProbeKind::Liveness, &id).await, ProbeObservation::Success);
+    assert_eq!(
+        probe(&p, ProbeKind::Liveness, &id).await,
+        ProbeObservation::Success
+    );
     let logged = log(&p, &id).await;
     assert!(logged.contains("probe started"), "{logged}");
-    assert!(logged.contains(&format!("listening on {}", p.port)), "{logged}");
+    assert!(
+        logged.contains(&format!("listening on {}", p.port)),
+        "{logged}"
+    );
     assert!(logged.contains("request /healthz"), "{logged}");
 
     let port = p.port;
@@ -154,7 +175,11 @@ async fn a_wasm_pod_starts_logs_answers_probes_restarts_after_a_crash_and_stops(
         log(&p, &id).await.contains("restart 1 of 3")
     })
     .await;
-    assert_eq!(state(&p, &id).await, RunState::Running, "an in-place restart surfaced the crash");
+    assert_eq!(
+        state(&p, &id).await,
+        RunState::Running,
+        "an in-place restart surfaced the crash"
+    );
     until("the crashed component answers again", || async {
         probe(&p, ProbeKind::Readiness, &id).await == ProbeObservation::Success
             && log(&p, &id).await.matches("probe started").count() == 2
@@ -166,10 +191,19 @@ async fn a_wasm_pod_starts_logs_answers_probes_restarts_after_a_crash_and_stops(
         state(&p, &id).await == RunState::Exited(ExitDisposition::Signal(15))
     })
     .await;
-    assert_eq!(probe(&p, ProbeKind::Liveness, &id).await, ProbeObservation::Failure);
-    assert_eq!(probe(&p, ProbeKind::Readiness, &id).await, ProbeObservation::Failure);
+    assert_eq!(
+        probe(&p, ProbeKind::Liveness, &id).await,
+        ProbeObservation::Failure
+    );
+    assert_eq!(
+        probe(&p, ProbeKind::Readiness, &id).await,
+        ProbeObservation::Failure
+    );
     until("the record is removed", || async {
-        !matches!(p.router.remove(&id).await, Err(KubeletError::NotReaped { .. }))
+        !matches!(
+            p.router.remove(&id).await,
+            Err(KubeletError::NotReaped { .. })
+        )
     })
     .await;
     assert!(p.router.status(&id).await.expect("status").is_none());
@@ -198,7 +232,9 @@ async fn under_restart_policy_never_a_crash_is_surfaced_to_the_kubelet() {
 async fn a_pod_kidou_refuses_never_starts() {
     let oci = pod("Always", |_| "ghcr.io/pleme-io/web:1".to_string());
     match oci.router.start(&oci.spec).await {
-        Err(KubeletError::InvalidPod { reason, .. }) => assert!(reason.contains("OCI reference"), "{reason}"),
+        Err(KubeletError::InvalidPod { reason, .. }) => {
+            assert!(reason.contains("OCI reference"), "{reason}")
+        }
         other => panic!("an OCI image started as a wasm pod: {other:?}"),
     }
     let mut unknown = pod("Always", file_image);
@@ -217,5 +253,8 @@ async fn a_pod_with_no_runtime_class_runs_on_the_default_runtime() {
     let mut p = pod("Always", file_image);
     p.spec.runtime_class = None;
     p.router.start(&p.spec).await.expect("start");
-    assert_eq!(p.default.events().await, vec![FakeEvent::Start("ns_hello_web".into())]);
+    assert_eq!(
+        p.default.events().await,
+        vec![FakeEvent::Start("ns_hello_web".into())]
+    );
 }

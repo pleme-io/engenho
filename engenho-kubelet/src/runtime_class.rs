@@ -16,8 +16,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::backend::{
-    ContainerRuntime, ContainerSpec, ContainerStatus, ExecOutcome, LogOptions, LogRead,
-    Readoption,
+    ContainerRuntime, ContainerSpec, ContainerStatus, ExecOutcome, LogOptions, LogRead, Readoption,
 };
 use crate::error::KubeletError;
 
@@ -41,7 +40,11 @@ impl RuntimeClassRouter {
 
     /// Serve `class` with `runtime`.
     #[must_use]
-    pub fn with_class(mut self, class: impl Into<String>, runtime: Arc<dyn ContainerRuntime>) -> Self {
+    pub fn with_class(
+        mut self,
+        class: impl Into<String>,
+        runtime: Arc<dyn ContainerRuntime>,
+    ) -> Self {
         self.classes.insert(class.into(), runtime);
         self
     }
@@ -89,7 +92,9 @@ impl ContainerRuntime for RuntimeClassRouter {
         container_id: &str,
         req: &crate::stream::StreamRequest,
     ) -> Result<crate::stream::StreamSession, KubeletError> {
-        self.route(container_id).exec_stream(container_id, req).await
+        self.route(container_id)
+            .exec_stream(container_id, req)
+            .await
     }
 
     async fn attach(
@@ -190,11 +195,19 @@ mod tests {
     async fn a_pod_naming_a_served_class_runs_on_that_class_and_stays_there() {
         let (r, default, wasm) = router();
         let started = r.start(&spec("c", Some("wasm"))).await.expect("start");
-        assert_eq!(wasm.events().await, vec![FakeEvent::Start("c".into())], "the wasm class did not reach the wasm runtime");
+        assert_eq!(
+            wasm.events().await,
+            vec![FakeEvent::Start("c".into())],
+            "the wasm class did not reach the wasm runtime"
+        );
         assert!(default.events().await.is_empty());
         r.stop(&started.container_id).await.expect("stop");
         r.remove(&started.container_id).await.expect("remove");
-        assert_eq!(wasm.events().await.len(), 3, "stop and remove left the class runtime");
+        assert_eq!(
+            wasm.events().await.len(),
+            3,
+            "stop and remove left the class runtime"
+        );
         assert!(default.events().await.is_empty());
     }
 
@@ -202,7 +215,12 @@ mod tests {
     async fn a_pod_naming_no_class_runs_on_the_default_runtime_unchanged() {
         let (r, default, wasm) = router();
         let started = r.start(&spec("c", None)).await.expect("start");
-        assert!(r.status(&started.container_id).await.expect("status").is_some());
+        assert!(
+            r.status(&started.container_id)
+                .await
+                .expect("status")
+                .is_some()
+        );
         assert_eq!(default.events().await, vec![FakeEvent::Start("c".into())]);
         assert!(wasm.events().await.is_empty());
     }

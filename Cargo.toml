@@ -236,6 +236,13 @@ module_name_repetitions = "allow"
 # runs in test.yml's ci-contract-tests), and fails if a workflow env or a
 # .cargo/config overrides either from outside this file.
 
+# Third-party crates build without debuginfo in dev and test builds; the
+# workspace's own crates keep it. With wasmtime and cranelift linked into every
+# engenho-kubelet test binary, full dependency debuginfo filled the release
+# gate's hosted runner ("No space left on device", run 40505058225).
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 codegen-units = 1
 lto = true
