@@ -327,9 +327,12 @@ impl Runtime {
         would_reject: &Arc<WouldRejectLedger>,
         rec: &mut BootRecorder,
     ) -> Result<Assembled, RuntimeError> {
-        // 3. Wait for raft leadership — MUST precede any propose.
-        rec.enter(BootPhase::AwaitLeadership)?;
-        await_leadership(store, boot, rec).await?;
+        let joins = boot.membership.joins();
+        if !joins {
+            // 3. Wait for raft leadership — MUST precede any propose.
+            rec.enter(BootPhase::AwaitLeadership)?;
+            await_leadership(store, boot, rec).await?;
+        }
         rec.enter(BootPhase::BuildScheduler)?;
 
         // 3a. The scheduler, from every `scheduler.*` field (T5.8):
@@ -351,42 +354,14 @@ impl Runtime {
         let windows = boot.windows(scheduler.fallback_interval());
         let health = Arc::new(Health::new(store, windows, panics));
 
-        // 4. Register THIS node so the scheduler has a target: create its
-        //    Node if absent, else merge only the host-owned fields — a
-        //    restart never undoes a cordon, a taint or an operator's label.
-        rec.enter(BootPhase::RegisterNode)?;
-        let node_name = &boot.node_name;
-        let host = HostOwned::measured(node_name)
-            .advertising(advertised)
-            .reporting(engenho_kubelet::node_info::measured(backend.as_ref()));
-        register_node(store, node_name, &host).await?;
-        rec.enter(BootPhase::SeedCluster)?;
-
-        // 4.5. Seed the bootstrap RBAC policy (Brick B) — cluster-admin +
-        //    system:discovery + system:basic-user + system:public-info-viewer
-        //    ClusterRoles + their ClusterRoleBindings — BEFORE the apiserver
-        //    binds, so the very first request authorizes against a seeded store.
-        //    Idempotent (Put preserves uid across restarts). MUST precede
-        //    step 5 so anonymous discovery + bound roles resolve through real
-        //    bindings from the first request.
-        //    Seed the four system namespaces FIRST: a namespace must exist
-        //    before anything namespaced can live in it, and `default` is what
-        //    every client opens to.
-        seed_system_namespaces(store).await?;
-        //    Then the `kubernetes` Service in `default`. It must follow the
-        //    namespaces (it lives in one) and precede the apiserver bind, so
-        //    the ClusterIP allocator sees .1 as held before any user Service
-        //    can be created.
-        seed_kubernetes_service(store, boot).await?;
-        seed_bootstrap_rbac(store).await?;
-        //    Then the default StorageClass. It must precede the apiserver bind
-        //    for the same reason the others do: a PVC created in the first
-        //    moments of a cluster's life should provision like any other, not
-        //    hang until something happens to seed a class later.
-        seed_default_storage_class(store).await?;
-        //    Then the snapshot CRDs, so the VolumeSnapshot controller spawned
-        //    below is watching kinds this cluster actually serves.
-        seed_snapshot_crds(store).await?;
+        if joins {
+            info!(
+                node_id = store.node_id(),
+                "a joining learner writes nothing at boot: its Node and the cluster seeds are the leader's"
+            );
+        } else {
+            register_and_seed(store, boot, backend, advertised, rec).await?;
+        }
 
         // 5. Bind the apiserver, backed by the same store. The listen address
         //    is read with the PKI: the server certificate is issued for it.
@@ -1062,6 +1037,52 @@ impl Publisher {
             |ca_pem| write_boot_kubeconfig(boot, self.bound_addr, ca_pem, self.admin.as_ref()),
         )
     }
+}
+
+async fn register_and_seed(
+    store: &Arc<StoreMesh>,
+    boot: &BootConfig,
+    backend: &Arc<dyn ContainerRuntime>,
+    advertised: Option<&NodeCapabilities>,
+    rec: &mut BootRecorder,
+) -> Result<(), RuntimeError> {
+    // 4. Register THIS node so the scheduler has a target: create its
+    //    Node if absent, else merge only the host-owned fields — a
+    //    restart never undoes a cordon, a taint or an operator's label.
+    rec.enter(BootPhase::RegisterNode)?;
+    let node_name = &boot.node_name;
+    let host = HostOwned::measured(node_name)
+        .advertising(advertised)
+        .reporting(engenho_kubelet::node_info::measured(backend.as_ref()));
+    register_node(store, node_name, &host).await?;
+    rec.enter(BootPhase::SeedCluster)?;
+
+    // 4.5. Seed the bootstrap RBAC policy (Brick B) — cluster-admin +
+    //    system:discovery + system:basic-user + system:public-info-viewer
+    //    ClusterRoles + their ClusterRoleBindings — BEFORE the apiserver
+    //    binds, so the very first request authorizes against a seeded store.
+    //    Idempotent (Put preserves uid across restarts). MUST precede
+    //    step 5 so anonymous discovery + bound roles resolve through real
+    //    bindings from the first request.
+    //    Seed the four system namespaces FIRST: a namespace must exist
+    //    before anything namespaced can live in it, and `default` is what
+    //    every client opens to.
+    seed_system_namespaces(store).await?;
+    //    Then the `kubernetes` Service in `default`. It must follow the
+    //    namespaces (it lives in one) and precede the apiserver bind, so
+    //    the ClusterIP allocator sees .1 as held before any user Service
+    //    can be created.
+    seed_kubernetes_service(store, boot).await?;
+    seed_bootstrap_rbac(store).await?;
+    //    Then the default StorageClass. It must precede the apiserver bind
+    //    for the same reason the others do: a PVC created in the first
+    //    moments of a cluster's life should provision like any other, not
+    //    hang until something happens to seed a class later.
+    seed_default_storage_class(store).await?;
+    //    Then the snapshot CRDs, so the VolumeSnapshot controller spawned
+    //    below is watching kinds this cluster actually serves.
+    seed_snapshot_crds(store).await?;
+    Ok(())
 }
 
 /// Wait for raft leadership. The one wait the boot does not bound by its own

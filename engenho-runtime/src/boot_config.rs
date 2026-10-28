@@ -147,7 +147,7 @@ impl BootConfig {
         let not_run = [
             shared.is_some().then_some(NotRun::HostClusterName),
             (!region.is_empty()).then_some(NotRun::Region),
-            Some(read_topology(revoada)?),
+            Some(read_topology(revoada, membership.joins())?),
             fabric_not_run,
         ]
         .into_iter()
@@ -343,7 +343,7 @@ impl ApiserverTls {
 
 /// `revoada`: a formation one node already is is read and not run; one that
 /// names several masters is refused.
-fn read_topology(revoada: &RevoadaConfig) -> Result<NotRun, Unhonoured> {
+fn read_topology(revoada: &RevoadaConfig, joins: bool) -> Result<NotRun, Unhonoured> {
     let RevoadaConfig { topology } = revoada;
     let TopologyConfig {
         strategy,
@@ -353,6 +353,9 @@ fn read_topology(revoada: &RevoadaConfig) -> Result<NotRun, Unhonoured> {
         grace_period_seconds: _,
     } = topology;
     match masters_named(*strategy) {
+        Some(_) if joins => Ok(NotRun::Topology {
+            strategy: *strategy,
+        }),
         Some(masters) => Err(Unhonoured::MultiNodeFormation {
             strategy: *strategy,
             masters,
@@ -735,6 +738,50 @@ mod tests {
                 Unhonoured::MultiNodeFormation { strategy, masters },
             );
         }
+    }
+
+    #[test]
+    fn a_multi_master_formation_is_read_not_refused_only_for_a_shared_node_that_joins() {
+        let shared = |seeds: Vec<std::net::SocketAddr>| engenho_config::SharedCluster {
+            name: "aldeia".into(),
+            ca_cert_path: "/pki/ca.crt".into(),
+            ca_key_path: "/pki/ca.key".into(),
+            identity_key_path: "/pki/node.key".into(),
+            seeds,
+        };
+        let formation = |c: &mut EngenhoConfig| {
+            c.revoada.topology.strategy = TopologyStrategyKind::Quorum3M;
+            c.revoada.topology.min_nodes = 3;
+        };
+        assert_eq!(
+            read(|c| {
+                formation(c);
+                c.cluster.shared = Some(shared(Vec::new()));
+            })
+            .map(|_| ())
+            .unwrap_err(),
+            Unhonoured::MultiNodeFormation {
+                strategy: TopologyStrategyKind::Quorum3M,
+                masters: 3
+            },
+            "a node that forms is still one voter"
+        );
+        let joins = read(|c| {
+            formation(c);
+            c.cluster.shared = Some(shared(vec!["127.0.0.1:7946".parse().unwrap()]));
+            #[cfg(feature = "mesh-quic")]
+            {
+                c.fabric = engenho_config::Fabric::Quic {
+                    bind: "127.0.0.1:0".parse().unwrap(),
+                };
+            }
+        });
+        #[cfg(feature = "mesh-quic")]
+        assert!(joins.unwrap().not_run.contains(&NotRun::Topology {
+            strategy: TopologyStrategyKind::Quorum3M
+        }));
+        #[cfg(not(feature = "mesh-quic"))]
+        assert_eq!(joins.map(|_| ()).unwrap_err(), Unhonoured::SeedsWithoutMesh);
     }
 
     #[test]
