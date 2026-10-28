@@ -152,6 +152,7 @@ impl World {
             .expect("the held port's address")
             .to_string();
         let mut config = EngenhoConfig::prescribed_default();
+        config.controllers.enable.hpa = true;
         config.runtime.kubelet_listen_addr.clone_from(&addr);
         config.runtime.etcd_listen_addr = addr;
         let boot = BootConfig::read(&config).expect("the prescribed default is run");

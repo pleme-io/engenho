@@ -32,8 +32,7 @@ use std::fmt;
 
 use engenho_controllers::{
     Controller, ControllerType, DnsController, DrvBuildController, DrvController,
-    EventDrivenController, HorizontalPodAutoscalerController, IngressController, PlantioController,
-    TieredCacheReconciler,
+    EventDrivenController, IngressController, PlantioController, TieredCacheReconciler,
 };
 
 use crate::runtime_health::Relister;
@@ -42,11 +41,6 @@ engenho_controllers::closed_enum! {
     /// Every controller type compiled into engenho that no driver runs.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub enum Dormant {
-        /// The HorizontalPodAutoscaler controller. Before it is wired in,
-        /// its scale target's group and version must come from the
-        /// target's own `apiVersion`, not the hand list in hpa.rs
-        /// `target_gv`, which sends every kind but three to the core group.
-        Hpa,
         /// The Ingress controller.
         Ingress,
         /// The cluster DNS controller.
@@ -77,10 +71,6 @@ engenho_controllers::closed_enum! {
     /// Why a controller type is compiled in and not run.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub enum DormantReason {
-        /// It scales from a metrics source, and the only `MetricsProvider`
-        /// is the test fake. engenho does not serve `metrics.k8s.io`
-        /// either: served-capability reports that APIService unavailable.
-        NoMetricsSource,
         /// Its backends write config for a proxy the binary does not run
         /// (Traefik routes, nginx server blocks). Running one beside engenho
         /// is a sidecar, which the one-binary rule refuses.
@@ -112,7 +102,6 @@ impl Dormant {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
-            Self::Hpa => "hpa",
             Self::Ingress => "ingress",
             Self::Dns => "dns",
             Self::Plantio => "plantio",
@@ -130,7 +119,6 @@ impl Dormant {
     #[must_use]
     pub fn controller_type(self) -> ControllerType {
         match self {
-            Self::Hpa => of::<HorizontalPodAutoscalerController>(),
             Self::Ingress => of::<IngressController>(),
             Self::Dns => of::<DnsController>(),
             Self::Plantio => of::<PlantioController>(),
@@ -148,7 +136,6 @@ impl Dormant {
     #[must_use]
     pub const fn reason(self) -> DormantReason {
         match self {
-            Self::Hpa => DormantReason::NoMetricsSource,
             Self::Ingress => DormantReason::NoIngressDatapath,
             Self::Dns => DormantReason::NoDnsResolver,
             Self::Plantio => DormantReason::NoRocaPlane,
@@ -168,7 +155,6 @@ impl fmt::Display for Dormant {
 impl fmt::Display for DormantReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::NoMetricsSource => "no metrics source: the only MetricsProvider is the test fake",
             Self::NoIngressDatapath => {
                 "no ingress datapath: its backends configure a proxy the binary does not run"
             }

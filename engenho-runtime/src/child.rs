@@ -124,6 +124,7 @@ engenho_controllers::closed_enum! {
         NodeManifests,
         NodeLifecycle,
         Kubelet,
+        HorizontalPodAutoscaler,
     }
 }
 
@@ -181,6 +182,7 @@ impl Driver {
             Self::NodeManifests => "node-manifests",
             Self::NodeLifecycle => "node-lifecycle",
             Self::Kubelet => "kubelet",
+            Self::HorizontalPodAutoscaler => "hpa",
         }
     }
 
@@ -219,7 +221,8 @@ impl Driver {
             | Self::CsiRegistrar
             // The round-robin cursor sits behind a std Mutex; a panic while
             // holding it poisons every later tick.
-            | Self::Scheduler => TickState::Stateful,
+            | Self::Scheduler
+            | Self::HorizontalPodAutoscaler => TickState::Stateful,
         }
     }
 
@@ -246,6 +249,7 @@ impl Driver {
             // binder binds, so it runs whenever the binder does.
             Self::PvBinder | Self::VolumeSnapshot | Self::PvcProtection => Some(S::PvBinder),
             Self::Crd => Some(S::Crd),
+            Self::HorizontalPodAutoscaler => Some(S::Hpa),
             Self::Scheduler
             | Self::ServedCapability
             | Self::NetworkPolicy
@@ -299,6 +303,7 @@ engenho_controllers::closed_enum! {
         PvBinder,
         /// `pdb`.
         Pdb,
+        Hpa,
     }
 }
 
@@ -350,6 +355,7 @@ impl EnableSwitch {
             namespace,
             pv_binder,
             pdb,
+            hpa,
         } = enable;
         *match self {
             Self::Replicaset => replicaset,
@@ -365,6 +371,7 @@ impl EnableSwitch {
             Self::Namespace => namespace,
             Self::PvBinder => pv_binder,
             Self::Pdb => pdb,
+            Self::Hpa => hpa,
         }
     }
 
@@ -385,6 +392,7 @@ impl EnableSwitch {
             Self::Namespace => "controllers.enable.namespace",
             Self::PvBinder => "controllers.enable.pv_binder",
             Self::Pdb => "controllers.enable.pdb",
+            Self::Hpa => "controllers.enable.hpa",
         }
     }
 }
@@ -566,7 +574,8 @@ impl Child {
                 | Driver::NodeManifests
                 | Driver::NodeLifecycle
                 | Driver::Scheduler
-                | Driver::NetworkPolicy => Respawn::Rebuild,
+                | Driver::NetworkPolicy
+                | Driver::HorizontalPodAutoscaler => Respawn::Rebuild,
                 Driver::Kubelet => {
                     Respawn::RebuildWith(&[Self::NodeLease, Self::Listener(Listener::KubeletHttp)])
                 }

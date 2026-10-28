@@ -75,6 +75,7 @@ driver_names!(
     NodeManifests,
     NodeLifecycle,
     Kubelet,
+    HorizontalPodAutoscaler,
 );
 
 /// A child's kind.

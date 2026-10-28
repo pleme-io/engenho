@@ -19,10 +19,11 @@ use engenho_config::{
 use engenho_controllers::{
     Controller, ControllerError, ControllerType, CrdController, CronJobController,
     DaemonSetController, DeclaresReads, DeploymentController, DynamicHandlerSink,
-    EndpointsController, FakeRouter, GcController, Heartbeat, IptablesRouter, IpvsRouter,
-    JobController, NamespaceController, PodDisruptionBudgetController, PvBinderController,
-    PvcProtectionController, Reads, ReconcileOutcome, ReplicaSetController, ServiceRouter,
-    ServiceRoutingController, StatefulSetController, WallClock, WatchDriver, WatchDriverConfig,
+    EndpointsController, FakeRouter, GcController, Heartbeat, HorizontalPodAutoscalerController,
+    IptablesRouter, IpvsRouter, JobController, NamespaceController, PANGEA_LEAF_PENDING_WORK,
+    PodDisruptionBudgetController, PvBinderController, PvcProtectionController, Reads,
+    ReconcileOutcome, ReplicaSetController, ServiceRouter, ServiceRoutingController,
+    StatefulSetController, StatusMetricsProvider, WallClock, WatchDriver, WatchDriverConfig,
     admission::{AdmissionChain, AdmissionMode, AdmissionWebhook},
     cluster_ip::{ClusterIpDefaultingWebhook, StoreServiceIpSource},
     event_recorder::EventSink,
@@ -3929,6 +3930,17 @@ impl Parts {
                 driver,
                 DeclaredHere::new(self.kubelet.load_full(), Reads::of(KUBELET_READS)),
             ),
+            Driver::HorizontalPodAutoscaler => self.watch(
+                driver,
+                HorizontalPodAutoscalerController::new(
+                    store.clone(),
+                    Arc::new(StatusMetricsProvider::new(
+                        store.clone(),
+                        vec![PANGEA_LEAF_PENDING_WORK],
+                    )),
+                    ns(),
+                ),
+            ),
         }
     }
 }
@@ -4628,6 +4640,7 @@ mod tests {
         cfg.runtime.node_manifests_dir = cfg.runtime.data_dir.join("manifests.d");
         cfg.controllers.fallback_interval_seconds = 1;
         cfg.controllers.debounce_milliseconds = 20;
+        cfg.controllers.enable.hpa = true;
         // Ephemeral ports for both listeners: parallel tests (or a real
         // engenho on this host) holding :10250 / :2379 would otherwise halt
         // them, and the child tests below assert that they serve.
@@ -4668,11 +4681,12 @@ mod tests {
         // Moving it is correct ONLY alongside an intentional change to the
         // driver set — which is what added served_capability, then
         // volume_snapshot (19 → 20), then pvc_protection (20 → 21, W9),
-        // node_manifests (21 → 22), and node_lifecycle (22 → 23).
+        // node_manifests (21 → 22), node_lifecycle (22 → 23), and hpa
+        // (23 → 24, LEAVES.md EH1).
         // Every driver in the catalog is on in this config, so it is also the
         // catalog's size.
-        assert_eq!(running_drivers(&rt), 23);
-        assert_eq!(Driver::ALL.len(), 23);
+        assert_eq!(running_drivers(&rt), 24);
+        assert_eq!(Driver::ALL.len(), 24);
         rt.shutdown().await.unwrap();
     }
 
@@ -5022,11 +5036,11 @@ mod tests {
     #[tokio::test]
     async fn disabling_service_routing_drops_one_driver() {
         // Gating works: turning off enable.service_routing removes exactly
-        // one spawned driver (22 → 21).
+        // one spawned driver (24 → 23).
         let mut cfg = ephemeral_test_config();
         cfg.controllers.enable.service_routing = false;
         let rt = Runtime::start(cfg).await.unwrap();
-        assert_eq!(running_drivers(&rt), 22);
+        assert_eq!(running_drivers(&rt), 23);
         assert!(
             rt.children()
                 .get(Child::Driver(Driver::ServiceRouting))
@@ -5101,6 +5115,7 @@ mod tests {
             Driver::NodeManifests => vec![file!("engenho-runtime/src/node_manifests.rs")],
             Driver::NodeLifecycle => vec![file!("engenho-controllers/src/node_lifecycle.rs")],
             Driver::Kubelet => vec![file!("engenho-kubelet/src/kubelet.rs")],
+            Driver::HorizontalPodAutoscaler => vec![file!("engenho-controllers/src/hpa.rs")],
         }
     }
 

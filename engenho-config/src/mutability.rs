@@ -232,6 +232,7 @@ fn build() -> Vec<LeafSpec> {
         namespace => drivers,
         pv_binder => drivers,
         pdb => drivers,
+        hpa => drivers,
     });
     section!(rows, "consistency", ConsistencyConfig {
         default_tier => inert,

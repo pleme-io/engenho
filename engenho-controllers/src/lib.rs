@@ -146,8 +146,9 @@ pub use event_driven::EventDrivenController;
 pub use gc::GcController;
 pub use heartbeat::{Beat, Heartbeat, TickClass};
 pub use hpa::{
-    FakeMetricsProvider, HorizontalPodAutoscalerController, MetricsError, MetricsProvider,
-    ScaleTarget,
+    FakeMetricsProvider, HorizontalPodAutoscalerController, MetricSpec, MetricSpecError,
+    MetricTarget, MetricsError, MetricsProvider, PANGEA_LEAF_PENDING_WORK, Recommendations,
+    ScaleTarget, StatusMetric, StatusMetricsProvider, Windows, recommend,
 };
 pub use ingress::{
     FakeIngressBackend, FakeIngressEvent, IngressBackend, IngressController, IngressError,

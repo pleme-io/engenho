@@ -94,6 +94,10 @@ pub struct ControllerEnable {
     /// operator YAML still deserializes (defaults on).
     #[serde(default = "default_true")]
     pub pdb: bool,
+    /// `HorizontalPodAutoscaler` controller, scaling on declared external
+    /// metrics (`pangea_leaf_pending_work`). Off unless declared.
+    #[serde(default)]
+    pub hpa: bool,
 }
 
 /// serde default for the `statefulset` / `job` toggles — `true` so an
@@ -120,6 +124,7 @@ impl TieredConfig for ControllersConfig {
                 namespace: false,
                 pv_binder: false,
                 pdb: false,
+                hpa: false,
             },
             namespace: String::new(),
             fallback_interval_seconds: 0,
@@ -143,6 +148,7 @@ impl TieredConfig for ControllersConfig {
                 namespace: true,
                 pv_binder: true,
                 pdb: true,
+                hpa: false,
             },
             namespace: String::new(),
             fallback_interval_seconds: 30,
@@ -208,6 +214,22 @@ mod tests {
         assert!(cfg.enable.namespace);
         assert!(cfg.enable.pv_binder);
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn the_hpa_is_off_unless_declared() {
+        assert!(!ControllersConfig::prescribed_default().enable.hpa);
+        assert!(!ControllersConfig::bare().enable.hpa);
+        let on: ControllersConfig = serde_yaml::from_str(
+            "enable: {replicaset: true, deployment: true, endpoints: true, gc: true, hpa: true}\nnamespace: ''\nfallback_interval_seconds: 30\ndebounce_milliseconds: 50\n",
+        )
+        .unwrap();
+        assert!(on.enable.hpa);
+        let absent: ControllersConfig = serde_yaml::from_str(
+            "enable: {replicaset: true, deployment: true, endpoints: true, gc: true}\nnamespace: ''\nfallback_interval_seconds: 30\ndebounce_milliseconds: 50\n",
+        )
+        .unwrap();
+        assert!(!absent.enable.hpa);
     }
 
     #[test]

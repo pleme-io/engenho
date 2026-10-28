@@ -50,6 +50,7 @@ let
     replicaset = true; deployment = true; statefulset = true; daemonset = true;
     job = true; cronjob = true; endpoints = true; service_routing = true;
     gc = true; crd = true; namespace = true; pv_binder = true; pdb = true;
+    hpa = false;
   };
 in
 {
@@ -393,7 +394,7 @@ in
         example = { gc = false; pdb = false; };
         description = ''
           Per-controller on/off. Only the keys you set are emitted; the rest
-          keep engenho's defaults (all on).
+          keep engenho's defaults (all on but hpa).
 
           Known controllers: ${lib.concatStringsSep ", "
             (lib.attrNames controllerToggles)}.

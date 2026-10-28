@@ -1031,6 +1031,7 @@ components:
         - node_manifests
         - node_lifecycle
         - kubelet
+        - horizontal_pod_autoscaler
     ChildName:
       type: string
       description: Every supervised child = every driver + every listener + the node lease.
@@ -1058,6 +1059,7 @@ components:
         - node_manifests
         - node_lifecycle
         - kubelet
+        - horizontal_pod_autoscaler
         - kubelet_http
         - etcd_facade
         - node_lease
