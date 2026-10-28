@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use crate::network::MeshNetwork;
 use crate::testing::Cluster;
 use crate::{ReadConsistency, ReadRefused, Reason, ResourceCommand, ResourceKey};
 
@@ -26,9 +27,11 @@ fn image(value: &serde_json::Value) -> Option<&str> {
         .and_then(serde_json::Value::as_str)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn partition_2_of_3_the_minority_neither_elects_nor_commits_and_heals_to_the_majority() {
-    let cluster = Cluster::start("p3-minority", 3).await.unwrap();
+async fn partition_2_of_3_the_minority_neither_elects_nor_commits_and_heals_to_the_majority<
+    N: MeshNetwork,
+>(
+    cluster: Cluster<N>,
+) {
     let old = cluster.leader(ELECT).await.expect("no first leader");
     let before = cluster
         .node(old)
@@ -97,9 +100,7 @@ async fn partition_2_of_3_the_minority_neither_elects_nor_commits_and_heals_to_t
     cluster.terminate().await.unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_deposed_leader_serves_no_stale_latest_read() {
-    let cluster = Cluster::start("p3-stale-read", 3).await.unwrap();
+async fn a_deposed_leader_serves_no_stale_latest_read<N: MeshNetwork>(cluster: Cluster<N>) {
     let old = cluster.leader(ELECT).await.expect("no first leader");
     let first = cluster.node(old).propose(put("x", "v1")).await.unwrap();
     assert!(
@@ -174,9 +175,9 @@ async fn a_deposed_leader_serves_no_stale_latest_read() {
     cluster.terminate().await.unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn dropped_and_delayed_appends_still_replicate_once_the_link_delivers() {
-    let cluster = Cluster::start("p3-drop-delay", 3).await.unwrap();
+async fn dropped_and_delayed_appends_still_replicate_once_the_link_delivers<N: MeshNetwork>(
+    cluster: Cluster<N>,
+) {
     let leader = cluster.leader(ELECT).await.expect("no leader");
     let [a, b] = cluster.others(leader)[..] else {
         panic!("three nodes");
@@ -205,9 +206,9 @@ async fn dropped_and_delayed_appends_still_replicate_once_the_link_delivers() {
     cluster.terminate().await.unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_fresh_leader_with_no_writes_serves_latest_reads_and_its_revision() {
-    let cluster = Cluster::start("p3-fresh-leader", 3).await.unwrap();
+async fn a_fresh_leader_with_no_writes_serves_latest_reads_and_its_revision<N: MeshNetwork>(
+    cluster: Cluster<N>,
+) {
     let leader = cluster.leader(ELECT).await.expect("no leader");
     let node = cluster.node(leader);
     assert_eq!(
@@ -221,3 +222,74 @@ async fn a_fresh_leader_with_no_writes_serves_latest_reads_and_its_revision() {
     );
     cluster.terminate().await.unwrap();
 }
+
+async fn a_stopped_leader_is_replaced_and_writes_still_replicate<N: MeshNetwork>(
+    mut cluster: Cluster<N>,
+) {
+    let old = cluster.leader(ELECT).await.expect("no first leader");
+    let first = cluster.node(old).propose(put("a", "v1")).await.unwrap();
+    assert!(
+        cluster
+            .all_applied(&cluster.ids(), first.applied_index, APPLY)
+            .await
+    );
+    cluster.stop(old).await.unwrap();
+    let survivors = cluster.ids();
+    assert_eq!(survivors.len(), 2);
+    let new = cluster
+        .leader_among(&survivors, ELECT)
+        .await
+        .expect("the survivors elected no leader");
+    assert_ne!(new, old);
+    let second = cluster.node(new).propose(put("a", "v2")).await.unwrap();
+    assert!(
+        cluster
+            .all_applied(&survivors, second.applied_index, APPLY)
+            .await
+    );
+    for &id in &survivors {
+        assert_eq!(
+            cluster
+                .node(id)
+                .get(&pod("a"))
+                .await
+                .as_ref()
+                .and_then(image),
+            Some("v2"),
+            "node {id}"
+        );
+    }
+    cluster.terminate().await.unwrap();
+}
+
+macro_rules! over_every_mesh {
+    ($($name:ident),* $(,)?) => {$(
+        mod $name {
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn in_process() {
+                let cluster = crate::testing::Cluster::start(stringify!($name), 3)
+                    .await
+                    .unwrap();
+                super::$name(cluster).await;
+            }
+
+            #[cfg(feature = "mesh-quic")]
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn quic() {
+                let cluster = crate::testing::quic_loopback(stringify!($name), 3)
+                    .await
+                    .unwrap();
+                super::$name(cluster).await;
+            }
+        }
+    )*};
+}
+
+over_every_mesh!(
+    partition_2_of_3_the_minority_neither_elects_nor_commits_and_heals_to_the_majority,
+    a_deposed_leader_serves_no_stale_latest_read,
+    dropped_and_delayed_appends_still_replicate_once_the_link_delivers,
+    a_fresh_leader_with_no_writes_serves_latest_reads_and_its_revision,
+);
+
+over_every_mesh!(a_stopped_leader_is_replaced_and_writes_still_replicate);

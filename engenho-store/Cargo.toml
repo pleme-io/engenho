@@ -31,11 +31,15 @@ futures            = { workspace = true }
 openraft           = { workspace = true }
 fjall              = { workspace = true }
 blake3             = "1"
+quinn                 = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring"], optional = true }
+rustls                = { workspace = true, optional = true }
+engenho-control-types = { workspace = true, features = ["tls"], optional = true }
 
 [features]
 default = []
 teia-nats = ["dep:engenho-teia", "engenho-teia/teia-nats"]
 test-support = []
+mesh-quic = ["dep:quinn", "dep:rustls", "dep:engenho-control-types"]
 
 [target.'cfg(unix)'.dependencies]
 # flock(2) for the data-dir lock. Unix-only on purpose: the lock is a real

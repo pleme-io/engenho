@@ -127,16 +127,7 @@ impl NatsRaftNetwork {
     }
 }
 
-/// JSON envelope so the consumer side can pattern-match a single
-/// type per subject. Mirrors `RpcRequest` in `network.rs` but
-/// typed for serde.
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "kind")]
-pub enum NatsRpcEnvelope {
-    AppendEntries(AppendEntriesRequest<TypeConfig>),
-    Vote(VoteRequest<RaftNodeId>),
-    InstallSnapshot(InstallSnapshotRequest<TypeConfig>),
-}
+pub type NatsRpcEnvelope = crate::network::RpcEnvelope;
 
 pub type NatsRpcReply<T, E = RaftError<RaftNodeId>> = Result<T, E>;
 
@@ -266,7 +257,6 @@ mod tests {
             NatsRpcEnvelope::Vote(decoded) => assert_eq!(decoded, req),
             _ => panic!("wrong variant"),
         }
-        // Tag is present.
-        assert!(json.contains("\"kind\":\"Vote\""));
+        assert!(json.starts_with("{\"Vote\":"), "{json}");
     }
 }

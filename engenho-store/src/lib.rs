@@ -108,6 +108,8 @@ pub mod network;
 pub mod owned_task;
 pub mod pagination;
 pub mod patch_apply;
+#[cfg(feature = "mesh-quic")]
+pub mod quic_network;
 pub mod read;
 pub mod resource;
 pub mod revision;
@@ -141,13 +143,15 @@ pub use mesh::{MeshFlushed, Quiesced, StoreError, StoreMesh, default_config};
 pub use nats_listener::NatsListener;
 #[cfg(feature = "teia-nats")]
 pub use nats_network::{NatsRaftNetwork, NatsRaftNetworkFactory, NatsRpcEnvelope};
-pub use network::{InProcessRouter, MeshNetwork};
+pub use network::{InProcessRouter, MeshNetwork, RpcEnvelope};
 pub use owned_task::{OwnedTask, TaskStop};
 pub use pagination::{ContinueInvalid, ContinueToken, ListPage, PageAtRevision};
 pub use patch_apply::{
     Gvk, JsonPath, ListMergeStrategy, MockPatchEnv, OpenApiPatchEnv, PatchBody, PatchDirective,
     PatchError, PatchSchemaEnv, apply as apply_patch_algorithm,
 };
+#[cfg(feature = "mesh-quic")]
+pub use quic_network::{QuicMeshError, QuicRouter};
 pub use read::{ReadConsistency, ReadRefused};
 pub use resource::{ListScope, ResourceKey, ResourceValue};
 pub use revision::{Change, ChangeKind, CompactedTooOld, Revision, VersionMeta};

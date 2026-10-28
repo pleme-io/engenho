@@ -71,9 +71,14 @@ impl FaultNet {
     }
 
     pub fn node(&self, local: RaftNodeId) -> FaultRouter {
+        self.over(local, self.inner.clone())
+    }
+
+    pub fn over<N: MeshNetwork>(&self, local: RaftNodeId, inner: N) -> FaultRouter<N> {
         FaultRouter {
             net: self.clone(),
             local,
+            inner,
         }
     }
 
@@ -134,49 +139,53 @@ impl FaultNet {
 }
 
 #[derive(Clone)]
-pub struct FaultRouter {
+pub struct FaultRouter<N = InProcessRouter> {
     net: FaultNet,
     local: RaftNodeId,
+    inner: N,
 }
 
-impl FaultRouter {
+impl<N> FaultRouter<N> {
     pub fn local(&self) -> RaftNodeId {
         self.local
     }
+
+    pub fn inner(&self) -> &N {
+        &self.inner
+    }
 }
 
-impl MeshNetwork for FaultRouter {
+impl<N: MeshNetwork> MeshNetwork for FaultRouter<N> {
     async fn register(&self, node_id: RaftNodeId, sender: mpsc::Sender<RpcRequest>) {
         assert_eq!(
             node_id, self.local,
             "a FaultRouter handle carries the faults of node {}, not of node {node_id}",
             self.local
         );
-        self.net.inner.register(node_id, sender).await;
+        self.inner.register(node_id, sender).await;
     }
 
     async fn deregister(&self, node_id: RaftNodeId) {
-        self.net.inner.deregister(node_id).await;
+        self.inner.deregister(node_id).await;
     }
 }
 
-impl RaftNetworkFactory<TypeConfig> for FaultRouter {
-    type Network = FaultNetwork;
+impl<N: MeshNetwork> RaftNetworkFactory<TypeConfig> for FaultRouter<N> {
+    type Network = FaultNetwork<N::Network>;
 
     async fn new_client(&mut self, target: RaftNodeId, node: &BasicNode) -> Self::Network {
-        let mut inner = self.net.inner.clone();
         FaultNetwork {
             link: (self.local, target),
             net: self.net.clone(),
-            inner: inner.new_client(target, node).await,
+            inner: self.inner.new_client(target, node).await,
         }
     }
 }
 
-pub struct FaultNetwork {
+pub struct FaultNetwork<I = InProcessNetwork> {
     link: Link,
     net: FaultNet,
-    inner: InProcessNetwork,
+    inner: I,
 }
 
 fn lost<E: std::error::Error>(link: Link, what: &str) -> RPCError<RaftNodeId, BasicNode, E> {
@@ -207,7 +216,7 @@ where
     answer
 }
 
-impl RaftNetwork<TypeConfig> for FaultNetwork {
+impl<I: RaftNetwork<TypeConfig>> RaftNetwork<TypeConfig> for FaultNetwork<I> {
     async fn append_entries(
         &mut self,
         rpc: AppendEntriesRequest<TypeConfig>,
@@ -261,22 +270,37 @@ pub fn fast_config(cluster_name: &str) -> Result<Arc<Config>, StoreError> {
         .map_err(|e| StoreError::ConfigInvalid(e.to_string()))
 }
 
-pub struct Cluster {
+pub struct Cluster<N: MeshNetwork = InProcessRouter> {
     net: FaultNet,
-    nodes: Vec<StoreMesh<FaultRouter>>,
+    nodes: Vec<StoreMesh<FaultRouter<N>>>,
 }
 
 impl Cluster {
     pub async fn start(cluster_name: &str, size: u64) -> Result<Self, StoreError> {
         let net = FaultNet::new();
+        let routers = (1..=size)
+            .map(|id| (id, address(id), net.inner.clone()))
+            .collect();
+        Cluster::start_over(net, cluster_name, routers).await
+    }
+}
+
+impl<N: MeshNetwork> Cluster<N> {
+    pub async fn start_over(
+        net: FaultNet,
+        cluster_name: &str,
+        routers: Vec<(RaftNodeId, String, N)>,
+    ) -> Result<Self, StoreError> {
         let cfg = fast_config(cluster_name)?;
+        let voters: Vec<(RaftNodeId, String)> = routers
+            .iter()
+            .map(|(id, addr, _)| (*id, addr.clone()))
+            .collect();
         let mut nodes = Vec::new();
-        for id in 1..=size {
-            nodes.push(StoreMesh::start(id, address(id), net.node(id), cfg.clone()).await?);
+        for (id, addr, inner) in routers {
+            nodes.push(StoreMesh::start(id, addr, net.over(id, inner), cfg.clone()).await?);
         }
-        nodes[0]
-            .initialize_with_voters((1..=size).map(|id| (id, address(id))).collect())
-            .await?;
+        nodes[0].initialize_with_voters(voters).await?;
         Ok(Self { net, nodes })
     }
 
@@ -292,7 +316,7 @@ impl Cluster {
         self.ids().into_iter().filter(|n| *n != id).collect()
     }
 
-    pub fn node(&self, id: RaftNodeId) -> &StoreMesh<FaultRouter> {
+    pub fn node(&self, id: RaftNodeId) -> &StoreMesh<FaultRouter<N>> {
         self.nodes
             .iter()
             .find(|n| n.node_id() == id)
@@ -335,6 +359,15 @@ impl Cluster {
         true
     }
 
+    pub async fn stop(&mut self, id: RaftNodeId) -> Result<(), StoreError> {
+        let at = self
+            .nodes
+            .iter()
+            .position(|n| n.node_id() == id)
+            .unwrap_or_else(|| panic!("no node {id} in this cluster"));
+        self.nodes.remove(at).terminate().await
+    }
+
     pub async fn terminate(self) -> Result<(), StoreError> {
         for node in self.nodes {
             node.terminate().await?;
@@ -345,6 +378,35 @@ impl Cluster {
 
 fn address(id: RaftNodeId) -> String {
     format!("fault-router://{id}")
+}
+
+#[cfg(feature = "mesh-quic")]
+pub async fn quic_loopback(
+    cluster_name: &str,
+    size: u64,
+) -> Result<Cluster<crate::quic_network::QuicRouter>, StoreError> {
+    use crate::quic_network::QuicRouter;
+    use engenho_control_types::pin::KeyMaterial;
+    let fatal = |e: &dyn std::error::Error| StoreError::Fatal(e.to_string());
+    let mut routers = Vec::new();
+    for id in 1..=size {
+        let key = KeyMaterial::generate().map_err(|e| fatal(&e))?;
+        let router = QuicRouter::bind(([127, 0, 0, 1], 0).into(), key).map_err(|e| fatal(&e))?;
+        routers.push((id, router));
+    }
+    for (id, router) in &routers {
+        for (peer, other) in &routers {
+            if peer != id {
+                router.admit(*peer, other.spki());
+            }
+        }
+    }
+    let mut placed = Vec::new();
+    for (id, router) in routers {
+        let addr = router.local_addr().map_err(|e| fatal(&e))?.to_string();
+        placed.push((id, addr, router));
+    }
+    Cluster::start_over(FaultNet::new(), cluster_name, placed).await
 }
 
 #[cfg(test)]

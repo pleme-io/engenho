@@ -35,6 +35,51 @@ pub enum RpcRequest {
     ),
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+pub enum RpcEnvelope {
+    AppendEntries(AppendEntriesRequest<TypeConfig>),
+    Vote(VoteRequest<RaftNodeId>),
+    InstallSnapshot(InstallSnapshotRequest<TypeConfig>),
+}
+
+impl RpcEnvelope {
+    pub async fn deliver(self, inbox: &mpsc::Sender<RpcRequest>) -> std::io::Result<Vec<u8>> {
+        fn encoded<T: serde::Serialize>(
+            received: Result<T, oneshot::error::RecvError>,
+        ) -> std::io::Result<Vec<u8>> {
+            let answer = received.map_err(std::io::Error::other)?;
+            serde_json::to_vec(&answer).map_err(std::io::Error::other)
+        }
+        let closed = |_| std::io::Error::other("the node's RPC inbox is closed");
+        match self {
+            Self::AppendEntries(rpc) => {
+                let (tx, rx) = oneshot::channel();
+                inbox
+                    .send(RpcRequest::AppendEntries(rpc, tx))
+                    .await
+                    .map_err(closed)?;
+                encoded(rx.await)
+            }
+            Self::Vote(rpc) => {
+                let (tx, rx) = oneshot::channel();
+                inbox
+                    .send(RpcRequest::Vote(rpc, tx))
+                    .await
+                    .map_err(closed)?;
+                encoded(rx.await)
+            }
+            Self::InstallSnapshot(rpc) => {
+                let (tx, rx) = oneshot::channel();
+                inbox
+                    .send(RpcRequest::InstallSnapshot(rpc, tx))
+                    .await
+                    .map_err(closed)?;
+                encoded(rx.await)
+            }
+        }
+    }
+}
+
 pub trait MeshNetwork: RaftNetworkFactory<TypeConfig> + Clone + Send + Sync + 'static {
     fn register(
         &self,
@@ -188,5 +233,41 @@ impl RaftNetwork<TypeConfig> for InProcessNetwork {
             .await
             .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
         answered(self.target, "Vote", rx.await)
+    }
+}
+
+#[cfg(test)]
+mod envelope_tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use openraft::{BasicNode, CommittedLeaderId, Entry, EntryPayload, LogId, Membership, Vote};
+
+    use super::RpcEnvelope;
+    use crate::type_config::TypeConfig;
+
+    #[test]
+    fn an_append_carrying_a_membership_entry_round_trips_through_json() {
+        let voters = BTreeSet::from([1, 2, 3]);
+        let nodes: BTreeMap<u64, BasicNode> = voters
+            .iter()
+            .map(|id| (*id, BasicNode::new(format!("127.0.0.1:{}", 7000 + id))))
+            .collect();
+        let entry = Entry::<TypeConfig> {
+            log_id: LogId::new(CommittedLeaderId::new(1, 1), 1),
+            payload: EntryPayload::Membership(Membership::new(vec![voters], nodes)),
+        };
+        let envelope = RpcEnvelope::AppendEntries(openraft::raft::AppendEntriesRequest {
+            vote: Vote::new_committed(1, 1),
+            prev_log_id: None,
+            entries: vec![entry.clone()],
+            leader_commit: None,
+        });
+        let wire = serde_json::to_vec(&envelope).unwrap();
+        let back: RpcEnvelope = serde_json::from_slice(&wire)
+            .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&wire)));
+        let RpcEnvelope::AppendEntries(decoded) = back else {
+            panic!("decoded as another kind");
+        };
+        assert_eq!(decoded.entries, vec![entry]);
     }
 }

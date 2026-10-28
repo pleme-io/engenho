@@ -55,7 +55,10 @@ async fn a_node_that_voted_and_restarted_grants_no_lower_vote_in_that_term() {
 
     let voter = durable(&net, dir.path()).await;
     let first = ask(&net, 2, TERM).await;
-    assert!(first.vote_granted, "the first candidate was refused: {first:?}");
+    assert!(
+        first.vote_granted,
+        "the first candidate was refused: {first:?}"
+    );
     assert_eq!(first.vote, Vote::new(TERM, 2));
     voter.terminate().await.unwrap();
 
@@ -66,7 +69,11 @@ async fn a_node_that_voted_and_restarted_grants_no_lower_vote_in_that_term() {
         "node {VOTER} voted for 2 at term {TERM}, restarted, and voted for 1 in the same term: \
          {second:?}"
     );
-    assert_eq!(second.vote, Vote::new(TERM, 2), "the vote it holds after the restart");
+    assert_eq!(
+        second.vote,
+        Vote::new(TERM, 2),
+        "the vote it holds after the restart"
+    );
 
     let later = ask(&net, 1, TERM + 1).await;
     assert!(
