@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use engenho_apiserver::{MetricsSource, ReconcileResult};
 use engenho_config::{EngenhoConfig, Fabric, KubeletBackendKind, SharedCluster};
 use engenho_runtime::Runtime;
 use engenho_store::{MeshAddr, Reason, ResourceCommand, ResourceKey, Revision};
@@ -49,6 +50,17 @@ impl Node {
             .into_iter()
             .find(|(id, _, _)| *id == self.id())
             .map(|(_, _, voter)| voter)
+    }
+
+    async fn standby_ticks(&self, driver: &str) -> u64 {
+        self.runtime
+            .health()
+            .snapshot()
+            .await
+            .reconciles
+            .iter()
+            .find(|c| c.controller == driver && c.result == ReconcileResult::RequeueAfter)
+            .map_or(0, |c| c.count)
     }
 
     async fn write(&self, name: &str) -> Revision {
@@ -162,6 +174,52 @@ async fn two_daemons_one_cluster_a_learner_serves_the_leaders_write_and_is_promo
     assert_eq!(two.voter(&one).await, Some(true));
     let at = one.write("after-promotion").await;
     assert!(two.serves("after-promotion", at).await);
+
+    two.runtime.shutdown().await.unwrap();
+    one.runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_cluster_controller_stands_by_on_a_learner_and_runs_on_the_leader() {
+    let ca_dir = tempfile::tempdir().unwrap();
+    let ca = ca(ca_dir.path());
+    let one = Node::start(&ca, "node-one", &[]).await;
+    let two = Node::start(&ca, "node-two", &[&one]).await;
+    one.runtime
+        .store()
+        .propose(ResourceCommand::put(
+            ResourceKey::namespaced("apps", "v1", "Deployment", "default", "wakes-every-node"),
+            serde_json::json!({
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {"name": "wakes-every-node", "namespace": "default"},
+                "spec": {
+                    "replicas": 0,
+                    "selector": {"matchLabels": {"app": "wakes-every-node"}},
+                    "template": {
+                        "metadata": {"labels": {"app": "wakes-every-node"}},
+                        "spec": {"containers": [{"name": "c", "image": "nix:/nix/store/a-c"}]}
+                    }
+                }
+            }),
+            Reason::Operator,
+        ))
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + BOUND;
+    while two.standby_ticks("deployment").await < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "node two runs its deployment controller instead of standing by"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        one.standby_ticks("deployment").await,
+        0,
+        "node one leads, yet its deployment controller stood by"
+    );
 
     two.runtime.shutdown().await.unwrap();
     one.runtime.shutdown().await.unwrap();

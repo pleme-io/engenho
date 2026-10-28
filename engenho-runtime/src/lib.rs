@@ -150,6 +150,7 @@ mod fault_matrix;
 mod health;
 #[cfg(test)]
 mod impl_census;
+mod leader_only;
 mod membership;
 mod node_lease;
 mod node_manifests;

@@ -139,7 +139,10 @@ voter's by a margin (it went on battery, its churn rose), leadership transfers.
 
 - Shards of non-node objects are leased to nodes by score, with a fencing epoch.
 - Control roles (scheduler, controllers, the gitops reconciler) are leased the
-  same way, with FLEET-DESIGN.md §4's fencing epochs.
+  same way, with FLEET-DESIGN.md §4's fencing epochs. Until those leases exist
+  (P6), the raft leader holds them all: `Driver::placement` names each loop
+  `Leader` or `EveryNode`, and a `Leader` loop on any other node stands by
+  (`engenho-runtime/src/leader_only.rs`).
 - Node-scoped objects always belong to their node.
 
 **Damping:** at most one shift per node per `hysteresis` interval. Every move is
