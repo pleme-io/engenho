@@ -79,6 +79,9 @@ const DECLARED: &[(&str, &str, Bound)] = &[
     ("Cluster", "others", Bound::NotTheCatalog),
     ("Cluster", "net", Bound::NotTheCatalog),
     ("Cluster", "node", Bound::NotTheCatalog),
+    ("QuicRouter", "bind", Bound::NotTheCatalog),
+    ("QuicRouter", "bind_with", Bound::NotTheCatalog),
+    ("QuicRouter", "table", Bound::NotTheCatalog),
 ];
 
 /// The crate's own sources, as `(path, text)`, excluding the test-only

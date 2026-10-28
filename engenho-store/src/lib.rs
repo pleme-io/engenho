@@ -109,6 +109,8 @@ pub mod owned_task;
 pub mod pagination;
 pub mod patch_apply;
 #[cfg(feature = "mesh-quic")]
+pub mod peer_table;
+#[cfg(feature = "mesh-quic")]
 pub mod quic_network;
 pub mod read;
 pub mod resource;
@@ -150,6 +152,8 @@ pub use patch_apply::{
     Gvk, JsonPath, ListMergeStrategy, MockPatchEnv, OpenApiPatchEnv, PatchBody, PatchDirective,
     PatchError, PatchSchemaEnv, apply as apply_patch_algorithm,
 };
+#[cfg(feature = "mesh-quic")]
+pub use peer_table::{Peer, PeerTable, PeerTableError};
 #[cfg(feature = "mesh-quic")]
 pub use quic_network::{QuicMeshError, QuicRouter};
 pub use read::{ReadConsistency, ReadRefused};

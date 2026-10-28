@@ -18,6 +18,7 @@ use tokio::task::JoinSet;
 
 use crate::network::{MeshNetwork, RpcEnvelope, RpcRequest, remote_answer};
 use crate::owned_task::OwnedTask;
+use crate::peer_table::{Peer, PeerTable, PeerTableError};
 use crate::type_config::{RaftNodeId, TypeConfig};
 
 pub const ALPN: &[u8] = b"engenho-mesh/1";
@@ -29,6 +30,8 @@ pub enum QuicMeshError {
     Key(#[from] KeyError),
     #[error("mesh tls: {0}")]
     Tls(String),
+    #[error(transparent)]
+    PeerTable(#[from] PeerTableError),
     #[error("bind the mesh endpoint at {addr}: {source}")]
     Bind {
         addr: SocketAddr,
@@ -63,6 +66,7 @@ struct Inner {
     endpoint: quinn::Endpoint,
     identity: KeyMaterial,
     peers: Arc<Peers>,
+    table: Option<Arc<PeerTable>>,
     connections: Mutex<HashMap<RaftNodeId, quinn::Connection>>,
     accept: Mutex<Option<OwnedTask>>,
 }
@@ -74,7 +78,30 @@ pub struct QuicRouter {
 
 impl QuicRouter {
     pub fn bind(bind: SocketAddr, identity: KeyMaterial) -> Result<Self, QuicMeshError> {
+        Self::bind_over(bind, identity, None)
+    }
+
+    pub fn bind_with(
+        bind: SocketAddr,
+        identity: KeyMaterial,
+        table: Arc<PeerTable>,
+    ) -> Result<Self, QuicMeshError> {
+        Self::bind_over(bind, identity, Some(table))
+    }
+
+    fn bind_over(
+        bind: SocketAddr,
+        identity: KeyMaterial,
+        table: Option<Arc<PeerTable>>,
+    ) -> Result<Self, QuicMeshError> {
         let peers = Arc::new(Peers::default());
+        for peer in table.iter().flat_map(|t| t.peers()) {
+            peers
+                .0
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(peer.node_id, peer.spki);
+        }
         let presented = Arc::new(Presented::new(&identity)?);
         let mut tls = pin::server_config(presented, Arc::clone(&peers) as Arc<dyn PinSet>)?;
         tls.alpn_protocols = vec![ALPN.to_vec()];
@@ -88,6 +115,7 @@ impl QuicRouter {
                 endpoint,
                 identity,
                 peers,
+                table,
                 connections: Mutex::new(HashMap::new()),
                 accept: Mutex::new(None),
             }),
@@ -109,6 +137,18 @@ impl QuicRouter {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(node, pin);
+    }
+
+    pub fn learn(&self, peer: Peer) -> Result<bool, PeerTableError> {
+        self.admit(peer.node_id, peer.spki);
+        self.inner
+            .table
+            .as_ref()
+            .map_or(Ok(false), |table| table.record(peer))
+    }
+
+    pub fn table(&self) -> Option<&Arc<PeerTable>> {
+        self.inner.table.as_ref()
     }
 
     pub async fn revoke(&self, node: RaftNodeId) {
@@ -429,6 +469,72 @@ mod tests {
             matches!(refused, Err(RPCError::Unreachable(_))),
             "node 1 spoke to a server presenting another key than node 2's pin: {refused:?}"
         );
+    }
+
+    fn peer_of(router: &QuicRouter, id: RaftNodeId) -> Peer {
+        Peer {
+            node_id: id,
+            address: router.local_addr().unwrap(),
+            spki: router.spki(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_router_bound_over_a_peer_table_answers_the_peers_it_names_and_no_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, stranger) = (bound(), bound());
+        let path = dir.path().join(PeerTable::FILE);
+        PeerTable::open(&path)
+            .unwrap()
+            .record(peer_of(&a, 1))
+            .unwrap();
+        let b = QuicRouter::bind_with(
+            ([127, 0, 0, 1], 0).into(),
+            KeyMaterial::generate().unwrap(),
+            Arc::new(PeerTable::open(&path).unwrap()),
+        )
+        .unwrap();
+        a.admit(2, b.spki());
+        stranger.admit(2, b.spki());
+        let _answered = answer_votes(serving(&b, 2).await);
+        assert!(vote(&a, 2, &b).await.unwrap().vote_granted);
+        assert!(vote(&stranger, 2, &b).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn what_a_router_learns_is_in_its_table_and_admitted_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mesh").join(PeerTable::FILE);
+        let a = bound();
+        let key = KeyMaterial::generate().unwrap();
+        let pem = key.to_pem();
+        let first = QuicRouter::bind_with(
+            ([127, 0, 0, 1], 0).into(),
+            key,
+            Arc::new(PeerTable::open(&path).unwrap()),
+        )
+        .unwrap();
+        assert!(first.learn(peer_of(&a, 1)).unwrap());
+        assert!(
+            !first.learn(peer_of(&a, 1)).unwrap(),
+            "a known peer is not rewritten"
+        );
+        first.deregister(2).await;
+        drop(first);
+
+        assert_eq!(
+            PeerTable::open(&path).unwrap().peers(),
+            vec![peer_of(&a, 1)]
+        );
+        let again = QuicRouter::bind_with(
+            ([127, 0, 0, 1], 0).into(),
+            KeyMaterial::from_pem(&pem).unwrap(),
+            Arc::new(PeerTable::open(&path).unwrap()),
+        )
+        .unwrap();
+        a.admit(2, again.spki());
+        let _answered = answer_votes(serving(&again, 2).await);
+        assert!(vote(&a, 2, &again).await.unwrap().vote_granted);
     }
 
     #[tokio::test]
