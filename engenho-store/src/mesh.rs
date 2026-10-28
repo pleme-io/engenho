@@ -1132,6 +1132,14 @@ impl StoreMesh {
             .unwrap_or_default()
     }
 
+    pub async fn campaign(&self) -> Result<(), StoreError> {
+        self.raft
+            .trigger()
+            .elect()
+            .await
+            .map_err(|e| StoreError::Fatal(e.to_string()))
+    }
+
     pub async fn promote_voter(&self, node: RaftNodeId) -> Result<(), StoreError> {
         self.raft
             .change_membership(

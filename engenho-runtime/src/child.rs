@@ -154,6 +154,44 @@ pub enum Child {
     NodeLease,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Placement {
+    Leader,
+    EveryNode,
+}
+
+impl Driver {
+    #[must_use]
+    pub const fn placement(self) -> Placement {
+        match self {
+            Self::Deployment
+            | Self::ReplicaSet
+            | Self::StatefulSet
+            | Self::DaemonSet
+            | Self::Job
+            | Self::CronJob
+            | Self::PodDisruptionBudget
+            | Self::Endpoints
+            | Self::Gc
+            | Self::Namespace
+            | Self::PvBinder
+            | Self::VolumeSnapshot
+            | Self::PvcProtection
+            | Self::Scheduler
+            | Self::ServedCapability
+            | Self::NodeLifecycle
+            | Self::HorizontalPodAutoscaler => Placement::Leader,
+            Self::ServiceRouting
+            | Self::Crd
+            | Self::NetworkPolicy
+            | Self::CsiRegistrar
+            | Self::CniStatus
+            | Self::NodeManifests
+            | Self::Kubelet => Placement::EveryNode,
+        }
+    }
+}
+
 impl Driver {
     /// Stable name, for logs and liveness rows.
     #[must_use]

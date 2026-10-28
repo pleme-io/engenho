@@ -53,11 +53,12 @@ use crate::boot::{BootKind, BootPhase, BootRecorder};
 use crate::boot_config::{ApiserverTls, BootConfig};
 use crate::child::{
     Child, ChildHandle, ChildTask, Children, ChildrenFollowed, DeadChild, Driver, EnableSwitch,
-    Listener, Respawn, RespawnError, Respawned, TickLoop, Wiring,
+    Listener, Placement, Respawn, RespawnError, Respawned, TickLoop, Wiring,
 };
 use crate::error::{RuntimeError, ShutdownStage, StrongCounts};
 use crate::health::{Health, Row, Tallied, Tally, Windows};
 use crate::layout::Area;
+use crate::leader_only::OnLeader;
 use crate::node_lease::NodeLease;
 use crate::node_registration::{HostOwned, register_node};
 use crate::panics::PanicCounter;
@@ -3810,12 +3811,17 @@ impl Parts {
         driver: Driver,
         controller: C,
     ) -> ChildTask {
-        drive(
-            TickLoop::Driver(driver),
-            controller,
-            &self.store,
-            self.windows.of_child(Child::Driver(driver)),
-        )
+        let windows = self.windows.of_child(Child::Driver(driver));
+        let tick_loop = TickLoop::Driver(driver);
+        match driver.placement() {
+            Placement::EveryNode => drive(tick_loop, controller, &self.store, windows),
+            Placement::Leader => drive(
+                tick_loop,
+                OnLeader::new(controller, self.store.clone()),
+                &self.store,
+                windows,
+            ),
+        }
     }
 
     #[allow(
