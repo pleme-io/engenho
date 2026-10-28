@@ -25,6 +25,15 @@ def component_annotation()
 end
 
 @doc """
+app_annotation: The pod annotation naming a directory inside the component's closure that the component reads at /app, its program bundle.
+
+    app_annotation #=> "wasm.pleme.io/app"
+"""
+def app_annotation()
+  "wasm.pleme.io/app"
+end
+
+@doc """
 restart_budget: How many crashes in a row the backend restarts in place before it surfaces the exit to the kubelet.
 
     restart_budget #=> 3
@@ -119,6 +128,42 @@ def local_component(facts, path)
     }
   else
     {path:, refused: nil}
+  end
+end
+
+@doc """
+app_of: The read-only preopen of the closure's app directory at /app, nil when the pod names none, or the reason it is refused.
+
+    get(app_of({"image" => "nix:/nix/store/abc-svc", "annotations" => {"wasm.pleme.io/app" => "app"}}).preopen, "hostPath") #=> "/nix/store/abc-svc/app"
+"""
+def app_of(facts)
+  name = annotation(facts, app_annotation)
+  image = field(facts, "image", "")
+  if name.nil?
+    {preopen: nil, refused: nil}
+  elsif not starts_with?(image, "nix:") or ends_with?(image, ".wasm")
+    {
+      preopen: nil,
+      refused: "#{app_annotation} #{name} needs an image that names a closure directory (nix:/nix/store/...)"
+    }
+  else
+    app_in(after("nix:", image), name)
+  end
+end
+
+def app_in(closure, name)
+  inner = inside(closure, name)
+  if inner.refused.nil?
+    {
+      preopen: {
+        "hostPath" => inner.path,
+        "guestPath" => "/app",
+        "writable" => false
+      },
+      refused: nil
+    }
+  else
+    {preopen: nil, refused: inner.refused}
   end
 end
 
@@ -257,14 +302,20 @@ grant_of: What the component is granted: its output, its environment, the declar
 """
 def grant_of(facts, access)
   mounts = field(facts, "mounts", [])
+  app = app_of(facts).preopen
+  declared = map(
+    (m) -> preopen_of(access, m),
+    filter((m) -> mountable?(access, m), mounts)
+  )
   {
     "stdout" => true,
     "stderr" => true,
     "env" => effect?(access, "environment"),
-    "preopens" => map(
-      (m) -> preopen_of(access, m),
-      filter((m) -> mountable?(access, m), mounts)
-    ),
+    "preopens" => if app.nil?
+      declared
+    else
+      append([app], declared)
+    end,
     "network" => network_of(access)
   }
 end
@@ -294,9 +345,11 @@ def serve_port(access)
   end
 end
 
-def refusal_of(component, access)
+def refusal_of(component, access, app)
   if not component.refused.nil?
     component.refused
+  elsif not app.refused.nil?
+    app.refused
   elsif not access.refused.nil?
     access.refused
   elsif not empty?(access.exec)
@@ -313,7 +366,7 @@ def admit(facts_text)
   facts = json_read(facts_text)
   component = component_of(facts)
   access = access_of(facts)
-  refused = refusal_of(component, access)
+  refused = refusal_of(component, access, app_of(facts))
   if refused.nil?
     json_stringify(
       {
@@ -453,6 +506,47 @@ test "an OCI image is refused and a closure directory resolves its component"
   assert not component_of(
     {"image" => "nix:/nix/store/abc/../../etc"}
   ).refused.nil?
+end
+
+test "an app directory inside the closure is preopened read-only at /app"
+  facts = {
+    "image" => "nix:/nix/store/abc-svc",
+    "annotations" => {"wasm.pleme.io/app" => "app"}
+  }
+  v = json_read(admit(json_stringify(facts)))
+  assert v.refused.nil?
+  assert member?(
+    {
+      "hostPath" => "/nix/store/abc-svc/app",
+      "guestPath" => "/app",
+      "writable" => false
+    },
+    v.grant.preopens
+  )
+  none = json_read(admit(json_stringify({"image" => "nix:/nix/store/abc-svc"})))
+  assert none.grant.preopens == []
+  escape = json_read(
+    admit(
+      json_stringify(
+        {
+          "image" => "nix:/nix/store/abc-svc",
+          "annotations" => {"wasm.pleme.io/app" => "../other"}
+        }
+      )
+    )
+  )
+  assert contains?(escape.refused, "must be a path inside the closure")
+  file = json_read(
+    admit(
+      json_stringify(
+        {
+          "image" => "nix:/nix/store/abc-svc/svc.wasm",
+          "annotations" => {"wasm.pleme.io/app" => "app"}
+        }
+      )
+    )
+  )
+  assert contains?(file.refused, "names a closure directory")
 end
 
 test "a file component runs only where the node allows local components"
