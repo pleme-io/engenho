@@ -22,6 +22,7 @@ default = []
 # when they need the full cofre security guarantee. The fallback
 # uses std::fs + chmod, which has a brief window at default perms.
 with-cofre = ["dep:cofre-fs"]
+mesh-quic = ["engenho-store/mesh-quic", "engenho-config/mesh-quic"]
 
 [dependencies]
 tokio-stream = { version = "0.1", features = ["net"] }

@@ -272,7 +272,8 @@ pub fn fast_config(cluster_name: &str) -> Result<Arc<Config>, StoreError> {
 
 pub struct Cluster<N: MeshNetwork = InProcessRouter> {
     net: FaultNet,
-    nodes: Vec<StoreMesh<FaultRouter<N>>>,
+    nodes: Vec<StoreMesh>,
+    routers: std::marker::PhantomData<N>,
 }
 
 impl Cluster {
@@ -301,7 +302,11 @@ impl<N: MeshNetwork> Cluster<N> {
             nodes.push(StoreMesh::start(id, addr, net.over(id, inner), cfg.clone()).await?);
         }
         nodes[0].initialize_with_voters(voters).await?;
-        Ok(Self { net, nodes })
+        Ok(Self {
+            net,
+            nodes,
+            routers: std::marker::PhantomData,
+        })
     }
 
     pub fn net(&self) -> &FaultNet {
@@ -316,7 +321,7 @@ impl<N: MeshNetwork> Cluster<N> {
         self.ids().into_iter().filter(|n| *n != id).collect()
     }
 
-    pub fn node(&self, id: RaftNodeId) -> &StoreMesh<FaultRouter<N>> {
+    pub fn node(&self, id: RaftNodeId) -> &StoreMesh {
         self.nodes
             .iter()
             .find(|n| n.node_id() == id)

@@ -220,6 +220,9 @@ pub enum RuntimeError {
          another identity; join the shared cluster from a fresh data_dir"
     )]
     NotAMember { node_id: engenho_store::RaftNodeId },
+
+    #[error("the store mesh transport: {reason}")]
+    Mesh { reason: String },
 }
 
 engenho_substrate::impl_error_kind! {
@@ -243,6 +246,7 @@ engenho_substrate::impl_error_kind! {
         { DataDirMoved { .. } } => "data_dir_moved",
         { Identity { .. } } => "identity",
         { NotAMember { .. } } => "not_a_member",
+        { Mesh { .. } } => "mesh",
     }
 }
 

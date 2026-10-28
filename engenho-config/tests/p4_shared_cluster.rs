@@ -78,3 +78,33 @@ fn a_shared_block_missing_a_field_or_carrying_an_unknown_one_is_refused() {
     let unknown = format!("{SHARED}    voters: 3\n");
     assert!(EngenhoConfig::from_yaml_with_defaults(&unknown).is_err());
 }
+
+const QUIC: &str = "fabric:\n  quic:\n    bind: 127.0.0.1:7946\n";
+
+#[cfg(feature = "mesh-quic")]
+#[test]
+fn a_quic_fabric_parses_for_a_shared_member_and_is_refused_without_one() {
+    use engenho_config::Fabric;
+    let cfg = EngenhoConfig::from_yaml_with_defaults(&format!("{SHARED}{QUIC}")).unwrap();
+    assert_eq!(
+        cfg.fabric,
+        Fabric::Quic {
+            bind: "127.0.0.1:7946".parse().unwrap()
+        }
+    );
+    let again = EngenhoConfig::from_yaml_with_defaults(&cfg.to_yaml().unwrap()).unwrap();
+    assert_eq!(again.fabric, cfg.fabric);
+    let err = EngenhoConfig::from_yaml_with_defaults(QUIC).unwrap_err();
+    assert!(err.to_string().contains("cluster.shared"), "{err}");
+    assert_eq!(
+        EngenhoConfig::prescribed_default().fabric,
+        Fabric::InBinary,
+        "the default fabric stays in-binary"
+    );
+}
+
+#[cfg(not(feature = "mesh-quic"))]
+#[test]
+fn a_quic_fabric_is_refused_at_parse_by_a_build_without_it() {
+    assert!(EngenhoConfig::from_yaml_with_defaults(&format!("{SHARED}{QUIC}")).is_err());
+}

@@ -29,5 +29,9 @@ figment            = { version = "0.10", features = ["yaml"] }
 blake3             = { workspace = true }
 gethostname        = "1"
 
+[features]
+default = []
+mesh-quic = []
+
 [dev-dependencies]
 tempfile = "3"

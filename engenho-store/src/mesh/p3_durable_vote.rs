@@ -5,7 +5,7 @@ use openraft::raft::{VoteRequest, VoteResponse};
 use openraft::{BasicNode, Vote};
 
 use crate::mesh::StoreMesh;
-use crate::testing::{FaultNet, FaultRouter, fast_config};
+use crate::testing::{FaultNet, fast_config};
 use crate::type_config::RaftNodeId;
 
 const VOTER: RaftNodeId = 3;
@@ -26,7 +26,7 @@ async fn ask(net: &FaultNet, candidate: RaftNodeId, term: u64) -> VoteResponse<R
         .unwrap_or_else(|e| panic!("vote from {candidate} at term {term}: {e}"))
 }
 
-async fn durable(net: &FaultNet, dir: &std::path::Path) -> StoreMesh<FaultRouter> {
+async fn durable(net: &FaultNet, dir: &std::path::Path) -> StoreMesh {
     let deadline = tokio::time::Instant::now() + REOPEN;
     loop {
         match StoreMesh::start_durable(

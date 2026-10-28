@@ -46,6 +46,7 @@ pub(crate) struct BootConfig {
     /// kubeconfig this node writes names.
     pub(crate) cluster_name: String,
     pub(crate) membership: Membership,
+    pub(crate) fabric: MeshFabric,
     /// `runtime.listen_addr`, as written. Parsed where it is bound, so the
     /// parse error can name the string.
     pub(crate) listen_addr: String,
@@ -134,13 +135,17 @@ impl BootConfig {
             shared,
         } = cluster;
         let membership = Membership::read(shared.as_ref());
+        let (mesh_fabric, fabric_not_run) = read_fabric(fabric, legacy_teia.as_ref())?;
+        if mesh_fabric.carries_peers() && membership.shared().is_none() {
+            return Err(Unhonoured::MeshWithoutIdentity);
+        }
         let cluster_name = shared.as_ref().map_or(name, |shared| &shared.name).clone();
         // Section order: the not-run records read in the order the config does.
         let not_run = [
             shared.is_some().then_some(NotRun::HostClusterName),
             (!region.is_empty()).then_some(NotRun::Region),
             Some(read_topology(revoada)?),
-            read_fabric(fabric, legacy_teia.as_ref()),
+            fabric_not_run,
         ]
         .into_iter()
         .flatten()
@@ -184,6 +189,7 @@ impl BootConfig {
         Ok(Self {
             cluster_name,
             membership,
+            fabric: mesh_fabric,
             listen_addr: listen_addr.clone(),
             data_dir: data_dir.clone(),
             durable: *durable,
@@ -353,11 +359,39 @@ fn read_topology(revoada: &RevoadaConfig) -> Result<NotRun, Unhonoured> {
 /// is in-process (`boot_store`) — so it records nothing. A `teia:` section
 /// still in the file is accepted for one release and read by nothing (I11,
 /// T5.2); that is the not-run record.
-fn read_fabric(fabric: &Fabric, legacy_teia: Option<&LegacyTeiaSection>) -> Option<NotRun> {
-    match fabric {
-        Fabric::InBinary => {}
+#[cfg_attr(feature = "mesh-quic", allow(clippy::unnecessary_wraps))]
+fn read_fabric(
+    fabric: &Fabric,
+    legacy_teia: Option<&LegacyTeiaSection>,
+) -> Result<(MeshFabric, Option<NotRun>), Unhonoured> {
+    #[allow(unreachable_patterns)]
+    let mesh = match fabric {
+        Fabric::InBinary => MeshFabric::InProcess,
+        #[cfg(feature = "mesh-quic")]
+        Fabric::Quic { bind } => MeshFabric::Quic { bind: *bind },
+        #[cfg(not(feature = "mesh-quic"))]
+        _ => return Err(Unhonoured::FabricNotBuilt),
+    };
+    Ok((mesh, legacy_teia.map(|_| NotRun::Teia)))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MeshFabric {
+    InProcess,
+    #[cfg(feature = "mesh-quic")]
+    Quic {
+        bind: std::net::SocketAddr,
+    },
+}
+
+impl MeshFabric {
+    pub(crate) const fn carries_peers(self) -> bool {
+        match self {
+            Self::InProcess => false,
+            #[cfg(feature = "mesh-quic")]
+            Self::Quic { .. } => true,
+        }
     }
-    legacy_teia.map(|_| NotRun::Teia)
 }
 
 /// `consistency`: the store's own tier is run; any other is refused.
@@ -446,6 +480,12 @@ pub enum Unhonoured {
         /// How many masters it names.
         masters: u32,
     },
+    #[error("fabric names a transport this build does not carry; build with mesh-quic")]
+    FabricNotBuilt,
+    #[error(
+        "fabric quic carries raft between shared-cluster members, and cluster.shared is not set"
+    )]
+    MeshWithoutIdentity,
     /// `consistency.default_tier` names a tier the store does not serve.
     /// Every write is a linearizable raft commit; no gossip, stream or
     /// content-addressed tier exists behind the name.
@@ -597,8 +637,10 @@ mod tests {
             })
         );
         assert_eq!(boot.not_run.first(), Some(&NotRun::HostClusterName));
+        assert_eq!(boot.fabric, super::MeshFabric::InProcess);
         let own = BootConfig::prescribed();
         assert_eq!(own.membership, Membership::Own);
+        assert_eq!(own.fabric, super::MeshFabric::InProcess);
         assert!(
             own.cluster_name.starts_with("engenho-"),
             "{}",

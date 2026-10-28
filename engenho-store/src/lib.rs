@@ -155,7 +155,7 @@ pub use patch_apply::{
 #[cfg(feature = "mesh-quic")]
 pub use peer_table::{Peer, PeerTable, PeerTableError};
 #[cfg(feature = "mesh-quic")]
-pub use quic_network::{QuicMeshError, QuicRouter};
+pub use quic_network::{MeshAddr, QuicMeshError, QuicRouter};
 pub use read::{ReadConsistency, ReadRefused};
 pub use resource::{ListScope, ResourceKey, ResourceValue};
 pub use revision::{Change, ChangeKind, CompactedTooOld, Revision, VersionMeta};

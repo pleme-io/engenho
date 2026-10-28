@@ -97,7 +97,7 @@ use engenho_controllers::node_lease::RENEW_INTERVAL;
 use engenho_controllers::{
     Beat, Controller, ControllerError, ControllerType, Heartbeat, RESUBSCRIBE, ReconcileOutcome,
 };
-use engenho_store::{MeshNetwork, Revision, StoreError, StoreMesh};
+use engenho_store::{Revision, StoreError, StoreMesh};
 use engenho_substrate::{
     Clock as _, Instant as WallInstant, Liveness, StaleAfter, TaskState, WallClock,
 };
@@ -746,9 +746,7 @@ impl LivenessSource for Health {
     }
 }
 
-pub(crate) async fn linearizable_revision<N: MeshNetwork>(
-    store: &StoreMesh<N>,
-) -> Result<Revision, StoreError> {
+pub(crate) async fn linearizable_revision(store: &StoreMesh) -> Result<Revision, StoreError> {
     store
         .linearizable_revision(engenho_apiserver::health::DEFAULT_STORE_READ_TIMEOUT)
         .await

@@ -178,11 +178,18 @@ fn build() -> Vec<LeafSpec> {
     let restart = M::RestartRuntime;
     let anchored = |anchor| M::NotOverridable { anchor };
 
+    let fabric = if cfg!(feature = "mesh-quic") {
+        anchored(Anchor::Identity)
+    } else {
+        M::Inert {
+            why: InertWhy::SingleAcceptedValue,
+        }
+    };
     let mut rows = Vec::new();
     section!(rows, "", EngenhoConfig {
         cluster,
         revoada,
-        fabric => M::Inert { why: InertWhy::SingleAcceptedValue },
+        fabric => fabric,
         legacy_teia as "teia",
         scheduler,
         controllers,

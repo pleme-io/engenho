@@ -96,7 +96,7 @@ fn pod_key(name: &str) -> ResourceKey {
 async fn a_three_node_store_replicates_over_a_network_that_is_not_the_in_process_router() {
     let router = CountingRouter::default();
     let cfg = default_config("engenho-store-p1-generic").unwrap();
-    let mut meshes: Vec<StoreMesh<CountingRouter>> = Vec::new();
+    let mut meshes: Vec<StoreMesh> = Vec::new();
     for id in 1..=3u64 {
         meshes.push(
             StoreMesh::start(

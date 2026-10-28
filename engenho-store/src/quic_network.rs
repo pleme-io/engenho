@@ -39,6 +39,51 @@ pub enum QuicMeshError {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MeshAddr {
+    pub socket: SocketAddr,
+    pub pin: Option<Spki>,
+}
+
+impl MeshAddr {
+    pub const fn pinned(socket: SocketAddr, pin: Spki) -> Self {
+        Self {
+            socket,
+            pin: Some(pin),
+        }
+    }
+}
+
+impl std::fmt::Display for MeshAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.pin {
+            Some(pin) => write!(f, "{}#{pin}", self.socket),
+            None => write!(f, "{}", self.socket),
+        }
+    }
+}
+
+impl std::str::FromStr for MeshAddr {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (socket, pin) = match s.split_once('#') {
+            Some((socket, pin)) => (socket, Some(Spki::parse(pin).map_err(|e| e.to_string())?)),
+            None => (s, None),
+        };
+        let socket = socket
+            .parse()
+            .map_err(|e| format!("mesh address {s:?}: {e}"))?;
+        Ok(Self { socket, pin })
+    }
+}
+
+impl From<Peer> for MeshAddr {
+    fn from(peer: Peer) -> Self {
+        Self::pinned(peer.address, peer.spki)
+    }
+}
+
 #[derive(Debug, Default)]
 struct Peers(RwLock<HashMap<RaftNodeId, Spki>>);
 
@@ -173,13 +218,12 @@ impl QuicRouter {
         {
             return Ok(conn.clone());
         }
-        let pin =
-            self.inner.peers.pin_of(target).ok_or_else(|| {
-                std::io::Error::other(format!("node {target} has no admitted pin"))
-            })?;
-        let addr: SocketAddr = addr
-            .parse()
-            .map_err(|e| std::io::Error::other(format!("node {target}'s address {addr:?}: {e}")))?;
+        let addr: MeshAddr = addr.parse().map_err(std::io::Error::other)?;
+        let pin = addr
+            .pin
+            .or_else(|| self.inner.peers.pin_of(target))
+            .ok_or_else(|| std::io::Error::other(format!("node {target} has no admitted pin")))?;
+        let addr = addr.socket;
         let mut tls =
             pin::client_config(&self.inner.identity, vec![pin]).map_err(std::io::Error::other)?;
         tls.alpn_protocols = vec![ALPN.to_vec()];
@@ -535,6 +579,38 @@ mod tests {
         a.admit(2, again.spki());
         let _answered = answer_votes(serving(&again, 2).await);
         assert!(vote(&a, 2, &again).await.unwrap().vote_granted);
+    }
+
+    #[test]
+    fn a_mesh_address_carries_its_pin_or_none() {
+        let spki = KeyMaterial::generate().unwrap().spki();
+        let socket: SocketAddr = "127.0.0.1:7946".parse().unwrap();
+        let pinned = MeshAddr::pinned(socket, spki);
+        assert_eq!(pinned.to_string().parse::<MeshAddr>(), Ok(pinned));
+        assert_eq!(
+            "127.0.0.1:7946".parse::<MeshAddr>(),
+            Ok(MeshAddr { socket, pin: None })
+        );
+        for bad in ["in-process://1", "127.0.0.1:7946#sha1:00", "#sha256:00"] {
+            assert!(bad.parse::<MeshAddr>().is_err(), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_member_address_that_carries_a_pin_is_reached_with_no_admit_call() {
+        let (a, b) = (bound(), bound());
+        b.admit(1, a.spki());
+        let _answered = answer_votes(serving(&b, 2).await);
+        let node = BasicNode::new(MeshAddr::pinned(b.local_addr().unwrap(), b.spki()).to_string());
+        let mut client = a.clone().new_client(2, &node).await;
+        let granted = client
+            .vote(
+                VoteRequest::new(openraft::Vote::new(1, 1), None),
+                RPCOption::new(Duration::from_secs(2)),
+            )
+            .await
+            .unwrap();
+        assert!(granted.vote_granted);
     }
 
     #[tokio::test]

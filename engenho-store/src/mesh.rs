@@ -10,13 +10,15 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::future::BoxFuture;
+
 use openraft::raft::ClientWriteResponse;
 use openraft::{BasicNode, Config, Raft};
 use tokio::sync::mpsc;
 
 use crate::command::{LoggedCommand, ResourceCommand, TxnOp};
 use crate::fjall_store::{FjallStore, Flushed, ImageTripwire};
-use crate::network::{InProcessRouter, MeshNetwork, RpcRequest};
+use crate::network::{MeshNetwork, RpcRequest};
 use crate::owned_task::{OwnedTask, TaskStop};
 use crate::pagination::PageAtRevision;
 use crate::read::{ReadConsistency, ReadRefused};
@@ -213,23 +215,34 @@ impl Quiesced {
     }
 }
 
-/// Raft-replicated K8s resource store.
-pub struct StoreMesh<N: MeshNetwork = InProcessRouter> {
+trait Registration: Send + Sync {
+    fn deregister(&self, node: RaftNodeId) -> BoxFuture<'_, ()>;
+}
+
+impl<N: MeshNetwork> Registration for N {
+    fn deregister(&self, node: RaftNodeId) -> BoxFuture<'_, ()> {
+        Box::pin(MeshNetwork::deregister(self, node))
+    }
+}
+
+/// Raft-replicated K8s resource store, over whichever [`MeshNetwork`] it
+/// was started on.
+pub struct StoreMesh {
     raft: Raft<TypeConfig>,
     store: StoreBackend,
     node_id: RaftNodeId,
     listen_addr: String,
-    router: N,
+    router: Box<dyn Registration>,
     /// Feeds peer RPCs from the router into `raft`, holding a `Raft` clone.
     /// Owned so [`Self::quiesce`] can abort AND await it.
     rpc_pump: OwnedTask,
 }
 
-impl<N: MeshNetwork> StoreMesh<N> {
+impl StoreMesh {
     /// Start an EPHEMERAL (in-memory) store mesh — the test / dev
     /// path. Process restart discards all state. For durable
     /// single-node restart-safe storage use [`Self::start_durable`].
-    pub async fn start(
+    pub async fn start<N: MeshNetwork>(
         node_id: RaftNodeId,
         listen_addr: String,
         router: N,
@@ -260,7 +273,7 @@ impl<N: MeshNetwork> StoreMesh<N> {
     ///
     /// Returns [`StoreError::Fatal`] if the keyspace can't be opened /
     /// hydrated or `Raft::new` fails.
-    pub async fn start_durable(
+    pub async fn start_durable<N: MeshNetwork>(
         node_id: RaftNodeId,
         listen_addr: String,
         router: N,
@@ -289,7 +302,7 @@ impl<N: MeshNetwork> StoreMesh<N> {
     /// # Errors
     ///
     /// Propagates [`Self::start_durable`] + initialize failures.
-    pub async fn start_or_resume(
+    pub async fn start_or_resume<N: MeshNetwork>(
         node_id: RaftNodeId,
         listen_addr: String,
         router: N,
@@ -304,7 +317,7 @@ impl<N: MeshNetwork> StoreMesh<N> {
     /// Shared raft + rpc-task wiring. The store is passed three times
     /// — as the log store, the state machine, and the read-side
     /// backend handle — all clones of the same underlying store.
-    async fn start_with_backend<LS, SM>(
+    async fn start_with_backend<N, LS, SM>(
         node_id: RaftNodeId,
         listen_addr: String,
         router: N,
@@ -314,6 +327,7 @@ impl<N: MeshNetwork> StoreMesh<N> {
         backend: StoreBackend,
     ) -> Result<Self, StoreError>
     where
+        N: MeshNetwork,
         LS: openraft::storage::RaftLogStorage<TypeConfig>,
         SM: openraft::storage::RaftStateMachine<TypeConfig>,
     {
@@ -348,7 +362,7 @@ impl<N: MeshNetwork> StoreMesh<N> {
             store: backend,
             node_id,
             listen_addr,
-            router,
+            router: Box::new(router),
             rpc_pump,
         })
     }
@@ -977,6 +991,10 @@ impl<N: MeshNetwork> StoreMesh<N> {
 
     pub fn node_id(&self) -> RaftNodeId {
         self.node_id
+    }
+
+    pub fn listen_addr(&self) -> &str {
+        &self.listen_addr
     }
 
     /// Stop every background task the mesh owns — the raft RPC pump and

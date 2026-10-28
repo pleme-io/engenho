@@ -245,9 +245,11 @@ impl TieredConfig for EngenhoConfig {
         Self {
             cluster: self.cluster.extend(&base.cluster),
             revoada: self.revoada.extend(&base.revoada),
-            // One arm: an overlay cannot disagree with its base yet. When a
-            // second arm lands, `fabric` needs an explicit "no opinion" tier.
-            fabric: self.fabric,
+            fabric: if self.fabric == Fabric::InBinary {
+                base.fabric
+            } else {
+                self.fabric
+            },
             legacy_teia: self.legacy_teia.or_else(|| base.legacy_teia.clone()),
             scheduler: self.scheduler.extend(&base.scheduler),
             controllers: self.controllers.extend(&base.controllers),
@@ -286,6 +288,15 @@ impl EngenhoConfig {
         self.networking.validate()?;
         self.runtime.validate()?;
         self.control.validate()?;
+
+        #[cfg(feature = "mesh-quic")]
+        if matches!(self.fabric, Fabric::Quic { .. }) && self.cluster.shared.is_none() {
+            return Err(ConfigError::Incoherent(
+                "fabric quic carries raft between the members of a shared cluster, and \
+                 cluster.shared is not set: this node has no identity key to be admitted by"
+                    .into(),
+            ));
+        }
 
         // Cross-section: quorum-requiring consensus needs >=3 nodes.
         if matches!(

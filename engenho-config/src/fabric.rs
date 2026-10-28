@@ -7,6 +7,8 @@
 //! nothing reads.
 
 use std::fmt;
+#[cfg(feature = "mesh-quic")]
+use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
 
@@ -17,13 +19,67 @@ use serde::{Deserialize, Serialize};
 /// When the multi-node transport is built (§5.1 (d), gated by edge 18) it also
 /// lives inside the binary and arrives as a new arm here.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(from = "FabricWire", into = "FabricWire")]
 pub enum Fabric {
     /// Every byte between engenho's components stays inside the one process:
     /// the store's Raft traffic rides the in-process router. No sidecar, no
     /// second daemon to start, supervise or upgrade.
     #[default]
     InBinary,
+    /// The store's Raft traffic rides QUIC between nodes, bound at `bind`,
+    /// each peer admitted by its SPKI pin. Needs `cluster.shared`.
+    #[cfg(feature = "mesh-quic")]
+    Quic {
+        /// The UDP address the mesh endpoint binds.
+        bind: SocketAddr,
+    },
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(untagged)]
+enum FabricWire {
+    Named(FabricName),
+    #[cfg(feature = "mesh-quic")]
+    Quic {
+        quic: QuicFabric,
+    },
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FabricName {
+    InBinary,
+}
+
+#[cfg(feature = "mesh-quic")]
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QuicFabric {
+    bind: SocketAddr,
+}
+
+impl From<FabricWire> for Fabric {
+    fn from(wire: FabricWire) -> Self {
+        match wire {
+            FabricWire::Named(FabricName::InBinary) => Self::InBinary,
+            #[cfg(feature = "mesh-quic")]
+            FabricWire::Quic {
+                quic: QuicFabric { bind },
+            } => Self::Quic { bind },
+        }
+    }
+}
+
+impl From<Fabric> for FabricWire {
+    fn from(fabric: Fabric) -> Self {
+        match fabric {
+            Fabric::InBinary => Self::Named(FabricName::InBinary),
+            #[cfg(feature = "mesh-quic")]
+            Fabric::Quic { bind } => Self::Quic {
+                quic: QuicFabric { bind },
+            },
+        }
+    }
 }
 
 /// The retired `teia:` section, exactly as operators and the Nix module wrote

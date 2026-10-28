@@ -59,7 +59,8 @@ impl FailureClass {
             RuntimeError::LeadershipTimeout { .. }
             | RuntimeError::ContainerRuntimeUnavailable { .. }
             | RuntimeError::KubeconfigIo { .. }
-            | RuntimeError::NodeRegistration(_) => Self::Backoff,
+            | RuntimeError::NodeRegistration(_)
+            | RuntimeError::Mesh { .. } => Self::Backoff,
 
             RuntimeError::Store(store) => Self::of_store(store),
             RuntimeError::Server(server) => Self::of_server(server),

@@ -9,7 +9,7 @@ use engenho_apiserver::{
     ApiServer, ChainAuthenticator, ClientMaterial, PkiFile, RbacAuthorizer, RouterHandlerSink,
     RouterState, SanEntry, ServerSanInputs, StoreRbacEnv, TlsMaterial, client_verifier,
     handlers_from_catalog_with_admission, issue_admin_client_material, issue_server_material,
-    load_or_generate_ca, metrics::log_would_reject,
+    metrics::log_would_reject,
 };
 use engenho_config::leaf::{flatten, nest};
 use engenho_config::mutability::{self, Mutability, RespawnSet};
@@ -2050,14 +2050,32 @@ pub(crate) const STORE_DIR: &str = crate::layout::Area::Store.dir();
 
 /// Bring up the store spine — durable or ephemeral per config.
 async fn boot_store(boot: &BootConfig) -> Result<(Arc<StoreMesh>, BootKind), RuntimeError> {
-    let cfg = default_config(&boot.cluster_name)?;
-    let router = InProcessRouter::new();
-    let node_id = crate::membership::identity(boot)?.as_ref().map_or(
+    let identity = crate::membership::identity(boot)?;
+    let node_id = identity.as_ref().map_or(
         crate::membership::SINGLETON,
         crate::membership::NodeIdentity::id,
     );
-    let listen = format!("in-process://{node_id}");
+    match boot.fabric {
+        crate::boot_config::MeshFabric::InProcess => {
+            let listen = format!("in-process://{node_id}");
+            open_store(boot, node_id, listen, InProcessRouter::new()).await
+        }
+        #[cfg(feature = "mesh-quic")]
+        crate::boot_config::MeshFabric::Quic { bind } => {
+            let identity = identity.ok_or(crate::Unhonoured::MeshWithoutIdentity)?;
+            let (router, listen) = crate::membership::bind_mesh(boot, bind, identity)?;
+            open_store(boot, node_id, listen, router).await
+        }
+    }
+}
 
+async fn open_store(
+    boot: &BootConfig,
+    node_id: engenho_store::RaftNodeId,
+    listen: String,
+    router: impl engenho_store::MeshNetwork,
+) -> Result<(Arc<StoreMesh>, BootKind), RuntimeError> {
+    let cfg = default_config(&boot.cluster_name)?;
     if boot.durable {
         let store_path = boot.data_dir.join(STORE_DIR);
         let (mesh, fresh) =
