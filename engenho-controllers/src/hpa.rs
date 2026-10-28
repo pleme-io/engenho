@@ -179,7 +179,7 @@ pub const PANGEA_LEAF_PENDING_WORK: StatusMetric = StatusMetric {
     version: "v1alpha1",
     kind: "PangeaFleetStatus",
     object: "default",
-    path: &["status", "leafWork", "pending"],
+    path: &["status", "leafWork", "metric"],
 };
 
 impl StatusMetric {
@@ -864,11 +864,14 @@ mod tests {
     }
 
     #[test]
-    fn leaf_work_reads_pending_as_a_non_negative_number() {
+    fn leaf_work_reads_the_operators_metric_as_a_non_negative_number() {
         let m = PANGEA_LEAF_PENDING_WORK;
         assert_eq!(
-            m.read(&json!({"status": {"leafWork": {"pending": 1800}}}))
-                .unwrap(),
+            m.read(&json!({"status": {"leafWork": {
+                "metric": 1800, "desired": 3, "unpaced": 0,
+                "credentials": [{"credential": "c", "pending": 5000, "cap": 937, "counted": 937}]
+            }}}))
+            .unwrap(),
             Some(1800.0)
         );
         assert_eq!(m.read(&json!({"status": {}})).unwrap(), None);
@@ -877,11 +880,11 @@ mod tests {
             None
         );
         assert!(
-            m.read(&json!({"status": {"leafWork": {"pending": -1}}}))
+            m.read(&json!({"status": {"leafWork": {"metric": -1}}}))
                 .is_err()
         );
         assert!(
-            m.read(&json!({"status": {"leafWork": {"pending": "9"}}}))
+            m.read(&json!({"status": {"leafWork": {"metric": "9"}}}))
                 .is_err()
         );
         assert!(m.read(&json!({"status": {"leafWork": 9}})).is_err());

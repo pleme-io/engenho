@@ -54,7 +54,7 @@ async fn set_pending(store: &StoreMesh, pending: f64) {
         json!({
             "apiVersion": "pangea.pleme.io/v1alpha1", "kind": "PangeaFleetStatus",
             "metadata": {"name": "default"},
-            "status": {"leafWork": {"pending": pending}}
+            "status": {"leafWork": {"metric": pending, "desired": 0, "unpaced": 0}}
         }),
     )
     .await;
@@ -166,7 +166,7 @@ async fn an_unreadable_leaf_work_holds_the_target() {
     put(
         &store,
         &fleet_status_key(),
-        json!({"metadata": {"name": "default"}, "status": {"leafWork": {"pending": "many"}}}),
+        json!({"metadata": {"name": "default"}, "status": {"leafWork": {"metric": "many"}}}),
     )
     .await;
     let metrics = Arc::new(StatusMetricsProvider::new(
