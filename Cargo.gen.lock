@@ -1,13 +1,13 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "e41e2a8086d70f355d65d5a109aa296b4ce031078960afc154b3254692d17ec0",
+  "cargo_lock_sha256": "f800d44754a79228edf6dd565e899c2ce735c8c42fcc505cb029d424d0cf9634",
   "manifest_sha256": {
     "Cargo.toml": "d1831c55a791771aefad6a5818093da186b4598cb420cd80e9d6acc4409aabf7",
     "engenho-apiserver/Cargo.toml": "aeef436a3f47aed782c0701805f9932fd99f4bbcd98ca03a2a7f3fff97b544d5",
     "engenho-cluster-config-render/Cargo.toml": "5f5f6d40c2b9a572f18418d12e568412517972684259f34a9aa3d34de0a5dc8c",
     "engenho-cluster-config/Cargo.toml": "49d8ea7131956ec2d6323ae41968f624fab66bbbbca1afbb0537b2327a683391",
     "engenho-cni/Cargo.toml": "f885e491a2490e5d1503fafe0f625ada2c38ade0ccac21ee27a6ab595f368945",
-    "engenho-config/Cargo.toml": "663a2eb970f314f8eea6242fce63190a45c143f25e356e8eaa566e83c3c73ac8",
+    "engenho-config/Cargo.toml": "24ed939d431673000e27510329a39b705b37ea5bf60c392ff6a93dbdfb20ed39",
     "engenho-control-client/Cargo.toml": "e90cb5d2e9e5c53d1e59b43b6f99fe2d5edf7ec1c21923edede71172d1c0de91",
     "engenho-control-server/Cargo.toml": "04f883c3bdc3cddb47558bdfaf37b00c3418e3c036ca405b400a9f4948f2b7e6",
     "engenho-control-types/Cargo.toml": "6f31045cccf72f10354b019946ca1c373c5ce9158b244f7f986a7292d24ba1b5",
@@ -24,10 +24,10 @@
     "engenho-mcp/Cargo.toml": "a73d0471a92fe4eeb98d75f5ca945aeafcf56c6034e36f47d06bbf980ed9e369",
     "engenho-oracle/Cargo.toml": "9b0da2a6c1d469c28eb0617b8d71df0b0bf6db7751596956e0bb74a6ac979984",
     "engenho-revoada/Cargo.toml": "08cfd6e45e8acfb75f3073e3a70a9a11a9c33575c43509d0199b1e73bb8012f9",
-    "engenho-runtime/Cargo.toml": "1795c67b4383837da2518444ce5bdbc5f83c4dba28c2dc5d7661923c31dee2b1",
+    "engenho-runtime/Cargo.toml": "1fdf07e98f14a68bbad795afeae5da543cd6e991c5f8692d22fec4f4d2e40d38",
     "engenho-scheduler/Cargo.toml": "b8e178bbb3012942524cd91c4f5e3c1160e11d2ec81eb81ce5f18bd1504426d1",
     "engenho-serve/Cargo.toml": "e91e4b03ebb3c2537969e30bce65f374c368c8e5a668006970524d2687023cd6",
-    "engenho-store/Cargo.toml": "6195471439fac6bd943eb091ff33a548392c170f834545a01972b1d8a549f912",
+    "engenho-store/Cargo.toml": "0ab8ed2ce00c8fdd983156fbeb617fd404704645beeb841e0a6c5023be97b30d",
     "engenho-substrate-core/Cargo.toml": "3bc0b7054258b721c4ac21dc36f7bf1b949352bb0d345171db6f812461d5bf8b",
     "engenho-substrate-incubator/Cargo.toml": "b50e274b639f6bc7cee77c27de9e3c01e2f250505707ca33ab1997bd68b54bd4",
     "engenho-substrate-props/Cargo.toml": "d5a75c33f45b46eddd6d7d4a7166e002f10b0787e57dc35bbbdd1521e126bec6",
@@ -5972,7 +5972,9 @@
           }
         ],
         "build_dependencies": [],
-        "features": []
+        "features": [
+          "default"
+        ]
       },
       "engenho-control-client-0.53.144": {
         "runtime_dependencies": [
