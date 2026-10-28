@@ -110,7 +110,7 @@ impl Controller for Faulty {
 
     async fn tick(&self) -> Result<ReconcileOutcome, ControllerError> {
         match self.0 {
-            TickFault::Panic => panic!("injected: the tick panicked"),
+            TickFault::Panic => panic!("{INJECTED}the tick panicked"),
             TickFault::Hang => std::future::pending().await,
             TickFault::Error => Err(ControllerError::Internal(
                 "injected: a Transient failure".into(),
@@ -128,11 +128,30 @@ impl DeclaresReads for Faulty {
 
 /// A serve attempt that panics.
 async fn panicking_attempt() {
-    panic!("injected: the serve attempt panicked");
+    panic!("{INJECTED}the serve attempt panicked");
 }
 
 /// A serve attempt whose server returned.
 async fn returning_attempt() {}
+
+const INJECTED: &str = "injected: ";
+
+fn quiet_injected_panics() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let payload = info.payload();
+            let message = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
+            if !message.is_some_and(|m| m.starts_with(INJECTED)) {
+                previous(info);
+            }
+        }));
+    });
+}
 
 /// What every injected child is built over.
 struct World {
@@ -340,6 +359,7 @@ async fn drain_deaths(children: &mut Children) {
 /// tick loop on a 200 ms fallback has ticked several times.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_child_meets_every_fault_as_the_catalog_declares() {
+    quiet_injected_panics();
     let world = World::new().await;
     let settle = REBIND.base() * 5 / 2;
 
