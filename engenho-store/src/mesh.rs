@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 
 use crate::command::{LoggedCommand, ResourceCommand, TxnOp};
 use crate::fjall_store::{FjallStore, Flushed, ImageTripwire};
-use crate::network::{MeshNetwork, RpcRequest};
+use crate::network::{LearnerAsk, LearnerVerdict, MeshNetwork, RpcRequest};
 use crate::owned_task::{OwnedTask, TaskStop};
 use crate::pagination::PageAtRevision;
 use crate::read::{ReadConsistency, ReadRefused};
@@ -342,8 +342,16 @@ impl StoreMesh {
 
         let raft_for_rpc = raft.clone();
         let rpc_pump = OwnedTask::spawn(async move {
+            let mut admissions = tokio::task::JoinSet::new();
             while let Some(req) = rx_rpc.recv().await {
+                while admissions.try_join_next().is_some() {}
                 match req {
+                    RpcRequest::AddLearner(ask, reply) => {
+                        let raft = raft_for_rpc.clone();
+                        admissions.spawn(async move {
+                            let _ = reply.send(admit_learner(&raft, node_id, ask).await);
+                        });
+                    }
                     RpcRequest::AppendEntries(rpc, reply) => {
                         let _ = reply.send(raft_for_rpc.append_entries(rpc).await);
                     }
@@ -997,6 +1005,38 @@ impl StoreMesh {
         &self.listen_addr
     }
 
+    pub fn metrics(
+        &self,
+    ) -> tokio::sync::watch::Receiver<openraft::RaftMetrics<RaftNodeId, BasicNode>> {
+        self.raft.metrics()
+    }
+
+    pub async fn members(&self) -> Vec<(RaftNodeId, String, bool)> {
+        self.raft
+            .with_raft_state(|state| {
+                let membership = state.membership_state.effective().membership();
+                let voters: std::collections::BTreeSet<RaftNodeId> =
+                    membership.voter_ids().collect();
+                membership
+                    .nodes()
+                    .map(|(id, node)| (*id, node.addr.clone(), voters.contains(id)))
+                    .collect()
+            })
+            .await
+            .unwrap_or_default()
+    }
+
+    pub async fn promote_voter(&self, node: RaftNodeId) -> Result<(), StoreError> {
+        self.raft
+            .change_membership(
+                openraft::ChangeMembers::AddVoterIds(std::collections::BTreeSet::from([node])),
+                false,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| StoreError::ClientWriteFailed(format!("promote node {node}: {e}")))
+    }
+
     /// Stop every background task the mesh owns — the raft RPC pump and
     /// the store's bookmark ticker — aborting AND awaiting each, so that on
     /// return neither holds anything of the store's.
@@ -1109,8 +1149,51 @@ mod p3_fault_router_partition;
 #[cfg(test)]
 mod p3_durable_vote;
 
+#[cfg(all(test, feature = "mesh-quic"))]
+mod p4_learner_join;
+
 #[cfg(all(test, feature = "teia-nats"))]
 mod nats_reply_tests;
+
+async fn admit_learner(raft: &Raft<TypeConfig>, me: RaftNodeId, ask: LearnerAsk) -> LearnerVerdict {
+    let (leader, nodes) = {
+        let metrics = raft.metrics();
+        let metrics = metrics.borrow();
+        let nodes: Vec<(RaftNodeId, String)> = metrics
+            .membership_config
+            .membership()
+            .nodes()
+            .map(|(id, node)| (*id, node.addr.clone()))
+            .collect();
+        (metrics.current_leader, nodes)
+    };
+    if leader != Some(me) {
+        return LearnerVerdict::NotLeader {
+            leader: leader.and_then(|l| nodes.into_iter().find(|(id, _)| *id == l)),
+        };
+    }
+    if let Err(e) = raft
+        .add_learner(ask.node_id, BasicNode { addr: ask.addr }, false)
+        .await
+    {
+        return LearnerVerdict::Refused {
+            reason: e.to_string(),
+        };
+    }
+    let members = raft
+        .with_raft_state(|state| {
+            state
+                .membership_state
+                .effective()
+                .membership()
+                .nodes()
+                .map(|(id, node)| (*id, node.addr.clone()))
+                .collect()
+        })
+        .await
+        .unwrap_or_default();
+    LearnerVerdict::Admitted { members }
+}
 
 pub fn default_config(cluster_name: &str) -> Result<Arc<Config>, StoreError> {
     let cfg = Config {

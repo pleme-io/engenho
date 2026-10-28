@@ -1,5 +1,6 @@
 //! Cluster identity config.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -114,6 +115,10 @@ pub struct SharedCluster {
     pub ca_key_path: PathBuf,
     /// This node's ed25519 identity key (PKCS#8 PEM), minted there when absent.
     pub identity_key_path: PathBuf,
+    /// Mesh addresses of members to join through. Empty, this node forms the
+    /// cluster; otherwise a fresh node joins it as a learner.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seeds: Vec<SocketAddr>,
 }
 
 impl SharedCluster {

@@ -139,6 +139,9 @@ impl BootConfig {
         if mesh_fabric.carries_peers() && membership.shared().is_none() {
             return Err(Unhonoured::MeshWithoutIdentity);
         }
+        if membership.joins() && !mesh_fabric.carries_peers() {
+            return Err(Unhonoured::SeedsWithoutMesh);
+        }
         let cluster_name = shared.as_ref().map_or(name, |shared| &shared.name).clone();
         // Section order: the not-run records read in the order the config does.
         let not_run = [
@@ -239,6 +242,7 @@ pub(crate) struct SharedMembership {
     pub(crate) ca_cert: PathBuf,
     pub(crate) ca_key: PathBuf,
     pub(crate) identity_key: PathBuf,
+    pub(crate) seeds: Vec<std::net::SocketAddr>,
 }
 
 impl Membership {
@@ -248,6 +252,7 @@ impl Membership {
             ca_cert_path,
             ca_key_path,
             identity_key_path,
+            seeds,
         }) = shared
         else {
             return Self::Own;
@@ -256,7 +261,12 @@ impl Membership {
             ca_cert: ca_cert_path.clone(),
             ca_key: ca_key_path.clone(),
             identity_key: identity_key_path.clone(),
+            seeds: seeds.clone(),
         })
+    }
+
+    pub(crate) fn joins(&self) -> bool {
+        self.shared().is_some_and(|shared| !shared.seeds.is_empty())
     }
 
     pub(crate) const fn shared(&self) -> Option<&SharedMembership> {
@@ -486,6 +496,10 @@ pub enum Unhonoured {
         "fabric quic carries raft between shared-cluster members, and cluster.shared is not set"
     )]
     MeshWithoutIdentity,
+    #[error(
+        "cluster.shared.seeds names members to join, and fabric is in_binary, which reaches none"
+    )]
+    SeedsWithoutMesh,
     /// `consistency.default_tier` names a tier the store does not serve.
     /// Every write is a linearizable raft commit; no gossip, stream or
     /// content-addressed tier exists behind the name.
@@ -624,6 +638,7 @@ mod tests {
                 ca_cert_path: "/pki/ca.crt".into(),
                 ca_key_path: "/pki/ca.key".into(),
                 identity_key_path: "/pki/node.key".into(),
+                seeds: Vec::new(),
             });
         })
         .expect("run");
@@ -634,6 +649,7 @@ mod tests {
                 ca_cert: "/pki/ca.crt".into(),
                 ca_key: "/pki/ca.key".into(),
                 identity_key: "/pki/node.key".into(),
+                seeds: Vec::new(),
             })
         );
         assert_eq!(boot.not_run.first(), Some(&NotRun::HostClusterName));

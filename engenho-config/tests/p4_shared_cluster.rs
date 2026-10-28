@@ -21,6 +21,18 @@ fn a_shared_cluster_block_parses_and_round_trips() {
     assert_eq!(block["ca_cert_path"], "/var/lib/engenho/cluster/ca.crt");
     assert_eq!(block["ca_key_path"], "/var/lib/engenho/cluster/ca.key");
     assert_eq!(block["identity_key_path"], "/var/lib/engenho/mesh/node.key");
+    assert!(block.get("seeds").is_none(), "no seeds: this node forms");
+    let joining = shared(&format!(
+        "{SHARED}    seeds: [\"10.0.0.1:7946\", \"10.0.0.2:7946\"]\n"
+    ));
+    assert_eq!(
+        joining["seeds"],
+        serde_json::json!(["10.0.0.1:7946", "10.0.0.2:7946"])
+    );
+    assert!(
+        EngenhoConfig::from_yaml_with_defaults(&format!("{SHARED}    seeds: [\"rio\"]\n")).is_err(),
+        "a seed is a socket address"
+    );
     let cfg = EngenhoConfig::from_yaml_with_defaults(SHARED).unwrap();
     let again = EngenhoConfig::from_yaml_with_defaults(&cfg.to_yaml().unwrap()).unwrap();
     assert_eq!(cfg, again);

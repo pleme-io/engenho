@@ -208,6 +208,7 @@ fn build() -> Vec<LeafSpec> {
         ca_cert_path => anchored(Anchor::Identity),
         ca_key_path => anchored(Anchor::Identity),
         identity_key_path => anchored(Anchor::Identity),
+        seeds => M::NextBoot,
     });
     section!(rows, "revoada", RevoadaConfig { topology });
     section!(rows, "revoada.topology", TopologyConfig {
@@ -344,6 +345,7 @@ mod tests {
             ca_cert_path: PathBuf::from("/pki/ca.crt"),
             ca_key_path: PathBuf::from("/pki/ca.key"),
             identity_key_path: PathBuf::from("/pki/node.key"),
+            seeds: vec!["127.0.0.1:7946".parse().unwrap()],
         });
         config.legacy_teia = Some(LegacyTeiaSection {
             servers: Some(vec!["nats://a".into()]),

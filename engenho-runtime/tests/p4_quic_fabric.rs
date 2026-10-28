@@ -23,6 +23,7 @@ fn node(data_dir: &Path, ca: &(PathBuf, PathBuf)) -> EngenhoConfig {
         ca_cert_path: ca.0.clone(),
         ca_key_path: ca.1.clone(),
         identity_key_path: data_dir.join("mesh").join("node.key"),
+        seeds: Vec::new(),
     });
     cfg.fabric = Fabric::Quic {
         bind: "127.0.0.1:0".parse().unwrap(),

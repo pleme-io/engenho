@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
 use engenho_control_types::pin::{self, KeyError, KeyMaterial, PinSet, Presented, Spki};
@@ -13,15 +13,42 @@ use openraft::raft::{
 };
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use serde::de::DeserializeOwned;
-use tokio::sync::{Mutex, mpsc};
+use serde::{Deserialize, Serialize};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
-use crate::network::{MeshNetwork, RpcEnvelope, RpcRequest, remote_answer};
+use crate::mesh_join::{JoinAnswer, JoinGate, JoinRequest, Sealed};
+use crate::network::{
+    LearnerAsk, LearnerVerdict, MeshNetwork, RpcEnvelope, RpcRequest, remote_answer,
+};
 use crate::owned_task::OwnedTask;
 use crate::peer_table::{Peer, PeerTable, PeerTableError};
 use crate::type_config::{RaftNodeId, TypeConfig};
 
-pub const ALPN: &[u8] = b"engenho-mesh/1";
+pub const ALPN: &[u8] = b"engenho-mesh/2";
+const ASK_TTL: Duration = Duration::from_secs(5);
+const JOIN_HOPS: usize = 4;
+
+#[derive(Serialize)]
+enum OutFrame<'a> {
+    Raft(&'a RpcEnvelope),
+    Join(&'a Sealed),
+}
+
+#[derive(Deserialize)]
+enum InFrame {
+    Raft(RpcEnvelope),
+    Join(Sealed),
+}
+
+#[derive(Debug)]
+struct Anyone;
+
+impl PinSet for Anyone {
+    fn admits(&self, _: &Spki) -> bool {
+        true
+    }
+}
 pub const MAX_FRAME: u32 = 64 << 20;
 
 #[derive(Debug, thiserror::Error)]
@@ -32,6 +59,8 @@ pub enum QuicMeshError {
     Tls(String),
     #[error(transparent)]
     PeerTable(#[from] PeerTableError),
+    #[error("join: {0}")]
+    Join(String),
     #[error("bind the mesh endpoint at {addr}: {source}")]
     Bind {
         addr: SocketAddr,
@@ -112,8 +141,10 @@ struct Inner {
     identity: KeyMaterial,
     peers: Arc<Peers>,
     table: Option<Arc<PeerTable>>,
+    gate: Option<JoinGate>,
     connections: Mutex<HashMap<RaftNodeId, quinn::Connection>>,
     accept: Mutex<Option<OwnedTask>>,
+    follow: Mutex<Option<OwnedTask>>,
 }
 
 #[derive(Clone)]
@@ -123,7 +154,7 @@ pub struct QuicRouter {
 
 impl QuicRouter {
     pub fn bind(bind: SocketAddr, identity: KeyMaterial) -> Result<Self, QuicMeshError> {
-        Self::bind_over(bind, identity, None)
+        Self::bind_over(bind, identity, None, None)
     }
 
     pub fn bind_with(
@@ -131,13 +162,23 @@ impl QuicRouter {
         identity: KeyMaterial,
         table: Arc<PeerTable>,
     ) -> Result<Self, QuicMeshError> {
-        Self::bind_over(bind, identity, Some(table))
+        Self::bind_over(bind, identity, Some(table), None)
+    }
+
+    pub fn bind_joinable(
+        bind: SocketAddr,
+        identity: KeyMaterial,
+        table: Arc<PeerTable>,
+        gate: JoinGate,
+    ) -> Result<Self, QuicMeshError> {
+        Self::bind_over(bind, identity, Some(table), Some(gate))
     }
 
     fn bind_over(
         bind: SocketAddr,
         identity: KeyMaterial,
         table: Option<Arc<PeerTable>>,
+        gate: Option<JoinGate>,
     ) -> Result<Self, QuicMeshError> {
         let peers = Arc::new(Peers::default());
         for peer in table.iter().flat_map(|t| t.peers()) {
@@ -148,7 +189,12 @@ impl QuicRouter {
                 .insert(peer.node_id, peer.spki);
         }
         let presented = Arc::new(Presented::new(&identity)?);
-        let mut tls = pin::server_config(presented, Arc::clone(&peers) as Arc<dyn PinSet>)?;
+        let clients: Arc<dyn PinSet> = if gate.is_some() {
+            Arc::new(Anyone)
+        } else {
+            Arc::clone(&peers) as Arc<dyn PinSet>
+        };
+        let mut tls = pin::server_config(presented, clients)?;
         tls.alpn_protocols = vec![ALPN.to_vec()];
         let crypto =
             QuicServerConfig::try_from(tls).map_err(|e| QuicMeshError::Tls(e.to_string()))?;
@@ -161,8 +207,10 @@ impl QuicRouter {
                 identity,
                 peers,
                 table,
+                gate,
                 connections: Mutex::new(HashMap::new()),
                 accept: Mutex::new(None),
+                follow: Mutex::new(None),
             }),
         })
     }
@@ -250,12 +298,193 @@ impl QuicRouter {
     async fn forget(&self, target: RaftNodeId) {
         self.inner.connections.lock().await.remove(&target);
     }
+
+    pub async fn follow(
+        &self,
+        mut metrics: watch::Receiver<openraft::RaftMetrics<RaftNodeId, BasicNode>>,
+    ) {
+        let inner = Arc::downgrade(&self.inner);
+        let task = OwnedTask::spawn(async move {
+            loop {
+                let members: Vec<(RaftNodeId, String)> = metrics
+                    .borrow_and_update()
+                    .membership_config
+                    .membership()
+                    .nodes()
+                    .map(|(id, node)| (*id, node.addr.clone()))
+                    .collect();
+                let Some(router) = Weak::upgrade(&inner).map(|inner| QuicRouter { inner }) else {
+                    return;
+                };
+                for peer in members.iter().filter_map(|(id, addr)| peer_of(*id, addr)) {
+                    if let Err(e) = router.learn(peer) {
+                        tracing::warn!(%e, node = peer.node_id, "a member's pin was not recorded");
+                    }
+                }
+                drop(router);
+                if metrics.changed().await.is_err() {
+                    return;
+                }
+            }
+        });
+        if let Some(previous) = self.inner.follow.lock().await.replace(task) {
+            let _ = previous.stop().await;
+        }
+    }
+
+    pub async fn join(
+        &self,
+        seeds: &[SocketAddr],
+        me: SocketAddr,
+        within: Duration,
+    ) -> Result<Vec<Peer>, QuicMeshError> {
+        let gate = self.inner.gate.as_ref().ok_or_else(|| {
+            QuicMeshError::Join("this router was bound without a join gate".into())
+        })?;
+        let me = MeshAddr::pinned(me, self.spki());
+        let deadline = tokio::time::Instant::now() + within;
+        let mut last = String::from("no seed was given");
+        loop {
+            let mut targets: VecDeque<SocketAddr> = seeds.iter().copied().collect();
+            let mut hops = 0;
+            while let Some(target) = targets.pop_front() {
+                match tokio::time::timeout(ASK_TTL, self.ask(gate, target, me)).await {
+                    Ok(Ok(LearnerVerdict::Admitted { members })) => {
+                        let peers: Vec<Peer> = members
+                            .iter()
+                            .filter_map(|(id, addr)| peer_of(*id, addr))
+                            .collect();
+                        for peer in &peers {
+                            self.learn(*peer)?;
+                        }
+                        return Ok(peers);
+                    }
+                    Ok(Ok(LearnerVerdict::NotLeader {
+                        leader: Some((id, addr)),
+                    })) if hops < JOIN_HOPS => {
+                        hops += 1;
+                        last = format!("{target} is not the leader; node {id} is");
+                        if let Some(leader) = peer_of(id, &addr) {
+                            targets.push_front(leader.address);
+                        }
+                    }
+                    Ok(Ok(LearnerVerdict::NotLeader { .. })) => {
+                        last = format!("{target} knows no leader");
+                    }
+                    Ok(Ok(LearnerVerdict::Refused { reason })) => {
+                        last = format!("{target} refused: {reason}");
+                    }
+                    Ok(Err(e)) => last = format!("{target}: {e}"),
+                    Err(_) => last = format!("{target}: no answer in {ASK_TTL:?}"),
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(QuicMeshError::Join(last));
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    async fn ask(
+        &self,
+        gate: &JoinGate,
+        target: SocketAddr,
+        me: MeshAddr,
+    ) -> std::io::Result<LearnerVerdict> {
+        let mut tls = pin::client_config_admitting(&self.inner.identity, Arc::new(Anyone))
+            .map_err(std::io::Error::other)?;
+        tls.alpn_protocols = vec![ALPN.to_vec()];
+        let crypto = QuicClientConfig::try_from(tls).map_err(std::io::Error::other)?;
+        let conn = self
+            .inner
+            .endpoint
+            .connect_with(
+                quinn::ClientConfig::new(Arc::new(crypto)),
+                target,
+                pin::CERT_NAME,
+            )
+            .map_err(std::io::Error::other)?
+            .await
+            .map_err(std::io::Error::other)?;
+        let asked = async {
+            let answering = presented(&conn)
+                .ok_or_else(|| std::io::Error::other("the seed presented no key"))?;
+            let nonce = nonce()?;
+            let request = JoinRequest {
+                cluster: gate.cluster.clone(),
+                node_id: self.spki().mesh_node_id(),
+                addr: me.to_string(),
+                nonce: nonce.clone(),
+            };
+            let sealed = gate.seal_request(&request).map_err(std::io::Error::other)?;
+            let frame =
+                serde_json::to_vec(&OutFrame::Join(&sealed)).map_err(std::io::Error::other)?;
+            let (mut send, mut recv) = conn.open_bi().await.map_err(std::io::Error::other)?;
+            write_frame(&mut send, &frame).await?;
+            send.finish().map_err(std::io::Error::other)?;
+            let reply = read_frame(&mut recv).await?;
+            let sealed: Sealed = serde_json::from_slice(&reply).map_err(std::io::Error::other)?;
+            let answer = gate
+                .open_answer(&sealed)
+                .ok_or_else(|| std::io::Error::other("the answer is not sealed by this cluster"))?;
+            if answer.nonce != nonce || answer.seed != answering {
+                return Err(std::io::Error::other("the answer is not to this request"));
+            }
+            Ok(answer.verdict)
+        };
+        let verdict = asked.await;
+        conn.close(0u32.into(), b"asked");
+        verdict
+    }
+}
+
+fn peer_of(node_id: RaftNodeId, addr: &str) -> Option<Peer> {
+    let addr: MeshAddr = addr.parse().ok()?;
+    Some(Peer {
+        node_id,
+        address: addr.socket,
+        spki: addr.pin?,
+    })
+}
+
+fn presented(conn: &quinn::Connection) -> Option<Spki> {
+    let certs = conn
+        .peer_identity()?
+        .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+        .ok()?;
+    Spki::of_certificate(certs.first()?).ok()
+}
+
+fn nonce() -> std::io::Result<String> {
+    let mut bytes = [0u8; 32];
+    rustls::crypto::ring::default_provider()
+        .secure_random
+        .fill(&mut bytes)
+        .map_err(|_| std::io::Error::other("no randomness for a join nonce"))?;
+    Ok(bytes.iter().fold(String::with_capacity(64), |mut hex, b| {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{b:02x}");
+        hex
+    }))
+}
+
+struct Serving {
+    inbox: mpsc::Sender<RpcRequest>,
+    peers: Arc<Peers>,
+    gate: Option<JoinGate>,
+    spki: Spki,
 }
 
 impl MeshNetwork for QuicRouter {
     async fn register(&self, _node_id: RaftNodeId, sender: mpsc::Sender<RpcRequest>) {
         let endpoint = self.inner.endpoint.clone();
-        let task = OwnedTask::spawn(accept(endpoint, sender));
+        let serving = Arc::new(Serving {
+            inbox: sender,
+            peers: Arc::clone(&self.inner.peers),
+            gate: self.inner.gate.clone(),
+            spki: self.spki(),
+        });
+        let task = OwnedTask::spawn(accept(endpoint, serving));
         if let Some(previous) = self.inner.accept.lock().await.replace(task) {
             let _ = previous.stop().await;
         }
@@ -265,20 +494,23 @@ impl MeshNetwork for QuicRouter {
         if let Some(task) = self.inner.accept.lock().await.take() {
             let _ = task.stop().await;
         }
+        if let Some(task) = self.inner.follow.lock().await.take() {
+            let _ = task.stop().await;
+        }
         self.inner.connections.lock().await.clear();
         self.inner.endpoint.close(0u32.into(), b"deregistered");
     }
 }
 
-async fn accept(endpoint: quinn::Endpoint, inbox: mpsc::Sender<RpcRequest>) {
+async fn accept(endpoint: quinn::Endpoint, serving: Arc<Serving>) {
     let mut connections = JoinSet::new();
     while let Some(incoming) = endpoint.accept().await {
         while connections.try_join_next().is_some() {}
-        connections.spawn(serve_connection(incoming, inbox.clone()));
+        connections.spawn(serve_connection(incoming, Arc::clone(&serving)));
     }
 }
 
-async fn serve_connection(incoming: quinn::Incoming, inbox: mpsc::Sender<RpcRequest>) {
+async fn serve_connection(incoming: quinn::Incoming, serving: Arc<Serving>) {
     let conn = match incoming.await {
         Ok(conn) => conn,
         Err(e) => {
@@ -286,23 +518,35 @@ async fn serve_connection(incoming: quinn::Incoming, inbox: mpsc::Sender<RpcRequ
             return;
         }
     };
+    let Some(caller) = presented(&conn) else {
+        conn.close(1u32.into(), b"no key");
+        return;
+    };
     let mut streams = JoinSet::new();
     while let Ok((send, recv)) = conn.accept_bi().await {
         while streams.try_join_next().is_some() {}
-        streams.spawn(serve_stream(send, recv, inbox.clone()));
+        streams.spawn(serve_stream(send, recv, Arc::clone(&serving), caller));
     }
 }
 
 async fn serve_stream(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
-    inbox: mpsc::Sender<RpcRequest>,
+    serving: Arc<Serving>,
+    caller: Spki,
 ) {
     let answered = async {
         let request = read_frame(&mut recv).await?;
-        let envelope: RpcEnvelope =
-            serde_json::from_slice(&request).map_err(std::io::Error::other)?;
-        let reply = envelope.deliver(&inbox).await?;
+        let frame: InFrame = serde_json::from_slice(&request).map_err(std::io::Error::other)?;
+        let reply = match frame {
+            InFrame::Raft(envelope) => {
+                if !serving.peers.admits(&caller) {
+                    return Err(std::io::Error::other(format!("{caller} is not admitted")));
+                }
+                envelope.deliver(&serving.inbox).await?
+            }
+            InFrame::Join(sealed) => answer_join(&serving, caller, &sealed).await?,
+        };
         write_frame(&mut send, &reply).await?;
         send.finish().map_err(std::io::Error::other)
     };
@@ -310,6 +554,58 @@ async fn serve_stream(
         tracing::debug!(%e, "mesh stream ended without a reply");
         let _ = send.reset(1u32.into());
     }
+}
+
+async fn answer_join(serving: &Serving, caller: Spki, sealed: &Sealed) -> std::io::Result<Vec<u8>> {
+    let gate = serving
+        .gate
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("this node takes no joins"))?;
+    let request = gate
+        .open_request(sealed)
+        .ok_or_else(|| std::io::Error::other("a join not sealed by this cluster"))?;
+    let verdict = match judge(gate, &request, caller) {
+        Ok(ask) => {
+            let (tx, rx) = oneshot::channel();
+            serving
+                .inbox
+                .send(RpcRequest::AddLearner(ask, tx))
+                .await
+                .map_err(|_| std::io::Error::other("the node's RPC inbox is closed"))?;
+            rx.await.map_err(std::io::Error::other)?
+        }
+        Err(reason) => LearnerVerdict::Refused { reason },
+    };
+    let answer = JoinAnswer {
+        nonce: request.nonce,
+        seed: serving.spki,
+        verdict,
+    };
+    let sealed = gate.seal_answer(&answer).map_err(std::io::Error::other)?;
+    serde_json::to_vec(&sealed).map_err(std::io::Error::other)
+}
+
+fn judge(gate: &JoinGate, request: &JoinRequest, caller: Spki) -> Result<LearnerAsk, String> {
+    if request.cluster != gate.cluster {
+        return Err(format!(
+            "this is cluster {}, not {}",
+            gate.cluster, request.cluster
+        ));
+    }
+    let addr: MeshAddr = request.addr.parse()?;
+    if addr.pin != Some(caller) {
+        return Err("the address names another key than the one that asked".into());
+    }
+    if request.node_id != caller.mesh_node_id() {
+        return Err(format!(
+            "node id {} is not the id of the key that asked",
+            request.node_id
+        ));
+    }
+    Ok(LearnerAsk {
+        node_id: request.node_id,
+        addr: request.addr.clone(),
+    })
 }
 
 async fn write_frame(send: &mut quinn::SendStream, bytes: &[u8]) -> std::io::Result<()> {
@@ -367,8 +663,8 @@ impl QuicNetwork {
         T: DeserializeOwned,
         E: DeserializeOwned + std::error::Error,
     {
-        let request =
-            serde_json::to_vec(envelope).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        let request = serde_json::to_vec(&OutFrame::Raft(envelope))
+            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         let conn = self
             .router
             .connection(self.target, &self.addr)
@@ -579,6 +875,33 @@ mod tests {
         a.admit(2, again.spki());
         let _answered = answer_votes(serving(&again, 2).await);
         assert!(vote(&a, 2, &again).await.unwrap().vote_granted);
+    }
+
+    #[tokio::test]
+    async fn a_joinable_router_never_delivers_a_raft_rpc_from_a_key_it_has_not_admitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = QuicRouter::bind_joinable(
+            ([127, 0, 0, 1], 0).into(),
+            KeyMaterial::generate().unwrap(),
+            Arc::new(PeerTable::open(dir.path().join(PeerTable::FILE)).unwrap()),
+            crate::mesh_join::JoinGate {
+                cluster: "c".into(),
+                key: crate::mesh_join::JoinKey::derive(b"k"),
+            },
+        )
+        .unwrap();
+        let (a, stranger) = (bound(), bound());
+        b.admit(1, a.spki());
+        a.admit(2, b.spki());
+        stranger.admit(2, b.spki());
+        let answered = answer_votes(serving(&b, 2).await);
+        assert!(vote(&a, 2, &b).await.unwrap().vote_granted);
+        assert!(
+            vote(&stranger, 2, &b).await.is_err(),
+            "a key the joinable router never admitted had its vote delivered"
+        );
+        b.deregister(2).await;
+        assert_eq!(answered.await.unwrap(), 1);
     }
 
     #[test]

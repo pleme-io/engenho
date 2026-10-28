@@ -243,6 +243,12 @@ pub trait PinSet: Send + Sync + fmt::Debug {
     fn admits(&self, spki: &Spki) -> bool;
 }
 
+impl PinSet for Vec<Spki> {
+    fn admits(&self, spki: &Spki) -> bool {
+        self.contains(spki)
+    }
+}
+
 /// Pin a certificate: its key's pin, when `admits` it.
 fn pinned(cert: &CertificateDer<'_>, admits: impl Fn(&Spki) -> bool) -> Result<Spki, Error> {
     let spki = Spki::of_certificate(cert)
@@ -341,7 +347,7 @@ impl ClientCertVerifier for ClientPins {
 /// one of the pins (several, so a rotation can overlap).
 #[derive(Debug)]
 struct ServerPins {
-    pins: Vec<Spki>,
+    pins: Arc<dyn PinSet>,
     signatures: Signatures,
 }
 
@@ -354,7 +360,7 @@ impl ServerCertVerifier for ServerPins {
         _ocsp: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, Error> {
-        pinned(end_entity, |spki| self.pins.contains(spki)).map(|_| ServerCertVerified::assertion())
+        pinned(end_entity, |spki| self.pins.admits(spki)).map(|_| ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
@@ -461,6 +467,20 @@ pub fn server_config(
 pub fn client_config(
     key: &KeyMaterial,
     server: Vec<Spki>,
+) -> Result<rustls::ClientConfig, KeyError> {
+    client_config_admitting(key, Arc::new(server))
+}
+
+/// A client's TLS trusting a server whose key `server` admits, looked up per
+/// handshake. The handshake signature is still checked against the key the
+/// server presents.
+///
+/// # Errors
+///
+/// As [`server_config`].
+pub fn client_config_admitting(
+    key: &KeyMaterial,
+    server: Arc<dyn PinSet>,
 ) -> Result<rustls::ClientConfig, KeyError> {
     let provider = provider();
     let signatures = Signatures(provider.signature_verification_algorithms);

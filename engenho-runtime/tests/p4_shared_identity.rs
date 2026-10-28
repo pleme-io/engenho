@@ -32,6 +32,7 @@ fn node(data_dir: &Path, shared: Option<&SharedCa>) -> EngenhoConfig {
         ca_cert_path: ca.cert.clone(),
         ca_key_path: ca.key.clone(),
         identity_key_path: data_dir.join("mesh").join("node.key"),
+        seeds: Vec::new(),
     });
     cfg.runtime.listen_addr = "127.0.0.1:0".into();
     cfg.runtime.kubelet_listen_addr = "127.0.0.1:0".into();

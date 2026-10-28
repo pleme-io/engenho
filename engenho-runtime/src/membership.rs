@@ -76,23 +76,40 @@ pub(crate) fn ca_dir(boot: &BootConfig) -> PathBuf {
 }
 
 #[cfg(feature = "mesh-quic")]
+pub(crate) struct BoundMesh {
+    pub(crate) router: engenho_store::QuicRouter,
+    pub(crate) listen: String,
+    pub(crate) socket: std::net::SocketAddr,
+}
+
+#[cfg(feature = "mesh-quic")]
 pub(crate) fn bind_mesh(
     boot: &BootConfig,
     bind: std::net::SocketAddr,
     identity: NodeIdentity,
-) -> Result<(engenho_store::QuicRouter, String), RuntimeError> {
+) -> Result<BoundMesh, RuntimeError> {
     use std::sync::Arc;
 
-    use engenho_store::{MeshAddr, PeerTable, QuicRouter};
+    use engenho_store::{JoinGate, JoinKey, MeshAddr, PeerTable, QuicRouter};
 
     let mesh = |reason: String| RuntimeError::Mesh { reason };
     let shared = boot
         .membership
         .shared()
         .ok_or(crate::Unhonoured::MeshWithoutIdentity)?;
+    let ca_key_pem = std::fs::read(&shared.ca_key).map_err(|e| {
+        mesh(format!(
+            "read the cluster CA key {}: {e}",
+            shared.ca_key.display()
+        ))
+    })?;
+    let gate = JoinGate {
+        cluster: boot.cluster_name.clone(),
+        key: JoinKey::derive(&ca_key_pem),
+    };
     let table = PeerTable::open(shared.identity_key.with_file_name(PeerTable::FILE))
         .map_err(|e| mesh(e.to_string()))?;
-    let router = QuicRouter::bind_with(bind, identity.into_key(), Arc::new(table))
+    let router = QuicRouter::bind_joinable(bind, identity.into_key(), Arc::new(table), gate)
         .map_err(|e| mesh(e.to_string()))?;
     let bound = router.local_addr().map_err(|e| mesh(e.to_string()))?;
     let socket = advertised(bound, &boot.advertise_address).ok_or_else(|| {
@@ -102,7 +119,52 @@ pub(crate) fn bind_mesh(
         ))
     })?;
     let listen = MeshAddr::pinned(socket, router.spki()).to_string();
-    Ok((router, listen))
+    Ok(BoundMesh {
+        router,
+        listen,
+        socket,
+    })
+}
+
+#[cfg(feature = "mesh-quic")]
+pub(crate) async fn join(
+    boot: &BootConfig,
+    store: &engenho_store::StoreMesh,
+    router: &engenho_store::QuicRouter,
+    seeds: &[std::net::SocketAddr],
+    me: std::net::SocketAddr,
+) -> Result<(), RuntimeError> {
+    let within = std::time::Duration::from_secs(u64::from(boot.leadership_timeout_seconds));
+    let peers = router
+        .join(seeds, me, within)
+        .await
+        .map_err(|e| RuntimeError::Mesh {
+            reason: e.to_string(),
+        })?;
+    tracing::info!(
+        node_id = store.node_id(),
+        members = peers.len(),
+        "admitted as a learner"
+    );
+    let deadline = tokio::time::Instant::now() + within;
+    let mut metrics = store.metrics();
+    while !store.is_member(store.node_id()).await {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero()
+            || !matches!(
+                tokio::time::timeout(left, metrics.changed()).await,
+                Ok(Ok(()))
+            )
+        {
+            return Err(RuntimeError::Mesh {
+                reason: format!(
+                    "admitted, and no membership naming node {} replicated within {within:?}",
+                    store.node_id()
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "mesh-quic")]
@@ -116,4 +178,101 @@ fn advertised(bound: std::net::SocketAddr, advertise: &str) -> Option<std::net::
         .or_else(|_| advertise.parse::<std::net::IpAddr>())
         .ok()?;
     Some(std::net::SocketAddr::new(host, bound.port()))
+}
+
+#[cfg(all(test, feature = "mesh-quic"))]
+mod tests {
+    use std::path::Path;
+    use std::time::Duration;
+
+    use engenho_config::{EngenhoConfig, Fabric, SharedCluster, TieredConfig as _};
+    use engenho_store::{MeshAddr, Reason, ResourceCommand, ResourceKey};
+
+    use crate::boot::BootKind;
+    use crate::boot_config::BootConfig;
+
+    fn boot(data_dir: &Path, ca: &Path, seeds: Vec<std::net::SocketAddr>) -> BootConfig {
+        let mut config = EngenhoConfig::prescribed_default();
+        let pki = engenho_apiserver::PkiFile::dir(ca);
+        config.cluster.shared = Some(SharedCluster {
+            name: "aldeia-join".into(),
+            ca_cert_path: pki.join("ca.crt"),
+            ca_key_path: pki.join("ca.key"),
+            identity_key_path: data_dir.join("mesh").join("node.key"),
+            seeds,
+        });
+        config.fabric = Fabric::Quic {
+            bind: "127.0.0.1:0".parse().unwrap(),
+        };
+        config.runtime.data_dir = data_dir.to_path_buf();
+        config.runtime.durable = true;
+        config.runtime.leadership_timeout_seconds = 10;
+        BootConfig::read(&config).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_node_booted_with_seeds_joins_the_formed_store_as_a_learner_and_replicates() {
+        let (ca, one, two) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
+        engenho_apiserver::load_or_generate_ca(ca.path()).unwrap();
+        let (first, kind) = crate::runtime::boot_store(&boot(one.path(), ca.path(), Vec::new()))
+            .await
+            .unwrap();
+        assert_eq!(kind, BootKind::FirstBoot);
+        assert!(first.wait_for_leadership(Duration::from_secs(10)).await);
+        let seed: MeshAddr = first.listen_addr().parse().unwrap();
+
+        let (second, kind) =
+            crate::runtime::boot_store(&boot(two.path(), ca.path(), vec![seed.socket]))
+                .await
+                .unwrap();
+        assert_eq!(kind, BootKind::FirstBoot);
+        let members = first.members().await;
+        assert!(
+            members.contains(&(second.node_id(), second.listen_addr().to_owned(), false)),
+            "{members:?}"
+        );
+
+        let key = ResourceKey::namespaced("", "v1", "ConfigMap", "default", "joined");
+        first
+            .propose(ResourceCommand::put(
+                key.clone(),
+                serde_json::json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "joined", "namespace": "default"}}),
+                Reason::Operator,
+            ))
+            .await
+            .unwrap();
+        let at = first.current_revision().await;
+        assert!(second.wait_for_revision(at, Duration::from_secs(10)).await);
+        assert!(second.get(&key).await.is_some());
+        assert!(!second.is_leader().await);
+
+        for store in [second, first] {
+            std::sync::Arc::try_unwrap(store)
+                .ok()
+                .unwrap()
+                .terminate()
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn seeds_without_the_quic_fabric_are_refused() {
+        let mut config = EngenhoConfig::prescribed_default();
+        config.cluster.shared = Some(SharedCluster {
+            name: "aldeia-join".into(),
+            ca_cert_path: "/ca.crt".into(),
+            ca_key_path: "/ca.key".into(),
+            identity_key_path: "/node.key".into(),
+            seeds: vec!["127.0.0.1:7946".parse().unwrap()],
+        });
+        assert_eq!(
+            BootConfig::read(&config).map(|_| ()).unwrap_err(),
+            crate::Unhonoured::SeedsWithoutMesh
+        );
+    }
 }

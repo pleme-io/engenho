@@ -33,6 +33,26 @@ pub enum RpcRequest {
         InstallSnapshotRequest<TypeConfig>,
         RpcReply<InstallSnapshotResponse<RaftNodeId>, RaftError<RaftNodeId, InstallSnapshotError>>,
     ),
+    AddLearner(LearnerAsk, oneshot::Sender<LearnerVerdict>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LearnerAsk {
+    pub node_id: RaftNodeId,
+    pub addr: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum LearnerVerdict {
+    Admitted {
+        members: Vec<(RaftNodeId, String)>,
+    },
+    NotLeader {
+        leader: Option<(RaftNodeId, String)>,
+    },
+    Refused {
+        reason: String,
+    },
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]

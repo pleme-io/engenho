@@ -2049,7 +2049,9 @@ fn build_backend(boot: &BootConfig) -> Result<Arc<dyn ContainerRuntime>, Runtime
 pub(crate) const STORE_DIR: &str = crate::layout::Area::Store.dir();
 
 /// Bring up the store spine — durable or ephemeral per config.
-async fn boot_store(boot: &BootConfig) -> Result<(Arc<StoreMesh>, BootKind), RuntimeError> {
+pub(crate) async fn boot_store(
+    boot: &BootConfig,
+) -> Result<(Arc<StoreMesh>, BootKind), RuntimeError> {
     let identity = crate::membership::identity(boot)?;
     let node_id = identity.as_ref().map_or(
         crate::membership::SINGLETON,
@@ -2058,13 +2060,26 @@ async fn boot_store(boot: &BootConfig) -> Result<(Arc<StoreMesh>, BootKind), Run
     match boot.fabric {
         crate::boot_config::MeshFabric::InProcess => {
             let listen = format!("in-process://{node_id}");
-            open_store(boot, node_id, listen, InProcessRouter::new()).await
+            let (store, kind) = open_store(boot, node_id, listen, InProcessRouter::new()).await?;
+            Ok((Arc::new(store), kind))
         }
         #[cfg(feature = "mesh-quic")]
         crate::boot_config::MeshFabric::Quic { bind } => {
             let identity = identity.ok_or(crate::Unhonoured::MeshWithoutIdentity)?;
-            let (router, listen) = crate::membership::bind_mesh(boot, bind, identity)?;
-            open_store(boot, node_id, listen, router).await
+            let mesh = crate::membership::bind_mesh(boot, bind, identity)?;
+            let (store, kind) = open_store(boot, node_id, mesh.listen, mesh.router.clone()).await?;
+            mesh.router.follow(store.metrics()).await;
+            if kind != BootKind::Resume
+                && let Some(shared) = boot.membership.shared()
+                && !shared.seeds.is_empty()
+                && let Err(e) =
+                    crate::membership::join(boot, &store, &mesh.router, &shared.seeds, mesh.socket)
+                        .await
+            {
+                let _ = store.terminate().await;
+                return Err(e);
+            }
+            Ok((Arc::new(store), kind))
         }
     }
 }
@@ -2074,12 +2089,16 @@ async fn open_store(
     node_id: engenho_store::RaftNodeId,
     listen: String,
     router: impl engenho_store::MeshNetwork,
-) -> Result<(Arc<StoreMesh>, BootKind), RuntimeError> {
+) -> Result<(StoreMesh, BootKind), RuntimeError> {
     let cfg = default_config(&boot.cluster_name)?;
+    let forms = !boot.membership.joins();
     if boot.durable {
         let store_path = boot.data_dir.join(STORE_DIR);
-        let (mesh, fresh) =
-            StoreMesh::start_or_resume(node_id, listen, router, cfg, store_path).await?;
+        let mesh = StoreMesh::start_durable(node_id, listen, router, cfg, store_path).await?;
+        let fresh = !mesh.is_initialized().await;
+        if fresh && forms {
+            mesh.initialize_singleton().await?;
+        }
         if !fresh && !mesh.is_member(node_id).await {
             let _ = mesh.terminate().await;
             return Err(RuntimeError::NotAMember { node_id });
@@ -2089,13 +2108,15 @@ async fn open_store(
         } else {
             BootKind::Resume
         };
-        info!(?kind, node_id, "durable store opened");
-        Ok((Arc::new(mesh), kind))
+        info!(?kind, node_id, forms, "durable store opened");
+        Ok((mesh, kind))
     } else {
         let mesh = StoreMesh::start(node_id, listen, router, cfg).await?;
-        mesh.initialize_singleton().await?;
-        info!(node_id, "ephemeral store initialized");
-        Ok((Arc::new(mesh), BootKind::Ephemeral))
+        if forms {
+            mesh.initialize_singleton().await?;
+        }
+        info!(node_id, forms, "ephemeral store opened");
+        Ok((mesh, BootKind::Ephemeral))
     }
 }
 

@@ -100,6 +100,8 @@ pub mod data_dir_lock;
 pub mod drv_committal;
 pub mod fjall_store;
 pub mod mesh;
+#[cfg(feature = "mesh-quic")]
+pub mod mesh_join;
 #[cfg(feature = "teia-nats")]
 pub mod nats_listener;
 #[cfg(feature = "teia-nats")]
@@ -141,11 +143,13 @@ pub use drv_committal::{
 };
 pub use fjall_store::{FjallStore, Flushed, IMAGE_GATE, ImageInconsistency, ImageTripwire};
 pub use mesh::{MeshFlushed, Quiesced, StoreError, StoreMesh, default_config};
+#[cfg(feature = "mesh-quic")]
+pub use mesh_join::{JoinGate, JoinKey};
 #[cfg(feature = "teia-nats")]
 pub use nats_listener::NatsListener;
 #[cfg(feature = "teia-nats")]
 pub use nats_network::{NatsRaftNetwork, NatsRaftNetworkFactory, NatsRpcEnvelope};
-pub use network::{InProcessRouter, MeshNetwork, RpcEnvelope};
+pub use network::{InProcessRouter, LearnerAsk, LearnerVerdict, MeshNetwork, RpcEnvelope};
 pub use owned_task::{OwnedTask, TaskStop};
 pub use pagination::{ContinueInvalid, ContinueToken, ListPage, PageAtRevision};
 pub use patch_apply::{
