@@ -25,12 +25,11 @@
 //! write by count and time). Without a flush on the stop path those writes
 //! would be left in the log for the next boot to replay.
 //!
-//! Residual, stated plainly: an entry a driver had in flight when it was
-//! aborted can still be applied after the stop's flush. An idle node with
-//! the fake backend proposes nothing after boot (measured: 25 s, zero
-//! applies), and the config maps written here trigger no controller, so
-//! neither case has such an entry. Closing it for a busy node needs the store
-//! to drain applies before flushing.
+//! Each node declares a namespace and a config map through its own
+//! `node_manifests_dir` (never the host's `/etc/engenho/manifests.d`), so its
+//! drivers propose while the stop runs: an entry a driver had queued in raft
+//! when it was aborted must be applied before the stop's flush
+//! (`StoreMesh::drain_applies`).
 
 use std::future::Future;
 use std::path::Path;
@@ -60,12 +59,23 @@ fn config(data_dir: &Path) -> EngenhoConfig {
     cfg.runtime.kubelet_listen_addr = "127.0.0.1:0".into();
     cfg.runtime.etcd_listen_addr = "127.0.0.1:0".into();
     cfg.runtime.data_dir = data_dir.to_path_buf();
+    cfg.runtime.node_manifests_dir = data_dir.join("manifests.d");
     cfg.runtime.durable = true;
     cfg.runtime.node_name = "node-A".into();
     cfg.runtime.kubelet_backend = KubeletBackendKind::Fake;
     cfg.runtime.leadership_timeout_seconds = 5;
     cfg.runtime.tls.enabled = false;
     cfg
+}
+
+fn declare_a_namespace(data_dir: &Path) {
+    let dir = data_dir.join("manifests.d");
+    std::fs::create_dir_all(&dir).expect("the node manifests directory");
+    std::fs::write(
+        dir.join("declared.yaml"),
+        "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: declared\n---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: declared\n  namespace: declared\ndata:\n  k: v\n",
+    )
+    .expect("a node manifest");
 }
 
 /// One node lifetime on its own runtime. Dropping the runtime at the end
@@ -238,6 +248,7 @@ fn assert_the_next_boot_replays_nothing(data_dir: &Path, acks: &[Ack]) {
 #[test]
 fn a_clean_stop_leaves_nothing_to_replay() {
     let tmp = tempfile::tempdir().expect("tempdir");
+    declare_a_namespace(tmp.path());
     let acks = lifetime(async {
         let rt = Runtime::start(config(tmp.path()))
             .await
@@ -260,6 +271,7 @@ fn a_clean_stop_leaves_nothing_to_replay() {
 #[test]
 fn a_stop_that_cannot_take_the_store_has_already_flushed_it() {
     let tmp = tempfile::tempdir().expect("tempdir");
+    declare_a_namespace(tmp.path());
     let acks = lifetime(async {
         let rt = Runtime::start(config(tmp.path()))
             .await

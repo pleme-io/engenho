@@ -909,6 +909,27 @@ impl<N: MeshNetwork> StoreMesh<N> {
         }
     }
 
+    pub async fn drain_applies(&self, within: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        let mut metrics = self.raft.metrics();
+        let barrier = tokio::time::timeout(within, self.raft.with_raft_state(|_| ())).await;
+        if !matches!(barrier, Ok(Ok(()))) {
+            return false;
+        }
+        metrics.borrow_and_update();
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, metrics.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(_) => return false,
+            }
+            let m = metrics.borrow_and_update();
+            if m.last_applied.map(|applied| applied.index) >= m.last_log_index {
+                return true;
+            }
+        }
+    }
+
     pub fn node_id(&self) -> RaftNodeId {
         self.node_id
     }

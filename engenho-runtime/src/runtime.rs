@@ -970,9 +970,15 @@ impl Runtime {
         // Bring the durable image up to the applied state while the store is
         // still behind the Arc, so the durability of this stop does not
         // depend on the unwrap below succeeding. Nothing new is proposed any
-        // more (the drivers and the apiserver are gone, the pump is stopped);
-        // an entry already in flight may still land, and terminate's own
-        // flush catches it.
+        // more (the drivers and the apiserver are gone, the pump is stopped),
+        // but an aborted driver's proposal may already be queued in raft, so
+        // the store first applies everything raft accepted.
+        if !store.drain_applies(SHUTDOWN_DRAIN).await {
+            warn!(
+                within = ?SHUTDOWN_DRAIN,
+                "the store still had log entries to apply when shutdown flushed it"
+            );
+        }
         let flushed = store.flush().await?;
         info!(?flushed, "store flushed at shutdown");
         let counts = StrongCounts {
@@ -1607,6 +1613,8 @@ fn itoa_i32(n: i32) -> String {
 
 /// Longest stderr excerpt carried into a preflight error, in bytes.
 const STDERR_TAIL_MAX: usize = 400;
+
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 
 /// The last meaningful line of a failed subprocess's stderr, ready to append.
 ///
