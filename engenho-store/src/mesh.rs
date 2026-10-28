@@ -1074,6 +1074,9 @@ mod rpc_reply_tests;
 #[cfg(test)]
 mod p3_fault_router_partition;
 
+#[cfg(test)]
+mod p3_durable_vote;
+
 #[cfg(all(test, feature = "teia-nats"))]
 mod nats_reply_tests;
 
