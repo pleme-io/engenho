@@ -8,6 +8,8 @@
 //!   boundary and releases it.
 //! * A failed boot names the phase it failed in.
 
+mod support;
+
 use engenho_config::{EngenhoConfig, KubeletBackendKind};
 use engenho_runtime::boot::{BootKind, BootPhase, BootProgress, BootRecorder};
 use engenho_runtime::{BootUnwind, Runtime, RuntimeError};
@@ -20,7 +22,7 @@ fn config(data_dir: &std::path::Path) -> EngenhoConfig {
     cfg.runtime.listen_addr = "127.0.0.1:0".into();
     cfg.runtime.kubelet_listen_addr = "127.0.0.1:0".into();
     cfg.runtime.etcd_listen_addr = "127.0.0.1:0".into();
-    cfg.runtime.data_dir = data_dir.to_path_buf();
+    support::place(&mut cfg, data_dir);
     cfg.runtime.durable = false;
     cfg.runtime.node_name = "node-phases".into();
     cfg.runtime.kubelet_backend = KubeletBackendKind::Fake;

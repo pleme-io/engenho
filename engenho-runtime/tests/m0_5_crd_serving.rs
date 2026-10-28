@@ -24,6 +24,8 @@
 //! loopback (127.0.0.1:0), ephemeral store, fast fallback so the controller
 //! registers within ~1s.
 
+mod support;
+
 use std::time::{Duration, Instant};
 
 use engenho_config::{EngenhoConfig, KubeletBackendKind};
@@ -43,7 +45,7 @@ fn crd_test_config(data_dir: &std::path::Path) -> EngenhoConfig {
     // A WRITABLE data_dir — the bootstrap admin BEARER token is minted under
     // data_dir/pki on every boot (Brick B), so the prescribed /var/lib/engenho
     // (not writable in CI) won't do.
-    cfg.runtime.data_dir = data_dir.to_path_buf();
+    support::place(&mut cfg, data_dir);
     // CRD controller on (default), plus a short fallback so registration
     // happens within ~1s of the CRD write even if the watch-wake is missed.
     cfg.controllers.enable.crd = true;

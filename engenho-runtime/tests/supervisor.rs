@@ -4,6 +4,8 @@
 //! drives it the way an operator (or a service manager's signal) would,
 //! reading the published [`Snapshot`] — never the loop — to see where it is.
 
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -25,7 +27,7 @@ fn config(data_dir: &Path, durable: bool) -> EngenhoConfig {
     cfg.runtime.listen_addr = "127.0.0.1:0".into();
     cfg.runtime.kubelet_listen_addr = "127.0.0.1:0".into();
     cfg.runtime.etcd_listen_addr = "127.0.0.1:0".into();
-    cfg.runtime.data_dir = data_dir.to_path_buf();
+    support::place(&mut cfg, data_dir);
     cfg.runtime.durable = durable;
     cfg.runtime.node_name = "node-supervised".into();
     cfg.runtime.kubelet_backend = KubeletBackendKind::Fake;

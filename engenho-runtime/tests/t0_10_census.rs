@@ -9,6 +9,8 @@
 //! dropping it, so no task of one lifetime (a store's state-machine worker, a
 //! listener) can still be writing while the next one reads the directory.
 
+mod support;
+
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -205,7 +207,7 @@ fn node_config(data_dir: &Path) -> EngenhoConfig {
     cfg.runtime.listen_addr = "127.0.0.1:0".into();
     cfg.runtime.kubelet_listen_addr = "127.0.0.1:0".into();
     cfg.runtime.etcd_listen_addr = "127.0.0.1:0".into();
-    cfg.runtime.data_dir = data_dir.to_path_buf();
+    support::place(&mut cfg, data_dir);
     cfg.runtime.durable = true;
     cfg.runtime.node_name = "node-census".into();
     cfg.runtime.kubelet_backend = KubeletBackendKind::Fake;

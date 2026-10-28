@@ -25,6 +25,8 @@
 //!      Deployments with the SAME name in namespaces `a` and `b` each get
 //!      their own RS+Pods in their own namespace; they don't collide.
 
+mod support;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -40,7 +42,7 @@ use shikumi::TieredConfig;
 fn durable_config(data_dir: &std::path::Path) -> EngenhoConfig {
     let mut cfg = EngenhoConfig::prescribed_default();
     cfg.runtime.listen_addr = "127.0.0.1:0".into();
-    cfg.runtime.data_dir = data_dir.to_path_buf();
+    support::place(&mut cfg, data_dir);
     cfg.runtime.durable = true;
     cfg.runtime.node_name = "node-A".into();
     cfg.runtime.kubelet_backend = KubeletBackendKind::Fake;

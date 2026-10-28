@@ -20,6 +20,8 @@
 //! `health` unit tests, which can stop a child's heartbeat; a booted daemon's
 //! drivers cannot be made to stall from outside.
 
+mod support;
+
 use std::time::{Duration, Instant};
 
 use engenho_config::{EngenhoConfig, KubeletBackendKind};
@@ -47,7 +49,7 @@ fn config(data_dir: &std::path::Path) -> EngenhoConfig {
     cfg.runtime.kubelet_backend = KubeletBackendKind::Fake;
     cfg.runtime.leadership_timeout_seconds = 5;
     cfg.runtime.tls.enabled = false;
-    cfg.runtime.data_dir = data_dir.to_path_buf();
+    support::place(&mut cfg, data_dir);
     cfg.controllers.fallback_interval_seconds = 1;
     cfg
 }

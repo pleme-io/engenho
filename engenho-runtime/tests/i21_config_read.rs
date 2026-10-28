@@ -14,6 +14,8 @@
 //! type). What makes a NEW field impossible to ignore is the destructure in
 //! `boot_config.rs` (E0027); these tests pin what the existing fields do.
 
+mod support;
+
 use std::time::{Duration, Instant};
 
 use engenho_config::{
@@ -44,7 +46,7 @@ fn config(data_dir: &std::path::Path) -> EngenhoConfig {
     cfg.runtime.kubelet_backend = KubeletBackendKind::Fake;
     cfg.runtime.leadership_timeout_seconds = 5;
     cfg.runtime.tls.enabled = false;
-    cfg.runtime.data_dir = data_dir.to_path_buf();
+    support::place(&mut cfg, data_dir);
     cfg.controllers.fallback_interval_seconds = 1;
     cfg.controllers.debounce_milliseconds = 20;
     cfg

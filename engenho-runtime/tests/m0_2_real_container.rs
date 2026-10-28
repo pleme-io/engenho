@@ -42,6 +42,8 @@
 //! name is unique-per-test so concurrent / leftover runs don't collide on
 //! the deterministic `<namespace>_<pod>` container name.
 
+mod support;
+
 use std::net::SocketAddr;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -220,7 +222,7 @@ fn poll_until_blocking<F: FnMut() -> bool>(
 fn durable_podman_config(data_dir: &std::path::Path) -> EngenhoConfig {
     let mut cfg = EngenhoConfig::prescribed_default();
     cfg.runtime.listen_addr = "127.0.0.1:0".into();
-    cfg.runtime.data_dir = data_dir.to_path_buf();
+    support::place(&mut cfg, data_dir);
     cfg.runtime.durable = true;
     cfg.runtime.node_name = "node-A".into();
     cfg.runtime.kubelet_backend = KubeletBackendKind::Podman;

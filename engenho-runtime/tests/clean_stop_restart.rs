@@ -31,6 +31,8 @@
 //! when it was aborted must be applied before the stop's flush
 //! (`StoreMesh::drain_applies`).
 
+mod support;
+
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
@@ -58,8 +60,7 @@ fn config(data_dir: &Path) -> EngenhoConfig {
     cfg.runtime.listen_addr = "127.0.0.1:0".into();
     cfg.runtime.kubelet_listen_addr = "127.0.0.1:0".into();
     cfg.runtime.etcd_listen_addr = "127.0.0.1:0".into();
-    cfg.runtime.data_dir = data_dir.to_path_buf();
-    cfg.runtime.node_manifests_dir = data_dir.join("manifests.d");
+    support::place(&mut cfg, data_dir);
     cfg.runtime.durable = true;
     cfg.runtime.node_name = "node-A".into();
     cfg.runtime.kubelet_backend = KubeletBackendKind::Fake;
@@ -69,7 +70,7 @@ fn config(data_dir: &Path) -> EngenhoConfig {
 }
 
 fn declare_a_namespace(data_dir: &Path) {
-    let dir = data_dir.join("manifests.d");
+    let dir = config(data_dir).runtime.node_manifests_dir;
     std::fs::create_dir_all(&dir).expect("the node manifests directory");
     std::fs::write(
         dir.join("declared.yaml"),

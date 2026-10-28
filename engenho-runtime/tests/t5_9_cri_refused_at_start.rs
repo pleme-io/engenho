@@ -16,6 +16,8 @@
 //! exist afterwards: the refusal lands before the store, the PKI or any
 //! listener is created.
 
+mod support;
+
 use engenho_config::{EngenhoConfig, KubeletBackendKind};
 use engenho_runtime::{Runtime, RuntimeError};
 use shikumi::TieredConfig;
@@ -29,7 +31,7 @@ async fn a_cri_node_fails_start_with_the_typed_refusal_not_a_podman_error() {
     cfg.runtime.listen_addr = "127.0.0.1:0".into();
     cfg.runtime.kubelet_listen_addr = "127.0.0.1:0".into();
     cfg.runtime.etcd_listen_addr = "127.0.0.1:0".into();
-    cfg.runtime.data_dir = data_dir.clone();
+    support::place(&mut cfg, &data_dir);
     cfg.runtime.tls.enabled = false;
     cfg.runtime.kubelet_backend = KubeletBackendKind::Cri;
     cfg.runtime.podman_binary = Some("/nonexistent/definitely-not-podman".into());

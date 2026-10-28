@@ -18,6 +18,8 @@
 //! so a second ledger is representable; this test is what catches the
 //! runtime forgetting to replace it.
 
+mod support;
+
 use std::time::Duration;
 
 use engenho_config::{EngenhoConfig, KubeletBackendKind};
@@ -60,7 +62,7 @@ fn config(data_dir: &std::path::Path) -> EngenhoConfig {
     cfg.runtime.leadership_timeout_seconds = 5;
     cfg.runtime.tls.enabled = false;
     // Writable: the bootstrap admin bearer token is minted under data_dir/pki.
-    cfg.runtime.data_dir = data_dir.to_path_buf();
+    support::place(&mut cfg, data_dir);
     cfg
 }
 

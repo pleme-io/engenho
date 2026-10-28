@@ -13,6 +13,8 @@
 //!   * twenty stop/boot cycles leave neither tasks nor file descriptors
 //!     behind.
 
+mod support;
+
 use std::time::Duration;
 
 use engenho_config::{EngenhoConfig, KubeletBackendKind};
@@ -27,7 +29,7 @@ fn durable(data_dir: &std::path::Path) -> EngenhoConfig {
     cfg.runtime.listen_addr = "127.0.0.1:0".into();
     cfg.runtime.kubelet_listen_addr = "127.0.0.1:0".into();
     cfg.runtime.etcd_listen_addr = "127.0.0.1:0".into();
-    cfg.runtime.data_dir = data_dir.to_path_buf();
+    support::place(&mut cfg, data_dir);
     cfg.runtime.durable = true;
     cfg.runtime.node_name = "node-A".into();
     cfg.runtime.kubelet_backend = KubeletBackendKind::Fake;
