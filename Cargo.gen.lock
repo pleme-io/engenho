@@ -24,7 +24,7 @@
     "engenho-mcp/Cargo.toml": "a73d0471a92fe4eeb98d75f5ca945aeafcf56c6034e36f47d06bbf980ed9e369",
     "engenho-oracle/Cargo.toml": "9b0da2a6c1d469c28eb0617b8d71df0b0bf6db7751596956e0bb74a6ac979984",
     "engenho-revoada/Cargo.toml": "08cfd6e45e8acfb75f3073e3a70a9a11a9c33575c43509d0199b1e73bb8012f9",
-    "engenho-runtime/Cargo.toml": "174d02add9f535d978810e32762a0a7094095bf2c5ccf6bb539410b0f7a5b87e",
+    "engenho-runtime/Cargo.toml": "1795c67b4383837da2518444ce5bdbc5f83c4dba28c2dc5d7661923c31dee2b1",
     "engenho-scheduler/Cargo.toml": "b8e178bbb3012942524cd91c4f5e3c1160e11d2ec81eb81ce5f18bd1504426d1",
     "engenho-serve/Cargo.toml": "e91e4b03ebb3c2537969e30bce65f374c368c8e5a668006970524d2687023cd6",
     "engenho-store/Cargo.toml": "6195471439fac6bd943eb091ff33a548392c170f834545a01972b1d8a549f912",
@@ -9269,7 +9269,8 @@
         ],
         "build_dependencies": [],
         "features": [
-          "default"
+          "default",
+          "test-support"
         ]
       },
       "engenho-substrate-0.53.143": {
