@@ -73,10 +73,9 @@
 //!   never asserted. That the runtime installs its sources at all is caught
 //!   by `tests/t2_8_health_from_observation.rs`, not a type: `RouterState`
 //!   still builds without them (and then fails every check).
-//! * `/readyz`'s store read is linearizable because the runtime's store is a
-//!   single voter (`boot_store` builds node 1 alone): the leader is the
-//!   whole quorum and every acknowledged write was applied before its ack.
-//!   A multi-voter store needs a read-index — deferred to engenho-store.
+//! * `/readyz`'s store read is linearizable by raft's read index
+//!   (`StoreMesh::linearizable_revision`), for one voter or many: a leader
+//!   deposed by a partition it has not noticed fails the quorum round.
 //! * The detector reads the controller's own report of what it changed. A
 //!   controller that writes without counting it is invisible here; the
 //!   store-side detector keyed by `(key, controller)` is deferred (T2.8).
@@ -98,7 +97,7 @@ use engenho_controllers::node_lease::RENEW_INTERVAL;
 use engenho_controllers::{
     Beat, Controller, ControllerError, ControllerType, Heartbeat, RESUBSCRIBE, ReconcileOutcome,
 };
-use engenho_store::{Revision, StoreError, StoreMesh};
+use engenho_store::{MeshNetwork, Revision, StoreError, StoreMesh};
 use engenho_substrate::{
     Clock as _, Instant as WallInstant, Liveness, StaleAfter, TaskState, WallClock,
 };
@@ -733,23 +732,27 @@ impl LivenessSource for Health {
         }
     }
 
-    /// Linearizable because the runtime's store is a single voter: this
-    /// node, while leader, is the whole quorum, and a write is acknowledged
-    /// only after it is applied here, so a local read begun after any ack
-    /// observes it. Not leader means the group has failed, and says so.
+    /// Linearizable by raft's read index: the leader confirms with a quorum
+    /// that it still leads, then waits for its catalog to apply up to the
+    /// read point. A leader deposed by a partition it has not noticed fails
+    /// that round, so it reports not-ready rather than its stale revision.
     async fn linearizable_read(&self) -> Result<Revision, StoreError> {
         let Some(store) = self.store.upgrade() else {
             return Err(StoreError::Fatal(String::from(
                 "the store has shut down; there is nothing to read",
             )));
         };
-        if !store.is_leader().await {
-            return Err(StoreError::Fatal(String::from(
-                "this single-voter store has no leader, so no read of it is linearizable",
-            )));
-        }
-        Ok(store.current_revision().await)
+        linearizable_revision(&store).await
     }
+}
+
+pub(crate) async fn linearizable_revision<N: MeshNetwork>(
+    store: &StoreMesh<N>,
+) -> Result<Revision, StoreError> {
+    store
+        .linearizable_revision(engenho_apiserver::health::DEFAULT_STORE_READ_TIMEOUT)
+        .await
+        .map_err(|refused| StoreError::Fatal(format!("no linearizable read: {refused}")))
 }
 
 #[async_trait::async_trait]
@@ -1214,6 +1217,49 @@ mod tests {
         assert_eq!(health.drain_state(), DrainState::Serving);
         health.begin_drain();
         assert_eq!(health.drain_state(), DrainState::Draining);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_leader_deposed_by_a_partition_it_has_not_noticed_is_not_ready() {
+        use engenho_store::testing::Cluster;
+        use engenho_store::{Reason, ResourceCommand, ResourceKey};
+        let elect = Duration::from_secs(10);
+        let put = |image: &str| ResourceCommand::Put {
+            key: ResourceKey::namespaced("", "v1", "Pod", "default", "x"),
+            value: serde_json::json!({"spec": {"image": image}}),
+            expected: None,
+            reason: Reason::Operator,
+        };
+        let cluster = Cluster::start("readyz-deposed", 3).await.unwrap();
+        let old = cluster.leader(elect).await.expect("no first leader");
+        assert!(linearizable_revision(cluster.node(old)).await.is_ok());
+        cluster.isolate(old);
+        let majority = cluster.others(old);
+        let new = cluster
+            .leader_among(&majority, elect)
+            .await
+            .expect("the majority elected no leader");
+        let written = cluster.node(new).propose(put("v2")).await.unwrap();
+        assert!(
+            cluster
+                .all_applied(&majority, written.applied_index, elect)
+                .await
+        );
+        assert!(linearizable_revision(cluster.node(new)).await.is_ok());
+        let at_old = tokio::time::timeout(
+            engenho_apiserver::health::DEFAULT_STORE_READ_TIMEOUT,
+            linearizable_revision(cluster.node(old)),
+        )
+        .await;
+        assert!(
+            !matches!(at_old, Ok(Ok(_))),
+            "node {old}, deposed by node {new} (is_leader={}), reported its store ready for a \
+             linearizable read at {at_old:?} after the majority committed index {}",
+            cluster.node(old).is_leader().await,
+            written.applied_index,
+        );
+        cluster.heal();
+        cluster.terminate().await.unwrap();
     }
 
     #[tokio::test]

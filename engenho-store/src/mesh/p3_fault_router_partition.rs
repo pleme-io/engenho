@@ -204,3 +204,20 @@ async fn dropped_and_delayed_appends_still_replicate_once_the_link_delivers() {
     }
     cluster.terminate().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fresh_leader_with_no_writes_serves_latest_reads_and_its_revision() {
+    let cluster = Cluster::start("p3-fresh-leader", 3).await.unwrap();
+    let leader = cluster.leader(ELECT).await.expect("no leader");
+    let node = cluster.node(leader);
+    assert_eq!(
+        node.get_consistent(&pod("absent"), ReadConsistency::Latest, READ_WAIT)
+            .await,
+        Ok(None)
+    );
+    assert_eq!(
+        node.linearizable_revision(READ_WAIT).await,
+        Ok(node.current_revision().await)
+    );
+    cluster.terminate().await.unwrap();
+}

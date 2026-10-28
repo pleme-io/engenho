@@ -644,6 +644,18 @@ impl<N: MeshNetwork> StoreMesh<N> {
         if consistency != ReadConsistency::Latest || self.voter_count() <= 1 {
             return Ok(());
         }
+        self.read_index(wait).await
+    }
+
+    pub async fn linearizable_revision(
+        &self,
+        wait: Duration,
+    ) -> Result<crate::revision::Revision, ReadRefused> {
+        self.read_index(wait).await?;
+        Ok(self.current_revision().await)
+    }
+
+    async fn read_index(&self, wait: Duration) -> Result<(), ReadRefused> {
         let deadline = tokio::time::Instant::now() + wait;
         let read_at = match tokio::time::timeout(wait, self.raft.get_read_log_id()).await {
             Ok(Ok((read_at, _applied))) => read_at,
@@ -654,15 +666,34 @@ impl<N: MeshNetwork> StoreMesh<N> {
             }
             Err(_) => return Err(ReadRefused::NotLinearizable { leader: None }),
         };
-        let index = read_at.map_or(0, |log_id| log_id.index);
+        let index = read_at.map(|log_id| log_id.index);
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if self.wait_for_applied(index, remaining).await {
+        if self.wait_for_raft_applied(index, remaining).await {
             Ok(())
         } else {
             Err(ReadRefused::NotLinearizable {
                 leader: Some(self.node_id),
             })
         }
+    }
+
+    async fn wait_for_raft_applied(&self, index: Option<u64>, within: Duration) -> bool {
+        let mut metrics = self.raft.metrics();
+        let reached = |m: &openraft::RaftMetrics<RaftNodeId, BasicNode>| {
+            m.last_applied.map(|applied| applied.index) >= index
+        };
+        tokio::time::timeout(within, async {
+            loop {
+                if reached(&metrics.borrow_and_update()) {
+                    return true;
+                }
+                if metrics.changed().await.is_err() {
+                    return reached(&metrics.borrow());
+                }
+            }
+        })
+        .await
+        .unwrap_or(false)
     }
 
     fn voter_count(&self) -> usize {
