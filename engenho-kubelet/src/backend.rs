@@ -916,6 +916,15 @@ pub trait ContainerRuntime: Send + Sync {
     /// backend must say which it is.
     fn readoption(&self) -> Readoption;
 
+    /// [`Self::readoption`] for a pod naming `runtime_class` (`None` when it
+    /// names none). A runtime that hands pods of a class to another runtime
+    /// answers for the runtime that runs the pod; every other runtime
+    /// answers as [`Self::readoption`].
+    fn readoption_of(&self, runtime_class: Option<&str>) -> Readoption {
+        let _ = runtime_class;
+        self.readoption()
+    }
+
     #[allow(missing_docs)]
     fn resource_enforcement(&self) -> crate::cgroup::ResourceEnforcement;
 

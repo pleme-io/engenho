@@ -283,7 +283,8 @@ def limits_of(facts)
   end
   {
     "memoryBytes" => field(facts, "memory_limit_bytes", nil),
-    "deadlineMs" => deadline
+    "deadlineMs" => deadline,
+    "cpuMillis" => field(facts, "cpu_limit_milli", nil)
   }
 end
 
@@ -570,13 +571,14 @@ test "an access that declares exec, or is not JSON, refuses the pod alone"
   assert contains?(b.refused, "not a JSON object")
 end
 
-test "limits come from the container memory limit and the pod deadline"
+test "limits come from the container memory and cpu limits and the pod deadline"
   v = json_read(
     admit(
       json_stringify(
         {
           "image" => "nix:/nix/store/a/a.wasm",
           "memory_limit_bytes" => 1024,
+          "cpu_limit_milli" => 250,
           "active_deadline_seconds" => 5
         }
       )
@@ -584,6 +586,7 @@ test "limits come from the container memory limit and the pod deadline"
   )
   assert v.limits.memoryBytes == 1024
   assert v.limits.deadlineMs == 5000
+  assert v.limits.cpuMillis == 250
 end
 
 test "a crash restarts in place within the budget, then surfaces"

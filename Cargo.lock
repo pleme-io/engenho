@@ -8265,9 +8265,9 @@ dependencies = [
 
 [[package]]
 name = "tatara-wasm"
-version = "0.2.828"
+version = "0.2.830"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "527173fc743841ae7c1eaab2ee1a2b8612e2d7c029c659d1367f0252e43be043"
+checksum = "9d7e8131837c1dc9cb94444f0cf8fde781d771ae3a33b25b86cf38bf14ba8097"
 dependencies = [
  "anyhow",
  "http-body-util",

@@ -1517,3 +1517,67 @@ async fn the_pods_termination_grace_reaches_the_runtime() {
 
     teardown(store, kubelet).await;
 }
+
+/// A pod of a runtime class is readopted by what ITS runtime can do, not by
+/// the default runtime's answer. Here the default runtime adopts running
+/// containers (podman's API) and the class runtime cannot (wasm components
+/// live in the kubelet's process): a `restartPolicy: Never` pod of that class
+/// whose run the old kubelet lost is torn down and published `Failed`, never
+/// run a second time.
+///
+/// RED RUN (2026-10-28): `readopt` asking `readoption()` (the default's
+/// `AdoptsRunning`) → `the lost run is not started again` (2 starts).
+#[tokio::test]
+async fn after_a_restart_a_runtime_class_pod_is_readopted_by_its_own_runtime() {
+    use engenho_kubelet::runtime_class::RuntimeClassRouter;
+    let store = boot_store().await;
+    let default = Arc::new(FakeBackend::new().with_readoption(Readoption::AdoptsRunning));
+    let wasm = Arc::new(FakeBackend::new());
+    let router: Arc<RuntimeClassRouter> =
+        Arc::new(RuntimeClassRouter::new(default.clone()).with_class("wasm", wasm.clone()));
+    let first = Kubelet::new(store.clone(), router.clone(), "node-A");
+    let value = json!({
+        "kind": "Pod",
+        "apiVersion": "v1",
+        "metadata": { "name": "job-w" },
+        "spec": {
+            "nodeName": "node-A",
+            "restartPolicy": "Never",
+            "runtimeClassName": "wasm",
+            "containers": [{ "name": "main", "image": "nix:/nix/store/x-job/job.wasm" }]
+        }
+    });
+    store
+        .propose(ResourceCommand::Put {
+            key: pod_key("job-w"),
+            value,
+            expected: None,
+            reason: Reason::Operator,
+        })
+        .await
+        .unwrap();
+    first.tick().await.unwrap();
+    assert_eq!(
+        count_starts(&wasm.events().await),
+        1,
+        "control: started on the class runtime"
+    );
+    drop(first);
+
+    let kubelet = Kubelet::new(store.clone(), router.clone(), "node-A");
+    kubelet.tick().await.unwrap();
+
+    assert_eq!(
+        count_starts(&wasm.events().await),
+        1,
+        "the lost run is not started again"
+    );
+    assert!(
+        default.events().await.is_empty(),
+        "nothing reached the default runtime"
+    );
+    let pod = store.get(&pod_key("job-w")).await.unwrap();
+    assert_eq!(pod_phase(&pod).as_deref(), Some("Failed"));
+
+    teardown(store, kubelet).await;
+}

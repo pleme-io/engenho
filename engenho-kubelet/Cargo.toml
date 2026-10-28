@@ -47,7 +47,7 @@ miniz_oxide        = "0.8"
 # Splits the port-forward tunnel's WebSocket into a reader and a writer task
 # (src/server.rs); already in the lock as axum's own ws dependency.
 futures-util       = "0.3"
-tatara-wasm        = { version = "0.2.828", features = ["wasi-http"] }
+tatara-wasm        = { version = "0.2.830", features = ["wasi-http"] }
 blue-lang-host     = "0.0.115"
 
 engenho-types       = { workspace = true }
@@ -62,7 +62,7 @@ tonic-prost-build = "0.14"
 
 [dev-dependencies]
 tempfile = "3"
-tatara-wasm = { version = "0.2.828", features = ["wasi-http", "fixtures"] }
+tatara-wasm = { version = "0.2.830", features = ["wasi-http", "fixtures"] }
 engenho-csi = { workspace = true, features = ["test-driver"] }
 proptest = "1"
 # A REAL client for the one test that opens an actual socket. The pure

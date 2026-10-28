@@ -79,6 +79,12 @@ impl ContainerRuntime for RuntimeClassRouter {
         self.default.readoption()
     }
 
+    fn readoption_of(&self, runtime_class: Option<&str>) -> Readoption {
+        runtime_class
+            .and_then(|class| self.classes.get(class))
+            .map_or_else(|| self.default.readoption(), |runtime| runtime.readoption())
+    }
+
     fn resource_enforcement(&self) -> crate::cgroup::ResourceEnforcement {
         self.default.resource_enforcement()
     }

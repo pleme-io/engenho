@@ -192,6 +192,9 @@ reuse is wanted — not needed to ship M0.0). What actually landed:
   (wasi:cli/run, or wasi:http/proxy served on its declared port) on
   `tatara-wasm`'s wasmtime host; grant, supervision and exec-probe answers are
   decided by the embedded `kidou` blue bidama; an unknown class is refused.
+  Since 2026-10-28 the container's cpu limit holds a component to its share,
+  a proxy component drains within the pod's grace on stop, and after a
+  kubelet restart a wasm pod is readopted by the wasm runtime's own answer.
 - **GATE:** zero skips; CNCF submission accepted — **first non-Go certified
   distribution**; engenho promoted to fleet default; rio cutover complete.
 

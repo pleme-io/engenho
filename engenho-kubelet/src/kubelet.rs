@@ -2266,7 +2266,10 @@ impl Kubelet {
         value: &Value,
         report: &mut ReconcileReport,
     ) -> Result<Readopted, ControllerError> {
-        if self.backend.readoption() != crate::backend::Readoption::Cannot {
+        let class = value
+            .pointer("/spec/runtimeClassName")
+            .and_then(Value::as_str);
+        if self.backend.readoption_of(class) != crate::backend::Readoption::Cannot {
             return Ok(Readopted::Start);
         }
         if let Err(unreaped) = self.reap_lost_runs(key, value).await {
@@ -3971,7 +3974,8 @@ impl Kubelet {
                             .find(|c| c.name() == cname)
                             .and_then(StoredContainer::run),
                         &status.container_id,
-                        self.backend.readoption(),
+                        self.backend
+                            .readoption_of(spec.runtime_class.as_ref().map(|r| r.name.as_str())),
                     );
                     let mut local = self.local.lock().await;
                     let entry = local.entry(key.clone()).or_default();

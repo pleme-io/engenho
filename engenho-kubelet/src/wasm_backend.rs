@@ -31,7 +31,7 @@ use crate::backend::{
     ContainerRuntime, ContainerSpec, ContainerStatus, ExecOutcome, LogOptions, LogRead, Readoption,
     RuntimeClassRequest,
 };
-use crate::cgroup::{NotEnforced, ResourceEnforcement};
+use crate::cgroup::ResourceEnforcement;
 use crate::cri::{ExitDisposition, RunState};
 use crate::cri_log::{LogStream, RecordEncoder};
 use crate::error::KubeletError;
@@ -63,6 +63,8 @@ pub struct PodFacts {
     pub mounts: Vec<MountFact>,
     /// `resources.limits.memory`, in bytes.
     pub memory_limit_bytes: Option<i64>,
+    /// `resources.limits.cpu`, in millicores.
+    pub cpu_limit_milli: Option<i64>,
     /// `spec.activeDeadlineSeconds`.
     pub active_deadline_seconds: Option<i64>,
     /// `spec.restartPolicy`.
@@ -103,6 +105,7 @@ impl PodFacts {
                 })
                 .collect(),
             memory_limit_bytes: spec.resources.memory_limit_bytes.value(),
+            cpu_limit_milli: spec.resources.cpu_limit_milli.value(),
             active_deadline_seconds: request.active_deadline_seconds,
             restart_policy: request.restart_policy.clone(),
             local_components,
@@ -159,6 +162,9 @@ pub struct Limits {
     /// Run deadline.
     #[serde(default)]
     pub deadline_ms: Option<u64>,
+    /// CPU share, in thousandths of a core.
+    #[serde(default)]
+    pub cpu_millis: Option<u32>,
 }
 
 /// The facts `kidou::supervise` decides on.
@@ -411,6 +417,7 @@ struct WasmContainer {
     log: Arc<PodLog>,
     run: Arc<Mutex<Run>>,
     supervisor: tokio::task::JoinHandle<()>,
+    grace: Duration,
 }
 
 /// Runs wasm pods' containers as components. See the module docs.
@@ -462,6 +469,7 @@ impl WasmBackend {
         let limits = admission.limits.unwrap_or(Limits {
             memory_bytes: None,
             deadline_ms: None,
+            cpu_millis: None,
         });
         let mut argv = vec![spec.pod.container_name.clone()];
         argv.extend(spec.argv());
@@ -495,6 +503,7 @@ impl WasmBackend {
             limits: WasmLimits {
                 memory_bytes: limits.memory_bytes,
                 deadline: limits.deadline_ms.map(Duration::from_millis),
+                cpu_millis: limits.cpu_millis,
             },
             serve_http: admission.serve_http,
         })
@@ -596,9 +605,10 @@ impl ContainerRuntime for WasmBackend {
         Readoption::Cannot
     }
 
-    /// Memory is bounded by the engine; CPU is not bounded at all.
+    /// The engine bounds both: memory by its store limiter, CPU by the
+    /// share `cpu_millis` holds a component to.
     fn resource_enforcement(&self) -> ResourceEnforcement {
-        ResourceEnforcement::NotEnforced(NotEnforced::PlatformUnsupported)
+        ResourceEnforcement::Enforced
     }
 
     async fn exec(&self, container_id: &str, argv: &[String]) -> Result<ExecOutcome, KubeletError> {
@@ -692,6 +702,7 @@ impl ContainerRuntime for WasmBackend {
                 log,
                 run,
                 supervisor,
+                grace: spec.termination_grace.duration(),
             },
         );
         Ok(ContainerStatus {
@@ -714,14 +725,16 @@ impl ContainerRuntime for WasmBackend {
         }))
     }
 
-    /// The component is interrupted at its next epoch tick; a component has
-    /// no SIGTERM to handle, so the grace period does not apply.
+    /// A proxy component drains within the pod's grace period: it takes no
+    /// new connection and its in-flight requests finish. A command
+    /// component has no signal to receive in WASI 0.2, so it ends at its
+    /// next epoch tick.
     async fn stop(&self, container_id: &str) -> Result<(), KubeletError> {
         let state = self.state.lock().map_err(|_| Self::poisoned())?;
         if let Some(c) = state.get(container_id) {
             let mut run = c.run.lock().map_err(|_| Self::poisoned())?;
             run.stopping = true;
-            run.process.stop();
+            run.process.stop_within(c.grace);
         }
         Ok(())
     }
