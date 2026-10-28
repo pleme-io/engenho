@@ -50,8 +50,8 @@ fn node(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_node_with_seeds_boots_as_a_learner_without_leadership_and_serves_what_the_leader_wrote()
-{
+async fn a_node_with_seeds_boots_as_a_learner_serves_what_the_leader_wrote_and_its_own_writes_reach_the_leader()
+ {
     let (ca_dir, one, two) = (
         tempfile::tempdir().unwrap(),
         tempfile::tempdir().unwrap(),
@@ -103,12 +103,52 @@ async fn a_node_with_seeds_boots_as_a_learner_without_leadership_and_serves_what
         .await
         .unwrap();
     assert_eq!(served["data"]["k"], "v", "{served}");
+    let registered = first
+        .store()
+        .get(&ResourceKey::cluster_scoped("", "v1", "Node", "node-two"))
+        .await
+        .expect("the learner's Node registration did not reach the leader");
     assert!(
-        learner
-            .get(&ResourceKey::cluster_scoped("", "v1", "Node", "node-two"))
-            .await
-            .is_none(),
-        "the learner registered no Node of its own: that write is the leader's"
+        registered.pointer("/status/capacity/cpu").is_some()
+            && registered.pointer("/status/nodeInfo").is_some(),
+        "the learner's boot did not register its host-owned Node fields: {registered}"
+    );
+    let lease = ResourceKey::namespaced(
+        "coordination.k8s.io",
+        "v1",
+        "Lease",
+        "kube-node-lease",
+        "node-two",
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while first.store().get(&lease).await.is_none() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the learner's node lease never reached the leader"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let created = reqwest::Client::new()
+        .post(format!(
+            "http://{}/api/v1/namespaces/default/configmaps",
+            second.local_addr()
+        ))
+        .bearer_auth(token.trim())
+        .json(&serde_json::json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "from-the-learner", "namespace": "default"}, "data": {"k": "learner"}}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        created.status().is_success(),
+        "{}",
+        created.text().await.unwrap()
+    );
+    let theirs = ResourceKey::namespaced("", "v1", "ConfigMap", "default", "from-the-learner");
+    assert_eq!(
+        first.store().get(&theirs).await.unwrap()["data"]["k"],
+        "learner",
+        "a write to the learner's apiserver is not the leader's"
     );
 
     drop(learner);

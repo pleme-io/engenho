@@ -168,6 +168,26 @@ impl<N: MeshNetwork> MeshNetwork for FaultRouter<N> {
     async fn deregister(&self, node_id: RaftNodeId) {
         self.inner.deregister(node_id).await;
     }
+
+    async fn forward(
+        &self,
+        leader: RaftNodeId,
+        addr: String,
+        command: crate::command::LoggedCommand,
+    ) -> crate::network::Forwarded {
+        let link = (self.local, leader);
+        match self.net.admit(link) {
+            Admit::Cut | Admit::Dropped => {
+                return Err(crate::network::ForwardRefused::Unreachable(format!(
+                    "fault router: forward cut on link {} -> {}",
+                    link.0, link.1
+                )));
+            }
+            Admit::Deliver(Some(by)) => tokio::time::sleep(by).await,
+            Admit::Deliver(None) => {}
+        }
+        self.inner.forward(leader, addr, command).await
+    }
 }
 
 impl<N: MeshNetwork> RaftNetworkFactory<TypeConfig> for FaultRouter<N> {

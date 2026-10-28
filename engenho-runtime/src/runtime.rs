@@ -354,13 +354,14 @@ impl Runtime {
         let windows = boot.windows(scheduler.fallback_interval());
         let health = Arc::new(Health::new(store, windows, panics));
 
+        register_this_node(store, boot, backend, advertised, rec).await?;
         if joins {
             info!(
                 node_id = store.node_id(),
-                "a joining learner writes nothing at boot: its Node and the cluster seeds are the leader's"
+                "a joining node forwards its Node to the leader and seeds nothing: the cluster seeds are the leader's"
             );
         } else {
-            register_and_seed(store, boot, backend, advertised, rec).await?;
+            seed_cluster(store, boot, rec).await?;
         }
 
         // 5. Bind the apiserver, backed by the same store. The listen address
@@ -1039,7 +1040,7 @@ impl Publisher {
     }
 }
 
-async fn register_and_seed(
+async fn register_this_node(
     store: &Arc<StoreMesh>,
     boot: &BootConfig,
     backend: &Arc<dyn ContainerRuntime>,
@@ -1055,6 +1056,14 @@ async fn register_and_seed(
         .advertising(advertised)
         .reporting(engenho_kubelet::node_info::measured(backend.as_ref()));
     register_node(store, node_name, &host).await?;
+    Ok(())
+}
+
+async fn seed_cluster(
+    store: &Arc<StoreMesh>,
+    boot: &BootConfig,
+    rec: &mut BootRecorder,
+) -> Result<(), RuntimeError> {
     rec.enter(BootPhase::SeedCluster)?;
 
     // 4.5. Seed the bootstrap RBAC policy (Brick B) — cluster-admin +

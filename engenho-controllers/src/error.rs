@@ -163,7 +163,9 @@ const fn store_scope(e: &StoreError) -> ErrorScope {
         | StoreError::ConfigInvalid(_)
         | StoreError::InitializeFailed(_)
         | StoreError::Fatal(_)
-        | StoreError::Persist(_) => ErrorScope::Sweep,
+        | StoreError::Persist(_)
+        | StoreError::NoLeader
+        | StoreError::LeaderUnreachable { .. } => ErrorScope::Sweep,
     }
 }
 
@@ -183,7 +185,10 @@ const fn store_scope(e: &StoreError) -> ErrorScope {
 ///     rather than defaulted if one ever does.
 const fn store_class(e: &StoreError) -> FailureKind {
     match e {
-        StoreError::ClientWriteFailed(_) | StoreError::Persist(_) => FailureKind::Transient,
+        StoreError::ClientWriteFailed(_)
+        | StoreError::Persist(_)
+        | StoreError::NoLeader
+        | StoreError::LeaderUnreachable { .. } => FailureKind::Transient,
         StoreError::ConfigInvalid(_) | StoreError::InitializeFailed(_) | StoreError::Fatal(_) => {
             FailureKind::Declarative
         }
@@ -239,9 +244,10 @@ mod tests {
         fn row(e: ControllerError) -> (ControllerError, FailureKind) {
             let want = match &e {
                 ControllerError::Store(s) => match s {
-                    StoreError::ClientWriteFailed(_) | StoreError::Persist(_) => {
-                        FailureKind::Transient
-                    }
+                    StoreError::ClientWriteFailed(_)
+                    | StoreError::Persist(_)
+                    | StoreError::NoLeader
+                    | StoreError::LeaderUnreachable { .. } => FailureKind::Transient,
                     StoreError::ConfigInvalid(_)
                     | StoreError::InitializeFailed(_)
                     | StoreError::Fatal(_) => FailureKind::Declarative,
@@ -266,6 +272,11 @@ mod tests {
             row(ControllerError::Store(StoreError::ClientWriteFailed(m()))),
             row(ControllerError::Store(StoreError::Fatal(m()))),
             row(ControllerError::Store(persist())),
+            row(ControllerError::Store(StoreError::NoLeader)),
+            row(ControllerError::Store(StoreError::LeaderUnreachable {
+                leader: 1,
+                reason: m(),
+            })),
             row(ControllerError::InvalidResource(m())),
             row(ControllerError::Shape(shape_error())),
             row(ControllerError::Internal(m())),
@@ -295,7 +306,9 @@ mod tests {
                     | StoreError::ConfigInvalid(_)
                     | StoreError::InitializeFailed(_)
                     | StoreError::Fatal(_)
-                    | StoreError::Persist(_) => ErrorScope::Sweep,
+                    | StoreError::Persist(_)
+                    | StoreError::NoLeader
+                    | StoreError::LeaderUnreachable { .. } => ErrorScope::Sweep,
                 },
                 ControllerError::InvalidResource(_)
                 | ControllerError::Shape(_)
@@ -311,7 +324,7 @@ mod tests {
     #[test]
     fn store_errors_and_panics_stop_a_sweep_and_nothing_else_does() {
         let rows = every_scope();
-        assert_eq!(rows.len(), 12, "one row per variant");
+        assert_eq!(rows.len(), 14, "one row per variant");
         for (e, want) in rows {
             assert_eq!(e.scope(), want, "{e:?}");
         }
@@ -320,7 +333,7 @@ mod tests {
     #[test]
     fn every_error_variant_maps_to_its_retry_class() {
         let rows = every_variant();
-        assert_eq!(rows.len(), 12, "one row per variant");
+        assert_eq!(rows.len(), 14, "one row per variant");
         for (e, want) in rows {
             assert_eq!(e.classify(), want, "{e:?}");
         }

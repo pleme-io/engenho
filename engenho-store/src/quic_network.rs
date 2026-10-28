@@ -17,17 +17,20 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
+use crate::command::LoggedCommand;
 use crate::mesh_join::{JoinAnswer, JoinGate, JoinRequest, Sealed};
 use crate::network::{
-    LearnerAsk, LearnerVerdict, MeshNetwork, RpcEnvelope, RpcRequest, remote_answer,
+    ForwardRefused, Forwarded, LearnerAsk, LearnerVerdict, MeshNetwork, RpcEnvelope, RpcRequest,
+    remote_answer,
 };
 use crate::owned_task::OwnedTask;
 use crate::peer_table::{Peer, PeerTable, PeerTableError};
-use crate::type_config::{RaftNodeId, TypeConfig};
+use crate::type_config::{ApplyResult, RaftNodeId, TypeConfig};
 
 pub const ALPN: &[u8] = b"engenho-mesh/2";
 const ASK_TTL: Duration = Duration::from_secs(5);
 const JOIN_HOPS: usize = 4;
+const FORWARD_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Serialize)]
 enum OutFrame<'a> {
@@ -499,6 +502,22 @@ impl MeshNetwork for QuicRouter {
         }
         self.inner.connections.lock().await.clear();
         self.inner.endpoint.close(0u32.into(), b"deregistered");
+    }
+
+    async fn forward(&self, leader: RaftNodeId, addr: String, command: LoggedCommand) -> Forwarded {
+        let network = QuicNetwork {
+            target: leader,
+            addr,
+            router: self.clone(),
+        };
+        match network
+            .call::<ApplyResult, ForwardRefused>(&RpcEnvelope::Forward(command), FORWARD_TTL)
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(RPCError::RemoteError(remote)) => Err(remote.source),
+            Err(e) => Err(ForwardRefused::Unreachable(e.to_string())),
+        }
     }
 }
 

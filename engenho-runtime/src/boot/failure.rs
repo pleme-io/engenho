@@ -77,7 +77,9 @@ impl FailureClass {
             StoreError::InitializeFailed(_)
             | StoreError::ClientWriteFailed(_)
             | StoreError::Fatal(_)
-            | StoreError::Persist(_) => Self::Backoff,
+            | StoreError::Persist(_)
+            | StoreError::NoLeader
+            | StoreError::LeaderUnreachable { .. } => Self::Backoff,
         }
     }
 

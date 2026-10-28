@@ -19,7 +19,8 @@ use openraft::raft::{
 };
 use tokio::sync::{Mutex, mpsc, oneshot};
 
-use crate::type_config::{RaftNodeId, TypeConfig};
+use crate::command::LoggedCommand;
+use crate::type_config::{ApplyResult, RaftNodeId, TypeConfig};
 
 pub type RpcReply<T, E = RaftError<RaftNodeId>> = oneshot::Sender<Result<T, E>>;
 
@@ -34,6 +35,24 @@ pub enum RpcRequest {
         RpcReply<InstallSnapshotResponse<RaftNodeId>, RaftError<RaftNodeId, InstallSnapshotError>>,
     ),
     AddLearner(LearnerAsk, oneshot::Sender<LearnerVerdict>),
+    Forward(LoggedCommand, oneshot::Sender<Forwarded>),
+}
+
+pub type Forwarded = Result<ApplyResult, ForwardRefused>;
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, thiserror::Error)]
+pub enum ForwardRefused {
+    #[error("node {at} is not the leader; the leader it knows is {leader:?}")]
+    NotLeader {
+        at: RaftNodeId,
+        leader: Option<RaftNodeId>,
+    },
+    #[error("the leader did not commit it: {0}")]
+    Failed(String),
+    #[error("the leader was not reached: {0}")]
+    Unreachable(String),
+    #[error("this mesh network carries no forwarded writes")]
+    Unsupported,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,6 +79,7 @@ pub enum RpcEnvelope {
     AppendEntries(AppendEntriesRequest<TypeConfig>),
     Vote(VoteRequest<RaftNodeId>),
     InstallSnapshot(InstallSnapshotRequest<TypeConfig>),
+    Forward(LoggedCommand),
 }
 
 impl RpcEnvelope {
@@ -96,6 +116,14 @@ impl RpcEnvelope {
                     .map_err(closed)?;
                 encoded(rx.await)
             }
+            Self::Forward(command) => {
+                let (tx, rx) = oneshot::channel();
+                inbox
+                    .send(RpcRequest::Forward(command, tx))
+                    .await
+                    .map_err(closed)?;
+                encoded(rx.await)
+            }
         }
     }
 }
@@ -108,6 +136,16 @@ pub trait MeshNetwork: RaftNetworkFactory<TypeConfig> + Clone + Send + Sync + 's
     ) -> impl std::future::Future<Output = ()> + Send;
 
     fn deregister(&self, node_id: RaftNodeId) -> impl std::future::Future<Output = ()> + Send;
+
+    fn forward(
+        &self,
+        leader: RaftNodeId,
+        addr: String,
+        command: LoggedCommand,
+    ) -> impl std::future::Future<Output = Forwarded> + Send {
+        let _ = (leader, addr, command);
+        std::future::ready(Err(ForwardRefused::Unsupported))
+    }
 }
 
 #[derive(Clone, Default)]
@@ -140,6 +178,23 @@ impl MeshNetwork for InProcessRouter {
 
     async fn deregister(&self, node_id: RaftNodeId) {
         InProcessRouter::deregister(self, node_id).await;
+    }
+
+    async fn forward(
+        &self,
+        leader: RaftNodeId,
+        _addr: String,
+        command: LoggedCommand,
+    ) -> Forwarded {
+        let unreachable =
+            || ForwardRefused::Unreachable(format!("no in-process route to node {leader}"));
+        let sender = self.lookup(leader).await.ok_or_else(unreachable)?;
+        let (tx, rx) = oneshot::channel();
+        sender
+            .send(RpcRequest::Forward(command, tx))
+            .await
+            .map_err(|_| unreachable())?;
+        rx.await.map_err(|_| unreachable())?
     }
 }
 

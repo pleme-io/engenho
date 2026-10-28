@@ -18,7 +18,9 @@ use tokio::sync::mpsc;
 
 use crate::command::{LoggedCommand, ResourceCommand, TxnOp};
 use crate::fjall_store::{FjallStore, Flushed, ImageTripwire};
-use crate::network::{LearnerAsk, LearnerVerdict, MeshNetwork, RpcRequest};
+use crate::network::{
+    ForwardRefused, Forwarded, LearnerAsk, LearnerVerdict, MeshNetwork, RpcRequest,
+};
 use crate::owned_task::{OwnedTask, TaskStop};
 use crate::pagination::PageAtRevision;
 use crate::read::{ReadConsistency, ReadRefused};
@@ -43,6 +45,10 @@ pub enum StoreError {
     /// in every `Result` that carries it.
     #[error("persist the applied image: {0}")]
     Persist(Box<openraft::StorageError<RaftNodeId>>),
+    #[error("no leader is known to forward the write to")]
+    NoLeader,
+    #[error("the write was not forwarded to leader {leader}: {reason}")]
+    LeaderUnreachable { leader: RaftNodeId, reason: String },
 }
 
 engenho_substrate::impl_error_kind! {
@@ -52,6 +58,8 @@ engenho_substrate::impl_error_kind! {
         (ClientWriteFailed(_)) => "client_write_failed",
         (Fatal(_)) => "fatal",
         (Persist(_)) => "persist_failed",
+        NoLeader => "no_leader",
+        { LeaderUnreachable { .. } } => "leader_unreachable",
     }
 }
 
@@ -217,13 +225,32 @@ impl Quiesced {
 
 trait Registration: Send + Sync {
     fn deregister(&self, node: RaftNodeId) -> BoxFuture<'_, ()>;
+
+    fn forward(
+        &self,
+        leader: RaftNodeId,
+        addr: String,
+        command: LoggedCommand,
+    ) -> BoxFuture<'_, Forwarded>;
 }
 
 impl<N: MeshNetwork> Registration for N {
     fn deregister(&self, node: RaftNodeId) -> BoxFuture<'_, ()> {
         Box::pin(MeshNetwork::deregister(self, node))
     }
+
+    fn forward(
+        &self,
+        leader: RaftNodeId,
+        addr: String,
+        command: LoggedCommand,
+    ) -> BoxFuture<'_, Forwarded> {
+        Box::pin(MeshNetwork::forward(self, leader, addr, command))
+    }
 }
+
+const FORWARD_HOPS: usize = 3;
+const FORWARD_CATCH_UP: Duration = Duration::from_secs(5);
 
 /// Raft-replicated K8s resource store, over whichever [`MeshNetwork`] it
 /// was started on.
@@ -352,6 +379,12 @@ impl StoreMesh {
                             let _ = reply.send(admit_learner(&raft, node_id, ask).await);
                         });
                     }
+                    RpcRequest::Forward(command, reply) => {
+                        let raft = raft_for_rpc.clone();
+                        admissions.spawn(async move {
+                            let _ = reply.send(lead_write(&raft, node_id, command).await);
+                        });
+                    }
                     RpcRequest::AppendEntries(rpc, reply) => {
                         let _ = reply.send(raft_for_rpc.append_entries(rpc).await);
                     }
@@ -435,12 +468,85 @@ impl StoreMesh {
     /// [`crate::ResourceOp::Unchanged`] with the revision untouched.
     pub async fn propose(&self, mut cmd: ResourceCommand) -> Result<ApplyResult, StoreError> {
         self.stamp_births(&mut cmd).await;
+        let command = LoggedCommand::proposed(cmd);
+        if self.leader_known().0 != Some(self.node_id) {
+            return self.forward(command).await;
+        }
         let resp: ClientWriteResponse<TypeConfig> = self
             .raft
-            .client_write(LoggedCommand::proposed(cmd))
+            .client_write(command)
             .await
             .map_err(|e| StoreError::ClientWriteFailed(e.to_string()))?;
         Ok(resp.data)
+    }
+
+    fn leader_known(&self) -> (Option<RaftNodeId>, Option<String>) {
+        let metrics = self.raft.metrics();
+        let metrics = metrics.borrow();
+        let leader = metrics.current_leader;
+        let addr = leader.and_then(|l| {
+            metrics
+                .membership_config
+                .membership()
+                .get_node(&l)
+                .map(|node| node.addr.clone())
+        });
+        (leader, addr)
+    }
+
+    async fn forward(&self, command: LoggedCommand) -> Result<ApplyResult, StoreError> {
+        let mut hops = 0;
+        loop {
+            let (Some(leader), Some(addr)) = self.leader_known() else {
+                return Err(StoreError::NoLeader);
+            };
+            if leader == self.node_id {
+                return self
+                    .raft
+                    .client_write(command)
+                    .await
+                    .map(|resp| resp.data)
+                    .map_err(|e| StoreError::ClientWriteFailed(e.to_string()));
+            }
+            let refused = match self.router.forward(leader, addr, command.clone()).await {
+                Ok(result) => {
+                    self.wait_for_revision(
+                        crate::revision::Revision(result.revision),
+                        FORWARD_CATCH_UP,
+                    )
+                    .await;
+                    return Ok(result);
+                }
+                Err(refused) => refused,
+            };
+            match refused {
+                ForwardRefused::NotLeader { leader: None, .. } => return Err(StoreError::NoLeader),
+                ForwardRefused::NotLeader {
+                    leader: Some(_), ..
+                } if hops < FORWARD_HOPS => {
+                    hops += 1;
+                    self.wait_for_another_leader(leader, FORWARD_CATCH_UP).await;
+                }
+                ForwardRefused::Failed(reason) => {
+                    return Err(StoreError::ClientWriteFailed(reason));
+                }
+                other => {
+                    return Err(StoreError::LeaderUnreachable {
+                        leader,
+                        reason: other.to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    async fn wait_for_another_leader(&self, than: RaftNodeId, within: Duration) {
+        let mut metrics = self.raft.metrics();
+        let _ = tokio::time::timeout(
+            within,
+            metrics.wait_for(|m| m.current_leader.is_some_and(|l| l != than)),
+        )
+        .await;
     }
 
     async fn stamp_births(&self, cmd: &mut ResourceCommand) {
@@ -1152,8 +1258,24 @@ mod p3_durable_vote;
 #[cfg(all(test, feature = "mesh-quic"))]
 mod p4_learner_join;
 
+#[cfg(test)]
+mod p5_forwarded_write;
+
 #[cfg(all(test, feature = "teia-nats"))]
 mod nats_reply_tests;
+
+async fn lead_write(raft: &Raft<TypeConfig>, me: RaftNodeId, command: LoggedCommand) -> Forwarded {
+    match raft.client_write(command).await {
+        Ok(resp) => Ok(resp.data),
+        Err(e) => Err(match e.forward_to_leader() {
+            Some(forward) => ForwardRefused::NotLeader {
+                at: me,
+                leader: forward.leader_id,
+            },
+            None => ForwardRefused::Failed(e.to_string()),
+        }),
+    }
+}
 
 async fn admit_learner(raft: &Raft<TypeConfig>, me: RaftNodeId, ask: LearnerAsk) -> LearnerVerdict {
     let (leader, nodes) = {

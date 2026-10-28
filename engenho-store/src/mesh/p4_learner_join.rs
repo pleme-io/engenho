@@ -130,6 +130,11 @@ async fn a_node_that_joins_replicates_as_a_learner_and_votes_only_once_promoted(
     );
     let at = write(&a, "before-promotion").await;
     assert!(reads(&b, "before-promotion", at).await);
+    let at = write(&b, "from-the-learner").await;
+    assert!(
+        reads(&a, "from-the-learner", at).await,
+        "a learner's write was not forwarded to the leader"
+    );
     assert!(!b.mesh.is_leader().await);
     assert!(b.mesh.is_member(b.id()).await);
     let recorded = PeerTable::open(b.dir.path().join(PeerTable::FILE)).unwrap();
