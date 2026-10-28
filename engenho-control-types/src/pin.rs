@@ -96,6 +96,17 @@ impl Spki {
         }
         Ok(Self(out))
     }
+
+    /// The raft node id a mesh member holding this key answers to: the
+    /// pin's first 52 bits with bit 52 set, so in `[2^52, 2^53)` — never
+    /// the singleton's 1, and exact in any JSON number.
+    #[must_use]
+    pub fn mesh_node_id(&self) -> u64 {
+        const LOW: u64 = (1 << 52) - 1;
+        let mut head = [0u8; 8];
+        head.copy_from_slice(&self.0[..8]);
+        (u64::from_be_bytes(head) & LOW) | (1 << 52)
+    }
 }
 
 impl fmt::Display for Spki {
@@ -497,6 +508,30 @@ mod tests {
             !format!("{key:?}").contains("PRIVATE"),
             "Debug never shows the key"
         );
+    }
+
+    #[test]
+    fn a_mesh_node_id_is_stable_per_key_never_the_singleton_and_exact_in_json() {
+        let keys: Vec<KeyMaterial> = (0..64).map(|_| KeyMaterial::generate().unwrap()).collect();
+        let mut ids = std::collections::BTreeSet::new();
+        for key in &keys {
+            let id = key.spki().mesh_node_id();
+            assert_eq!(
+                KeyMaterial::from_pem(&key.to_pem())
+                    .unwrap()
+                    .spki()
+                    .mesh_node_id(),
+                id
+            );
+            assert!((1u64 << 52..1u64 << 53).contains(&id), "{id}");
+            assert_ne!(id, 1);
+            ids.insert(id);
+        }
+        assert_eq!(ids.len(), keys.len(), "distinct keys, distinct ids");
+        let zero = Spki::parse(&format!("sha256:{}", "0".repeat(64))).unwrap();
+        assert_eq!(zero.mesh_node_id(), 1 << 52);
+        let ones = Spki::parse(&format!("sha256:{}", "f".repeat(64))).unwrap();
+        assert_eq!(ones.mesh_node_id(), (1 << 53) - 1);
     }
 
     #[test]

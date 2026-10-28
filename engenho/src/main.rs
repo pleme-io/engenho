@@ -53,7 +53,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use engenho_apiserver::{PkiFile, load_or_generate_ca};
+use engenho_apiserver::{PkiFile, load_or_generate_ca, load_shared_ca};
 use engenho_config::{
     ConfigError, ConfigTier, EngenhoConfig, OverrideLayer, ProgressiveResolution, SocketDefaults,
     TieredConfig, render_provenance,
@@ -533,7 +533,7 @@ fn resolve_declared_config(
 ) -> Result<ResolvedConfig, ConfigError> {
     let (config, provenance) = EngenhoConfig::resolve_progressively_with(overrides)?.into_parts();
     tracing::info!(
-        cluster = %config.cluster.name,
+        cluster = %config.cluster.effective_name(),
         node = %config.runtime.node_name,
         listen = %config.runtime.listen_addr,
         durable = config.runtime.durable,
@@ -602,7 +602,11 @@ fn run_kubeconfig(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     // The persisted CA. `load_or_generate_ca` LOADS when the CA already
     // exists (the daemon minted it at first boot); it only generates if
     // absent — handing out the kubeconfig before the daemon's first boot.
-    let ca = load_or_generate_ca(&data_dir).map_err(|e| anyhow::anyhow!("load cluster CA: {e}"))?;
+    let ca = match &config.cluster.shared {
+        Some(shared) => load_shared_ca(&shared.ca_cert_path, &shared.ca_key_path, &data_dir),
+        None => load_or_generate_ca(&data_dir),
+    }
+    .map_err(|e| anyhow::anyhow!("load cluster CA: {e}"))?;
 
     // Default server URL: loopback + the configured listen port. The
     // operator can override with --server for a non-loopback address.
@@ -616,13 +620,17 @@ fn run_kubeconfig(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let admin_key = std::fs::read(PkiFile::AdminKey.path(&data_dir)).ok();
     let yaml = match (admin_cert, admin_key) {
         (Some(cert), Some(key)) => emit_kubeconfig_with_admin(
-            &config.cluster.name,
+            config.cluster.effective_name(),
             &server_url,
             ca.cert_pem().as_bytes(),
             &cert,
             &key,
         ),
-        _ => emit_kubeconfig(&config.cluster.name, &server_url, ca.cert_pem().as_bytes()),
+        _ => emit_kubeconfig(
+            config.cluster.effective_name(),
+            &server_url,
+            ca.cert_pem().as_bytes(),
+        ),
     }
     .map_err(|e| anyhow::anyhow!("emit kubeconfig: {e}"))?;
     print!("{yaml}");

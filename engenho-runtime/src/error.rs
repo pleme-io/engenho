@@ -208,6 +208,18 @@ pub enum RuntimeError {
         /// Where the configuration now puts the data directory.
         resolved: std::path::PathBuf,
     },
+
+    #[error("node identity key {path}: {reason}")]
+    Identity {
+        path: std::path::PathBuf,
+        reason: String,
+    },
+
+    #[error(
+        "the durable store does not name raft node {node_id} as a member: it was formed under \
+         another identity; join the shared cluster from a fresh data_dir"
+    )]
+    NotAMember { node_id: engenho_store::RaftNodeId },
 }
 
 engenho_substrate::impl_error_kind! {
@@ -229,6 +241,8 @@ engenho_substrate::impl_error_kind! {
         (NodeRegistration(_)) => "node_registration",
         { BootCancelled { .. } } => "boot_cancelled",
         { DataDirMoved { .. } } => "data_dir_moved",
+        { Identity { .. } } => "identity",
+        { NotAMember { .. } } => "not_a_member",
     }
 }
 

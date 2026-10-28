@@ -1110,7 +1110,7 @@ fn issue_pki(boot: &BootConfig, listen_addr: SocketAddr) -> Result<IssuedPki, Ru
     let ApiserverTls::SelfIssued { extra_sans } = &boot.tls else {
         return Ok(IssuedPki::default());
     };
-    let ca = load_or_generate_ca(&boot.data_dir).map_err(|e| RuntimeError::Server(e.into()))?;
+    let ca = crate::membership::cluster_ca(boot).map_err(|e| RuntimeError::Server(e.into()))?;
     // ── ★ A PUBLIC CA MAY NOT SERVE A REACHABLE ADDRESS ──────────
     // See `RuntimeError::PublicCaOnReachableAddress`. The danger is not
     // the CA by itself and not the address by itself; it is the pair,
@@ -1119,7 +1119,7 @@ fn issue_pki(boot: &BootConfig, listen_addr: SocketAddr) -> Result<IssuedPki, Ru
     if ca.is_publicly_derivable() && !is_loopback_only(listen_addr) {
         return Err(RuntimeError::PublicCaOnReachableAddress {
             listen_addr: boot.listen_addr.clone(),
-            pki_dir: PkiFile::dir(&boot.data_dir).display().to_string(),
+            pki_dir: crate::membership::ca_dir(boot).display().to_string(),
         });
     }
     let listen_ip = san_listen_ip(listen_addr);
@@ -2052,23 +2052,31 @@ pub(crate) const STORE_DIR: &str = crate::layout::Area::Store.dir();
 async fn boot_store(boot: &BootConfig) -> Result<(Arc<StoreMesh>, BootKind), RuntimeError> {
     let cfg = default_config(&boot.cluster_name)?;
     let router = InProcessRouter::new();
-    // Single-node self-loop address; registration happens inside start.
-    let listen = "in-process://1".to_string();
+    let node_id = crate::membership::identity(boot)?.as_ref().map_or(
+        crate::membership::SINGLETON,
+        crate::membership::NodeIdentity::id,
+    );
+    let listen = format!("in-process://{node_id}");
 
     if boot.durable {
         let store_path = boot.data_dir.join(STORE_DIR);
-        let (mesh, fresh) = StoreMesh::start_or_resume(1, listen, router, cfg, store_path).await?;
+        let (mesh, fresh) =
+            StoreMesh::start_or_resume(node_id, listen, router, cfg, store_path).await?;
+        if !fresh && !mesh.is_member(node_id).await {
+            let _ = mesh.terminate().await;
+            return Err(RuntimeError::NotAMember { node_id });
+        }
         let kind = if fresh {
             BootKind::FirstBoot
         } else {
             BootKind::Resume
         };
-        info!(?kind, "durable store opened");
+        info!(?kind, node_id, "durable store opened");
         Ok((Arc::new(mesh), kind))
     } else {
-        let mesh = StoreMesh::start(1, listen, router, cfg).await?;
+        let mesh = StoreMesh::start(node_id, listen, router, cfg).await?;
         mesh.initialize_singleton().await?;
-        info!("ephemeral store initialized");
+        info!(node_id, "ephemeral store initialized");
         Ok((Arc::new(mesh), BootKind::Ephemeral))
     }
 }
@@ -3245,7 +3253,7 @@ fn random_admin_token() -> String {
 /// listable. Matches the mode `engenho-apiserver`'s PKI loader already gives
 /// the same directory, whichever of the two reaches it first.
 #[cfg(all(unix, feature = "with-cofre"))]
-fn create_pki_dir(pki: &std::path::Path) -> Result<(), RuntimeError> {
+pub(crate) fn create_pki_dir(pki: &std::path::Path) -> Result<(), RuntimeError> {
     cofre_fs::create_secret_dir(pki, 0o700).map_err(|source| RuntimeError::KubeconfigIo {
         path: pki.to_path_buf(),
         source,
@@ -3254,7 +3262,7 @@ fn create_pki_dir(pki: &std::path::Path) -> Result<(), RuntimeError> {
 
 /// Unix without cofre: create dir then set mode via chmod.
 #[cfg(all(unix, not(feature = "with-cofre")))]
-fn create_pki_dir(pki: &std::path::Path) -> Result<(), RuntimeError> {
+pub(crate) fn create_pki_dir(pki: &std::path::Path) -> Result<(), RuntimeError> {
     std::fs::create_dir_all(pki).map_err(|source| RuntimeError::KubeconfigIo {
         path: pki.to_path_buf(),
         source,
@@ -3270,7 +3278,7 @@ fn create_pki_dir(pki: &std::path::Path) -> Result<(), RuntimeError> {
 
 /// Non-unix: no modes to set.
 #[cfg(not(unix))]
-fn create_pki_dir(pki: &std::path::Path) -> Result<(), RuntimeError> {
+pub(crate) fn create_pki_dir(pki: &std::path::Path) -> Result<(), RuntimeError> {
     std::fs::create_dir_all(pki).map_err(|source| RuntimeError::KubeconfigIo {
         path: pki.to_path_buf(),
         source,
@@ -3286,7 +3294,11 @@ fn create_pki_dir(pki: &std::path::Path) -> Result<(), RuntimeError> {
 /// unlink means a pre-placed symlink is not written through. The mode is a
 /// required argument there, which is why it stays one here.
 #[cfg(all(unix, feature = "with-cofre"))]
-fn write_at_mode(path: &std::path::Path, contents: &str, mode: u32) -> Result<(), RuntimeError> {
+pub(crate) fn write_at_mode(
+    path: &std::path::Path,
+    contents: &str,
+    mode: u32,
+) -> Result<(), RuntimeError> {
     cofre_fs::write_secret(path, contents.as_bytes(), mode).map_err(|source| {
         RuntimeError::KubeconfigIo {
             path: path.to_path_buf(),
@@ -3297,7 +3309,11 @@ fn write_at_mode(path: &std::path::Path, contents: &str, mode: u32) -> Result<()
 
 /// Unix without cofre: write then chmod. Has a brief window at default perms.
 #[cfg(all(unix, not(feature = "with-cofre")))]
-fn write_at_mode(path: &std::path::Path, contents: &str, mode: u32) -> Result<(), RuntimeError> {
+pub(crate) fn write_at_mode(
+    path: &std::path::Path,
+    contents: &str,
+    mode: u32,
+) -> Result<(), RuntimeError> {
     std::fs::write(path, contents.as_bytes()).map_err(|source| RuntimeError::KubeconfigIo {
         path: path.to_path_buf(),
         source,
@@ -3314,7 +3330,11 @@ fn write_at_mode(path: &std::path::Path, contents: &str, mode: u32) -> Result<()
 /// Non-unix: file modes don't apply, so this is a plain write. cofre-fs is
 /// `#![cfg(unix)]` for the same reason.
 #[cfg(not(unix))]
-fn write_at_mode(path: &std::path::Path, contents: &str, _mode: u32) -> Result<(), RuntimeError> {
+pub(crate) fn write_at_mode(
+    path: &std::path::Path,
+    contents: &str,
+    _mode: u32,
+) -> Result<(), RuntimeError> {
     std::fs::write(path, contents.as_bytes()).map_err(|source| RuntimeError::KubeconfigIo {
         path: path.to_path_buf(),
         source,
@@ -4130,7 +4150,7 @@ fn build_kubelet(
     let sa_key = engenho_apiserver::sa_token::load_or_generate_sa_key(&boot.data_dir)
         .map_err(|e| warn!(error = %e, "no SA signing key; pods get no ServiceAccount projection"))
         .ok();
-    let ca_pem_for_sa = engenho_apiserver::load_or_generate_ca(&boot.data_dir)
+    let ca_pem_for_sa = crate::membership::cluster_ca(boot)
         .map(|ca| ca.cert_pem().to_string())
         .map_err(|e| warn!(error = %e, "no cluster CA; pods get no ServiceAccount projection"))
         .ok();

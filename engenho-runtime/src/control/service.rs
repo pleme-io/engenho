@@ -397,7 +397,7 @@ impl DaemonControl {
                 cluster_name,
                 node_name,
                 recorded_at,
-            }) if *cluster_name == config.cluster.name
+            }) if cluster_name == config.cluster.effective_name()
                 && *node_name == config.runtime.node_name =>
             {
                 types::FirstBootIdentity::Matches {
@@ -411,7 +411,14 @@ impl DaemonControl {
             },
         };
         types::IdentityFacts {
-            cluster_name: sourced(&["cluster", "name"], &config.cluster.name),
+            cluster_name: if config.cluster.shared.is_some() {
+                sourced(
+                    &["cluster", "shared", "name"],
+                    config.cluster.effective_name(),
+                )
+            } else {
+                sourced(&["cluster", "name"], &config.cluster.name)
+            },
             node_name: sourced(&["runtime", "node_name"], &config.runtime.node_name),
             first_boot,
         }
@@ -731,7 +738,7 @@ impl EngenhoControl for DaemonControl {
             principal: by.view(),
             grant: by.grant().clone(),
             cluster: types::ClusterIdentity {
-                cluster_name: config.cluster.name,
+                cluster_name: config.cluster.effective_name().to_owned(),
                 node_name: config.runtime.node_name,
                 ca: self.ca_binding(),
             },

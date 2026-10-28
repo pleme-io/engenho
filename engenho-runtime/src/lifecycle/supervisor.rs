@@ -1590,7 +1590,7 @@ impl Supervisor {
 
     fn record_identity(&mut self, config: &EngenhoConfig, at: Timestamp) {
         let identity = IdentityRecord {
-            cluster_name: config.cluster.name.clone(),
+            cluster_name: config.cluster.effective_name().to_owned(),
             node_name: config.runtime.node_name.clone(),
             recorded_at: at,
         };

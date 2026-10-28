@@ -503,6 +503,23 @@ pub fn load_or_generate_ca(data_dir: &Path) -> Result<ClusterCa, PkiError> {
     }
 }
 
+/// Load a CA several clusters' members share from `ca_cert_path` and
+/// `ca_key_path`; this node's leaves are still derived from the seed under
+/// `data_dir/pki/`, minted there when absent.
+///
+/// # Errors
+///
+/// [`PkiError::Io`] when either file cannot be read or the seed cannot be
+/// written; [`PkiError::Crypto`] when they do not parse.
+pub fn load_shared_ca(
+    ca_cert_path: &Path,
+    ca_key_path: &Path,
+    data_dir: &Path,
+) -> Result<ClusterCa, PkiError> {
+    let cluster_seed = load_or_generate_cluster_seed(data_dir)?;
+    load_ca(ca_cert_path, ca_key_path, cluster_seed)
+}
+
 /// Load an existing CA from its persisted `ca.crt` + `ca.key` PEM.
 fn load_ca(
     ca_cert_path: &Path,

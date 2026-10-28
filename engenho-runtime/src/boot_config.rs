@@ -32,7 +32,7 @@ use engenho_config::{
     ClusterConfig, ConsistencyConfig, ConsistencyTierKind, ControllerEnable, ControllersConfig,
     DatapathMode, EngenhoConfig, Fabric, HealthReasons, KubeconfigVisibility, KubeletBackendKind,
     LegacyTeiaSection, NativeCgroups, NetworkingConfig, RevoadaConfig, RuntimeConfig,
-    SchedulerConfig, TlsConfig, TopologyConfig, TopologyStrategyKind,
+    SchedulerConfig, SharedCluster, TlsConfig, TopologyConfig, TopologyStrategyKind,
 };
 
 use crate::health::Windows;
@@ -45,6 +45,7 @@ pub(crate) struct BootConfig {
     /// `cluster.name`: the store's raft cluster name, and the cluster every
     /// kubeconfig this node writes names.
     pub(crate) cluster_name: String,
+    pub(crate) membership: Membership,
     /// `runtime.listen_addr`, as written. Parsed where it is bound, so the
     /// parse error can name the string.
     pub(crate) listen_addr: String,
@@ -127,9 +128,16 @@ impl BootConfig {
             // up before any boot and outlives every one (lifecycle/).
             control: _,
         } = config;
-        let ClusterConfig { name, region } = cluster;
+        let ClusterConfig {
+            name,
+            region,
+            shared,
+        } = cluster;
+        let membership = Membership::read(shared.as_ref());
+        let cluster_name = shared.as_ref().map_or(name, |shared| &shared.name).clone();
         // Section order: the not-run records read in the order the config does.
         let not_run = [
+            shared.is_some().then_some(NotRun::HostClusterName),
             (!region.is_empty()).then_some(NotRun::Region),
             Some(read_topology(revoada)?),
             read_fabric(fabric, legacy_teia.as_ref()),
@@ -174,7 +182,8 @@ impl BootConfig {
         } = runtime;
 
         Ok(Self {
-            cluster_name: name.clone(),
+            cluster_name,
+            membership,
             listen_addr: listen_addr.clone(),
             data_dir: data_dir.clone(),
             durable: *durable,
@@ -210,6 +219,45 @@ impl BootConfig {
     /// from `scheduler.tick_interval_seconds`.
     pub(crate) fn windows(&self, scheduler_fallback: Duration) -> Windows {
         Windows::new(self.fallback, self.debounce, scheduler_fallback)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Membership {
+    Own,
+    Shared(SharedMembership),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SharedMembership {
+    pub(crate) ca_cert: PathBuf,
+    pub(crate) ca_key: PathBuf,
+    pub(crate) identity_key: PathBuf,
+}
+
+impl Membership {
+    fn read(shared: Option<&SharedCluster>) -> Self {
+        let Some(SharedCluster {
+            name: _,
+            ca_cert_path,
+            ca_key_path,
+            identity_key_path,
+        }) = shared
+        else {
+            return Self::Own;
+        };
+        Self::Shared(SharedMembership {
+            ca_cert: ca_cert_path.clone(),
+            ca_key: ca_key_path.clone(),
+            identity_key: identity_key_path.clone(),
+        })
+    }
+
+    pub(crate) const fn shared(&self) -> Option<&SharedMembership> {
+        match self {
+            Self::Own => None,
+            Self::Shared(shared) => Some(shared),
+        }
     }
 }
 
@@ -414,6 +462,7 @@ pub enum Unhonoured {
 /// A config field the runtime reads and does not run, and why.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NotRun {
+    HostClusterName,
     /// `cluster.region`: nothing in a single-node runtime places or labels
     /// by region. Destination: the Node's `topology.kubernetes.io/region`
     /// label, once a label value is validated at the border.
@@ -435,6 +484,7 @@ impl NotRun {
     /// The config section the field lives in, for the boot log.
     pub(crate) const fn field(self) -> &'static str {
         match self {
+            Self::HostClusterName => "cluster.name",
             Self::Region => "cluster.region",
             Self::Topology { .. } => "revoada.topology",
             Self::Teia => "teia",
@@ -445,6 +495,9 @@ impl NotRun {
 impl fmt::Display for NotRun {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::HostClusterName => {
+                f.write_str("this node is a member of cluster.shared.name, which it answers to")
+            }
             Self::Region => f.write_str("nothing in a single-node runtime places by region"),
             Self::Topology { strategy } => write!(
                 f,
@@ -479,7 +532,9 @@ mod tests {
     use engenho_config::{ConsistencyTierKind, EngenhoConfig, TopologyStrategyKind};
     use shikumi::TieredConfig as _;
 
-    use super::{ApiserverTls, BootConfig, NotRun, PkiField, Unhonoured};
+    use super::{
+        ApiserverTls, BootConfig, Membership, NotRun, PkiField, SharedMembership, Unhonoured,
+    };
 
     fn read(edit: impl FnOnce(&mut EngenhoConfig)) -> Result<BootConfig, Unhonoured> {
         let mut config = EngenhoConfig::prescribed_default();
@@ -519,6 +574,36 @@ mod tests {
         })
         .expect("a config with the retired section still boots");
         assert!(boot.not_run.contains(&NotRun::Teia), "{:?}", boot.not_run);
+    }
+
+    #[test]
+    fn a_shared_block_names_the_cluster_and_is_the_membership() {
+        let boot = read(|c| {
+            c.cluster.shared = Some(engenho_config::SharedCluster {
+                name: "aldeia".into(),
+                ca_cert_path: "/pki/ca.crt".into(),
+                ca_key_path: "/pki/ca.key".into(),
+                identity_key_path: "/pki/node.key".into(),
+            });
+        })
+        .expect("run");
+        assert_eq!(boot.cluster_name, "aldeia");
+        assert_eq!(
+            boot.membership,
+            Membership::Shared(SharedMembership {
+                ca_cert: "/pki/ca.crt".into(),
+                ca_key: "/pki/ca.key".into(),
+                identity_key: "/pki/node.key".into(),
+            })
+        );
+        assert_eq!(boot.not_run.first(), Some(&NotRun::HostClusterName));
+        let own = BootConfig::prescribed();
+        assert_eq!(own.membership, Membership::Own);
+        assert!(
+            own.cluster_name.starts_with("engenho-"),
+            "{}",
+            own.cluster_name
+        );
     }
 
     #[test]

@@ -102,7 +102,7 @@ pub use params::{
 pub use pki::{
     ClientMaterial, ClusterCa, PkiError, SanEntry, SanParseError, ServerSanInputs, TlsMaterial,
     VerifiedClientCert, client_verifier, issue_admin_client_material, issue_server_material,
-    load_or_generate_ca, parse_client_cert,
+    load_or_generate_ca, load_shared_ca, parse_client_cert,
 };
 pub use pki_files::PkiFile;
 pub use pod_logs::{LogChunk, LogQuery, PodLogReader};

@@ -214,7 +214,7 @@ impl DaemonControl {
     fn names(&self, snapshot: &Snapshot) -> Result<(String, String), ControlError> {
         match (self.effective(), &snapshot.identity) {
             (Ok(resolved), _) => Ok((
-                resolved.config.cluster.name,
+                resolved.config.cluster.effective_name().to_owned(),
                 resolved.config.runtime.node_name,
             )),
             (Err(_), Some(first)) => Ok((first.cluster_name.clone(), first.node_name.clone())),

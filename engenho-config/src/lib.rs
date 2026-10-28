@@ -125,7 +125,7 @@ mod scheduler;
 mod teia;
 mod tls;
 
-pub use cluster::ClusterConfig;
+pub use cluster::{ClusterConfig, SharedCluster};
 pub use consistency::{ConsistencyConfig, ConsistencyTierKind};
 pub use control::{
     AuthorizedClientConfig, ControlConfig, ControlSocketConfig, DEFAULT_REMOTE_LISTEN, GroupTier,

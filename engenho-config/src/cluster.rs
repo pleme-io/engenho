@@ -1,5 +1,7 @@
 //! Cluster identity config.
 
+use std::path::{Path, PathBuf};
+
 use serde::{Deserialize, Serialize};
 use shikumi::TieredConfig;
 
@@ -93,6 +95,72 @@ pub struct ClusterConfig {
     pub name: String,
     /// Cloud region or homelab location identifier.
     pub region: String,
+    /// Membership of a cluster several nodes share. Absent, the node is its
+    /// own cluster: the per-host name, a CA minted under its data dir, raft
+    /// node id 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared: Option<SharedCluster>,
+}
+
+/// The identity a node holds as one member of a shared cluster.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedCluster {
+    /// The cluster's name, the same on every member.
+    pub name: String,
+    /// The cluster CA certificate every member serves under.
+    pub ca_cert_path: PathBuf,
+    /// The cluster CA private key.
+    pub ca_key_path: PathBuf,
+    /// This node's ed25519 identity key (PKCS#8 PEM), minted there when absent.
+    pub identity_key_path: PathBuf,
+}
+
+impl SharedCluster {
+    /// Validate the block.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::InvalidField`] for an invalid name or a path that is
+    /// not absolute.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        validate_name("cluster.shared.name", &self.name)?;
+        for (field, path) in [
+            ("cluster.shared.ca_cert_path", &self.ca_cert_path),
+            ("cluster.shared.ca_key_path", &self.ca_key_path),
+            ("cluster.shared.identity_key_path", &self.identity_key_path),
+        ] {
+            absolute(field, path)?;
+        }
+        Ok(())
+    }
+}
+
+fn absolute(field: &str, path: &Path) -> Result<(), ConfigError> {
+    if path.is_absolute() {
+        Ok(())
+    } else {
+        Err(ConfigError::InvalidField {
+            field: field.into(),
+            reason: format!("{} is not an absolute path", path.display()),
+        })
+    }
+}
+
+fn validate_name(field: &str, name: &str) -> Result<(), ConfigError> {
+    if name.is_empty() {
+        return Err(ConfigError::InvalidField {
+            field: field.into(),
+            reason: "cluster name cannot be empty".into(),
+        });
+    }
+    if name.contains('.') || name.contains(' ') {
+        return Err(ConfigError::InvalidField {
+            field: field.into(),
+            reason: format!("cluster name '{name}' contains invalid chars (.,space)"),
+        });
+    }
+    Ok(())
 }
 
 impl TieredConfig for ClusterConfig {
@@ -100,6 +168,7 @@ impl TieredConfig for ClusterConfig {
         Self {
             name: String::new(),
             region: String::new(),
+            shared: None,
         }
     }
 
@@ -111,6 +180,7 @@ impl TieredConfig for ClusterConfig {
             // or the file tier when a shared name is genuinely wanted.
             name: default_cluster_name(),
             region: "homelab".into(),
+            shared: None,
         }
     }
 
@@ -126,6 +196,7 @@ impl TieredConfig for ClusterConfig {
             } else {
                 self.region
             },
+            shared: self.shared.or_else(|| base.shared.clone()),
         }
     }
 }
@@ -139,22 +210,17 @@ impl ClusterConfig {
     /// contains dots/spaces (the substrate uses cluster name in
     /// NATS subjects which require alphanumeric tokens).
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.name.is_empty() {
-            return Err(ConfigError::InvalidField {
-                field: "cluster.name".into(),
-                reason: "cluster name cannot be empty".into(),
-            });
-        }
-        if self.name.contains('.') || self.name.contains(' ') {
-            return Err(ConfigError::InvalidField {
-                field: "cluster.name".into(),
-                reason: format!(
-                    "cluster name '{}' contains invalid chars (.,space)",
-                    self.name
-                ),
-            });
-        }
-        Ok(())
+        validate_name("cluster.name", &self.name)?;
+        self.shared.as_ref().map_or(Ok(()), SharedCluster::validate)
+    }
+
+    /// The name the cluster answers to: the shared cluster's when this node
+    /// is a member of one, else `name`.
+    #[must_use]
+    pub fn effective_name(&self) -> &str {
+        self.shared
+            .as_ref()
+            .map_or(&self.name, |shared| &shared.name)
     }
 }
 
@@ -183,6 +249,7 @@ mod tests {
             let cfg = ClusterConfig {
                 name: cluster_name_for_host(raw),
                 region: "homelab".into(),
+                shared: None,
             };
             cfg.validate()
                 .unwrap_or_else(|e| panic!("{raw:?} produced an invalid name {:?}: {e}", cfg.name));
@@ -239,6 +306,7 @@ mod tests {
         let cfg = ClusterConfig {
             name: "rio.example".into(),
             region: "x".into(),
+            shared: None,
         };
         assert!(cfg.validate().is_err());
     }
@@ -248,6 +316,7 @@ mod tests {
         let overlay = ClusterConfig {
             name: "myname".into(),
             region: String::new(),
+            shared: None,
         };
         let base = ClusterConfig::prescribed_default();
         let merged = overlay.extend(&base);

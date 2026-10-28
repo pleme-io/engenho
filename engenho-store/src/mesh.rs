@@ -696,6 +696,20 @@ impl<N: MeshNetwork> StoreMesh<N> {
         .unwrap_or(false)
     }
 
+    pub async fn is_member(&self, node: RaftNodeId) -> bool {
+        self.raft
+            .with_raft_state(move |state| {
+                state
+                    .membership_state
+                    .effective()
+                    .membership()
+                    .get_node(&node)
+                    .is_some()
+            })
+            .await
+            .unwrap_or(false)
+    }
+
     fn voter_count(&self) -> usize {
         self.raft
             .metrics()

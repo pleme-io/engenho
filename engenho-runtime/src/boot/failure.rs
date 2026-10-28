@@ -47,6 +47,8 @@ impl FailureClass {
             | RuntimeError::PublicCaOnReachableAddress { .. }
             | RuntimeError::Kubeconfig(_)
             | RuntimeError::DataDirMoved { .. }
+            | RuntimeError::Identity { .. }
+            | RuntimeError::NotAMember { .. }
             // A boot someone stopped is not retried on a timer.
             | RuntimeError::BootCancelled { .. }
             // Never produced by a boot (a stop's error); retrying cannot

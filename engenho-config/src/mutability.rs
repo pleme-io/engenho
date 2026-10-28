@@ -17,7 +17,7 @@ use crate::leaf::LeafPath;
 use crate::{
     ClusterConfig, ConsistencyConfig, ControlConfig, ControlSocketConfig, ControllerEnable,
     ControllersConfig, EngenhoConfig, LegacyTeiaSection, NetworkingConfig, RemoteControlConfig,
-    RevoadaConfig, RuntimeConfig, SchedulerConfig, TlsConfig, TopologyConfig,
+    RevoadaConfig, RuntimeConfig, SchedulerConfig, SharedCluster, TlsConfig, TopologyConfig,
 };
 
 /// What applying a change to one leaf does. The spellings are the control
@@ -194,6 +194,13 @@ fn build() -> Vec<LeafSpec> {
     section!(rows, "cluster", ClusterConfig {
         name => anchored(Anchor::Identity),
         region => inert,
+        shared,
+    });
+    section!(rows, "cluster.shared", SharedCluster {
+        name => anchored(Anchor::Identity),
+        ca_cert_path => anchored(Anchor::Identity),
+        ca_key_path => anchored(Anchor::Identity),
+        identity_key_path => anchored(Anchor::Identity),
     });
     section!(rows, "revoada", RevoadaConfig { topology });
     section!(rows, "revoada.topology", TopologyConfig {
@@ -325,6 +332,12 @@ mod tests {
     /// serializes to names every leaf there is.
     fn maximal() -> EngenhoConfig {
         let mut config = EngenhoConfig::prescribed_default();
+        config.cluster.shared = Some(SharedCluster {
+            name: "aldeia".into(),
+            ca_cert_path: PathBuf::from("/pki/ca.crt"),
+            ca_key_path: PathBuf::from("/pki/ca.key"),
+            identity_key_path: PathBuf::from("/pki/node.key"),
+        });
         config.legacy_teia = Some(LegacyTeiaSection {
             servers: Some(vec!["nats://a".into()]),
             cluster: Some("c".into()),
@@ -373,6 +386,9 @@ mod tests {
             "runtime.durable",
             "runtime.node_name",
             "cluster.name",
+            "cluster.shared.name",
+            "cluster.shared.ca_key_path",
+            "cluster.shared.identity_key_path",
             "networking.service_cidr",
             "control.socket.path",
             "teia.servers",
