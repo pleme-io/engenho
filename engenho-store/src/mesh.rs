@@ -615,6 +615,7 @@ impl<N: MeshNetwork> StoreMesh<N> {
         consistency: ReadConsistency,
         wait: Duration,
     ) -> Result<PageAtRevision, ReadRefused> {
+        self.fence(consistency, wait).await?;
         self.catch_up(consistency, wait).await;
         self.store
             .read(|c| c.read_page(scope, after, limit, consistency))
@@ -634,8 +635,44 @@ impl<N: MeshNetwork> StoreMesh<N> {
         consistency: ReadConsistency,
         wait: Duration,
     ) -> Result<Option<ResourceValue>, ReadRefused> {
+        self.fence(consistency, wait).await?;
         self.catch_up(consistency, wait).await;
         self.store.read(|c| c.read_one(key, consistency)).await
+    }
+
+    async fn fence(&self, consistency: ReadConsistency, wait: Duration) -> Result<(), ReadRefused> {
+        if consistency != ReadConsistency::Latest || self.voter_count() <= 1 {
+            return Ok(());
+        }
+        let deadline = tokio::time::Instant::now() + wait;
+        let read_at = match tokio::time::timeout(wait, self.raft.get_read_log_id()).await {
+            Ok(Ok((read_at, _applied))) => read_at,
+            Ok(Err(e)) => {
+                return Err(ReadRefused::NotLinearizable {
+                    leader: e.forward_to_leader().and_then(|f| f.leader_id),
+                });
+            }
+            Err(_) => return Err(ReadRefused::NotLinearizable { leader: None }),
+        };
+        let index = read_at.map_or(0, |log_id| log_id.index);
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if self.wait_for_applied(index, remaining).await {
+            Ok(())
+        } else {
+            Err(ReadRefused::NotLinearizable {
+                leader: Some(self.node_id),
+            })
+        }
+    }
+
+    fn voter_count(&self) -> usize {
+        self.raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .voter_ids()
+            .count()
     }
 
     /// Wait, up to `wait`, for this replica to reach the revision
@@ -981,6 +1018,12 @@ impl<N: MeshNetwork> StoreMesh<N> {
 
 #[cfg(test)]
 mod rpc_reply_tests;
+
+#[cfg(test)]
+mod p3_fault_router_partition;
+
+#[cfg(all(test, feature = "teia-nats"))]
+mod nats_reply_tests;
 
 pub fn default_config(cluster_name: &str) -> Result<Arc<Config>, StoreError> {
     let cfg = Config {

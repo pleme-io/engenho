@@ -56,10 +56,15 @@
 //! [`ReadConsistency`] (each judges and reads inside one `&self` call); it is
 //! pinned by tests, not by a type. [`ReadConsistency::Latest`] is this
 //! replica's newest applied revision: on the leader of a single-voter store
-//! (engenho's deployed shape) that is the newest committed revision, on a
-//! follower it is not a quorum read.
+//! (engenho's deployed shape) that is the newest committed revision. With
+//! more than one voter, [`crate::StoreMesh`] fences a `Latest` read first:
+//! the replica confirms its leadership with a quorum (openraft's read index)
+//! and applies up to that index, or refuses with
+//! [`ReadRefused::NotLinearizable`]. A follower, or a leader deposed by a
+//! partition it has not noticed, refuses rather than serves its stale head.
 
 use crate::revision::{CompactedTooOld, Revision};
+use crate::type_config::RaftNodeId;
 
 /// How fresh a read must be: the store's reading of `resourceVersion` +
 /// `resourceVersionMatch`. See the module docs for the full table.
@@ -149,12 +154,15 @@ pub enum ReadRefused {
         requested: Revision,
         compacted: Revision,
     },
+    #[error("this replica cannot confirm it is current; leader: {leader:?}")]
+    NotLinearizable { leader: Option<RaftNodeId> },
 }
 
 engenho_substrate::impl_error_kind! {
     ReadRefused {
         { TooLarge { .. } } => "too_large",
         { Expired { .. } } => "expired",
+        { NotLinearizable { .. } } => "not_linearizable",
     }
 }
 
@@ -200,6 +208,10 @@ mod tests {
         };
         assert_eq!(too_large.kind(), "too_large");
         assert_eq!(expired.kind(), "expired");
+        assert_eq!(
+            ReadRefused::NotLinearizable { leader: Some(2) }.kind(),
+            "not_linearizable"
+        );
     }
 
     #[test]
@@ -324,6 +336,9 @@ mod tests {
                     prop_assert_eq!(c, ReadConsistency::Exact(requested));
                     prop_assert_eq!(compacted, floor);
                     prop_assert!(requested < floor);
+                }
+                Err(refused @ ReadRefused::NotLinearizable { .. }) => {
+                    prop_assert!(false, "judge never fences; {c:?} came back {refused}");
                 }
             }
         }

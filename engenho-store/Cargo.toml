@@ -35,6 +35,7 @@ blake3             = "1"
 [features]
 default = []
 teia-nats = ["dep:engenho-teia", "engenho-teia/teia-nats"]
+test-support = []
 
 [target.'cfg(unix)'.dependencies]
 # flock(2) for the data-dir lock. Unix-only on purpose: the lock is a real

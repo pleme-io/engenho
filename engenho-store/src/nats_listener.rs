@@ -51,6 +51,19 @@ fn raft_id_hex(id: RaftNodeId) -> String {
     format!("{id:016x}")
 }
 
+pub(crate) async fn dispatch(
+    raft: &Raft<TypeConfig>,
+    envelope: NatsRpcEnvelope,
+) -> Result<Vec<u8>, serde_json::Error> {
+    match envelope {
+        NatsRpcEnvelope::AppendEntries(req) => serde_json::to_vec(&raft.append_entries(req).await),
+        NatsRpcEnvelope::Vote(req) => serde_json::to_vec(&raft.vote(req).await),
+        NatsRpcEnvelope::InstallSnapshot(req) => {
+            serde_json::to_vec(&raft.install_snapshot(req).await)
+        }
+    }
+}
+
 /// Handle to a running listener. Owning the handle keeps the
 /// listener task alive; dropping the handle aborts it.
 pub struct NatsListener {
@@ -103,49 +116,11 @@ impl NatsListener {
                     }
                 };
 
-                let reply_bytes: Vec<u8> = match envelope {
-                    NatsRpcEnvelope::AppendEntries(req) => {
-                        match raft_for_task.append_entries(req).await {
-                            Ok(resp) => match serde_json::to_vec(&resp) {
-                                Ok(b) => b,
-                                Err(e) => {
-                                    error!(error = %e, "encode AppendEntries response");
-                                    continue;
-                                }
-                            },
-                            Err(e) => {
-                                warn!(error = %e, "AppendEntries dispatch failed");
-                                continue;
-                            }
-                        }
-                    }
-                    NatsRpcEnvelope::Vote(req) => match raft_for_task.vote(req).await {
-                        Ok(resp) => match serde_json::to_vec(&resp) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                error!(error = %e, "encode Vote response");
-                                continue;
-                            }
-                        },
-                        Err(e) => {
-                            warn!(error = %e, "Vote dispatch failed");
-                            continue;
-                        }
-                    },
-                    NatsRpcEnvelope::InstallSnapshot(req) => {
-                        match raft_for_task.install_snapshot(req).await {
-                            Ok(resp) => match serde_json::to_vec(&resp) {
-                                Ok(b) => b,
-                                Err(e) => {
-                                    error!(error = %e, "encode InstallSnapshot response");
-                                    continue;
-                                }
-                            },
-                            Err(e) => {
-                                warn!(error = %e, "InstallSnapshot dispatch failed");
-                                continue;
-                            }
-                        }
+                let reply_bytes = match dispatch(&raft_for_task, envelope).await {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        error!(error = %e, subject = %msg.subject, "encode Raft RPC reply");
+                        continue;
                     }
                 };
 

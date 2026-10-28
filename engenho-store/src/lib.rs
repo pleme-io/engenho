@@ -114,6 +114,8 @@ pub mod revision;
 pub mod ssa;
 pub mod state;
 pub mod store;
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;
 pub mod type_config;
 pub mod watch;
 pub mod watch_backend;

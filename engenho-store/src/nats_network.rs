@@ -41,6 +41,7 @@ use openraft::raft::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::network::remote_answer;
 use crate::type_config::{RaftNodeId, TypeConfig};
 
 /// Default RPC timeout — Raft expects sub-second responses for
@@ -137,6 +138,37 @@ pub enum NatsRpcEnvelope {
     InstallSnapshot(InstallSnapshotRequest<TypeConfig>),
 }
 
+pub type NatsRpcReply<T, E = RaftError<RaftNodeId>> = Result<T, E>;
+
+impl NatsRaftNetwork {
+    async fn call<T, E>(
+        &self,
+        what: &str,
+        subject: String,
+        envelope: &NatsRpcEnvelope,
+    ) -> Result<T, RPCError<RaftNodeId, BasicNode, E>>
+    where
+        T: serde::de::DeserializeOwned,
+        E: serde::de::DeserializeOwned + std::error::Error,
+    {
+        let reply = self
+            .client
+            .request_json::<NatsRpcEnvelope, NatsRpcReply<T, E>>(
+                subject,
+                envelope,
+                self.rpc_timeout,
+            )
+            .await
+            .map_err(|e| {
+                RPCError::Network(NetworkError::new(&std::io::Error::other(format!(
+                    "NATS {what} to {} failed: {e}",
+                    self.target
+                ))))
+            })?;
+        remote_answer(self.target, reply)
+    }
+}
+
 impl RaftNetwork<TypeConfig> for NatsRaftNetwork {
     async fn append_entries(
         &mut self,
@@ -147,19 +179,8 @@ impl RaftNetwork<TypeConfig> for NatsRaftNetwork {
         RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId>>,
     > {
         let envelope = NatsRpcEnvelope::AppendEntries(rpc);
-        self.client
-            .request_json::<NatsRpcEnvelope, AppendEntriesResponse<RaftNodeId>>(
-                self.append_subject(),
-                &envelope,
-                self.rpc_timeout,
-            )
+        self.call("append_entries", self.append_subject(), &envelope)
             .await
-            .map_err(|e| {
-                RPCError::Network(NetworkError::new(&std::io::Error::other(format!(
-                    "NATS append_entries to {} failed: {e}",
-                    self.target
-                ))))
-            })
     }
 
     async fn install_snapshot(
@@ -175,19 +196,8 @@ impl RaftNetwork<TypeConfig> for NatsRaftNetwork {
         >,
     > {
         let envelope = NatsRpcEnvelope::InstallSnapshot(rpc);
-        self.client
-            .request_json::<NatsRpcEnvelope, InstallSnapshotResponse<RaftNodeId>>(
-                self.snapshot_subject(),
-                &envelope,
-                self.rpc_timeout,
-            )
+        self.call("install_snapshot", self.snapshot_subject(), &envelope)
             .await
-            .map_err(|e| {
-                RPCError::Network(NetworkError::new(&std::io::Error::other(format!(
-                    "NATS install_snapshot to {} failed: {e}",
-                    self.target
-                ))))
-            })
     }
 
     async fn vote(
@@ -197,19 +207,7 @@ impl RaftNetwork<TypeConfig> for NatsRaftNetwork {
     ) -> Result<VoteResponse<RaftNodeId>, RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId>>>
     {
         let envelope = NatsRpcEnvelope::Vote(rpc);
-        self.client
-            .request_json::<NatsRpcEnvelope, VoteResponse<RaftNodeId>>(
-                self.vote_subject(),
-                &envelope,
-                self.rpc_timeout,
-            )
-            .await
-            .map_err(|e| {
-                RPCError::Network(NetworkError::new(&std::io::Error::other(format!(
-                    "NATS vote to {} failed: {e}",
-                    self.target
-                ))))
-            })
+        self.call("vote", self.vote_subject(), &envelope).await
     }
 }
 

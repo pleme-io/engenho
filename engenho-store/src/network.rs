@@ -78,6 +78,16 @@ impl MeshNetwork for InProcessRouter {
     }
 }
 
+pub(crate) fn remote_answer<T, E>(
+    target: RaftNodeId,
+    answer: Result<T, E>,
+) -> Result<T, RPCError<RaftNodeId, BasicNode, E>>
+where
+    E: std::error::Error,
+{
+    answer.map_err(|e| RPCError::RemoteError(RemoteError::new(target, e)))
+}
+
 fn answered<T, E>(
     target: RaftNodeId,
     kind: &str,
@@ -86,13 +96,12 @@ fn answered<T, E>(
 where
     E: std::error::Error,
 {
-    received
-        .map_err(|e| {
-            RPCError::Network(NetworkError::new(&std::io::Error::other(format!(
-                "{kind} oneshot dropped: {e}"
-            ))))
-        })?
-        .map_err(|e| RPCError::RemoteError(RemoteError::new(target, e)))
+    let answer = received.map_err(|e| {
+        RPCError::Network(NetworkError::new(&std::io::Error::other(format!(
+            "{kind} oneshot dropped: {e}"
+        ))))
+    })?;
+    remote_answer(target, answer)
 }
 
 impl RaftNetworkFactory<TypeConfig> for InProcessRouter {

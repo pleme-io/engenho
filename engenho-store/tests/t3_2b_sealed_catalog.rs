@@ -75,6 +75,10 @@ const DECLARED: &[(&str, &str, Bound)] = &[
     // Hit counts per `ImageInconsistency` kind: bounded by that enum.
     ("StoreMesh", "image_tripwire", Bound::NotTheCatalog),
     ("FjallStore", "image_tripwire", Bound::NotTheCatalog),
+    ("Cluster", "ids", Bound::NotTheCatalog),
+    ("Cluster", "others", Bound::NotTheCatalog),
+    ("Cluster", "net", Bound::NotTheCatalog),
+    ("Cluster", "node", Bound::NotTheCatalog),
 ];
 
 /// The crate's own sources, as `(path, text)`, excluding the test-only

@@ -122,6 +122,14 @@ Each transport has a sweet spot. Per-write, engenho chooses one:
   today's single-voter nodes the one node is the whole quorum, so a
   read issued after a write returns sees that write. That is
   read-your-writes on one node, not linearizability across nodes.
+  The fenced exception: `get_consistent` and `list_page_consistent`
+  at `ReadConsistency::Latest` on a store with more than one voter
+  first take openraft's read index (`get_read_log_id`, a quorum
+  heartbeat) and apply up to it, or refuse with
+  `ReadRefused::NotLinearizable`. A follower or a deposed leader
+  refuses instead of serving its stale head
+  (`engenho-store/src/mesh/p3_fault_router_partition.rs`, recorded
+  red before the fence).
 
   **Latency:** ~5-20ms for commits depending on network +
   follower count. Reads are free because they are local — the same
