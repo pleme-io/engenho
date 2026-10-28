@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 
 use crate::command::{LoggedCommand, ResourceCommand, TxnOp};
 use crate::fjall_store::{FjallStore, Flushed, ImageTripwire};
-use crate::network::{InProcessRouter, RpcRequest};
+use crate::network::{InProcessRouter, MeshNetwork, RpcRequest};
 use crate::owned_task::{OwnedTask, TaskStop};
 use crate::pagination::PageAtRevision;
 use crate::read::{ReadConsistency, ReadRefused};
@@ -214,25 +214,25 @@ impl Quiesced {
 }
 
 /// Raft-replicated K8s resource store.
-pub struct StoreMesh {
+pub struct StoreMesh<N: MeshNetwork = InProcessRouter> {
     raft: Raft<TypeConfig>,
     store: StoreBackend,
     node_id: RaftNodeId,
     listen_addr: String,
-    router: InProcessRouter,
+    router: N,
     /// Feeds peer RPCs from the router into `raft`, holding a `Raft` clone.
     /// Owned so [`Self::quiesce`] can abort AND await it.
     rpc_pump: OwnedTask,
 }
 
-impl StoreMesh {
+impl<N: MeshNetwork> StoreMesh<N> {
     /// Start an EPHEMERAL (in-memory) store mesh — the test / dev
     /// path. Process restart discards all state. For durable
     /// single-node restart-safe storage use [`Self::start_durable`].
     pub async fn start(
         node_id: RaftNodeId,
         listen_addr: String,
-        router: InProcessRouter,
+        router: N,
         config: Arc<Config>,
     ) -> Result<Self, StoreError> {
         let store = InMemoryStore::new();
@@ -263,7 +263,7 @@ impl StoreMesh {
     pub async fn start_durable(
         node_id: RaftNodeId,
         listen_addr: String,
-        router: InProcessRouter,
+        router: N,
         config: Arc<Config>,
         store_path: impl Into<std::path::PathBuf>,
     ) -> Result<Self, StoreError> {
@@ -292,7 +292,7 @@ impl StoreMesh {
     pub async fn start_or_resume(
         node_id: RaftNodeId,
         listen_addr: String,
-        router: InProcessRouter,
+        router: N,
         config: Arc<Config>,
         store_path: impl Into<std::path::PathBuf>,
     ) -> Result<(Self, bool), StoreError> {
@@ -307,7 +307,7 @@ impl StoreMesh {
     async fn start_with_backend<LS, SM>(
         node_id: RaftNodeId,
         listen_addr: String,
-        router: InProcessRouter,
+        router: N,
         config: Arc<Config>,
         log_store: LS,
         state_machine: SM,
@@ -331,19 +331,13 @@ impl StoreMesh {
             while let Some(req) = rx_rpc.recv().await {
                 match req {
                     RpcRequest::AppendEntries(rpc, reply) => {
-                        if let Ok(resp) = raft_for_rpc.append_entries(rpc).await {
-                            let _ = reply.send(resp);
-                        }
+                        let _ = reply.send(raft_for_rpc.append_entries(rpc).await);
                     }
                     RpcRequest::Vote(rpc, reply) => {
-                        if let Ok(resp) = raft_for_rpc.vote(rpc).await {
-                            let _ = reply.send(resp);
-                        }
+                        let _ = reply.send(raft_for_rpc.vote(rpc).await);
                     }
                     RpcRequest::InstallSnapshot(rpc, reply) => {
-                        if let Ok(resp) = raft_for_rpc.install_snapshot(rpc).await {
-                            let _ = reply.send(resp);
-                        }
+                        let _ = reply.send(raft_for_rpc.install_snapshot(rpc).await);
                     }
                 }
             }
@@ -984,6 +978,9 @@ impl StoreMesh {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod rpc_reply_tests;
 
 pub fn default_config(cluster_name: &str) -> Result<Arc<Config>, StoreError> {
     let cfg = Config {

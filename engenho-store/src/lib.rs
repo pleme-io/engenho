@@ -139,7 +139,7 @@ pub use mesh::{MeshFlushed, Quiesced, StoreError, StoreMesh, default_config};
 pub use nats_listener::NatsListener;
 #[cfg(feature = "teia-nats")]
 pub use nats_network::{NatsRaftNetwork, NatsRaftNetworkFactory, NatsRpcEnvelope};
-pub use network::InProcessRouter;
+pub use network::{InProcessRouter, MeshNetwork};
 pub use owned_task::{OwnedTask, TaskStop};
 pub use pagination::{ContinueInvalid, ContinueToken, ListPage, PageAtRevision};
 pub use patch_apply::{
