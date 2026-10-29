@@ -61,6 +61,9 @@ pub(crate) async fn dispatch(
         NatsRpcEnvelope::InstallSnapshot(req) => {
             serde_json::to_vec(&raft.install_snapshot(req).await)
         }
+        NatsRpcEnvelope::Forward(_) => serde_json::to_vec(&crate::network::Forwarded::Err(
+            crate::network::ForwardRefused::Unsupported,
+        )),
     }
 }
 
