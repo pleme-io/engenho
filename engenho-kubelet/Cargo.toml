@@ -48,7 +48,7 @@ miniz_oxide        = "0.8"
 # (src/server.rs); already in the lock as axum's own ws dependency.
 futures-util       = "0.3"
 tatara-wasm        = { version = "0.2.830", features = ["wasi-http"] }
-blue-lang-host     = "0.0.115"
+blue-lang-host     = "0.0.125"
 
 engenho-types       = { workspace = true }
 engenho-store       = { workspace = true }
