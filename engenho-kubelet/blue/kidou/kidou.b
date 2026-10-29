@@ -52,7 +52,7 @@ def restart_delay_ms(n)
 end
 
 def default_effects()
-  ["network", "clock", "entropy", "environment"]
+  %w[network clock entropy environment]
 end
 
 def after(prefix, s)
@@ -592,8 +592,8 @@ end
 test "a declared access grants exactly its peers, its writes and its listen ports"
   access = json_stringify(
     {
-      "effects" => ["network", "filesystem", "clock"],
-      "egress" => ["db.data.svc:5432", "cache"],
+      "effects" => %w[network filesystem clock],
+      "egress" => %w[db.data.svc:5432 cache],
       "reads" => [],
       "writes" => ["/data"],
       "listen" => [9000]
@@ -726,10 +726,10 @@ end
 
 test "an exec probe is answered from the component's state"
   assert json_read(
-    probe(json_stringify({"argv" => ["cat", "/ready"], "running" => true}))
+    probe(json_stringify({"argv" => %w[cat /ready], "running" => true}))
   ).exitCode == 0
   ended = json_read(
-    probe(json_stringify({"argv" => ["cat", "/ready"], "running" => false}))
+    probe(json_stringify({"argv" => %w[cat /ready], "running" => false}))
   )
   assert ended.exitCode == 1
   assert contains?(ended.stderr, "cat /ready was not run")
