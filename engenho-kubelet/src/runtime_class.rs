@@ -10,7 +10,7 @@
 //! class runtime started each container, and every id it did not record
 //! belongs to the default runtime.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -87,6 +87,14 @@ impl ContainerRuntime for RuntimeClassRouter {
 
     fn resource_enforcement(&self) -> crate::cgroup::ResourceEnforcement {
         self.default.resource_enforcement()
+    }
+
+    async fn release_unclaimed(&self, bound_pods: &BTreeSet<String>) -> Result<(), KubeletError> {
+        self.default.release_unclaimed(bound_pods).await?;
+        for runtime in self.classes.values() {
+            runtime.release_unclaimed(bound_pods).await?;
+        }
+        Ok(())
     }
 
     async fn exec(&self, container_id: &str, argv: &[String]) -> Result<ExecOutcome, KubeletError> {
@@ -229,6 +237,23 @@ mod tests {
         );
         assert_eq!(default.events().await, vec![FakeEvent::Start("c".into())]);
         assert!(wasm.events().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn release_of_unclaimed_workloads_reaches_every_runtime_behind_the_router() {
+        let (r, default, wasm) = router();
+        let bound = BTreeSet::from(["uid-a".to_string()]);
+        r.release_unclaimed(&bound).await.expect("release");
+        assert_eq!(
+            default.releases().await,
+            vec![bound.clone()],
+            "the default runtime never saw the release"
+        );
+        assert_eq!(
+            wasm.releases().await,
+            vec![bound],
+            "a class runtime never saw the release"
+        );
     }
 
     /// RED RUN (2026-10-27): the unknown arm falling back to the default
