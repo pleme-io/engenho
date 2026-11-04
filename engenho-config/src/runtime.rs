@@ -146,6 +146,17 @@ pub enum NativeCgroups {
     Off,
 }
 
+/// Whether the kubelet API needs its bearer token. `Required` is the default:
+/// workloads share the host's loopback, so a bind alone protects nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(missing_docs)]
+pub enum KubeletAuth {
+    #[default]
+    Required,
+    Off,
+}
+
 /// How a node treats the security of a native container.
 ///
 /// `Enforce` is the default: a pod that says nothing runs as a non-root
@@ -380,6 +391,9 @@ pub struct RuntimeConfig {
     pub native_security: NativeSecurity,
     #[allow(missing_docs)]
     #[serde(default)]
+    pub kubelet_auth: KubeletAuth,
+    #[allow(missing_docs)]
+    #[serde(default)]
     pub health_reasons: HealthReasons,
     /// Optional explicit podman binary path.
     ///
@@ -444,6 +458,7 @@ impl TieredConfig for RuntimeConfig {
             kubelet_backend: KubeletBackendKind::Fake,
             native_cgroups: NativeCgroups::Off,
             native_security: NativeSecurity::Enforce,
+            kubelet_auth: KubeletAuth::Required,
             health_reasons: HealthReasons::Withheld,
             podman_binary: None,
             host_path_allowlist: Vec::new(),
@@ -509,6 +524,7 @@ impl TieredConfig for RuntimeConfig {
             kubelet_backend: KubeletBackendKind::PodmanApi,
             native_cgroups: NativeCgroups::Delegated,
             native_security: NativeSecurity::Enforce,
+            kubelet_auth: KubeletAuth::Required,
             health_reasons: HealthReasons::Named,
             podman_binary: None,
             host_path_allowlist: Vec::new(),
@@ -572,6 +588,7 @@ impl TieredConfig for RuntimeConfig {
             kubelet_backend: self.kubelet_backend,
             native_cgroups: self.native_cgroups,
             native_security: self.native_security,
+            kubelet_auth: self.kubelet_auth,
             health_reasons: self.health_reasons,
             // No "unset" sentinel on an enum whose safe arm is also a
             // meaningful value, so the overlay's value wins — same rule as
@@ -867,6 +884,7 @@ mod tests {
             kubelet_backend: KubeletBackendKind::Fake,
             native_cgroups: NativeCgroups::Off,
             native_security: NativeSecurity::Enforce,
+            kubelet_auth: KubeletAuth::Required,
             health_reasons: HealthReasons::Withheld,
             podman_binary: None,
             host_path_allowlist: Vec::new(),
@@ -1006,7 +1024,7 @@ mod node_local_listener_tests {
     fn the_etcd_facade_serves_every_secret_so_it_binds_only_when_asked() {
         let cfg = RuntimeConfig::prescribed_default();
         assert!(
-            cfg.node_local_addr(NodeLocalListener::Etcd)
+            cfg.node_local_addr(NodeLocalListener::EtcdFacade)
                 .expect("etcd address")
                 .is_none()
         );

@@ -4094,10 +4094,17 @@ pub(crate) fn listener_task(
                 node_name: boot.node_name.clone(),
                 advertise_address: boot.advertise_address.clone(),
             };
+            let auth = boot.kubelet_auth;
             ChildTask::new(
                 beat.clone(),
                 serve_rebinding(listener, beat, move || {
-                    serve_kubelet_http(addr.clone(), api.clone(), endpoint.clone(), publish.clone())
+                    serve_kubelet_http(
+                        addr.clone(),
+                        api.clone(),
+                        endpoint.clone(),
+                        publish.clone(),
+                        auth,
+                    )
                 }),
             )
         }
@@ -4363,6 +4370,7 @@ async fn serve_kubelet_http(
     api: Arc<dyn engenho_kubelet::server::KubeletApi>,
     endpoint: KubeletEndpoint,
     publish: KubeletPublish,
+    auth: engenho_config::KubeletAuth,
 ) {
     match tokio::net::TcpListener::bind(&addr).await {
         Ok(listener) => {
@@ -4373,8 +4381,11 @@ async fn serve_kubelet_http(
             }
             let bound = local.map_or_else(|| addr.clone(), |a| a.to_string());
             info!(addr = %bound, "kubelet HTTP surface bound");
-            let app =
-                engenho_kubelet::server::KubeletServer::new(api).routes_requiring(kubelet_token());
+            let server = engenho_kubelet::server::KubeletServer::new(api);
+            let app = match auth {
+                engenho_config::KubeletAuth::Required => server.routes_requiring(kubelet_token()),
+                engenho_config::KubeletAuth::Off => server.routes(),
+            };
             let served = axum::serve(listener, app).await;
             endpoint.store(None);
             match served {

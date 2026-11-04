@@ -30,9 +30,10 @@ use std::time::Duration;
 
 use engenho_config::{
     ClusterConfig, ConsistencyConfig, ConsistencyTierKind, ControllerEnable, ControllersConfig,
-    DatapathMode, EngenhoConfig, Fabric, HealthReasons, KubeconfigVisibility, KubeletBackendKind,
-    LegacyTeiaSection, NativeCgroups, NativeSecurity, NetworkingConfig, RevoadaConfig,
-    RuntimeConfig, SchedulerConfig, SharedCluster, TlsConfig, TopologyConfig, TopologyStrategyKind,
+    DatapathMode, EngenhoConfig, Fabric, HealthReasons, KubeconfigVisibility, KubeletAuth,
+    KubeletBackendKind, LegacyTeiaSection, NativeCgroups, NativeSecurity, NetworkingConfig,
+    RevoadaConfig, RuntimeConfig, SchedulerConfig, SharedCluster, TlsConfig, TopologyConfig,
+    TopologyStrategyKind,
 };
 
 use crate::health::Windows;
@@ -76,6 +77,7 @@ pub(crate) struct BootConfig {
     pub(crate) kubelet_backend: KubeletBackendKind,
     pub(crate) native_cgroups: NativeCgroups,
     pub(crate) native_security: NativeSecurity,
+    pub(crate) kubelet_auth: KubeletAuth,
     pub(crate) health_reasons: HealthReasons,
     /// `runtime.podman_binary`, read with `kubelet_backend`.
     pub(crate) podman_binary: Option<String>,
@@ -183,6 +185,7 @@ impl BootConfig {
             kubelet_backend,
             native_cgroups,
             native_security,
+            kubelet_auth,
             health_reasons,
             podman_binary,
             host_path_allowlist,
@@ -209,6 +212,7 @@ impl BootConfig {
             kubelet_backend: *kubelet_backend,
             native_cgroups: *native_cgroups,
             native_security: *native_security,
+            kubelet_auth: *kubelet_auth,
             health_reasons: *health_reasons,
             podman_binary: podman_binary.clone(),
             host_path_allowlist: host_path_allowlist.clone(),
