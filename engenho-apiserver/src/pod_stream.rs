@@ -170,6 +170,19 @@ pub async fn dial_kubelet(
     authority: &str,
     target: &PodStreamTarget,
 ) -> Result<PodStreamUpstream, ApiError> {
+    dial_kubelet_with(authority, target, None).await
+}
+
+/// [`dial_kubelet`] carrying the kubelet API's bearer token.
+///
+/// # Errors
+///
+/// As [`dial_kubelet`].
+pub async fn dial_kubelet_with(
+    authority: &str,
+    target: &PodStreamTarget,
+    bearer: Option<&str>,
+) -> Result<PodStreamUpstream, ApiError> {
     let url = format!("ws://{authority}{}", target.kubelet_path());
     let mut request = url
         .as_str()
@@ -181,6 +194,11 @@ pub async fn dial_kubelet(
         request
             .headers_mut()
             .insert(header::SEC_WEBSOCKET_PROTOCOL, offered);
+    }
+    if let Some(token) = bearer {
+        let value = HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|e| ApiError::Internal(format!("kubelet bearer token: {e}")))?;
+        request.headers_mut().insert(header::AUTHORIZATION, value);
     }
     let (ws, response) = tokio_tungstenite::connect_async(request)
         .await

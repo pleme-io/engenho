@@ -33,6 +33,89 @@ def default_uid()
 end
 
 @doc """
+namespace_uid: The account of a namespace's pods that name none: stable, non-root, and its own, so one namespace cannot signal another or read its files.
+
+    namespace_uid("rubrica") == namespace_uid("rubrica") #=> true
+    namespace_uid("rubrica") != namespace_uid("kensa") #=> true
+    namespace_uid("rubrica") >= 100000 #=> true
+"""
+def namespace_uid(namespace)
+  digits = chars(blake3_hex(namespace))
+  value = reduce(
+    (acc, c) -> acc * 16 + text_index("0123456789abcdef", c, 0),
+    0,
+    take(4, digits)
+  )
+  100_000 + value
+end
+
+@doc """
+hidden_paths: What an enclosed container never sees, beyond what its account already cannot read.
+
+    member?("/run/secrets", hidden_paths) #=> true
+"""
+def hidden_paths()
+  %w[
+    /root
+    /home
+    /Users
+    /run/secrets
+    /run/secrets.d
+    /etc/ssh
+    /etc/engenho
+    /var/lib
+    /var/log
+    /srv
+  ]
+end
+
+@doc """
+under?: Whether a path is the base or below it.
+
+    under?("/var/lib/x", "/var/lib") #=> true
+    under?("/var/lib", "/var/lib") #=> true
+    under?("/var/library", "/var/lib") #=> false
+"""
+def under?(path, base)
+  path == base or starts_with?(path, "#{base}/")
+end
+
+@doc """
+hide_list: The hidden paths that do not hold or sit inside one of the container's own volumes.
+
+    hide_list(["/var/lib/app"]) == remove_item(hidden_paths, "/var/lib") #=> true
+"""
+def hide_list(volumes)
+  filter(
+    fn(hidden)
+      not any?((v) -> under?(v, hidden) or under?(hidden, v), volumes)
+    end,
+    hidden_paths
+  )
+end
+
+@doc """
+scratch_list: The directories an enclosed container gets fresh and private, unless its own volume lives in one.
+
+    scratch_list([]) #=> ["/tmp", "/var/tmp"]
+    scratch_list(["/var/tmp/job"]) #=> ["/tmp"]
+"""
+def scratch_list(volumes)
+  filter(
+    (dir) -> not any?((v) -> under?(v, dir) or under?(dir, v), volumes),
+    %w[/tmp /var/tmp]
+  )
+end
+
+def remove_item(xs, x)
+  filter((y) -> y != x, xs)
+end
+
+def any?(f, xs)
+  length(filter(f, xs)) != 0
+end
+
+@doc """
 grant_annotation: The pod annotation that grants root, its value the reason written where a reader sees it.
 
     grant_annotation #=> "kakoi.pleme.io/root"
@@ -151,6 +234,8 @@ def identity(facts)
     named
   elsif granted?(facts)
     nil
+  elsif field(facts, "namespace", "") != ""
+    namespace_uid(facts["namespace"])
   else
     default_uid
   end
@@ -175,7 +260,8 @@ def declared_only(facts)
   [declared["run_as_user"], declared["run_as_group"]]
 end
 
-def verdict_text(refused, ids, confine, warnings)
+def verdict_text(refused, ids, confine, warnings, volumes?)
+  own = volumes or []
   json_stringify(
     {
       "refused" => refused,
@@ -183,6 +269,17 @@ def verdict_text(refused, ids, confine, warnings)
       "gid" => ids[1],
       "no_new_privs" => confine,
       "clear_caps" => confine,
+      "enclosed" => confine,
+      "hide" => if confine
+        hide_list(own)
+      else
+        []
+      end,
+      "scratch" => if confine
+        scratch_list(own)
+      else
+        []
+      end,
       "warnings" => warnings
     }
   )
@@ -224,7 +321,13 @@ def enclose(facts_text)
     verdict_text(why, [nil, nil], false, [])
   else
     granted = granted?(facts)
-    verdict_text(nil, identity(facts), not granted, [])
+    verdict_text(
+      nil,
+      identity(facts),
+      not granted,
+      [],
+      field(facts, "volumes", [])
+    )
   end
 end
 
@@ -237,6 +340,7 @@ test "a pod that says nothing runs as the default account with nothing kept"
   assert v.refused.nil?
   assert v.uid == 65532
   assert v.gid == 65532
+  assert v.enclosed == true
   assert v.no_new_privs == true
   assert v.clear_caps == true
 end
@@ -308,6 +412,36 @@ test "a contradiction is refused even with a grant"
     }
   )
   assert v.refused == "runAsNonRoot and runAsUser 0 contradict"
+end
+
+test "an enclosed container hides the host's private paths, except where its own volume lives"
+  v = answer(
+    {
+      "mode" => "enforce",
+      "can_enforce" => true,
+      "namespace" => "rubrica",
+      "volumes" => ["/srv/pool/data/rubrica"],
+      "declared" => {}
+    }
+  )
+  assert v.enclosed == true
+  assert member?("/run/secrets", v.hide)
+  assert member?("/srv", v.hide) == false
+  assert v.uid == namespace_uid("rubrica")
+end
+
+test "a grant is not enclosed, and neither audit nor off"
+  granted = answer(
+    {
+      "mode" => "enforce",
+      "can_enforce" => true,
+      "grant" => "x",
+      "declared" => {}
+    }
+  )
+  assert granted.enclosed == false
+  audit = answer({"mode" => "audit", "can_enforce" => true, "declared" => {}})
+  assert audit.enclosed == false
 end
 
 test "a non-root identity needs no grant and keeps nothing"

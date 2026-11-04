@@ -502,7 +502,7 @@ impl TieredConfig for RuntimeConfig {
             advertise_address: String::new(),
             remote_kubeconfig_publish_path: String::new(),
             kubelet_listen_addr: "127.0.0.1:10250".into(),
-            etcd_listen_addr: "127.0.0.1:2379".into(),
+            etcd_listen_addr: String::new(),
             // ★ The API backend, not the shell-out one. A default that
             // violates the fleet's NO SHELL law is a default that has to be
             // overridden on every node to be correct.
@@ -995,13 +995,21 @@ mod node_local_listener_tests {
     #[test]
     fn the_prescribed_defaults_bind_loopback() {
         let cfg = RuntimeConfig::prescribed_default();
-        for listener in NodeLocalListener::ALL {
-            let addr = cfg
-                .node_local_addr(listener)
-                .unwrap_or_else(|e| panic!("{listener}: {e}"))
-                .unwrap_or_else(|| panic!("{listener} must bind by default"));
-            assert!(addr.socket_addr().ip().is_loopback(), "{listener}: {addr}");
-        }
+        let kubelet = cfg
+            .node_local_addr(NodeLocalListener::Kubelet)
+            .expect("kubelet address")
+            .expect("the kubelet binds by default");
+        assert!(kubelet.socket_addr().ip().is_loopback(), "{kubelet}");
+    }
+
+    #[test]
+    fn the_etcd_facade_serves_every_secret_so_it_binds_only_when_asked() {
+        let cfg = RuntimeConfig::prescribed_default();
+        assert!(
+            cfg.node_local_addr(NodeLocalListener::Etcd)
+                .expect("etcd address")
+                .is_none()
+        );
     }
 
     #[test]

@@ -1560,6 +1560,24 @@ fn build_pod_log_handler(
 /// first bind and after it stops.
 pub(crate) type KubeletEndpoint = Arc<arc_swap::ArcSwapOption<SocketAddr>>;
 
+/// The kubelet API's bearer token: random per process and held only in memory,
+/// so the one door to `/exec` and `/containerLogs` is the apiserver and its RBAC.
+fn kubelet_token() -> Arc<str> {
+    static TOKEN: std::sync::OnceLock<Arc<str>> = std::sync::OnceLock::new();
+    TOKEN
+        .get_or_init(|| {
+            let mut bytes = [0u8; 32];
+            getrandom::fill(&mut bytes).expect("the OS random source");
+            let mut text = String::with_capacity(64);
+            for b in bytes {
+                text.push(char::from(b"0123456789abcdef"[usize::from(b >> 4)]));
+                text.push(char::from(b"0123456789abcdef"[usize::from(b & 15)]));
+            }
+            Arc::from(text)
+        })
+        .clone()
+}
+
 /// The Pod streaming relay: resolves the pod's node to a kubelet address and
 /// dials it over the kubelet's own WebSocket protocol, even on this node.
 struct KubeletStreamProxy {
@@ -1617,7 +1635,8 @@ impl engenho_apiserver::PodStreamProxy for KubeletStreamProxy {
             )));
         };
         let authority = self.authority(node).await?;
-        engenho_apiserver::dial_kubelet(&authority, target).await
+        engenho_apiserver::dial_kubelet_with(&authority, target, Some(kubelet_token().as_ref()))
+            .await
     }
 }
 
@@ -4354,7 +4373,8 @@ async fn serve_kubelet_http(
             }
             let bound = local.map_or_else(|| addr.clone(), |a| a.to_string());
             info!(addr = %bound, "kubelet HTTP surface bound");
-            let app = engenho_kubelet::server::KubeletServer::new(api).routes();
+            let app =
+                engenho_kubelet::server::KubeletServer::new(api).routes_requiring(kubelet_token());
             let served = axum::serve(listener, app).await;
             endpoint.store(None);
             match served {

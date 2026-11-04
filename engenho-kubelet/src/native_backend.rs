@@ -685,14 +685,33 @@ impl NativeBackend {
         self
     }
 
-    async fn verdict_for(&self, confinement: &Confinement) -> Result<Verdict, NativeError> {
+    fn volumes_of(spec: &ContainerSpec) -> Vec<crate::kakoi::Volume> {
+        spec.mounts
+            .iter()
+            .map(|m| crate::kakoi::Volume {
+                path: m.mount_path.clone(),
+                read_only: m.read_only,
+            })
+            .collect()
+    }
+
+    async fn verdict_for(&self, spec: &ContainerSpec) -> Result<Verdict, NativeError> {
         static KAKOI: OnceLock<Result<Kakoi, String>> = OnceLock::new();
         let kakoi = KAKOI
             .get_or_init(Kakoi::start)
             .clone()
             .map_err(NativeError::Kakoi)?;
         kakoi
-            .enclose(confinement, self.security, crate::kakoi::can_enforce())
+            .enclose(
+                &spec.confinement,
+                &spec.pod.namespace,
+                &Self::volumes_of(spec)
+                    .into_iter()
+                    .map(|v| v.path)
+                    .collect::<Vec<_>>(),
+                self.security,
+                crate::kakoi::can_enforce(),
+            )
             .await
             .map_err(NativeError::Kakoi)
     }
@@ -923,7 +942,7 @@ impl ContainerRuntime for NativeBackend {
     }
 
     async fn confinement_warnings(&self, spec: &ContainerSpec) -> Vec<String> {
-        match self.verdict_for(&spec.confinement).await {
+        match self.verdict_for(spec).await {
             Ok(verdict) => verdict.warnings,
             Err(e) => vec![e.to_string()],
         }
@@ -935,7 +954,7 @@ impl ContainerRuntime for NativeBackend {
 
     async fn start(&self, spec: &ContainerSpec) -> Result<ContainerStatus, KubeletError> {
         let admission = self.admit(&spec.resources)?;
-        let verdict = self.verdict_for(&spec.confinement).await?;
+        let verdict = self.verdict_for(spec).await?;
         if let Some(why) = verdict.refused.clone() {
             return Err(NativeError::Refused(why).into());
         }
@@ -999,13 +1018,6 @@ impl ContainerRuntime for NativeBackend {
             }
             None
         };
-        if let Some(uid) = verdict.uid {
-            cmd.uid(uid);
-        }
-        if let Some(gid) = verdict.gid {
-            cmd.gid(gid);
-        }
-        crate::kakoi::enter_on_exec(&mut cmd, &verdict);
 
         let leaf = match admission {
             Admission::Unbounded => None,
@@ -1021,6 +1033,12 @@ impl ContainerRuntime for NativeBackend {
             }
         };
 
+        crate::kakoi::enter_on_exec(&mut cmd, &verdict, &Self::volumes_of(spec)).map_err(|e| {
+            NativeError::Spawn {
+                program: program.clone(),
+                detail: e.to_string(),
+            }
+        })?;
         let spawned = cmd.spawn();
         drop(cmd);
         let child = match spawned {

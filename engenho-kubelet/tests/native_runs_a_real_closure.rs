@@ -575,6 +575,62 @@ async fn a_pod_that_says_nothing_runs_unprivileged_as_the_kernel_reports_it() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
+async fn an_enclosed_pod_cannot_write_the_host_or_see_its_secrets_and_keeps_its_volume() {
+    use std::os::unix::fs::MetadataExt;
+    if std::fs::metadata("/proc/self").expect("procfs").uid() != 0 {
+        return;
+    }
+    let tools = closure("nixpkgs#bash");
+    let dir = tempfile::tempdir_in("/var/tmp").expect("volume dir");
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o777),
+    )
+    .expect("open the volume");
+    let volume = dir.path().to_string_lossy().to_string();
+    let backend = NativeBackend::new(
+        Isolation::HostProcess,
+        std::env::temp_dir().join("engenho-native-e2e-enclosure"),
+        Cgroups::Off,
+    );
+    let mut image = String::from("nix:");
+    image.push_str(&tools);
+    let script = format!(
+        "echo x > {volume}/own && echo own-ok; \
+         echo x > /tmp/scratch && echo tmp-ok; \
+         (echo x > /etc/kakoi-escape) 2>/dev/null || echo etc-refused; \
+         (echo x > /nix/kakoi-escape) 2>/dev/null || echo nix-refused; \
+         (ls /root) 2>/dev/null || echo root-hidden; \
+         test -d /run/secrets && (ls /run/secrets 2>/dev/null || echo secrets-hidden)"
+    );
+    let mut s = spec(&image, &["bash", "-c", &script], &[]);
+    s.pod.namespace = "kakoi-test".to_string();
+    s.mounts = vec![engenho_kubelet::pod_volume::ResolvedMount {
+        source: engenho_kubelet::pod_volume::MountSource::UserHostPath(dir.path().to_path_buf()),
+        mount_path: volume.clone(),
+        read_only: false,
+        sub_path: None,
+    }];
+    let out = output_of(&backend, &s).await;
+    for expected in [
+        "own-ok",
+        "tmp-ok",
+        "etc-refused",
+        "nix-refused",
+        "root-hidden",
+    ] {
+        assert!(out.contains(expected), "{expected} missing from: {out}");
+    }
+    assert!(std::fs::metadata(format!("{volume}/own")).is_ok(), "{out}");
+    assert!(
+        std::fs::metadata("/tmp/scratch").is_err(),
+        "the pod's /tmp reached the host"
+    );
+    assert!(std::fs::metadata("/etc/kakoi-escape").is_err(), "{out}");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
 async fn root_starts_only_with_a_grant_and_the_kernel_agrees() {
     use std::os::unix::fs::MetadataExt;
     if std::fs::metadata("/proc/self").expect("procfs").uid() != 0 {

@@ -108,7 +108,7 @@ pub use pki_files::PkiFile;
 pub use pod_logs::{LogChunk, LogQuery, PodLogReader};
 pub use pod_stream::{
     PodStreamKind, PodStreamProxy, PodStreamTarget, PodStreamUpstream, dial_kubelet,
-    kubelet_authority_of_node,
+    dial_kubelet_with, kubelet_authority_of_node,
 };
 pub use router::{RouterState, build};
 pub use scale::{

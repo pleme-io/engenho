@@ -160,10 +160,53 @@ pub struct KubeletServer {
     api: Arc<dyn KubeletApi>,
 }
 
+async fn require_bearer(
+    token: Arc<str>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let presented = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let open = req.uri().path() == "/healthz";
+    if open || presented.is_some_and(|p| bearer_matches(p, &token)) {
+        next.run(req).await
+    } else {
+        (
+            axum::http::StatusCode::UNAUTHORIZED,
+            "the kubelet API needs its bearer token; reach it through the apiserver",
+        )
+            .into_response()
+    }
+}
+
+fn bearer_matches(presented: &str, token: &str) -> bool {
+    presented.len() == token.len()
+        && presented
+            .bytes()
+            .zip(token.bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
+}
+
 impl KubeletServer {
     #[must_use]
     pub fn new(api: Arc<dyn KubeletApi>) -> Self {
         Self { api }
+    }
+
+    /// The routes, each needing `Authorization: Bearer <token>` except
+    /// `/healthz`. A workload shares the host's loopback with this listener, so
+    /// binding loopback alone would let any pod `exec` into any other.
+    #[must_use]
+    pub fn routes_requiring(self, token: Arc<str>) -> Router {
+        self.routes()
+            .layer(axum::middleware::from_fn(move |req, next| {
+                require_bearer(Arc::clone(&token), req, next)
+            }))
     }
 
     /// The kubelet's HTTP routes.
@@ -799,6 +842,42 @@ mod tests {
             .await
             .expect("body");
         (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    #[tokio::test]
+    async fn the_gate_refuses_a_missing_or_wrong_token_and_leaves_healthz_open() {
+        let call = |path: &'static str, bearer: Option<&'static str>| async move {
+            let app = KubeletServer::new(Arc::new(FakeApi)).routes_requiring(Arc::from("sesame"));
+            let mut req = axum::http::Request::builder().uri(path);
+            if let Some(b) = bearer {
+                req = req.header("authorization", format!("Bearer {b}"));
+            }
+            tower::ServiceExt::oneshot(app, req.body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status()
+        };
+        assert_eq!(
+            call("/pods", None).await,
+            axum::http::StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            call("/pods", Some("wrong!")).await,
+            axum::http::StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            call("/pods", Some("sesame")).await,
+            axum::http::StatusCode::OK
+        );
+        assert_eq!(
+            call("/containerLogs/default/nginx/app", None).await,
+            axum::http::StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            call("/exec/default/nginx/app", None).await,
+            axum::http::StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(call("/healthz", None).await, axum::http::StatusCode::OK);
     }
 
     #[tokio::test]
