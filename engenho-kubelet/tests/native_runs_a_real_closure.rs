@@ -319,7 +319,7 @@ async fn a_workload_ignoring_sigterm_is_sigkilled_after_the_pods_grace_and_reape
     // `exec` keeps the pid and the ignored SIGTERM: the process the backend
     // signals IS the one that ignores it, with no child of its own.
     let script = format!("trap '' TERM; echo $$; echo ready; exec {coreutils}/bin/sleep 30");
-    let mut s = spec(&image, &["bash", "-c", &script], &[]);
+    let mut s = spec(&image, &["sh", "-c", &script], &[]);
     s.termination_grace = TerminationGrace::from_seconds(2);
     let grace = s.termination_grace.duration();
 
@@ -566,8 +566,16 @@ async fn a_pod_that_says_nothing_runs_unprivileged_as_the_kernel_reports_it() {
     image.push_str(&coreutils);
     let s = spec(&image, &["cat", "/proc/self/status"], &[]);
     let out = output_of(&backend, &s).await;
-    assert!(status_field(&out, "Uid:").starts_with("65532"), "{out}");
-    assert!(status_field(&out, "Gid:").starts_with("65532"), "{out}");
+    let uid: u32 = status_field(&out, "Uid:")
+        .split_whitespace()
+        .next()
+        .and_then(|u| u.parse().ok())
+        .expect("a uid");
+    assert!(uid >= 100_000, "the namespace's own account: {out}");
+    assert!(
+        status_field(&out, "Gid:").starts_with(&uid.to_string()),
+        "{out}"
+    );
     assert_eq!(status_field(&out, "NoNewPrivs:"), "1", "{out}");
     assert_eq!(status_field(&out, "CapEff:"), "0000000000000000", "{out}");
     assert_eq!(status_field(&out, "CapPrm:"), "0000000000000000", "{out}");
@@ -580,7 +588,7 @@ async fn an_enclosed_pod_cannot_write_the_host_or_see_its_secrets_and_keeps_its_
     if std::fs::metadata("/proc/self").expect("procfs").uid() != 0 {
         return;
     }
-    let tools = closure("nixpkgs#bash");
+    let tools = closure("nixpkgs#busybox");
     let dir = tempfile::tempdir_in("/var/tmp").expect("volume dir");
     std::fs::set_permissions(
         dir.path(),
@@ -603,7 +611,7 @@ async fn an_enclosed_pod_cannot_write_the_host_or_see_its_secrets_and_keeps_its_
          (ls /root) 2>/dev/null || echo root-hidden; \
          test -d /run/secrets && (ls /run/secrets 2>/dev/null || echo secrets-hidden)"
     );
-    let mut s = spec(&image, &["bash", "-c", &script], &[]);
+    let mut s = spec(&image, &["sh", "-c", &script], &[]);
     s.pod.namespace = "kakoi-test".to_string();
     s.mounts = vec![engenho_kubelet::pod_volume::ResolvedMount {
         source: engenho_kubelet::pod_volume::MountSource::UserHostPath(dir.path().to_path_buf()),
