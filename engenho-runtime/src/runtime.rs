@@ -473,6 +473,15 @@ impl Runtime {
                 engenho_apiserver::health::FailureReasons::Withheld
             }
         });
+        let router_state = match boot.api_audit {
+            engenho_config::ApiAudit::Record => {
+                router_state.with_audit_log(Arc::new(engenho_apiserver::audit::AuditLog::open(
+                    boot.data_dir.join("audit"),
+                    engenho_apiserver::audit::AuditLimits::default(),
+                )))
+            }
+            engenho_config::ApiAudit::Off => router_state,
+        };
         // The minting half, from the SAME key the authenticator verifies with.
         // Without it RBAC is decorative: the authorizer, the Roles and the
         // bindings all work, but nothing can present a non-admin identity to

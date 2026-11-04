@@ -1,0 +1,22 @@
+[package]
+name = "engenho-blue"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+categories.workspace = true
+keywords.workspace = true
+authors.workspace = true
+description = "engenho-blue — a blue program embedded in an engenho crate, loaded under an empty posture on its own thread. It decides from the facts it is handed, reaches nothing, and Rust applies its verdict."
+
+[lints]
+workspace = true
+
+[dependencies]
+blue-lang-host = "0.0.125"
+serde          = { workspace = true }
+serde_json     = { workspace = true }
+tokio          = { workspace = true }

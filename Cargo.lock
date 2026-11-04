@@ -1805,6 +1805,7 @@ dependencies = [
  "bytes",
  "chrono",
  "ed25519-dalek",
+ "engenho-blue",
  "engenho-control-types",
  "engenho-controllers",
  "engenho-kube-proto",
@@ -1840,6 +1841,16 @@ dependencies = [
  "tower",
  "tracing",
  "utoipa",
+]
+
+[[package]]
+name = "engenho-blue"
+version = "0.53.153"
+dependencies = [
+ "blue-lang-host",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -2160,7 +2171,7 @@ dependencies = [
  "async-trait",
  "axum 0.7.9",
  "base64",
- "blue-lang-host",
+ "engenho-blue",
  "engenho-config",
  "engenho-controllers",
  "engenho-csi",

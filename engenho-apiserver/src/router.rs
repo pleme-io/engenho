@@ -148,6 +148,11 @@ pub struct RouterState {
     /// `None` ⇒ those families are absent from the scrape (a dashboard
     /// reads "no data"), never rendered as zeros it would chart as real.
     pub metrics_source: Option<Arc<dyn crate::metrics::MetricsSource>>,
+    /// The API audit log, wrapped around every route by [`build`].
+    ///
+    /// `None` ⇒ nothing is recorded. The runtime installs one unless
+    /// `runtime.api_audit` says `off`.
+    pub audit_log: Option<Arc<crate::audit::AuditLog>>,
     pub api_face: engenho_types::ApiFace,
 }
 
@@ -180,6 +185,7 @@ impl RouterState {
             readyz_store_read_timeout: crate::health::DEFAULT_STORE_READ_TIMEOUT,
             health_reasons: crate::health::FailureReasons::default(),
             metrics_source: None,
+            audit_log: None,
             api_face: engenho_types::ApiFace::VENDORED,
         }
     }
@@ -262,6 +268,14 @@ impl RouterState {
     #[must_use]
     pub fn with_authorizer(mut self, authorizer: Arc<dyn crate::authz::Authorizer>) -> Self {
         self.authorizer = authorizer;
+        self
+    }
+
+    /// Install the API audit log. Builder style, before any clone of this
+    /// state, because [`build`] reads it once.
+    #[must_use]
+    pub fn with_audit_log(mut self, log: Arc<crate::audit::AuditLog>) -> Self {
+        self.audit_log = Some(log);
         self
     }
 
@@ -393,6 +407,7 @@ pub fn build(state: RouterState) -> Router {
     // and still gets a typed answer).
     let authenticator = state.authenticator.clone();
     let authorizer = state.authorizer.clone();
+    let audit_log = state.audit_log.clone();
     let router = build_routes(state);
     // Layer order (axum: the LAST `.layer()` is OUTERMOST), outside in:
     //
@@ -409,7 +424,7 @@ pub fn build(state: RouterState) -> Router {
     // is what runs. The always-allow check is the first branch inside the
     // authz middleware after the lookup (health/version are pre-authz so they
     // work with an unseeded RBAC store).
-    router
+    let router = router
         .layer(axum::middleware::from_fn(
             move |req: axum::http::Request<Body>, next: axum::middleware::Next| {
                 let authorizer = authorizer.clone();
@@ -422,7 +437,64 @@ pub fn build(state: RouterState) -> Router {
                 async move { authn_middleware(authenticator, req, next).await }
             },
         ))
-        .layer(axum::middleware::from_fn(request_info_middleware))
+        .layer(axum::middleware::from_fn(request_info_middleware));
+    match audit_log {
+        Some(log) => router.layer(axum::middleware::from_fn(
+            move |req: axum::http::Request<Body>, next: axum::middleware::Next| {
+                let log = log.clone();
+                async move { audit_middleware(log, req, next).await }
+            },
+        )),
+        None => router,
+    }
+}
+
+/// The audit middleware — the outermost layer. It reads only what the layers
+/// below it copied into the response extensions, so it parses nothing and
+/// disagrees with nothing, and it sees a request any of them refused. The query
+/// string and the headers never reach the record.
+async fn audit_middleware(
+    log: Arc<crate::audit::AuditLog>,
+    req: axum::http::Request<Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    let method = req.method().as_str().to_ascii_lowercase();
+    let path = req.uri().path().to_owned();
+    let received = chrono::Utc::now();
+    let response = next.run(req).await;
+    let response_code = response.status().as_u16();
+    let extensions = response.extensions();
+    let info = extensions.get::<crate::coords::RequestInfo>();
+    let object = info.and_then(|i| match i.target() {
+        crate::coords::RequestTarget::Resource(c) => Some(crate::audit::ObjectRef {
+            resource: &c.plural,
+            subresource: c.subresource.as_deref(),
+            namespace: c.namespace.as_deref(),
+            name: c.name.as_deref(),
+            api_group: c.group_key(),
+            api_version: c.version_key(),
+        }),
+        crate::coords::RequestTarget::NonResource(_) => None,
+    });
+    let long_running =
+        response_code == 101 || info.is_some_and(crate::coords::RequestInfo::is_watch);
+    log.record(&crate::audit::AuditRequest {
+        verb: info.map_or(method.as_str(), crate::coords::RequestInfo::verb),
+        path: &path,
+        object,
+        user: extensions.get::<UserInfo>(),
+        authorization: extensions.get::<crate::audit::Authorization>().copied(),
+        classified: info.is_some(),
+        response_code,
+        stage: if long_running {
+            crate::audit::Stage::ResponseStarted
+        } else {
+            crate::audit::Stage::ResponseComplete
+        },
+        received,
+    })
+    .await;
+    response
 }
 
 /// The router built from [`route_table`], without the layers. Split out from
@@ -605,8 +677,10 @@ async fn authn_middleware(
     };
     match authenticator.authenticate(&creds) {
         Ok(user_info) => {
-            req.extensions_mut().insert(user_info);
-            next.run(req).await
+            req.extensions_mut().insert(user_info.clone());
+            let mut response = next.run(req).await;
+            response.extensions_mut().insert(user_info);
+            response
         }
         // A typed-bad credential (e.g. a structurally-SA bearer this brick
         // can't validate) → a typed 401 K8s Status. This is the ONLY authn
@@ -646,8 +720,10 @@ async fn request_info_middleware(
 ) -> Response {
     match crate::coords::RequestInfo::parse(req.method(), req.uri()) {
         Ok(info) => {
-            req.extensions_mut().insert(info);
-            next.run(req).await
+            req.extensions_mut().insert(info.clone());
+            let mut response = next.run(req).await;
+            response.extensions_mut().insert(info);
+            response
         }
         Err(e) => ApiError::from(e).into_response(),
     }
@@ -686,18 +762,25 @@ async fn authz_middleware(
         }
     };
     let Some(attrs) = attrs else {
-        return next.run(req).await;
+        let mut response = next.run(req).await;
+        response
+            .extensions_mut()
+            .insert(crate::audit::Authorization::Allow);
+        return response;
     };
 
-    match authorizer.authorize(&attrs).await {
-        crate::authz::Decision::Allow => next.run(req).await,
+    let (mut response, authorization) = match authorizer.authorize(&attrs).await {
+        crate::authz::Decision::Allow => (next.run(req).await, crate::audit::Authorization::Allow),
         // NoOpinion (the RBAC default-deny) + an explicit Deny both render the
         // standard RBAC 403 with the typed `forbidden: User ... cannot ...`
         // message (NOT the admission `"admission denied:"` prefix).
-        crate::authz::Decision::Deny | crate::authz::Decision::NoOpinion => {
-            ApiError::AuthzForbidden(crate::error::forbidden_message(&attrs)).into_response()
-        }
-    }
+        crate::authz::Decision::Deny | crate::authz::Decision::NoOpinion => (
+            ApiError::AuthzForbidden(crate::error::forbidden_message(&attrs)).into_response(),
+            crate::audit::Authorization::Forbid,
+        ),
+    };
+    response.extensions_mut().insert(authorization);
+    response
 }
 
 /// Extract the `Authorization: Bearer <token>` value, if present. Case-
@@ -3997,6 +4080,233 @@ mod request_info_coverage {
 
 /// T4.8 — a resolved subresource carries the instance name it targets, so no
 /// dispatch arm re-reads `coords.name` and asserts it is present.
+#[cfg(test)]
+mod audit_trail {
+    use super::*;
+    use crate::audit::{AuditLimits, AuditLog};
+    use axum::http::StatusCode;
+    use serde_json::Value;
+    use std::path::{Path, PathBuf};
+
+    struct Deny;
+
+    #[async_trait::async_trait]
+    impl crate::authz::Authorizer for Deny {
+        async fn authorize(&self, _: &crate::authz::Attributes) -> crate::authz::Decision {
+            crate::authz::Decision::NoOpinion
+        }
+    }
+
+    fn base() -> RouterState {
+        RouterState::new(Vec::new()).with_liveness_source(Arc::new(
+            crate::health::FixedLiveness::all_alive(&["test-child"]),
+        ))
+    }
+
+    fn logged(state: RouterState, dir: &Path) -> (Router, Arc<AuditLog>, PathBuf) {
+        let audit = dir.join("audit");
+        let log = Arc::new(AuditLog::open(audit.clone(), AuditLimits::default()));
+        (build(state.with_audit_log(log.clone())), log, audit)
+    }
+
+    async fn send(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        bearer: Option<&str>,
+        body: &str,
+    ) -> StatusCode {
+        use tower::ServiceExt as _;
+        let mut req = axum::http::Request::builder().method(method).uri(uri);
+        if let Some(token) = bearer {
+            req = req.header("authorization", format!("Bearer {token}"));
+        }
+        let req = req
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_owned()))
+            .expect("test request");
+        app.clone()
+            .oneshot(req)
+            .await
+            .expect("the router is infallible")
+            .status()
+    }
+
+    fn text_of(log: &AuditLog, audit: &Path) -> String {
+        log.flush();
+        std::fs::read_to_string(audit.join("audit.log")).unwrap_or_default()
+    }
+
+    fn events_of(log: &AuditLog, audit: &Path) -> Vec<Value> {
+        text_of(log, audit)
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("one JSON object per line"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_denied_request_is_recorded_with_who_and_what() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, log, audit) = logged(base().with_authorizer(Arc::new(Deny)), dir.path());
+        let status = send(
+            &app,
+            "DELETE",
+            "/api/v1/namespaces/prod/secrets/db",
+            None,
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let events = events_of(&log, &audit);
+        assert_eq!(events.len(), 1, "{events:?}");
+        let ev = &events[0];
+        assert_eq!(ev["kind"], "Event");
+        assert_eq!(ev["apiVersion"], "audit.k8s.io/v1");
+        assert_eq!(ev["verb"], "delete");
+        assert_eq!(ev["user"]["username"], "system:anonymous");
+        assert_eq!(ev["objectRef"]["resource"], "secrets");
+        assert_eq!(ev["objectRef"]["namespace"], "prod");
+        assert_eq!(ev["objectRef"]["name"], "db");
+        assert_eq!(ev["responseStatus"]["code"], 403);
+        assert_eq!(ev["annotations"]["authorization.k8s.io/decision"], "forbid");
+    }
+
+    #[tokio::test]
+    async fn a_denied_read_of_an_ordinary_resource_is_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, log, audit) = logged(base().with_authorizer(Arc::new(Deny)), dir.path());
+        send(&app, "GET", "/api/v1/namespaces/prod/pods", None, "").await;
+        let events = events_of(&log, &audit);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["verb"], "list");
+    }
+
+    #[tokio::test]
+    async fn an_allowed_write_is_recorded_and_an_allowed_read_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, log, audit) = logged(base(), dir.path());
+        send(&app, "GET", "/api/v1/namespaces/prod/pods/a", None, "").await;
+        send(&app, "GET", "/healthz", None, "").await;
+        assert_eq!(events_of(&log, &audit).len(), 0);
+        send(&app, "POST", "/api/v1/namespaces/prod/pods", None, "{}").await;
+        let events = events_of(&log, &audit);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["verb"], "create");
+        assert_eq!(
+            events[0]["annotations"]["authorization.k8s.io/decision"],
+            "allow"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_allowed_read_of_a_secret_and_a_session_opened_by_get_are_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, log, audit) = logged(base(), dir.path());
+        send(&app, "GET", "/api/v1/namespaces/prod/secrets/db", None, "").await;
+        send(&app, "GET", "/api/v1/namespaces/prod/pods/a/exec", None, "").await;
+        let events = events_of(&log, &audit);
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0]["objectRef"]["resource"], "secrets");
+        assert_eq!(events[1]["objectRef"]["subresource"], "exec");
+    }
+
+    #[tokio::test]
+    async fn no_body_token_or_query_string_reaches_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, log, audit) = logged(base(), dir.path());
+        send(
+            &app,
+            "POST",
+            "/api/v1/namespaces/prod/secrets?token=query-credential",
+            Some("opaque-bearer-credential"),
+            r#"{"kind":"Secret","stringData":{"password":"hunter2"}}"#,
+        )
+        .await;
+        let text = text_of(&log, &audit);
+        assert!(text.contains("\"resource\":\"secrets\""), "{text}");
+        for leak in ["hunter2", "opaque-bearer-credential", "query-credential"] {
+            assert!(!text.contains(leak), "{leak} reached the log: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_authentication_refused_is_recorded_without_its_token() {
+        use base64::Engine as _;
+        let b64 = |s: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s.as_bytes());
+        let token = [
+            b64(r#"{"alg":"RS256","typ":"JWT"}"#),
+            b64(r#"{"iss":"https://kubernetes.default.svc","sub":"system:serviceaccount:default:b"}"#),
+            b64("not-a-real-signature"),
+        ]
+        .join(".");
+        let dir = tempfile::tempdir().unwrap();
+        let (app, log, audit) = logged(base(), dir.path());
+        let status = send(
+            &app,
+            "GET",
+            "/api/v1/namespaces/prod/pods",
+            Some(&token),
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let text = text_of(&log, &audit);
+        assert!(!text.contains(&token), "{text}");
+        let events = events_of(&log, &audit);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["responseStatus"]["code"], 401);
+        assert_eq!(events[0]["user"], serde_json::json!({}));
+        assert!(events[0].get("annotations").is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unclassifiable_request_is_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, log, audit) = logged(base(), dir.path());
+        let status = send(&app, "GET", "/api/v1/namespaces/default/pods/%FF", None, "").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let events = events_of(&log, &audit);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["verb"], "get");
+        assert_eq!(events[0]["responseStatus"]["code"], 400);
+        assert!(events[0].get("objectRef").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_log_that_cannot_write_does_not_fail_the_request() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("audit"), "a file where the directory goes").unwrap();
+        let (app, log, _audit) = logged(base(), dir.path());
+        let status = send(&app, "GET", "/api/v1/namespaces/prod/secrets/db", None, "").await;
+        assert_ne!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let healthz = send(&app, "GET", "/healthz", None, "").await;
+        assert_eq!(healthz, StatusCode::OK);
+        log.flush();
+        assert_eq!(log.counts().write_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn metrics_counts_what_became_of_the_events() {
+        use http_body_util::BodyExt as _;
+        use tower::ServiceExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let (app, log, _audit) = logged(base(), dir.path());
+        send(&app, "POST", "/api/v1/namespaces/prod/pods", None, "{}").await;
+        log.flush();
+        let req = axum::http::Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains("engenho_audit_events_total{result=\"written\"} 1"),
+            "{text}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod subresource_target {
     use super::*;

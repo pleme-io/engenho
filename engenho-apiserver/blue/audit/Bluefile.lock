@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "bluefile_b3": "b3:21b7b775625e3278f35ddfb39dfeaf9f955d4542f54286d92c93a13a8b17a63b",
+  "manifest": {
+    "schema": 1,
+    "name": "audit",
+    "version": "0.1.0",
+    "needs": {},
+    "when": "anytime",
+    "sources": {},
+    "packages": [],
+    "runs": {},
+    "tools": [],
+    "checks": {},
+    "apps": {},
+    "catalog": null
+  },
+  "sources": {}
+}

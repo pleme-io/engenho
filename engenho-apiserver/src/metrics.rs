@@ -39,6 +39,7 @@
 //! | `controller_runtime_reconcile_total{controller,result}` | the [`MetricsSource`] |
 //! | `engenho_controller_last_tick_timestamp_seconds{controller}` | the [`MetricsSource`] |
 //! | `engenho_would_reject_total{gate,reason}` | the rollout-gate ledger |
+//! | `engenho_audit_events_total{result}` | the [`crate::audit::AuditLog`], when one is on |
 //!
 //! ★ NAMES ARE UPSTREAM'S WHERE UPSTREAM HAS ONE. `etcd_object_counts` is
 //! the name kube-apiserver published this gauge under, and
@@ -411,6 +412,28 @@ pub fn log_would_reject(event: &engenho_substrate::WouldReject<'_>) {
     );
 }
 
+/// `engenho_audit_events_total{result}`: what became of each event the audit
+/// log was handed.
+#[must_use]
+pub fn audit_family(counts: crate::audit::AuditCounts) -> MetricFamily {
+    #[allow(clippy::cast_precision_loss)]
+    let sample = |result: &str, count: u64| Sample {
+        labels: vec![("result".to_string(), result.to_string())],
+        value: count as f64,
+    };
+    MetricFamily {
+        name: "engenho_audit_events_total".into(),
+        help: "API audit events, by what became of them.".into(),
+        kind: MetricType::Counter,
+        samples: vec![
+            sample("written", counts.written),
+            sample("write_failed", counts.write_failures),
+            sample("dropped", counts.dropped),
+            sample("undecided", counts.decision_failures),
+        ],
+    }
+}
+
 /// Everything `GET /metrics` serves, rendered from the router's state and,
 /// when one is installed, its [`MetricsSource`].
 pub async fn render_state(state: &crate::router::RouterState) -> String {
@@ -419,6 +442,9 @@ pub async fn render_state(state: &crate::router::RouterState) -> String {
         families.extend(source_families(&source.snapshot().await));
     }
     families.push(would_reject_family(&state.would_reject.snapshot()));
+    if let Some(log) = &state.audit_log {
+        families.push(audit_family(log.counts()));
+    }
     render(&families)
 }
 

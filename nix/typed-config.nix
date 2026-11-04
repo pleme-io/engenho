@@ -307,6 +307,12 @@ in
         share the host's loopback, so a bind alone protects nothing.
       '';
 
+      apiAudit = optional (types.enum [ "record" "off" ]) ''
+        Whether the apiserver records who did what. `record`, engenho's default:
+        JSON lines of `audit.k8s.io/v1` Events under `dataDir/audit`, mode 0600,
+        bounded by rotation. `off` records nothing.
+      '';
+
       nativeCgroups = optional (types.enum [ "delegated" "off" ]) ''
         How the `native` backend enforces a container's `resources` on Linux.
 
@@ -610,6 +616,7 @@ in
         native_cgroups = cfg.runtime.nativeCgroups;
         native_security = cfg.runtime.nativeSecurity;
         kubelet_auth = cfg.runtime.kubeletAuth;
+        api_audit = cfg.runtime.apiAudit;
         health_reasons = cfg.runtime.healthReasons;
         host_path_allowlist = cfg.runtime.hostPathAllowlist;
         node_manifests_dir = cfg.runtime.nodeManifestsDir;

@@ -51,6 +51,10 @@ The kubelet API (`/exec`, `/containerLogs`, `/pods`) needs a bearer token that i
 
 The etcd facade serves every Secret, so it binds only when `runtime.etcd_listen_addr` names an address.
 
+## The API's record
+
+Every API request is recorded by default as a JSON-line `audit.k8s.io/v1` Event in `data_dir/audit/audit.log`, mode 0600, rotated at 64 MiB with 4 files kept. A denied request is recorded too. An Event has no body field, so no body or token can reach it; `engenho-apiserver/blue/audit/audit.b` decides the level. A full queue or a failed write loses that event, counts in `engenho_audit_events_total{result}` and warns, and never fails the request. `runtime.api_audit: off` configures it off. It does not yet record source addresses, and a handler that panics goes unrecorded.
+
 ## What this does not do yet
 
 - **The network is not yet per pod.** A pod with the network effect, which is every pod with no access value, shares the host's network, so it can reach whatever listens on loopback. Each surface engenho itself listens on is gated above; a workload's own listener must authenticate.
@@ -72,7 +76,6 @@ Read 2026-11-04 from engenho's source, against Kubernetes Pod Security Standards
 | 5 | Two pods with one `runAsUser` share an identity; no default `pids.max` or `memory.max` | kakoi identity and cgroup defaults |
 | 6 | `capabilities.add: NET_BIND_SERVICE`, which Restricted allows, needs the root grant, which removes the whole enclosure | kakoi: name capabilities an enclosed pod may keep |
 | 7 | `hostPID`, `hostIPC`, `readOnlyRootFilesystem`, `capabilities.drop`, `seccompProfile`, sysctls and devices are ignored or unread | kakoi facts, refused when they cannot be honoured |
-| 8 | No API audit log; `engenho-apiserver/src/audit.rs` has only test callers | middleware in the apiserver |
 | 9 | Secrets are plaintext in the store | envelope encryption with a node-held key |
 | 10 | No image or closure verification at admission; tameshi's verifier has no caller | the admission rule, then Nix signature checks |
 | 11 | Certificates run to 2100 with no rotation | a shorter span and rotation in `engenho-apiserver/src/pki.rs` |

@@ -1,9 +1,10 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "7de2b02b4d5d1564cbf17523c89beb914c086c43c47ad9659de5e1069bd0e219",
+  "cargo_lock_sha256": "305495a5580be085877bb76f301ae5e521e8cb7d05e457e0745eb1b51dee1ed2",
   "manifest_sha256": {
-    "Cargo.toml": "b9630ca0c5fbb1fbc0e163b71dbc4c3962fbe06e90b38d8726baad7ae3d84c52",
-    "engenho-apiserver/Cargo.toml": "aeef436a3f47aed782c0701805f9932fd99f4bbcd98ca03a2a7f3fff97b544d5",
+    "Cargo.toml": "26dfb1b343e834c428bbf3eafef47bef2309718ae1229d085129acacfc66cc6b",
+    "engenho-apiserver/Cargo.toml": "9067f6fa2bc2ae377fa39f17105775d0a8026c554d3fca62b7a1ceb850381307",
+    "engenho-blue/Cargo.toml": "189fb47c512d35e4aea021453b404938920f29e3e0dd19dcf7741ee9ccd6b14e",
     "engenho-cluster-config-render/Cargo.toml": "5f5f6d40c2b9a572f18418d12e568412517972684259f34a9aa3d34de0a5dc8c",
     "engenho-cluster-config/Cargo.toml": "49d8ea7131956ec2d6323ae41968f624fab66bbbbca1afbb0537b2327a683391",
     "engenho-cni/Cargo.toml": "f885e491a2490e5d1503fafe0f625ada2c38ade0ccac21ee27a6ab595f368945",
@@ -20,7 +21,7 @@
     "engenho-kube-client/Cargo.toml": "91708a8a8ec2457678a3dcb977c6145d09b82a0930e609381cce93af4a1c7b3e",
     "engenho-kube-codegen/Cargo.toml": "2fd91bb5b562a4adbd5f8298595155bcdbb51c52070e49b2efc47cc805a070ea",
     "engenho-kube-proto/Cargo.toml": "7545b21650bdbf36fa4b0592ee3659069a39555f10174f42142bf337b1f1c00b",
-    "engenho-kubelet/Cargo.toml": "d3f49c517ff8503a79f543ccfd913e50a2ab0309ec08c404ed1f6e51c241bf72",
+    "engenho-kubelet/Cargo.toml": "3a1a936ceaac9ffa5f624927d05a4cf446de7cd4d334cea3222705a61791531c",
     "engenho-mcp/Cargo.toml": "a73d0471a92fe4eeb98d75f5ca945aeafcf56c6034e36f47d06bbf980ed9e369",
     "engenho-oracle/Cargo.toml": "9b0da2a6c1d469c28eb0617b8d71df0b0bf6db7751596956e0bb74a6ac979984",
     "engenho-revoada/Cargo.toml": "08cfd6e45e8acfb75f3073e3a70a9a11a9c33575c43509d0199b1e73bb8012f9",
@@ -5467,6 +5468,16 @@
             "tree": "target"
           },
           {
+            "name": "engenho_blue",
+            "package_key": "engenho-blue-0.53.153",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
             "name": "engenho_controllers",
             "package_key": "engenho-controllers-0.53.153",
             "kind": "normal",
@@ -5773,6 +5784,56 @@
             "kind": "normal",
             "features": [
               "axum_extras"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
+      },
+      "engenho-blue-0.53.153": {
+        "runtime_dependencies": [
+          {
+            "name": "blue_lang_host",
+            "package_key": "blue-lang-host-0.0.125",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "serde",
+            "package_key": "serde-1.0.229",
+            "kind": "normal",
+            "features": [
+              "derive"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "serde_json",
+            "package_key": "serde_json-1.0.150",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tokio",
+            "package_key": "tokio-1.52.3",
+            "kind": "normal",
+            "features": [
+              "full"
             ],
             "uses_default_features": true,
             "optional": false,
@@ -7925,8 +7986,8 @@
             "tree": "target"
           },
           {
-            "name": "blue_lang_host",
-            "package_key": "blue-lang-host-0.0.125",
+            "name": "engenho_blue",
+            "package_key": "engenho-blue-0.53.153",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -48385,6 +48446,13 @@
       "edition": "2024",
       "lib_target": {
         "name": "engenho_apiserver",
+        "path": "src/lib.rs"
+      }
+    },
+    "engenho-blue-0.53.153": {
+      "edition": "2024",
+      "lib_target": {
+        "name": "engenho_blue",
         "path": "src/lib.rs"
       }
     },

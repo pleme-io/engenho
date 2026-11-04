@@ -70,6 +70,7 @@ engenho-kube-proto = { workspace = true }
 prost              = "0.14"
 prost-reflect      = "0.16"
 chrono             = "0.4"
+engenho-blue       = { workspace = true }
 # ErrorKind trait + impl_error_kind! macro — stable .kind() tags.
 engenho-substrate  = { workspace = true }
 

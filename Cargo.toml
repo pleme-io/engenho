@@ -12,6 +12,7 @@ members = [
   "engenho-revoada",
   "engenho-store",
   "engenho-apiserver",
+  "engenho-blue",
   "engenho-teia",
   "engenho-scheduler",
   "engenho-controllers",
@@ -63,6 +64,7 @@ engenho-kube-client    = { path = "engenho-kube-client", version = "0.53.153" }
 engenho-kube-proto     = { path = "engenho-kube-proto", version = "0.53.153" }
 engenho-store          = { path = "engenho-store", version = "0.53.153" }
 engenho-apiserver      = { path = "engenho-apiserver", version = "0.53.153" }
+engenho-blue           = { path = "engenho-blue", version = "0.53.153" }
 engenho-serve          = { path = "engenho-serve", version = "0.53.153" }
 engenho-control-types  = { path = "engenho-control-types", version = "0.53.153" }
 engenho-control-server = { path = "engenho-control-server", version = "0.53.153" }

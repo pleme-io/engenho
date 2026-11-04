@@ -233,7 +233,13 @@ async fn full_scrape() -> String {
             at: engenho_substrate::Instant::from_ms(1_758_000_000_000),
         }],
     };
-    let state = RouterState::new(vec![]).with_metrics_source(Arc::new(FixedMetrics(snapshot)));
+    let audit_dir = tempfile::tempdir().expect("tempdir");
+    let state = RouterState::new(vec![])
+        .with_metrics_source(Arc::new(FixedMetrics(snapshot)))
+        .with_audit_log(Arc::new(engenho_apiserver::audit::AuditLog::open(
+            audit_dir.path().join("audit"),
+            engenho_apiserver::audit::AuditLimits::default(),
+        )));
     let shadow = Gate::new("doc_truth", Rollout::Shadow);
     assert!(
         shadow

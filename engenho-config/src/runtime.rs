@@ -157,6 +157,18 @@ pub enum KubeletAuth {
     Off,
 }
 
+/// Whether the apiserver records who did what. `Record` is the default: JSON
+/// lines of `audit.k8s.io/v1` Events under `data_dir/audit`, mode 0600, bounded
+/// by rotation. `Off` records nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(missing_docs)]
+pub enum ApiAudit {
+    #[default]
+    Record,
+    Off,
+}
+
 /// How a node treats the security of a native container.
 ///
 /// `Enforce` is the default: a pod that says nothing runs as a non-root
@@ -394,6 +406,9 @@ pub struct RuntimeConfig {
     pub kubelet_auth: KubeletAuth,
     #[allow(missing_docs)]
     #[serde(default)]
+    pub api_audit: ApiAudit,
+    #[allow(missing_docs)]
+    #[serde(default)]
     pub health_reasons: HealthReasons,
     /// Optional explicit podman binary path.
     ///
@@ -459,6 +474,7 @@ impl TieredConfig for RuntimeConfig {
             native_cgroups: NativeCgroups::Off,
             native_security: NativeSecurity::Enforce,
             kubelet_auth: KubeletAuth::Required,
+            api_audit: ApiAudit::Record,
             health_reasons: HealthReasons::Withheld,
             podman_binary: None,
             host_path_allowlist: Vec::new(),
@@ -525,6 +541,7 @@ impl TieredConfig for RuntimeConfig {
             native_cgroups: NativeCgroups::Delegated,
             native_security: NativeSecurity::Enforce,
             kubelet_auth: KubeletAuth::Required,
+            api_audit: ApiAudit::Record,
             health_reasons: HealthReasons::Named,
             podman_binary: None,
             host_path_allowlist: Vec::new(),
@@ -589,6 +606,7 @@ impl TieredConfig for RuntimeConfig {
             native_cgroups: self.native_cgroups,
             native_security: self.native_security,
             kubelet_auth: self.kubelet_auth,
+            api_audit: self.api_audit,
             health_reasons: self.health_reasons,
             // No "unset" sentinel on an enum whose safe arm is also a
             // meaningful value, so the overlay's value wins — same rule as
@@ -885,6 +903,7 @@ mod tests {
             native_cgroups: NativeCgroups::Off,
             native_security: NativeSecurity::Enforce,
             kubelet_auth: KubeletAuth::Required,
+            api_audit: ApiAudit::Record,
             health_reasons: HealthReasons::Withheld,
             podman_binary: None,
             host_path_allowlist: Vec::new(),
@@ -1322,6 +1341,34 @@ mod native_cgroups_tests {
             EngenhoConfig::from_yaml_with_defaults("runtime:\n  native_cgroups: on\n").is_err(),
             "an unknown arm must not fall back to a default"
         );
+    }
+}
+
+#[cfg(test)]
+mod api_audit_tests {
+    use super::ApiAudit;
+    use crate::EngenhoConfig;
+    use shikumi::TieredConfig;
+
+    #[test]
+    fn a_config_that_does_not_name_it_records() {
+        let cfg = EngenhoConfig::from_yaml_with_defaults("runtime: {}\n").expect("parses");
+        assert_eq!(cfg.runtime.api_audit, ApiAudit::Record);
+        assert_eq!(
+            super::RuntimeConfig::prescribed_default().api_audit,
+            ApiAudit::Record
+        );
+    }
+
+    #[test]
+    fn each_wire_name_reads_back_as_its_variant() {
+        for (wire, want) in [("record", ApiAudit::Record), ("off", ApiAudit::Off)] {
+            let cfg =
+                EngenhoConfig::from_yaml_with_defaults(&format!("runtime:\n  api_audit: {wire}\n"))
+                    .unwrap_or_else(|e| panic!("`{wire}` must parse: {e}"));
+            assert_eq!(cfg.runtime.api_audit, want);
+        }
+        assert!(EngenhoConfig::from_yaml_with_defaults("runtime:\n  api_audit: loud\n").is_err());
     }
 }
 
