@@ -1740,6 +1740,10 @@ impl Mountpoint {
     }
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the podman CLI is a node tool, not a pod's process"
+)]
 impl PodmanVolumeMaterializer {
     /// The mode every `emptyDir` host directory is widened to. Upstream
     /// kubelet's `pkg/volume/empty_dir/empty_dir.go` uses exactly this value;
@@ -1912,6 +1916,10 @@ impl PodmanVolumeMaterializer {
     }
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the podman CLI is a node tool, not a pod's process"
+)]
 #[async_trait]
 impl VolumeMaterializer for PodmanVolumeMaterializer {
     fn name(&self) -> &'static str {

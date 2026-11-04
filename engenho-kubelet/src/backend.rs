@@ -77,6 +77,9 @@ pub struct Confinement {
     /// The reason a pod states for running with root, from its annotation.
     #[serde(default)]
     pub root_grant: Option<String>,
+    /// The blue `access` value a pod carries, as its annotation states it.
+    #[serde(default)]
+    pub access: Option<String>,
 }
 
 impl Default for Confinement {
@@ -99,6 +102,7 @@ impl Default for Confinement {
             run_as_non_root: None,
             allow_escalation: None,
             root_grant: None,
+            access: None,
         }
     }
 }
@@ -129,6 +133,7 @@ impl Confinement {
             run_as_non_root: sc.run_as_non_root,
             allow_escalation: sc.allow_privilege_escalation,
             root_grant: None,
+            access: None,
         }
     }
 
@@ -149,13 +154,16 @@ impl Confinement {
             sc.and_then(|s| s.get("runAsNonRoot"))
                 .and_then(serde_json::Value::as_bool)
         });
-        self.root_grant = pod
-            .get("metadata")
-            .and_then(|m| m.get("annotations"))
-            .and_then(|a| a.get(crate::kakoi::GRANT_ANNOTATION))
-            .and_then(serde_json::Value::as_str)
+        let annotation = |key: &str| {
+            pod.get("metadata")
+                .and_then(|m| m.get("annotations"))
+                .and_then(|a| a.get(key))
+                .and_then(serde_json::Value::as_str)
+        };
+        self.root_grant = annotation(crate::kakoi::GRANT_ANNOTATION)
             .filter(|reason| !reason.trim().is_empty())
             .map(str::to_string);
+        self.access = annotation(crate::kakoi::ACCESS_ANNOTATION).map(str::to_string);
         self
     }
 
@@ -2421,6 +2429,10 @@ impl PodmanBackend {
     /// process env (tokio `Command` inherits by default — we never call
     /// `env_clear`), so an ambient `REGISTRY_AUTH_FILE` flows through
     /// unchanged. podman reads the variable natively.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the podman CLI is a node tool; podman makes the pod's process"
+    )]
     fn command(&self, argv: &[String]) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new(&self.binary);
         cmd.args(argv);

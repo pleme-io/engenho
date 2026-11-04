@@ -150,6 +150,7 @@ impl Pty {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, reason = "tests drive a plain shell")]
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};

@@ -650,6 +650,72 @@ async fn an_enclosed_pod_cannot_write_the_host_or_see_its_secrets_and_keeps_its_
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
+async fn a_pods_access_reaches_the_kernel() {
+    use std::os::unix::fs::MetadataExt;
+    if std::fs::metadata("/proc/self").expect("procfs").uid() != 0 {
+        return;
+    }
+    let tools = closure("nixpkgs#busybox");
+    let open = tempfile::tempdir_in("/var/tmp").expect("volume");
+    let shut = tempfile::tempdir_in("/var/tmp").expect("volume");
+    for dir in [&open, &shut] {
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o777),
+        )
+        .expect("open the volume");
+    }
+    let open_path = open.path().to_string_lossy().to_string();
+    let shut_path = shut.path().to_string_lossy().to_string();
+    let backend = NativeBackend::new(
+        Isolation::HostProcess,
+        std::env::temp_dir().join("engenho-native-e2e-access"),
+        Cgroups::Off,
+    );
+    let mut image = String::from("nix:");
+    image.push_str(&tools);
+    let script = format!(
+        "echo x > {open_path}/f && echo writes-ok; \
+         (echo x > {shut_path}/f) 2>/dev/null || echo narrowed; \
+         test \"$(wc -l < /proc/net/dev)\" = 3 && echo only-loopback || echo host-network; \
+         test -e /nix/var/nix/daemon-socket/socket && echo nix-socket || echo no-nix-socket; \
+         (echo x > /dev/shm/kakoi-shm) && echo shm-ok"
+    );
+    let mut s = spec(&image, &["sh", "-c", &script], &[]);
+    s.pod.namespace = "kakoi-access-test".to_string();
+    s.confinement.access = Some(format!(
+        r#"{{"effects":["filesystem"],"writes":["{open_path}"]}}"#
+    ));
+    s.mounts = [&open, &shut]
+        .iter()
+        .map(|dir| engenho_kubelet::pod_volume::ResolvedMount {
+            source: engenho_kubelet::pod_volume::MountSource::UserHostPath(
+                dir.path().to_path_buf(),
+            ),
+            mount_path: dir.path().to_string_lossy().to_string(),
+            read_only: false,
+            sub_path: None,
+        })
+        .collect();
+    let out = output_of(&backend, &s).await;
+    for expected in [
+        "writes-ok",
+        "narrowed",
+        "only-loopback",
+        "no-nix-socket",
+        "shm-ok",
+    ] {
+        assert!(out.contains(expected), "{expected} missing from: {out}");
+    }
+    assert!(
+        std::fs::metadata(format!("{shut_path}/f")).is_err(),
+        "{out}"
+    );
+    assert!(std::fs::metadata("/dev/shm/kakoi-shm").is_err(), "{out}");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
 async fn a_command_run_in_an_enclosed_pod_enters_its_enclosure() {
     use std::os::unix::fs::MetadataExt;
     if std::fs::metadata("/proc/self").expect("procfs").uid() != 0 {

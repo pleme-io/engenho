@@ -21,6 +21,9 @@ const ENTRY: &str = "use(\"kakoi\")\n";
 /// The pod annotation that grants root; its value is the reason.
 pub const GRANT_ANNOTATION: &str = "kakoi.pleme.io/root";
 
+/// The pod annotation that carries the blue `access` value; it only narrows.
+pub const ACCESS_ANNOTATION: &str = "kakoi.pleme.io/access";
+
 #[derive(Serialize)]
 struct Declared<'a> {
     run_as_user: Option<i64>,
@@ -29,6 +32,9 @@ struct Declared<'a> {
     privileged: bool,
     allow_escalation: Option<bool>,
     cap_add: &'a [String],
+    cap_drop: &'a [String],
+    read_only_root_fs: bool,
+    no_new_privileges: bool,
 }
 
 #[derive(Serialize)]
@@ -40,6 +46,8 @@ struct Facts<'a> {
     can_enforce: bool,
     kernel_decides: bool,
     grant: Option<&'a str>,
+    access: Option<serde_json::Value>,
+    access_invalid: bool,
     declared: Declared<'a>,
 }
 
@@ -90,6 +98,12 @@ pub struct Verdict {
     /// Calls refused for what their first argument asks.
     #[serde(default)]
     pub guards: Vec<Guard>,
+    /// The kernel namespaces the child gets of its own.
+    #[serde(default)]
+    pub namespaces: Vec<String>,
+    /// Volumes that stay read-only, because the pod's access does not write them.
+    #[serde(default)]
+    pub narrowed: Vec<String>,
     /// What the node could not enforce, for an event a reader sees.
     #[serde(default)]
     pub warnings: Vec<String>,
@@ -120,6 +134,22 @@ impl Kakoi {
         mode: NativeSecurity,
         can_enforce: bool,
     ) -> Result<Verdict, String> {
+        let Confinement {
+            privileged,
+            read_only_root_fs,
+            no_new_privileges,
+            cap_drop,
+            cap_add,
+            run_as_user,
+            run_as_group,
+            run_as_non_root,
+            allow_escalation,
+            root_grant,
+            access,
+        } = confinement;
+        let parsed = access
+            .as_deref()
+            .map(serde_json::from_str::<serde_json::Value>);
         let facts = Facts {
             arch: std::env::consts::ARCH,
             namespace,
@@ -127,14 +157,19 @@ impl Kakoi {
             mode,
             can_enforce,
             kernel_decides: cfg!(target_os = "linux"),
-            grant: confinement.root_grant.as_deref(),
+            grant: root_grant.as_deref(),
+            access_invalid: matches!(parsed, Some(Err(_))),
+            access: parsed.and_then(Result::ok),
             declared: Declared {
-                run_as_user: confinement.run_as_user,
-                run_as_group: confinement.run_as_group,
-                run_as_non_root: confinement.run_as_non_root,
-                privileged: confinement.privileged,
-                allow_escalation: confinement.allow_escalation,
-                cap_add: &confinement.cap_add,
+                run_as_user: *run_as_user,
+                run_as_group: *run_as_group,
+                run_as_non_root: *run_as_non_root,
+                privileged: *privileged,
+                allow_escalation: *allow_escalation,
+                cap_add,
+                cap_drop,
+                read_only_root_fs: *read_only_root_fs,
+                no_new_privileges: *no_new_privileges,
             },
         };
         let facts = serde_json::to_string(&facts).map_err(|e| e.to_string())?;
@@ -428,18 +463,25 @@ pub fn enter_on_exec(
             .filter(|p| std::path::Path::new(p).is_dir())
             .cloned(),
     );
+    let stays_read_only = |m: &&Volume| m.read_only || v.narrowed.contains(&m.path);
     let writable = cstrings(
         volumes
             .iter()
-            .filter(|m| !m.read_only)
+            .filter(|m| !stays_read_only(m))
             .map(|m| m.path.clone()),
     );
     let readable = cstrings(
         volumes
             .iter()
-            .filter(|m| m.read_only)
+            .filter(stays_read_only)
             .map(|m| m.path.clone()),
     );
+    let unshare = v
+        .namespaces
+        .iter()
+        .try_fold(UnshareFlags::empty(), |flags, word| {
+            own_namespace(word).map(|(flag, _, _)| flags | flag)
+        })?;
     let filter = seccomp_filter(&v);
     let empty = c"";
     let tmpfs = c"tmpfs";
@@ -454,7 +496,7 @@ pub fn enter_on_exec(
     unsafe {
         cmd.pre_exec(move || {
             if v.enclosed {
-                rustix::thread::unshare_unsafe(UnshareFlags::NEWNS)?;
+                rustix::thread::unshare_unsafe(unshare)?;
                 rustix::mount::mount_change(
                     root,
                     MountPropagationFlags::PRIVATE | MountPropagationFlags::REC,
@@ -586,29 +628,70 @@ pub fn join_on_exec(
         }
         return Ok(());
     }
-    let namespace = if v.enclosed {
+    let mut joined = Vec::new();
+    if v.enclosed {
         let pid = container_pid.ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "the container's process is gone, so its enclosure cannot be joined",
             )
         })?;
-        Some(std::fs::File::open(format!("/proc/{pid}/ns/mnt"))?)
-    } else {
-        None
-    };
+        for word in &v.namespaces {
+            let (_, kind, file) = own_namespace(word)?;
+            joined.push((std::fs::File::open(format!("/proc/{pid}/ns/{file}"))?, kind));
+        }
+    }
     let filter = seccomp_filter(&v);
     #[allow(unsafe_code)]
     unsafe {
         cmd.pre_exec(move || {
-            if let Some(namespace) = &namespace {
-                move_into_link_name_space(namespace.as_fd(), Some(LinkNameSpaceType::Mount))?;
+            for (namespace, kind) in &joined {
+                move_into_link_name_space(namespace.as_fd(), Some(*kind))?;
+            }
+            if v.enclosed {
                 rustix::process::chdir(c"/")?;
             }
             become_declared(&v, &filter)
         });
     }
     Ok(())
+}
+
+/// A namespace blue named, as the kernel knows it: the flag that makes one, the
+/// type that joins one, and its name under `/proc/<pid>/ns`. A word with no row
+/// refuses the pod rather than running it with less than blue decided.
+#[cfg(target_os = "linux")]
+fn own_namespace(
+    word: &str,
+) -> std::io::Result<(
+    rustix::thread::UnshareFlags,
+    rustix::thread::LinkNameSpaceType,
+    &'static str,
+)> {
+    use rustix::thread::{LinkNameSpaceType, UnshareFlags};
+    match word {
+        "mount" => Ok((UnshareFlags::NEWNS, LinkNameSpaceType::Mount, "mnt")),
+        "ipc" => Ok((
+            UnshareFlags::NEWIPC,
+            LinkNameSpaceType::InterProcessCommunication,
+            "ipc",
+        )),
+        "uts" => Ok((
+            UnshareFlags::NEWUTS,
+            LinkNameSpaceType::HostNameAndNISDomainName,
+            "uts",
+        )),
+        "cgroup" => Ok((
+            UnshareFlags::NEWCGROUP,
+            LinkNameSpaceType::ControlGroup,
+            "cgroup",
+        )),
+        "net" => Ok((UnshareFlags::NEWNET, LinkNameSpaceType::Network, "net")),
+        other => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("kakoi named a namespace this seam does not know: {other}"),
+        )),
+    }
 }
 
 /// No enclosure can be entered off Linux; [`can_enforce`] said so first.
@@ -667,6 +750,48 @@ mod tests {
     const ALLOW: u32 = 0x7fff_0000;
     #[cfg(target_os = "linux")]
     const KILL: u32 = 0x8000_0000;
+
+    #[tokio::test]
+    async fn every_host_effect_blue_knows_has_a_rendering_here() {
+        let rendered: Vec<String> = kakoi()
+            .0
+            .ask("kakoi::rendered_capabilities", "{}".to_string())
+            .await
+            .unwrap();
+        for effect in blue_lang_host::Capability::host_effects() {
+            assert!(
+                rendered.iter().any(|row| row == effect.label()),
+                "{} has no row in kakoi::capability_rendering",
+                effect.label()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pods_access_narrows_its_enclosure_and_a_bad_one_refuses_it() {
+        let confined = |access: &str| Confinement {
+            access: Some(access.to_string()),
+            ..Confinement::default()
+        };
+        let volumes = ["/data".to_string(), "/cfg".to_string()];
+        let on = |c: Confinement| {
+            let volumes = volumes.clone();
+            async move {
+                kakoi()
+                    .enclose(&c, "", &volumes, NativeSecurity::Enforce, true)
+                    .await
+                    .unwrap()
+            }
+        };
+        let closed = on(confined(r#"{"effects":["filesystem"],"writes":["/data"]}"#)).await;
+        assert!(closed.namespaces.iter().any(|n| n == "net"));
+        assert_eq!(closed.narrowed, vec!["/cfg".to_string()]);
+        let open = on(Confinement::default()).await;
+        assert!(!open.namespaces.iter().any(|n| n == "net"));
+        assert!(open.narrowed.is_empty());
+        let unread = on(confined("not json")).await;
+        assert!(unread.refused.unwrap().contains(ACCESS_ANNOTATION));
+    }
 
     fn write_as(
         groups: &[&str],

@@ -32,6 +32,8 @@
 //!   S13 a SPDY upgrade without `portforward.k8s.io` is a 403 naming it, and
 //!      a stream without a port is refused, not paired
 
+#![allow(clippy::disallowed_methods, reason = "the test drives plain processes")]
+
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;

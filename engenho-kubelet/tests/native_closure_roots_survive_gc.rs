@@ -11,6 +11,11 @@
 //! Needs `nix-store`; like the other native tests it fails rather than skips
 //! without one.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "the test drives nix-store itself"
+)]
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

@@ -231,6 +231,10 @@ impl NixClosureStore {
 
     /// `nix-store --realise <closure> --add-root <link>`: substitutes the
     /// closure when it is missing, and registers `link` as an indirect root.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "nix-store is a node tool, not a pod's process"
+    )]
     async fn realise(&self, closure: &Path, link: &Path) -> Result<(), String> {
         let mut cmd = tokio::process::Command::new(&self.nix_store);
         cmd.arg("--realise")

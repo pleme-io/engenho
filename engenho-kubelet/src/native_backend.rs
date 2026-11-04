@@ -489,6 +489,10 @@ fn workload_command<'a>(
     args: impl IntoIterator<Item = &'a String>,
     env: &std::collections::BTreeMap<String, String>,
 ) -> tokio::process::Command {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the door: every caller passes this through kakoi::enter_on_exec"
+    )]
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args);
     cmd.env_clear();
@@ -1307,6 +1311,10 @@ impl NativeBackend {
             };
             (container.verdict.clone(), pid)
         };
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "the door: the next line passes this through kakoi::join_on_exec"
+        )]
         let mut cmd = tokio::process::Command::new(&target);
         cmd.args(argv.iter().skip(1));
         crate::kakoi::join_on_exec(&mut cmd, &verdict, pid).map_err(|e| NativeError::Spawn {

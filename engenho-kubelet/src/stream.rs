@@ -465,6 +465,7 @@ impl AttachPoint {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, reason = "tests drive a plain shell")]
 mod tests {
     use super::*;
 

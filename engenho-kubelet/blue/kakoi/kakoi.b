@@ -6,6 +6,8 @@ Secure is what a pod gets by saying nothing: a non-root account, no new privileg
     default_uid #=> 65532
 """
 
+use("retsu", %i[last without])
+
 @doc """
 field: A record's value at a key, or the default when it is absent or the record is not one.
 
@@ -66,6 +68,12 @@ def hidden_paths()
     /var/lib
     /var/log
     /srv
+    /nix/var/nix/daemon-socket
+    /run/dbus
+    /run/user
+    /run/podman
+    /run/docker
+    /run/containerd
   ]
 end
 
@@ -83,7 +91,7 @@ end
 @doc """
 hide_list: The hidden paths that do not hold or sit inside one of the container's own volumes.
 
-    hide_list(["/var/lib/app"]) == remove_item(hidden_paths, "/var/lib") #=> true
+    hide_list(["/var/lib/app"]) == without(hidden_paths, "/var/lib") #=> true
 """
 def hide_list(volumes)
   filter(
@@ -97,20 +105,160 @@ end
 @doc """
 scratch_list: The directories an enclosed container gets fresh and private, unless its own volume lives in one.
 
-    scratch_list([]) #=> ["/tmp", "/var/tmp"]
-    scratch_list(["/var/tmp/job"]) #=> ["/tmp"]
+    scratch_list([]) #=> ["/tmp", "/var/tmp", "/dev/shm"]
+    scratch_list(["/var/tmp/job"]) #=> ["/tmp", "/dev/shm"]
 """
 def scratch_list(volumes)
   filter(
     (dir) -> not any?((v) -> under?(v, dir) or under?(dir, v), volumes),
-    %w[/tmp /var/tmp]
+    %w[/tmp /var/tmp /dev/shm]
   )
 end
 
-def remove_item(xs, x)
-  filter((y) -> y != x, xs)
+@doc """
+access_annotation: The pod annotation that carries the access value a Bluefile declares, rendered by haibi. It only narrows, so writing it takes no grant.
+
+    access_annotation #=> "kakoi.pleme.io/access"
+"""
+def access_annotation()
+  "kakoi.pleme.io/access"
 end
 
+@doc """
+effect?: Whether an access allows an effect. A pod with no access declares none of this, so nothing narrows.
+
+    effect?(nil, "network") #=> true
+    effect?({"effects" => ["clock"]}, "network") #=> false
+    effect?({"effects" => ["network"]}, "network") #=> true
+    effect?({"writes" => []}, "network") #=> true
+"""
+def effect?(access, word)
+  if access.nil? or field(access, "effects", nil).nil?
+    true
+  else
+    member?(word, access["effects"])
+  end
+end
+
+@doc """
+namespaces: The kernel namespaces an enclosed container gets of its own. An access without the network effect gets an empty network.
+
+    namespaces(nil) #=> ["mount", "ipc", "uts", "cgroup"]
+    last(namespaces({"effects" => ["clock"]})) #=> "net"
+"""
+def namespaces(access)
+  own = %w[mount ipc uts cgroup]
+  if effect?(access, "network")
+    own
+  else
+    append(own, ["net"])
+  end
+end
+
+@doc """
+narrowed: The container's volumes its access does not let it write, which stay read-only. A pod with no access keeps what its spec declares.
+
+    narrowed(nil, ["/data"]) #=> []
+    narrowed({"writes" => ["/data"]}, ["/data", "/cfg"]) #=> ["/cfg"]
+    narrowed({"writes" => ["/data"], "effects" => ["clock"]}, ["/data"]) #=> ["/data"]
+    narrowed({"effects" => ["clock"]}, ["/x"]) #=> ["/x"]
+"""
+def narrowed(access, volumes)
+  if access.nil?
+    []
+  elsif not effect?(access, "filesystem")
+    volumes
+  else
+    writes = field(access, "writes", [])
+    filter((v) -> not any?((w) -> under?(v, w), writes), volumes)
+  end
+end
+
+@doc """
+access_refusal: Why an access cannot be true, or nil, as blue judges the same fields in a Bluefile.
+
+    access_refusal({"writes" => ["/x"], "effects" => ["clock"]}) #=> "access writes /x without the filesystem effect"
+    access_refusal({"listen" => [80], "effects" => ["clock"]}) #=> "access listens without the network effect"
+    access_refusal({"effects" => ["clock"]}) #=> nil
+    access_refusal(nil) #=> nil
+"""
+def access_refusal(access)
+  writes = field(access, "writes", [])
+  if length(writes) != 0 and not effect?(access, "filesystem")
+    "access writes #{join(writes, ", ")} without the filesystem effect"
+  elsif length(field(access, "listen", [])) != 0 and
+      not effect?(access, "network")
+    "access listens without the network effect"
+  end
+end
+
+@doc """
+capability_rendering: What the enclosure does with each of blue's host effects. A row may say the kernel has no door; it may not be absent, and engenho's build fails on an effect with no row.
+
+    retsu::first(capability_rendering) #=> ["network", "an empty network namespace when refused"]
+"""
+def capability_rendering()
+  [
+    ["network", "an empty network namespace when refused"],
+    ["filesystem", "no writable volume when refused"],
+    ["process", "no kernel door yet: the engine refuses it"],
+    ["environment", "no kernel door: engine only"],
+    [
+      "clock",
+      "setting the clock is always denied; reading it has no kernel door"
+    ],
+    ["entropy", "no kernel door: engine only"],
+    ["comm-flash", "no device until a row says so"],
+    ["comm-scavenger", "no device until a row says so"],
+    ["mpc-threshold", "no kernel door: engine only"],
+    ["storage-append", "follows filesystem"],
+    ["audio-out", "no device until a row says so"],
+    ["audio-in", "no device until a row says so"],
+    ["display", "no device until a row says so"],
+    ["kernel-bpf", "named capabilities by grant"]
+  ]
+end
+
+@doc """
+rendered_capabilities: The effects capability_rendering has a row for, as an answer the seam can read.
+
+    member?("network", json_read(rendered_capabilities("{}"))) #=> true
+"""
+def rendered_capabilities(_facts_text)
+  json_stringify(map(retsu::first, capability_rendering))
+end
+
+@doc """
+unhonoured: What a granted pod declares that a grant cannot apply, since a grant keeps no enclosure.
+
+    unhonoured({"read_only_root_fs" => true}) #=> ["readOnlyRootFilesystem"]
+    unhonoured({"cap_drop" => ["ALL"]}) #=> ["capabilities.drop"]
+    unhonoured({"no_new_privileges" => true}) #=> ["allowPrivilegeEscalation: false"]
+    unhonoured({}) #=> []
+"""
+def unhonoured(declared)
+  append(
+    if field(declared, "read_only_root_fs", false)
+      ["readOnlyRootFilesystem"]
+    else
+      []
+    end,
+    if length(field(declared, "cap_drop", [])) != 0
+      ["capabilities.drop"]
+    else
+      []
+    end,
+    if field(declared, "no_new_privileges", false)
+      ["allowPrivilegeEscalation: false"]
+    else
+      []
+    end
+  )
+end
+
+@doc """
+any?: Whether f accepts some element; false for [].
+"""
 def any?(f, xs)
   length(filter(f, xs)) != 0
 end
@@ -118,7 +266,7 @@ end
 @doc """
 denied_syscalls: What an enclosed container may never call: changing what it can see, reaching other processes or the kernel's own machinery. Each is a name and its number on x86_64 and aarch64, nil where the architecture has none.
 
-    first(denied_syscalls) #=> ["mount", 165, 40]
+    retsu::first(denied_syscalls) #=> ["mount", 165, 40]
 """
 def denied_syscalls()
   [
@@ -188,7 +336,7 @@ end
 @doc """
 withheld_syscalls: Calls answered as though this kernel lacked them, so a C library falls back to one the filter can read. clone3 keeps its flags in user memory, where no filter can see them.
 
-    first(withheld_syscalls) #=> ["clone3", 435, 435]
+    retsu::first(withheld_syscalls) #=> ["clone3", 435, 435]
 """
 def withheld_syscalls()
   [["clone3", 435, 435]]
@@ -247,7 +395,7 @@ end
 @doc """
 guarded_calls: Calls allowed except for what their first argument asks: clone with any namespace flag, which would reach what unshare is denied, and a socket of the kernel crypto or vsock families.
 
-    first(guarded_calls("x86_64"))["mask"] #=> 2114060288
+    retsu::first(guarded_calls("x86_64"))["mask"] #=> 2114060288
     last(guarded_calls("aarch64"))["number"] #=> 198
     guarded_calls("riscv64") #=> []
 """
@@ -408,7 +556,7 @@ def declared_only(facts)
   [declared["run_as_user"], declared["run_as_group"]]
 end
 
-def verdict_text(refused, ids, confine, warnings, volumes?, arch?)
+def verdict_text(refused, ids, confine, warnings, volumes?, arch?, access?)
   own = volumes or []
   json_stringify(
     {
@@ -446,6 +594,16 @@ def verdict_text(refused, ids, confine, warnings, volumes?, arch?)
       else
         []
       end,
+      "namespaces" => if confine
+        namespaces(access)
+      else
+        []
+      end,
+      "narrowed" => if confine
+        narrowed(access, own)
+      else
+        []
+      end,
       "warnings" => warnings
     }
   )
@@ -459,7 +617,14 @@ enclose: The verdict for one container: refused or its identity, what it keeps, 
 def enclose(facts_text)
   facts = json_read(facts_text)
   mode = field(facts, "mode", "enforce")
-  why = refusal(facts)
+  access = field(facts, "access", nil)
+  why = if field(facts, "access_invalid", false)
+    "the annotation #{access_annotation} does not read as an access value"
+  elsif access_refusal(access) != nil
+    access_refusal(access)
+  else
+    refusal(facts)
+  end
   outside = outside_range(field(facts, "declared", {}))
   if outside != nil
     verdict_text(outside, [nil, nil], false, [])
@@ -505,13 +670,25 @@ def enclose(facts_text)
         []
       )
     else
+      lost = if granted
+        unhonoured(field(facts, "declared", {}))
+      else
+        []
+      end
       verdict_text(
         nil,
         identity(facts),
         not granted,
-        [],
+        if length(lost) == 0
+          []
+        else
+          [
+            "this pod's root grant keeps no enclosure, so #{join(lost, ", ")} is not applied"
+          ]
+        end,
         field(facts, "volumes", []),
-        arch
+        arch,
+        access
       )
     end
   end
@@ -528,7 +705,7 @@ def dig(value, path)
   if length(path) == 0
     value
   else
-    dig(field(value, first(path), nil), rest(path))
+    dig(field(value, retsu::first(path), nil), retsu::rest(path))
   end
 end
 
@@ -552,7 +729,7 @@ def grant_in(object)
   if length(found) == 0
     nil
   else
-    first(found)
+    retsu::first(found)
   end
 end
 
@@ -601,6 +778,59 @@ end
 
 def granting_pod(reason)
   {"metadata" => {"annotations" => {grant_annotation => reason}}}
+end
+
+def enforced(extra)
+  {
+    "mode" => "enforce",
+    "can_enforce" => true,
+    "declared" => field(extra, "declared", {}),
+    "volumes" => field(extra, "volumes", []),
+    "access" => field(extra, "access", nil),
+    "access_invalid" => field(extra, "access_invalid", false),
+    "grant" => field(extra, "grant", nil)
+  }
+end
+
+test "an access narrows the enclosure and never widens it"
+  plain = answer(enforced({"volumes" => ["/data"]}))
+  assert plain.namespaces == %w[mount ipc uts cgroup]
+  assert plain.narrowed == []
+  closed = answer(
+    enforced(
+      {
+        "volumes" => %w[/data /cfg],
+        "access" => {"effects" => %w[filesystem clock], "writes" => ["/data"]}
+      }
+    )
+  )
+  assert member?("net", closed.namespaces)
+  assert closed.narrowed == ["/cfg"]
+  assert closed.enclosed == true
+  granted = answer(
+    enforced({"grant" => "x", "access" => {"effects" => ["clock"]}})
+  )
+  assert granted.namespaces == []
+end
+
+test "an access that cannot be true refuses that pod under enforce and warns under audit"
+  bad = {"access" => {"effects" => ["clock"], "writes" => ["/x"]}}
+  assert contains?(answer(enforced(bad)).refused, "filesystem effect")
+  unread = {"access_invalid" => true}
+  assert contains?(answer(enforced(unread)).refused, access_annotation)
+  audit = answer(assoc(enforced(bad), "mode", "audit"))
+  assert audit.refused.nil?
+  assert contains?(retsu::first(audit.warnings), "would refuse")
+end
+
+test "a grant says what it cannot apply"
+  v = answer(
+    enforced({"grant" => "x", "declared" => {"read_only_root_fs" => true}})
+  )
+  assert v.refused.nil?
+  assert contains?(retsu::first(v.warnings), "readOnlyRootFilesystem")
+  enclosed = answer(enforced({"declared" => {"read_only_root_fs" => true}}))
+  assert length(enclosed.warnings) == 0
 end
 
 test "only a holder may add or change a root grant, anywhere it would reach a pod"
@@ -809,8 +1039,8 @@ test "an enclosure withholds clone3, guards clone and socket, and stops at the n
   )
   assert v.absent == [435]
   assert v.newest == newest_allowed_syscall
-  assert first(v.guards)["number"] == 220
-  assert first(v.guards)["mask"] == 2_114_060_288
+  assert retsu::first(v.guards)["number"] == 220
+  assert retsu::first(v.guards)["mask"] == 2_114_060_288
   assert last(v.guards)["values"] == [38, 40]
   granted = answer(
     {
@@ -835,7 +1065,7 @@ end
 
 test "every denied call names a number on some architecture and none repeats"
   assert every?((row) -> row[1] != nil or row[2] != nil, denied_syscalls)
-  assert length(distinct(map(first, denied_syscalls))) ==
+  assert length(distinct(map(retsu::first, denied_syscalls))) ==
     length(denied_syscalls)
   assert length(distinct(denied_numbers("x86_64"))) ==
     length(denied_numbers("x86_64"))
@@ -882,7 +1112,7 @@ test "audit applies only what is declared, and says what enforce would refuse"
   assert v.refused.nil?
   assert v.uid == 0
   assert v.no_new_privs == false
-  assert contains?(first(v.warnings), "would refuse under enforce")
+  assert contains?(retsu::first(v.warnings), "would refuse under enforce")
   quiet = answer({"mode" => "audit", "can_enforce" => true, "declared" => {}})
   assert quiet.uid.nil?
   assert length(quiet.warnings) == 0
@@ -918,7 +1148,7 @@ test "a node that cannot enforce never claims it did"
   assert v.refused.nil?
   assert v.uid.nil?
   assert v.no_new_privs == false
-  assert contains?(first(v.warnings), "cannot change identity")
+  assert contains?(retsu::first(v.warnings), "cannot change identity")
 end
 
 test "an unprivileged daemon on Linux hands a declared uid to the kernel to refuse, never its own account in its place"
@@ -933,7 +1163,7 @@ test "an unprivileged daemon on Linux hands a declared uid to the kernel to refu
   assert v.refused.nil?
   assert v.uid == 65534
   assert v.enclosed == false
-  assert contains?(first(v.warnings), "the kernel refuses")
+  assert contains?(retsu::first(v.warnings), "the kernel refuses")
   silent = answer(
     {
       "mode" => "enforce",

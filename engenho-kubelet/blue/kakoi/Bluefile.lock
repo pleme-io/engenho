@@ -1,11 +1,13 @@
 {
   "schema": 1,
-  "bluefile_b3": "b3:0d7479cc994808b9ffc819791d2dd85feb59205ed929d819d6a3e659cf251d10",
+  "bluefile_b3": "b3:5f280b1353c34ff7e47e69433472ee987f1801406e513ca9a917a522ce209d4b",
   "manifest": {
     "schema": 1,
     "name": "kakoi",
     "version": "0.1.0",
-    "needs": {},
+    "needs": {
+      "retsu": "^0.1.0"
+    },
     "when": "anytime",
     "sources": {},
     "packages": [],
