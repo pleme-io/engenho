@@ -4,6 +4,7 @@
 //! program is loaded under an empty posture: it decides from the facts it is
 //! handed and reaches nothing, and Rust applies its verdict.
 
+pub use blue_lang_host::Capability;
 use blue_lang_host::{Embedded, Entry, Program};
 use tokio::sync::oneshot;
 

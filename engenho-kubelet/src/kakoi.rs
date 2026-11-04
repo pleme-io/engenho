@@ -758,7 +758,7 @@ mod tests {
             .ask("kakoi::rendered_capabilities", "{}".to_string())
             .await
             .unwrap();
-        for effect in blue_lang_host::Capability::host_effects() {
+        for effect in engenho_blue::Capability::host_effects() {
             assert!(
                 rendered.iter().any(|row| row == effect.label()),
                 "{} has no row in kakoi::capability_rendering",
