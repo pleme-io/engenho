@@ -142,6 +142,7 @@ pub enum Reason {
     /// why it is surfaced where `kubectl describe` shows it.
     NetworkPolicyNotEnforced,
     ResourcesNotEnforced,
+    ConfinementNotEnforced,
     // ── rollout gates ──
     /// A gate in Shadow allowed what Enforce would refuse. The string is
     /// [`engenho_substrate::WouldReject::EVENT_REASON`], owned by the
@@ -181,6 +182,7 @@ impl Reason {
             Self::VolumeFailedDelete => "VolumeFailedDelete",
             Self::NetworkPolicyNotEnforced => "NetworkPolicyNotEnforced",
             Self::ResourcesNotEnforced => "ResourcesNotEnforced",
+            Self::ConfinementNotEnforced => "ConfinementNotEnforced",
             Self::WouldReject => engenho_substrate::WouldReject::EVENT_REASON,
         }
     }
@@ -209,6 +211,7 @@ impl Reason {
             | Self::FailedToUpdateEndpoint
             | Self::NetworkPolicyNotEnforced
             | Self::ResourcesNotEnforced
+            | Self::ConfinementNotEnforced
             | Self::WouldReject => Severity::Warning,
             Self::Pulled
             | Self::Created
@@ -367,6 +370,7 @@ mod tests {
             Reason::FailedToUpdateEndpoint,
             Reason::NetworkPolicyNotEnforced,
             Reason::ResourcesNotEnforced,
+            Reason::ConfinementNotEnforced,
             Reason::ProbeBlind,
             Reason::WouldReject,
         ] {

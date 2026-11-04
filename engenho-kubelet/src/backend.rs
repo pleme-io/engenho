@@ -66,6 +66,17 @@ pub struct Confinement {
     pub run_as_user: Option<i64>,
     /// gid to run as, when the Pod says so.
     pub run_as_group: Option<i64>,
+    /// `runAsNonRoot`, when the Pod says so.
+    #[serde(default)]
+    pub run_as_non_root: Option<bool>,
+    /// `allowPrivilegeEscalation` as stated. `no_new_privileges` is Kubernetes'
+    /// reading of it; a backend whose own default is stricter needs to tell
+    /// "said true" from "said nothing".
+    #[serde(default)]
+    pub allow_escalation: Option<bool>,
+    /// The reason a pod states for running with root, from its annotation.
+    #[serde(default)]
+    pub root_grant: Option<String>,
 }
 
 impl Default for Confinement {
@@ -85,6 +96,9 @@ impl Default for Confinement {
             cap_add: Vec::new(),
             run_as_user: None,
             run_as_group: None,
+            run_as_non_root: None,
+            allow_escalation: None,
+            root_grant: None,
         }
     }
 }
@@ -112,7 +126,37 @@ impl Confinement {
             cap_add: caps.map(|c| c.add.clone()).unwrap_or_default(),
             run_as_user: sc.run_as_user,
             run_as_group: sc.run_as_group,
+            run_as_non_root: sc.run_as_non_root,
+            allow_escalation: sc.allow_privilege_escalation,
+            root_grant: None,
         }
+    }
+
+    /// Fill what the container left unset from its pod, as Kubernetes does: a
+    /// container's own field wins, and only these three exist at both levels.
+    /// Read at this one place because a backend that reads only the container
+    /// silently drops the pod's, and the workload runs as whoever the daemon is.
+    #[must_use]
+    pub fn inheriting_pod(mut self, pod: &serde_json::Value) -> Self {
+        let sc = pod.get("spec").and_then(|s| s.get("securityContext"));
+        let int = |k: &str| {
+            sc.and_then(|s| s.get(k))
+                .and_then(serde_json::Value::as_i64)
+        };
+        self.run_as_user = self.run_as_user.or_else(|| int("runAsUser"));
+        self.run_as_group = self.run_as_group.or_else(|| int("runAsGroup"));
+        self.run_as_non_root = self.run_as_non_root.or_else(|| {
+            sc.and_then(|s| s.get("runAsNonRoot"))
+                .and_then(serde_json::Value::as_bool)
+        });
+        self.root_grant = pod
+            .get("metadata")
+            .and_then(|m| m.get("annotations"))
+            .and_then(|a| a.get(crate::kakoi::GRANT_ANNOTATION))
+            .and_then(serde_json::Value::as_str)
+            .filter(|reason| !reason.trim().is_empty())
+            .map(str::to_string);
+        self
     }
 
     /// Read a container's `securityContext` out of the Pod JSON.
@@ -926,6 +970,12 @@ pub trait ContainerRuntime: Send + Sync {
     }
 
     #[allow(missing_docs)]
+    /// What this backend would not enforce for `spec`, for an event a reader
+    /// sees. Empty for a backend that has its own confinement.
+    async fn confinement_warnings(&self, _spec: &ContainerSpec) -> Vec<String> {
+        Vec::new()
+    }
+
     fn resource_enforcement(&self) -> crate::cgroup::ResourceEnforcement;
 
     /// Run `argv` inside a previously-started container (`podman exec <id>

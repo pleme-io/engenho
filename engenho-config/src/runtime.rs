@@ -146,6 +146,23 @@ pub enum NativeCgroups {
     Off,
 }
 
+/// How a node treats the security of a native container.
+///
+/// `Enforce` is the default: a pod that says nothing runs as a non-root
+/// account with no new privileges and no capabilities, and root takes a grant.
+/// `Audit` applies what a pod declares and records what `Enforce` would
+/// refuse, for bringing an existing node across. `Off` applies what a pod
+/// declares and says nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(missing_docs)]
+pub enum NativeSecurity {
+    #[default]
+    Enforce,
+    Audit,
+    Off,
+}
+
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -360,6 +377,9 @@ pub struct RuntimeConfig {
     pub native_cgroups: NativeCgroups,
     #[allow(missing_docs)]
     #[serde(default)]
+    pub native_security: NativeSecurity,
+    #[allow(missing_docs)]
+    #[serde(default)]
     pub health_reasons: HealthReasons,
     /// Optional explicit podman binary path.
     ///
@@ -423,6 +443,7 @@ impl TieredConfig for RuntimeConfig {
             etcd_listen_addr: String::new(),
             kubelet_backend: KubeletBackendKind::Fake,
             native_cgroups: NativeCgroups::Off,
+            native_security: NativeSecurity::Enforce,
             health_reasons: HealthReasons::Withheld,
             podman_binary: None,
             host_path_allowlist: Vec::new(),
@@ -487,6 +508,7 @@ impl TieredConfig for RuntimeConfig {
             // overridden on every node to be correct.
             kubelet_backend: KubeletBackendKind::PodmanApi,
             native_cgroups: NativeCgroups::Delegated,
+            native_security: NativeSecurity::Enforce,
             health_reasons: HealthReasons::Named,
             podman_binary: None,
             host_path_allowlist: Vec::new(),
@@ -549,6 +571,7 @@ impl TieredConfig for RuntimeConfig {
             },
             kubelet_backend: self.kubelet_backend,
             native_cgroups: self.native_cgroups,
+            native_security: self.native_security,
             health_reasons: self.health_reasons,
             // No "unset" sentinel on an enum whose safe arm is also a
             // meaningful value, so the overlay's value wins — same rule as
@@ -843,6 +866,7 @@ mod tests {
             etcd_listen_addr: String::new(),
             kubelet_backend: KubeletBackendKind::Fake,
             native_cgroups: NativeCgroups::Off,
+            native_security: NativeSecurity::Enforce,
             health_reasons: HealthReasons::Withheld,
             podman_binary: None,
             host_path_allowlist: Vec::new(),

@@ -122,7 +122,13 @@ pub fn make_container_runtime_with_apiserver(
     podman_binary: Option<&str>,
     apiserver: Option<(String, u16)>,
 ) -> Result<Arc<dyn ContainerRuntime>, BackendRefused> {
-    make_container_runtime_on_node(kind, podman_binary, apiserver, NativeCgroups::default())
+    make_container_runtime_on_node(
+        kind,
+        podman_binary,
+        apiserver,
+        NativeCgroups::default(),
+        engenho_config::NativeSecurity::default(),
+    )
 }
 
 #[allow(missing_docs, clippy::missing_errors_doc)]
@@ -131,6 +137,7 @@ pub fn make_container_runtime_on_node(
     podman_binary: Option<&str>,
     apiserver: Option<(String, u16)>,
     native_cgroups: NativeCgroups,
+    native_security: engenho_config::NativeSecurity,
 ) -> Result<Arc<dyn ContainerRuntime>, BackendRefused> {
     if let Some(refused) = construction_refusal(kind) {
         return Err(refused);
@@ -224,14 +231,17 @@ pub fn make_container_runtime_on_node(
             }
         }
         KubeletBackendKind::Fake => Arc::new(FakeBackend::new()),
-        KubeletBackendKind::Native => Arc::new(crate::native_backend::NativeBackend::new(
-            // The honest tier, named at the construction site so it appears in
-            // review rather than only in a doc comment: this backend confines
-            // nothing yet. See native_backend's module docs.
-            crate::native_backend::Isolation::HostProcess,
-            native_log_dir(),
-            crate::cgroup::Cgroups::select(native_cgroups),
-        )),
+        KubeletBackendKind::Native => Arc::new(
+            crate::native_backend::NativeBackend::new(
+                // The honest tier, named at the construction site so it appears in
+                // review rather than only in a doc comment: this backend confines
+                // nothing yet. See native_backend's module docs.
+                crate::native_backend::Isolation::HostProcess,
+                native_log_dir(),
+                crate::cgroup::Cgroups::select(native_cgroups),
+            )
+            .with_security(native_security),
+        ),
     };
     Ok(Arc::new(
         crate::runtime_class::RuntimeClassRouter::new(runtime).with_class(

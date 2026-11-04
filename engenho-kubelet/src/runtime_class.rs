@@ -85,6 +85,10 @@ impl ContainerRuntime for RuntimeClassRouter {
             .map_or_else(|| self.default.readoption(), |runtime| runtime.readoption())
     }
 
+    async fn confinement_warnings(&self, spec: &ContainerSpec) -> Vec<String> {
+        self.default.confinement_warnings(spec).await
+    }
+
     fn resource_enforcement(&self) -> crate::cgroup::ResourceEnforcement {
         self.default.resource_enforcement()
     }

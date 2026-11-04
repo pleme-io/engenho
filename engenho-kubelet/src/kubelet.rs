@@ -1838,7 +1838,8 @@ impl Kubelet {
                         c.get("securityContext"),
                         &format!("{namespace}/{name}"),
                         &cname,
-                    )?,
+                    )?
+                    .inheriting_pod(pod),
                     // Extra /etc/hosts entries; the backend fills in
                     // host.containers.internal on Linux native when needed.
                     host_add: Vec::new(),
@@ -4240,6 +4241,22 @@ impl Kubelet {
     /// # Errors
     ///
     /// [`LaunchFailed`]: the runtime's error and what it cost on the curve.
+    async fn report_unenforced_confinement(&self, spec: &ContainerSpec) {
+        for why in self.backend.confinement_warnings(spec).await {
+            engenho_controllers::event_recorder::record_pod_event(
+                self.events.as_ref(),
+                &spec.pod.namespace,
+                &spec.pod.name,
+                None,
+                engenho_controllers::event_recorder::Reason::ConfinementNotEnforced,
+                format!("container {}: {why}", spec.pod.container_name),
+                KUBELET_COMPONENT,
+                &engenho_types::time::now_rfc3339_utc(),
+            )
+            .await;
+        }
+    }
+
     async fn report_unenforced_resources(&self, spec: &ContainerSpec) {
         let crate::cgroup::ResourceEnforcement::NotEnforced(why) =
             self.backend.resource_enforcement()
@@ -4279,6 +4296,7 @@ impl Kubelet {
             Ok(status) => {
                 self.start_ledger.lock().await.succeeded(permit);
                 self.report_unenforced_resources(spec).await;
+                self.report_unenforced_confinement(spec).await;
                 Ok(status)
             }
             Err(cause) => {

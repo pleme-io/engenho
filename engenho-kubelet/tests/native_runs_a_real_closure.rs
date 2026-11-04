@@ -523,6 +523,84 @@ async fn a_limited_container_joins_its_leaf_before_it_runs_and_the_leaf_goes_whe
 }
 
 #[cfg(target_os = "linux")]
+async fn output_of(backend: &NativeBackend, s: &engenho_kubelet::backend::ContainerSpec) -> String {
+    let started = backend.start(s).await.expect("start");
+    for _ in 0..250 {
+        let st = backend
+            .status(&started.container_id)
+            .await
+            .expect("status")
+            .expect("tracked");
+        if !st.is_running() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    backend
+        .logs(&started.container_id, &LogOptions::default())
+        .await
+        .expect("logs")
+}
+
+#[cfg(target_os = "linux")]
+fn status_field<'a>(text: &'a str, key: &str) -> &'a str {
+    text.lines()
+        .find_map(|l| l.split_once(key))
+        .map_or("", |(_, v)| v.trim())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_pod_that_says_nothing_runs_unprivileged_as_the_kernel_reports_it() {
+    use std::os::unix::fs::MetadataExt;
+    if std::fs::metadata("/proc/self").expect("procfs").uid() != 0 {
+        return;
+    }
+    let coreutils = closure("nixpkgs#coreutils");
+    let backend = NativeBackend::new(
+        Isolation::HostProcess,
+        std::env::temp_dir().join("engenho-native-e2e-kakoi"),
+        Cgroups::Off,
+    );
+    let mut image = String::from("nix:");
+    image.push_str(&coreutils);
+    let s = spec(&image, &["cat", "/proc/self/status"], &[]);
+    let out = output_of(&backend, &s).await;
+    assert!(status_field(&out, "Uid:").starts_with("65532"), "{out}");
+    assert!(status_field(&out, "Gid:").starts_with("65532"), "{out}");
+    assert_eq!(status_field(&out, "NoNewPrivs:"), "1", "{out}");
+    assert_eq!(status_field(&out, "CapEff:"), "0000000000000000", "{out}");
+    assert_eq!(status_field(&out, "CapPrm:"), "0000000000000000", "{out}");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn root_starts_only_with_a_grant_and_the_kernel_agrees() {
+    use std::os::unix::fs::MetadataExt;
+    if std::fs::metadata("/proc/self").expect("procfs").uid() != 0 {
+        return;
+    }
+    let coreutils = closure("nixpkgs#coreutils");
+    let backend = NativeBackend::new(
+        Isolation::HostProcess,
+        std::env::temp_dir().join("engenho-native-e2e-grant"),
+        Cgroups::Off,
+    );
+    let mut image = String::from("nix:");
+    image.push_str(&coreutils);
+    let mut s = spec(&image, &["cat", "/proc/self/status"], &[]);
+    s.confinement.run_as_user = Some(0);
+    let refused = backend.start(&s).await.expect_err("root with no grant");
+    assert!(
+        refused.to_string().contains("kakoi.pleme.io/root"),
+        "{refused}"
+    );
+    s.confinement.root_grant = Some("this test".to_string());
+    let out = output_of(&backend, &s).await;
+    assert!(status_field(&out, "Uid:").starts_with('0'), "{out}");
+}
+
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn the_pods_run_as_user_is_the_workloads_uid_on_linux() {
     use std::os::unix::fs::MetadataExt;

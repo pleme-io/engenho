@@ -17,7 +17,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
-use blue_lang_host::{Embedded, Entry, Program};
 use serde::{Deserialize, Serialize};
 use tatara_wasm::wasmtime_impl::WasmtimeEngine;
 use tatara_wasm::{
@@ -25,12 +24,12 @@ use tatara_wasm::{
     WasmCapabilities, WasmEngine, WasmExit, WasmFeatures, WasmLimits, WasmModuleSource,
     WasmProcess, WasmRuntime, WasmSpawn,
 };
-use tokio::sync::oneshot;
 
 use crate::backend::{
     ContainerRuntime, ContainerSpec, ContainerStatus, ExecOutcome, LogOptions, LogRead, Readoption,
     RuntimeClassRequest,
 };
+use crate::blue_worker::BlueWorker;
 use crate::cgroup::ResourceEnforcement;
 use crate::cri::{ExitDisposition, RunState};
 use crate::cri_log::{LogStream, RecordEncoder};
@@ -242,23 +241,11 @@ struct ProbeAnswer {
     stderr: String,
 }
 
-enum Call {
-    Admit(String),
-    Supervise(String),
-    Probe(String),
-}
-
-struct Job {
-    call: Call,
-    reply: oneshot::Sender<Result<String, String>>,
-}
-
-/// The `kidou` program, running on its own thread: a loaded blue program is
-/// not `Send`, so calls reach it over a channel.
+/// The `kidou` program.
 #[derive(Clone)]
-pub struct Kidou {
-    jobs: std::sync::mpsc::Sender<Job>,
-}
+pub struct Kidou(BlueWorker);
+
+const KIDOU_FILES: &[(&str, &str)] = &[("kidou/kidou.b", PROGRAM)];
 
 impl Kidou {
     /// Load the program under an empty posture.
@@ -266,56 +253,7 @@ impl Kidou {
     /// # Errors
     /// The load error, as text, when the program does not load.
     pub fn start() -> Result<Self, String> {
-        let (jobs, inbox) = std::sync::mpsc::channel::<Job>();
-        let (ready, loaded) = std::sync::mpsc::channel::<Result<(), String>>();
-        std::thread::Builder::new()
-            .name("kidou".to_string())
-            .spawn(move || {
-                let loader = Embedded {
-                    name: "kidou",
-                    files: &[("kidou/kidou.b", PROGRAM)],
-                };
-                let mut host = ();
-                let loaded = Program::builder(Entry::anonymous(ENTRY))
-                    .loader(&loader)
-                    .posture(&[])
-                    .load(&mut host);
-                let mut program = match loaded {
-                    Ok(p) => p,
-                    Err(e) => {
-                        let _ = ready.send(Err(e.to_string()));
-                        return;
-                    }
-                };
-                let _ = ready.send(Ok(()));
-                for job in inbox {
-                    let (word, facts) = match job.call {
-                        Call::Admit(f) => ("kidou::admit", f),
-                        Call::Supervise(f) => ("kidou::supervise", f),
-                        Call::Probe(f) => ("kidou::probe", f),
-                    };
-                    let answer = program
-                        .call::<String>(word, (facts,), &mut host)
-                        .map_err(|e| e.to_string());
-                    let _ = job.reply.send(answer);
-                }
-            })
-            .map_err(|e| e.to_string())?;
-        loaded
-            .recv()
-            .map_err(|_| "the kidou thread ended before it loaded".to_string())??;
-        Ok(Self { jobs })
-    }
-
-    async fn ask<T: for<'de> Deserialize<'de>>(&self, call: Call) -> Result<T, String> {
-        let (reply, answer) = oneshot::channel();
-        self.jobs
-            .send(Job { call, reply })
-            .map_err(|_| "the kidou thread stopped".to_string())?;
-        let text = answer
-            .await
-            .map_err(|_| "the kidou thread stopped".to_string())??;
-        serde_json::from_str(&text).map_err(|e| format!("kidou answered {text}: {e}"))
+        BlueWorker::start("kidou", ENTRY, KIDOU_FILES).map(Self)
     }
 
     /// `kidou::admit`.
@@ -324,7 +262,7 @@ impl Kidou {
     /// The program's error, or an answer that does not read.
     pub async fn admit(&self, facts: &PodFacts) -> Result<Admission, String> {
         let facts = serde_json::to_string(facts).map_err(|e| e.to_string())?;
-        self.ask(Call::Admit(facts)).await
+        self.0.ask("kidou::admit", facts).await
     }
 
     /// `kidou::supervise`.
@@ -333,13 +271,13 @@ impl Kidou {
     /// The program's error, or an answer that does not read.
     pub async fn supervise(&self, facts: &ExitFacts<'_>) -> Result<Supervision, String> {
         let facts = serde_json::to_string(facts).map_err(|e| e.to_string())?;
-        self.ask(Call::Supervise(facts)).await
+        self.0.ask("kidou::supervise", facts).await
     }
 
     async fn probe(&self, argv: &[String], running: bool) -> Result<ExecOutcome, String> {
         let facts =
             serde_json::to_string(&ProbeFacts { argv, running }).map_err(|e| e.to_string())?;
-        let answer: ProbeAnswer = self.ask(Call::Probe(facts)).await?;
+        let answer: ProbeAnswer = self.0.ask("kidou::probe", facts).await?;
         Ok(ExecOutcome {
             exit_code: answer.exit_code,
             stdout: answer.stdout,

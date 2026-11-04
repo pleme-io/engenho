@@ -17,12 +17,13 @@
 //!
 //! [`Isolation`] has one variant, [`Isolation::HostProcess`], and the caller
 //! must name it. That is not ceremony — it is the honest tier. A workload
-//! started here runs with the **daemon's own privileges**: no Seatbelt profile,
-//! no container principal, no uid-scoped reaper. On Linux two things do bind
-//! it: the pod's `runAsUser` / `runAsGroup`, and its declared `resources`,
-//! enforced in a cgroup v2 leaf under the daemon's delegated cgroup
-//! ([`crate::cgroup`]). On macOS neither does, and the kubelet says so with a
-//! `ResourcesNotEnforced` event. Confinement lives in
+//! started here shares the host's filesystem and network: no Seatbelt profile,
+//! no namespaces. On Linux three things do bind it: its identity and what it
+//! keeps, decided by the embedded `kakoi` program ([`crate::kakoi`]), and its
+//! declared `resources`, enforced in a cgroup v2 leaf under the daemon's
+//! delegated cgroup ([`crate::cgroup`]). On macOS neither does, and the kubelet
+//! says so with `ConfinementNotEnforced` and `ResourcesNotEnforced` events.
+//! Filesystem confinement lives in
 //! `pleme-io/nawabari` (`shimenawa` renders the profile, `kakoi::enter` drops
 //! the principal and applies it) and arrives here as a second `Isolation`
 //! variant once that crate is a dependency.
@@ -83,10 +84,11 @@ use crate::cgroup::{
 use crate::cri::{ExitDisposition, RunState};
 use crate::error::KubeletError;
 use crate::image_source::ImageSource;
+use crate::kakoi::{Kakoi, NativeSecurity, Verdict};
 use crate::pod_volume::BindSource;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::oneshot;
 
@@ -169,8 +171,10 @@ pub enum NativeError {
     ResourcesUnparseable(UnparseableResources),
     #[allow(missing_docs)]
     ResourcesUnenforceable(Unenforceable),
-    #[allow(missing_docs)]
-    RunAs { field: &'static str, value: i64 },
+    /// `kakoi` refused this container, naming why.
+    Refused(String),
+    /// The `kakoi` program did not answer; nothing was started.
+    Kakoi(String),
 }
 
 impl std::fmt::Display for NativeError {
@@ -260,11 +264,8 @@ impl std::fmt::Display for NativeError {
             ),
             Self::ResourcesUnparseable(e) => write!(f, "{e}"),
             Self::ResourcesUnenforceable(e) => write!(f, "{e}"),
-            Self::RunAs { field, value } => write!(
-                f,
-                "securityContext.{field} is {value}, which is not an id this \
-                 host can run a process as"
-            ),
+            Self::Refused(why) => f.write_str(why),
+            Self::Kakoi(why) => write!(f, "the kakoi program did not answer: {why}"),
         }
     }
 }
@@ -292,8 +293,8 @@ impl From<NativeError> for KubeletError {
 /// docs for why this is a type rather than a default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Isolation {
-    /// No confinement: the workload runs with the daemon's own privileges,
-    /// less the uid and gid its pod names (applied on Linux only).
+    /// No namespaces: the workload shares the host's filesystem and network.
+    /// Its identity and what it keeps are [`crate::kakoi`]'s (Linux only).
     ///
     /// Honest about what it is. Appropriate for a single-operator node where
     /// the alternative is a whole Linux VM; NOT a substitute for a sandbox.
@@ -361,37 +362,21 @@ enum Admission {
     Bounded(Arc<CgroupTree>, CgroupPlan),
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct RunAs {
-    uid: Option<u32>,
-    gid: Option<u32>,
-}
-
-impl RunAs {
-    fn of(confinement: &Confinement) -> Result<Self, NativeError> {
-        if !cfg!(target_os = "linux") {
-            return Ok(Self::default());
-        }
-        Ok(Self {
-            uid: host_id("runAsUser", confinement.run_as_user)?,
-            gid: host_id("runAsGroup", confinement.run_as_group)?,
-        })
-    }
-
-    fn apply(self, cmd: &mut tokio::process::Command) {
-        if let Some(uid) = self.uid {
-            cmd.uid(uid);
-        }
-        if let Some(gid) = self.gid {
-            cmd.gid(gid);
+fn chown_tree(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    #[allow(unsafe_code)]
+    let (owner, group) = unsafe {
+        (
+            rustix::fs::Uid::from_raw(uid),
+            rustix::fs::Gid::from_raw(gid),
+        )
+    };
+    rustix::fs::chown(path, Some(owner), Some(group))?;
+    if path.is_dir() && !path.is_symlink() {
+        for entry in std::fs::read_dir(path)? {
+            chown_tree(&entry?.path(), uid, gid)?;
         }
     }
-}
-
-fn host_id(field: &'static str, value: Option<i64>) -> Result<Option<u32>, NativeError> {
-    value
-        .map(|v| u32::try_from(v).map_err(|_| NativeError::RunAs { field, value: v }))
-        .transpose()
+    Ok(())
 }
 
 fn join_on_exec(cmd: &mut tokio::process::Command, procs: std::fs::File) {
@@ -653,6 +638,7 @@ impl NativeContainer {
 
 /// Runs containers as native host processes out of Nix closures.
 pub struct NativeBackend {
+    security: NativeSecurity,
     isolation: Isolation,
     log_dir: PathBuf,
     cgroups: Cgroups,
@@ -691,10 +677,56 @@ pub struct NativeBackend {
 const HOST_NETWORK_POD_IP: &str = "127.0.0.1";
 
 impl NativeBackend {
+    /// Choose how this node treats a container's security. The default is
+    /// [`NativeSecurity::Enforce`].
+    #[must_use]
+    pub fn with_security(mut self, security: NativeSecurity) -> Self {
+        self.security = security;
+        self
+    }
+
+    async fn verdict_for(&self, confinement: &Confinement) -> Result<Verdict, NativeError> {
+        static KAKOI: OnceLock<Result<Kakoi, String>> = OnceLock::new();
+        let kakoi = KAKOI
+            .get_or_init(Kakoi::start)
+            .clone()
+            .map_err(NativeError::Kakoi)?;
+        kakoi
+            .enclose(confinement, self.security, crate::kakoi::can_enforce())
+            .await
+            .map_err(NativeError::Kakoi)
+    }
+
+    /// Give a container the storage made for it, so an account that is not the
+    /// daemon's can read and write it. A host path is left alone: it belongs to
+    /// whoever declared it.
+    fn hand_over_volumes(spec: &ContainerSpec, verdict: &Verdict) -> Result<(), NativeError> {
+        let Some(uid) = verdict.uid else {
+            return Ok(());
+        };
+        for m in &spec.mounts {
+            let owned = match &m.source {
+                crate::pod_volume::MountSource::EmptyDirHostDir(p) => Some(p.as_path()),
+                crate::pod_volume::MountSource::Materialized(dir) => Some(dir.path()),
+                _ => None,
+            };
+            if let Some(path) = owned {
+                chown_tree(path, uid, verdict.gid.unwrap_or(uid)).map_err(|e| {
+                    NativeError::VolumePath {
+                        path: path.to_path_buf(),
+                        detail: e.to_string(),
+                    }
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     /// Build a backend that writes container logs under `log_dir`.
     #[must_use]
     pub fn new(isolation: Isolation, log_dir: impl Into<PathBuf>, cgroups: Cgroups) -> Self {
         Self {
+            security: NativeSecurity::default(),
             isolation,
             log_dir: log_dir.into(),
             cgroups,
@@ -890,17 +922,28 @@ impl ContainerRuntime for NativeBackend {
         Readoption::Cannot
     }
 
+    async fn confinement_warnings(&self, spec: &ContainerSpec) -> Vec<String> {
+        match self.verdict_for(&spec.confinement).await {
+            Ok(verdict) => verdict.warnings,
+            Err(e) => vec![e.to_string()],
+        }
+    }
+
     fn resource_enforcement(&self) -> ResourceEnforcement {
         self.cgroups.enforcement()
     }
 
     async fn start(&self, spec: &ContainerSpec) -> Result<ContainerStatus, KubeletError> {
         let admission = self.admit(&spec.resources)?;
-        let run_as = RunAs::of(&spec.confinement)?;
+        let verdict = self.verdict_for(&spec.confinement).await?;
+        if let Some(why) = verdict.refused.clone() {
+            return Err(NativeError::Refused(why).into());
+        }
         let closure = Self::closure_of(spec)?;
         let argv = spec.argv();
         let program = Self::resolve_program(&closure, &argv)?;
         Self::verify_mounts(spec)?;
+        Self::hand_over_volumes(spec, &verdict)?;
 
         let id = Self::container_id(spec);
         // ── ★ ONE PROCESS PER ID ───────────────────────────────────────────
@@ -956,7 +999,13 @@ impl ContainerRuntime for NativeBackend {
             }
             None
         };
-        run_as.apply(&mut cmd);
+        if let Some(uid) = verdict.uid {
+            cmd.uid(uid);
+        }
+        if let Some(gid) = verdict.gid {
+            cmd.gid(gid);
+        }
+        crate::kakoi::enter_on_exec(&mut cmd, &verdict);
 
         let leaf = match admission {
             Admission::Unbounded => None,
@@ -1824,26 +1873,6 @@ mod tests {
         assert_eq!(b.resource_enforcement(), Cgroups::Off.enforcement());
         let b = NativeBackend::new(Isolation::HostProcess, "/tmp/nb-test-logs", undelegated());
         assert_eq!(b.resource_enforcement(), undelegated().enforcement());
-    }
-
-    #[test]
-    fn a_run_as_id_outside_the_hosts_range_is_refused() {
-        assert_eq!(host_id("runAsUser", None), Ok(None));
-        assert_eq!(host_id("runAsUser", Some(65_534)), Ok(Some(65_534)));
-        assert_eq!(
-            host_id("runAsUser", Some(-1)),
-            Err(NativeError::RunAs {
-                field: "runAsUser",
-                value: -1
-            })
-        );
-        assert_eq!(
-            host_id("runAsGroup", Some(i64::from(u32::MAX) + 1)),
-            Err(NativeError::RunAs {
-                field: "runAsGroup",
-                value: i64::from(u32::MAX) + 1
-            })
-        );
     }
 
     #[tokio::test]

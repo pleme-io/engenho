@@ -46,6 +46,7 @@
 
 pub mod backend;
 pub mod backoff;
+pub mod blue_worker;
 pub mod cgroup;
 pub mod closure_store;
 pub mod config_bridge;
@@ -76,6 +77,7 @@ pub mod node_info;
 /// Re-exported so every existing `engenho_kubelet::node_lease::…` path still
 /// resolves (★★ MODULARIZE, DON'T DELETE).
 pub use engenho_controllers::node_lease;
+pub mod kakoi;
 pub mod pod_volume;
 pub mod podman_api;
 pub mod port_forward;

@@ -2205,6 +2205,7 @@ mod tests {
                 cap_add: vec!["NET_BIND_SERVICE".to_string()],
                 run_as_user: Some(65534),
                 run_as_group: Some(65534),
+                ..crate::backend::Confinement::default()
             },
             ..ContainerSpec::default()
         }

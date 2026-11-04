@@ -2071,6 +2071,7 @@ fn build_backend(boot: &BootConfig) -> Result<Arc<dyn ContainerRuntime>, Runtime
         boot.podman_binary.as_deref(),
         reachability.injectable(),
         boot.native_cgroups,
+        boot.native_security,
     )?)
 }
 
