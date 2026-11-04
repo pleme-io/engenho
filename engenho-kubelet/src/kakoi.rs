@@ -40,6 +40,19 @@ struct Facts<'a> {
     declared: Declared<'a>,
 }
 
+/// A call refused with `EPERM` for what its first argument asks.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+pub struct Guard {
+    /// The syscall number.
+    pub number: u32,
+    /// Refused when the first argument has any of these bits.
+    #[serde(default)]
+    pub mask: Option<u32>,
+    /// Refused when the first argument is one of these.
+    #[serde(default)]
+    pub values: Vec<u32>,
+}
+
 /// What `kakoi::enclose` answered.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 pub struct Verdict {
@@ -65,6 +78,15 @@ pub struct Verdict {
     /// Syscall numbers denied with `EPERM`, for this architecture.
     #[serde(default)]
     pub deny: Vec<u32>,
+    /// Syscall numbers answered `ENOSYS`, so a C library falls back.
+    #[serde(default)]
+    pub absent: Vec<u32>,
+    /// The highest syscall number allowed; anything above answers `ENOSYS`.
+    #[serde(default)]
+    pub newest: Option<u32>,
+    /// Calls refused for what their first argument asks.
+    #[serde(default)]
+    pub guards: Vec<Guard>,
     /// What the node could not enforce, for an event a reader sees.
     #[serde(default)]
     pub warnings: Vec<String>,
@@ -147,7 +169,7 @@ fn host_mounts(mountinfo: &str) -> Vec<HostMount> {
                 || target == "/dev"
                 || target.starts_with("/dev/")
                 || target.starts_with("/proc/");
-            if kernel || target.contains("\\") {
+            if kernel {
                 return None;
             }
             let mut keep = MountFlags::empty();
@@ -163,11 +185,35 @@ fn host_mounts(mountinfo: &str) -> Vec<HostMount> {
                 };
             }
             Some(HostMount {
-                target: std::ffi::CString::new(target).ok()?,
+                target: std::ffi::CString::new(mountinfo_path(target)).ok()?,
                 keep,
             })
         })
         .collect()
+}
+
+/// A path as the kernel meant it: `mountinfo` writes a space, tab, newline or
+/// backslash as a backslash and three octal digits.
+#[cfg(target_os = "linux")]
+fn mountinfo_path(field: &str) -> Vec<u8> {
+    let bytes = field.as_bytes();
+    let mut path = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let octal = bytes
+            .get(i + 1..i + 4)
+            .filter(|_| bytes[i] == b'\\')
+            .and_then(|digits| std::str::from_utf8(digits).ok())
+            .and_then(|digits| u8::from_str_radix(digits, 8).ok());
+        if let Some(byte) = octal {
+            path.push(byte);
+            i += 4;
+        } else {
+            path.push(bytes[i]);
+            i += 1;
+        }
+    }
+    path
 }
 
 #[cfg(target_os = "linux")]
@@ -199,17 +245,24 @@ fn stmt(code: u16, k: u32) -> libc::sock_filter {
 }
 
 /// The filter: another architecture's numbers mean other calls, so a foreign
-/// call is killed; a denied number answers `EPERM`; the rest run.
+/// call is killed; a number above the newest allowed or a withheld one answers
+/// `ENOSYS`; a denied number, or a guarded call whose first argument asks what
+/// its guard refuses, answers `EPERM`; the rest run.
 #[cfg(target_os = "linux")]
-fn seccomp_filter(deny: &[u32]) -> Vec<libc::sock_filter> {
+fn seccomp_filter(verdict: &Verdict) -> Vec<libc::sock_filter> {
     const LD_W_ABS: u16 = 0x20;
     const JEQ_K: u16 = 0x15;
+    const JGT_K: u16 = 0x25;
+    const JSET_K: u16 = 0x45;
     const RET_K: u16 = 0x06;
     const RET_KILL_PROCESS: u32 = 0x8000_0000;
     const RET_ERRNO_EPERM: u32 = 0x0005_0001;
+    const RET_ERRNO_ENOSYS: u32 = 0x0005_0026;
     const RET_ALLOW: u32 = 0x7fff_0000;
     const OFFSET_NR: u32 = 0;
     const OFFSET_ARCH: u32 = 4;
+    const OFFSET_ARG0: u32 = 16;
+    let jump = |code, k, jf| libc::sock_filter { code, jt: 0, jf, k };
     let mut program = vec![
         stmt(LD_W_ABS, OFFSET_ARCH),
         libc::sock_filter {
@@ -221,14 +274,32 @@ fn seccomp_filter(deny: &[u32]) -> Vec<libc::sock_filter> {
         stmt(RET_K, RET_KILL_PROCESS),
         stmt(LD_W_ABS, OFFSET_NR),
     ];
-    for number in deny {
-        program.push(libc::sock_filter {
-            code: JEQ_K,
-            jt: 0,
-            jf: 1,
-            k: *number,
-        });
+    if let Some(newest) = verdict.newest {
+        program.push(jump(JGT_K, newest, 1));
+        program.push(stmt(RET_K, RET_ERRNO_ENOSYS));
+    }
+    for number in &verdict.absent {
+        program.push(jump(JEQ_K, *number, 1));
+        program.push(stmt(RET_K, RET_ERRNO_ENOSYS));
+    }
+    for number in &verdict.deny {
+        program.push(jump(JEQ_K, *number, 1));
         program.push(stmt(RET_K, RET_ERRNO_EPERM));
+    }
+    for guard in &verdict.guards {
+        let mut body = vec![stmt(LD_W_ABS, OFFSET_ARG0)];
+        if let Some(mask) = guard.mask {
+            body.push(jump(JSET_K, mask, 1));
+            body.push(stmt(RET_K, RET_ERRNO_EPERM));
+        }
+        for value in &guard.values {
+            body.push(jump(JEQ_K, *value, 1));
+            body.push(stmt(RET_K, RET_ERRNO_EPERM));
+        }
+        body.push(stmt(LD_W_ABS, OFFSET_NR));
+        let skip = u8::try_from(body.len()).unwrap_or(u8::MAX);
+        program.push(jump(JEQ_K, guard.number, skip));
+        program.extend(body);
     }
     program.push(stmt(RET_K, RET_ALLOW));
     program
@@ -256,7 +327,7 @@ pub fn enter_on_exec(
     volumes: &[Volume],
 ) -> std::io::Result<()> {
     use rustix::mount::{MountFlags, MountPropagationFlags};
-    use rustix::thread::{CapabilitySet, CapabilitySets, UnshareFlags};
+    use rustix::thread::UnshareFlags;
 
     let v = verdict.clone();
     if !v.enclosed && !v.no_new_privs && !v.clear_caps {
@@ -291,7 +362,7 @@ pub fn enter_on_exec(
             .filter(|m| m.read_only)
             .map(|m| m.path.clone()),
     );
-    let filter = seccomp_filter(&v.deny);
+    let filter = seccomp_filter(&v);
     let empty = c"";
     let tmpfs = c"tmpfs";
     let root = c"/";
@@ -359,42 +430,104 @@ pub fn enter_on_exec(
                     )?;
                 }
             }
-            if let Some(gid) = v.gid {
-                rustix::thread::set_thread_groups(&[])?;
-                rustix::thread::set_thread_gid(rustix::fs::Gid::from_raw(gid))?;
+            become_declared(&v, &filter)
+        });
+    }
+    Ok(())
+}
+
+/// The child's last steps before `exec`, in this one order: groups, gid, uid,
+/// capabilities, `no_new_privs`, the filter.
+#[cfg(target_os = "linux")]
+fn become_declared(v: &Verdict, filter: &[libc::sock_filter]) -> std::io::Result<()> {
+    use rustix::thread::{CapabilitySet, CapabilitySets};
+
+    if let Some(gid) = v.gid {
+        rustix::thread::set_thread_groups(&[])?;
+        rustix::thread::set_thread_gid(rustix::fs::Gid::from_raw(gid))?;
+    }
+    if let Some(uid) = v.uid {
+        rustix::thread::set_thread_uid(rustix::fs::Uid::from_raw(uid))?;
+    }
+    if v.clear_caps {
+        let none = CapabilitySet::empty();
+        rustix::thread::set_capabilities(
+            None,
+            CapabilitySets {
+                effective: none,
+                permitted: none,
+                inheritable: none,
+            },
+        )?;
+    }
+    if v.no_new_privs {
+        rustix::thread::set_no_new_privs(true)?;
+    }
+    if !v.deny.is_empty() {
+        let program = libc::sock_fprog {
+            len: filter.len() as u16,
+            filter: filter.as_ptr().cast_mut(),
+        };
+        #[allow(unsafe_code)]
+        let installed = unsafe {
+            libc::prctl(
+                libc::PR_SET_SECCOMP,
+                libc::SECCOMP_MODE_FILTER,
+                std::ptr::from_ref(&program),
+            )
+        };
+        if installed != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Arrange for a command run in a live container (an exec or an exec probe) to
+/// enter that container's enclosure and take its identity, filter included.
+///
+/// # Errors
+/// An enclosed container whose process is gone, since nothing can be joined,
+/// or the namespace that could not be opened.
+#[cfg(target_os = "linux")]
+pub fn join_on_exec(
+    cmd: &mut tokio::process::Command,
+    verdict: &Verdict,
+    container_pid: Option<u32>,
+) -> std::io::Result<()> {
+    use rustix::thread::{LinkNameSpaceType, move_into_link_name_space};
+    use std::os::fd::AsFd;
+
+    let v = verdict.clone();
+    if !v.enclosed && !v.no_new_privs && !v.clear_caps {
+        if let Some(uid) = v.uid {
+            cmd.uid(uid);
+        }
+        if let Some(gid) = v.gid {
+            cmd.gid(gid);
+        }
+        return Ok(());
+    }
+    let namespace = if v.enclosed {
+        let pid = container_pid.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "the container's process is gone, so its enclosure cannot be joined",
+            )
+        })?;
+        Some(std::fs::File::open(format!("/proc/{pid}/ns/mnt"))?)
+    } else {
+        None
+    };
+    let filter = seccomp_filter(&v);
+    #[allow(unsafe_code)]
+    unsafe {
+        cmd.pre_exec(move || {
+            if let Some(namespace) = &namespace {
+                move_into_link_name_space(namespace.as_fd(), Some(LinkNameSpaceType::Mount))?;
+                rustix::process::chdir(c"/")?;
             }
-            if let Some(uid) = v.uid {
-                rustix::thread::set_thread_uid(rustix::fs::Uid::from_raw(uid))?;
-            }
-            if v.clear_caps {
-                let none = CapabilitySet::empty();
-                rustix::thread::set_capabilities(
-                    None,
-                    CapabilitySets {
-                        effective: none,
-                        permitted: none,
-                        inheritable: none,
-                    },
-                )?;
-            }
-            if v.no_new_privs {
-                rustix::thread::set_no_new_privs(true)?;
-            }
-            if !v.deny.is_empty() {
-                let program = libc::sock_fprog {
-                    len: filter.len() as u16,
-                    filter: filter.as_ptr().cast_mut(),
-                };
-                if libc::prctl(
-                    libc::PR_SET_SECCOMP,
-                    libc::SECCOMP_MODE_FILTER,
-                    std::ptr::from_ref(&program),
-                ) != 0
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-            Ok(())
+            become_declared(&v, &filter)
         });
     }
     Ok(())
@@ -416,12 +549,247 @@ pub fn enter_on_exec(
     Ok(())
 }
 
+/// No enclosure exists off Linux, so a command in a container takes its identity.
+#[cfg(not(target_os = "linux"))]
+pub fn join_on_exec(
+    cmd: &mut tokio::process::Command,
+    verdict: &Verdict,
+    _container_pid: Option<u32>,
+) -> std::io::Result<()> {
+    enter_on_exec(cmd, verdict, &[])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn kakoi() -> Kakoi {
         Kakoi::start().expect("kakoi loads")
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn enclosed_verdict() -> Verdict {
+        kakoi()
+            .enclose(
+                &Confinement::default(),
+                "",
+                &[],
+                NativeSecurity::Enforce,
+                true,
+            )
+            .await
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    const EPERM: u32 = 0x0005_0001;
+    #[cfg(target_os = "linux")]
+    const ENOSYS: u32 = 0x0005_0026;
+    #[cfg(target_os = "linux")]
+    const ALLOW: u32 = 0x7fff_0000;
+    #[cfg(target_os = "linux")]
+    const KILL: u32 = 0x8000_0000;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_mount_with_a_space_in_its_path_is_still_found() {
+        let found = host_mounts(
+            "36 25 8:1 / /mnt/my\\040disk rw,noatime shared:1 - ext4 /dev/sda1 rw\n\
+             37 25 0:5 / /dev/shm rw shared:2 - tmpfs tmpfs rw\n",
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].target.as_bytes(), b"/mnt/my disk");
+        assert_eq!(mountinfo_path("/a\\134b"), b"/a\\b");
+        assert_eq!(mountinfo_path("/plain"), b"/plain");
+        assert_eq!(mountinfo_path("/end\\04"), b"/end\\04");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_filter(program: &[libc::sock_filter], arch: u32, nr: u32, arg0: u32) -> u32 {
+        let load = |offset| match offset {
+            0 => nr,
+            4 => arch,
+            16 => arg0,
+            other => panic!("the filter reads an unknown offset {other}"),
+        };
+        let mut pc = 0;
+        let mut a = 0;
+        loop {
+            let i = program[pc];
+            pc += 1;
+            let taken = match i.code {
+                0x20 => {
+                    a = load(i.k);
+                    continue;
+                }
+                0x06 => return i.k,
+                0x15 => a == i.k,
+                0x25 => a > i.k,
+                0x45 => a & i.k != 0,
+                other => panic!("the filter holds an unknown instruction {other:#x}"),
+            };
+            pc += usize::from(if taken { i.jt } else { i.jf });
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_filter_answers_each_call_as_blue_declared() {
+        let v = enclosed_verdict().await;
+        let program = seccomp_filter(&v);
+        let on = |nr, arg0| run_filter(&program, AUDIT_ARCH, nr, arg0);
+        let number = |sys: libc::c_long| u32::try_from(sys).unwrap();
+        assert_eq!(on(number(libc::SYS_getpid), 0), ALLOW);
+        assert_eq!(on(number(libc::SYS_mount), 0), EPERM);
+        assert_eq!(on(number(libc::SYS_io_uring_setup), 0), EPERM);
+        assert_eq!(on(number(libc::SYS_fsopen), 0), EPERM);
+        assert_eq!(on(number(libc::SYS_clone3), 0), ENOSYS);
+        assert_eq!(on(0x4000_0000 | number(libc::SYS_mount), 0), ENOSYS);
+        assert_eq!(on(v.newest.unwrap(), 0), ALLOW);
+        assert_eq!(on(v.newest.unwrap() + 1, 0), ENOSYS);
+        let clone = number(libc::SYS_clone);
+        let thread = u32::try_from(libc::CLONE_VM | libc::CLONE_THREAD).unwrap();
+        assert_eq!(on(clone, thread), ALLOW);
+        for flag in [
+            libc::CLONE_NEWNS,
+            libc::CLONE_NEWUSER,
+            libc::CLONE_NEWPID,
+            libc::CLONE_NEWNET,
+            libc::CLONE_NEWIPC,
+            libc::CLONE_NEWUTS,
+            libc::CLONE_NEWCGROUP,
+        ] {
+            assert_eq!(on(clone, u32::try_from(flag).unwrap()), EPERM, "{flag:#x}");
+        }
+        let socket = number(libc::SYS_socket);
+        assert_eq!(on(socket, u32::try_from(libc::AF_INET).unwrap()), ALLOW);
+        assert_eq!(on(socket, u32::try_from(libc::AF_UNIX).unwrap()), ALLOW);
+        assert_eq!(on(socket, u32::try_from(libc::AF_ALG).unwrap()), EPERM);
+        assert_eq!(on(socket, u32::try_from(libc::AF_VSOCK).unwrap()), EPERM);
+        assert_eq!(run_filter(&program, 0x4000_0003, 1, 0), KILL);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[tokio::test]
+    async fn the_denied_numbers_are_the_kernels_for_their_names() {
+        let mut expected: Vec<libc::c_long> = vec![
+            libc::SYS_mount,
+            libc::SYS_umount2,
+            libc::SYS_pivot_root,
+            libc::SYS_chroot,
+            libc::SYS_unshare,
+            libc::SYS_setns,
+            libc::SYS_ptrace,
+            libc::SYS_process_vm_readv,
+            libc::SYS_process_vm_writev,
+            libc::SYS_bpf,
+            libc::SYS_perf_event_open,
+            libc::SYS_kexec_load,
+            libc::SYS_kexec_file_load,
+            libc::SYS_init_module,
+            libc::SYS_finit_module,
+            libc::SYS_delete_module,
+            libc::SYS_reboot,
+            libc::SYS_swapon,
+            libc::SYS_swapoff,
+            libc::SYS_acct,
+            libc::SYS_add_key,
+            libc::SYS_request_key,
+            libc::SYS_keyctl,
+            libc::SYS_userfaultfd,
+            libc::SYS_open_by_handle_at,
+            libc::SYS_quotactl,
+            libc::SYS_settimeofday,
+            libc::SYS_clock_settime,
+            libc::SYS_adjtimex,
+            libc::SYS_iopl,
+            libc::SYS_ioperm,
+            libc::SYS_io_uring_setup,
+            libc::SYS_io_uring_enter,
+            libc::SYS_io_uring_register,
+            libc::SYS_open_tree,
+            libc::SYS_move_mount,
+            libc::SYS_fsopen,
+            libc::SYS_fsconfig,
+            libc::SYS_fsmount,
+            libc::SYS_fspick,
+            libc::SYS_mount_setattr,
+            libc::SYS_pidfd_getfd,
+            libc::SYS_process_madvise,
+            libc::SYS_quotactl_fd,
+            libc::SYS_kcmp,
+            libc::SYS_fanotify_init,
+            libc::SYS_syslog,
+            libc::SYS_clock_adjtime,
+            libc::SYS_sethostname,
+            libc::SYS_setdomainname,
+            libc::SYS_vhangup,
+            libc::SYS_lookup_dcookie,
+            libc::SYS_nfsservctl,
+            libc::SYS_mbind,
+            libc::SYS_set_mempolicy,
+            libc::SYS_migrate_pages,
+            libc::SYS_move_pages,
+            libc::SYS_uselib,
+            libc::SYS_ustat,
+            libc::SYS_sysfs,
+        ];
+        expected.sort_unstable();
+        let mut denied: Vec<libc::c_long> = enclosed_verdict()
+            .await
+            .deny
+            .iter()
+            .map(|n| libc::c_long::from(*n))
+            .collect();
+        denied.sort_unstable();
+        assert_eq!(denied, expected);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[allow(unsafe_code)]
+    #[tokio::test]
+    async fn the_kernel_answers_a_filtered_child_as_the_filter_says() {
+        let filter = seccomp_filter(&enclosed_verdict().await);
+        let program = libc::sock_fprog {
+            len: u16::try_from(filter.len()).unwrap(),
+            filter: filter.as_ptr().cast_mut(),
+        };
+        let probes: [(libc::c_long, libc::c_long, i32); 4] = [
+            (libc::SYS_io_uring_setup, 1, libc::EPERM),
+            (libc::SYS_clone3, 0, libc::ENOSYS),
+            (
+                libc::SYS_clone,
+                libc::c_long::from(libc::CLONE_NEWUSER),
+                libc::EPERM,
+            ),
+            (libc::SYS_fsopen, 0, libc::EPERM),
+        ];
+        unsafe {
+            let child = libc::fork();
+            assert!(child >= 0);
+            if child == 0 {
+                libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+                let installed = libc::prctl(
+                    libc::PR_SET_SECCOMP,
+                    libc::SECCOMP_MODE_FILTER,
+                    std::ptr::from_ref(&program),
+                );
+                if installed != 0 {
+                    libc::_exit(100);
+                }
+                for (index, (call, arg0, errno)) in probes.iter().enumerate() {
+                    let answer = libc::syscall(*call, *arg0, 0, 0, 0, 0);
+                    if answer != -1 || *libc::__errno_location() != *errno {
+                        libc::_exit(1 + i32::try_from(index).unwrap_or(50));
+                    }
+                }
+                libc::_exit(0);
+            }
+            let mut status = 0;
+            assert_eq!(libc::waitpid(child, &raw mut status, 0), child);
+            assert!(libc::WIFEXITED(status), "status {status}");
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+        }
     }
 
     #[tokio::test]

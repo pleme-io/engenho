@@ -328,6 +328,8 @@ struct NativeContainer {
     program: PathBuf,
     /// The pod's `SIGTERM` → `SIGKILL` window, from the spec it started with.
     grace: Duration,
+    /// What it was enclosed under; a command run in it enters the same.
+    verdict: Verdict,
     /// Where the process is in its life, and who holds it.
     process: Process,
     leaf: Option<Leaf>,
@@ -1077,6 +1079,7 @@ impl ContainerRuntime for NativeBackend {
                 log_path,
                 program,
                 grace: spec.termination_grace.duration(),
+                verdict,
                 process: Process::Live(child),
                 leaf,
                 stdio,
@@ -1245,15 +1248,11 @@ impl ContainerRuntime for NativeBackend {
     }
 
     async fn exec(&self, container_id: &str, argv: &[String]) -> Result<ExecOutcome, KubeletError> {
-        let target = self.exec_target(container_id, argv)?;
-        let out = tokio::process::Command::new(&target)
-            .args(argv.iter().skip(1))
-            .output()
-            .await
-            .map_err(|e| NativeError::Spawn {
-                program: target.clone(),
-                detail: e.to_string(),
-            })?;
+        let (mut cmd, target) = self.exec_command(container_id, argv)?;
+        let out = cmd.output().await.map_err(|e| NativeError::Spawn {
+            program: target,
+            detail: e.to_string(),
+        })?;
         Ok(ExecOutcome {
             exit_code: out.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -1266,9 +1265,7 @@ impl ContainerRuntime for NativeBackend {
         container_id: &str,
         req: &crate::stream::StreamRequest,
     ) -> Result<crate::stream::StreamSession, KubeletError> {
-        let target = self.exec_target(container_id, &req.argv)?;
-        let mut cmd = tokio::process::Command::new(&target);
-        cmd.args(req.argv.iter().skip(1));
+        let (cmd, _) = self.exec_command(container_id, &req.argv)?;
         crate::stream::spawn_local(cmd, req)
     }
 
@@ -1289,6 +1286,36 @@ impl ContainerRuntime for NativeBackend {
 }
 
 impl NativeBackend {
+    /// A command for `argv` that runs inside the container's own enclosure.
+    fn exec_command(
+        &self,
+        container_id: &str,
+        argv: &[String],
+    ) -> Result<(tokio::process::Command, PathBuf), NativeError> {
+        let target = self.exec_target(container_id, argv)?;
+        let (verdict, pid) = {
+            let guard = self.state.lock().map_err(|_| NativeError::StatePoisoned)?;
+            let container =
+                guard
+                    .get(container_id)
+                    .ok_or_else(|| NativeError::NoSuchContainer {
+                        id: container_id.to_string(),
+                    })?;
+            let pid = match &container.process {
+                Process::Live(child) => child.id(),
+                _ => None,
+            };
+            (container.verdict.clone(), pid)
+        };
+        let mut cmd = tokio::process::Command::new(&target);
+        cmd.args(argv.iter().skip(1));
+        crate::kakoi::join_on_exec(&mut cmd, &verdict, pid).map_err(|e| NativeError::Spawn {
+            program: target.clone(),
+            detail: e.to_string(),
+        })?;
+        Ok((cmd, target))
+    }
+
     /// The program an exec of `argv` runs: `argv[0]` resolved against the
     /// SAME closure the container runs from, so an exec cannot accidentally
     /// run a binary from the host's PATH instead of the one in the image.

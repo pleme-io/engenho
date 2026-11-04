@@ -650,6 +650,61 @@ async fn an_enclosed_pod_cannot_write_the_host_or_see_its_secrets_and_keeps_its_
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
+async fn a_command_run_in_an_enclosed_pod_enters_its_enclosure() {
+    use std::os::unix::fs::MetadataExt;
+    if std::fs::metadata("/proc/self").expect("procfs").uid() != 0 {
+        return;
+    }
+    let tools = closure("nixpkgs#busybox");
+    let backend = NativeBackend::new(
+        Isolation::HostProcess,
+        std::env::temp_dir().join("engenho-native-e2e-enclosed-exec"),
+        Cgroups::Off,
+    );
+    let mut image = String::from("nix:");
+    image.push_str(&tools);
+    let mut s = spec(&image, &["sleep", "30"], &[]);
+    s.pod.namespace = "kakoi-exec-test".to_string();
+    let started = backend.start(&s).await.expect("start");
+    let run = |script: &str| vec!["sh".to_string(), "-c".to_string(), script.to_string()];
+    let out = backend
+        .exec(
+            &started.container_id,
+            &run("echo uid=$(id -u); \
+                 (echo x > /etc/kakoi-exec-escape) 2>/dev/null || echo etc-refused; \
+                 (ls /root) 2>/dev/null || echo root-hidden; \
+                 test -e /proc/1/status && echo pid1-visible || echo pid1-hidden; \
+                 unshare -m true 2>/dev/null && echo unshare-allowed || echo unshare-denied"),
+        )
+        .await
+        .expect("exec");
+    let text = out.stdout;
+    let uid: u32 = text
+        .lines()
+        .find_map(|l| l.strip_prefix("uid="))
+        .and_then(|u| u.parse().ok())
+        .unwrap_or_else(|| panic!("no uid in: {text}"));
+    assert!(
+        uid >= 100_000,
+        "the namespace's own account, not {uid}: {text}"
+    );
+    for expected in [
+        "etc-refused",
+        "root-hidden",
+        "pid1-hidden",
+        "unshare-denied",
+    ] {
+        assert!(text.contains(expected), "{expected} missing from: {text}");
+    }
+    assert!(
+        std::fs::metadata("/etc/kakoi-exec-escape").is_err(),
+        "{text}"
+    );
+    backend.stop(&started.container_id).await.expect("stop");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
 async fn root_starts_only_with_a_grant_and_the_kernel_agrees() {
     use std::os::unix::fs::MetadataExt;
     if std::fs::metadata("/proc/self").expect("procfs").uid() != 0 {

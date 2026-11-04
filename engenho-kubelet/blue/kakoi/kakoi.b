@@ -152,27 +152,114 @@ def denied_syscalls()
     ["clock_settime", 227, 112],
     ["adjtimex", 159, 171],
     ["iopl", 172, nil],
-    ["ioperm", 173, nil]
+    ["ioperm", 173, nil],
+    ["io_uring_setup", 425, 425],
+    ["io_uring_enter", 426, 426],
+    ["io_uring_register", 427, 427],
+    ["open_tree", 428, 428],
+    ["move_mount", 429, 429],
+    ["fsopen", 430, 430],
+    ["fsconfig", 431, 431],
+    ["fsmount", 432, 432],
+    ["fspick", 433, 433],
+    ["mount_setattr", 442, 442],
+    ["pidfd_getfd", 438, 438],
+    ["process_madvise", 440, 440],
+    ["quotactl_fd", 443, 443],
+    ["kcmp", 312, 272],
+    ["fanotify_init", 300, 262],
+    ["syslog", 103, 116],
+    ["clock_adjtime", 305, 266],
+    ["sethostname", 170, 161],
+    ["setdomainname", 171, 162],
+    ["vhangup", 153, 58],
+    ["lookup_dcookie", 212, 18],
+    ["nfsservctl", 180, 42],
+    ["mbind", 237, 235],
+    ["set_mempolicy", 238, 237],
+    ["migrate_pages", 256, 238],
+    ["move_pages", 279, 239],
+    ["uselib", 134, nil],
+    ["ustat", 136, nil],
+    ["sysfs", 139, nil]
   ]
 end
 
 @doc """
-denied_numbers: The numbers of the denied calls on one architecture, none where the architecture is not known, since a wrong number would deny the wrong call.
+withheld_syscalls: Calls answered as though this kernel lacked them, so a C library falls back to one the filter can read. clone3 keeps its flags in user memory, where no filter can see them.
+
+    first(withheld_syscalls) #=> ["clone3", 435, 435]
+"""
+def withheld_syscalls()
+  [["clone3", 435, 435]]
+end
+
+@doc """
+newest_allowed_syscall: The highest call number an enclosure may make. A call the kernel adds later is refused until this is raised on purpose, and so is every number in the x32 range, which shares the x86_64 architecture value and would miss each entry above.
+
+    newest_allowed_syscall #=> 466
+"""
+def newest_allowed_syscall()
+  466
+end
+
+@doc """
+arch_column: Which column of a syscall table holds this architecture's numbers, or nil where it is not known.
+
+    arch_column("x86_64") #=> 1
+    arch_column("aarch64") #=> 2
+    arch_column("riscv64") #=> nil
+"""
+def arch_column(arch)
+  if arch == "x86_64"
+    1
+  elsif arch == "aarch64"
+    2
+  end
+end
+
+@doc """
+numbers_in: One architecture's numbers from a syscall table, none where the architecture is not known, since a wrong number would deny the wrong call.
+
+    numbers_in(withheld_syscalls, "x86_64") #=> [435]
+    numbers_in(withheld_syscalls, "riscv64") #=> []
+"""
+def numbers_in(table, arch)
+  column = arch_column(arch)
+  if column.nil?
+    []
+  else
+    filter((n) -> n != nil, map((row) -> row[column], table))
+  end
+end
+
+@doc """
+denied_numbers: The numbers of the denied calls on one architecture.
 
     member?(165, denied_numbers("x86_64")) #=> true
     member?(40, denied_numbers("aarch64")) #=> true
     denied_numbers("riscv64") #=> []
 """
 def denied_numbers(arch)
-  column = if arch == "x86_64"
-    1
-  elsif arch == "aarch64"
-    2
-  end
+  numbers_in(denied_syscalls, arch)
+end
+
+@doc """
+guarded_calls: Calls allowed except for what their first argument asks: clone with any namespace flag, which would reach what unshare is denied, and a socket of the kernel crypto or vsock families.
+
+    first(guarded_calls("x86_64"))["mask"] #=> 2114060288
+    last(guarded_calls("aarch64"))["number"] #=> 198
+    guarded_calls("riscv64") #=> []
+"""
+def guarded_calls(arch)
+  column = arch_column(arch)
   if column.nil?
     []
   else
-    filter((n) -> n != nil, map((row) -> row[column], denied_syscalls))
+    [
+      {"number" => ["clone", 56, 220][column], "mask" => 2_114_060_288},
+      {"number" => ["socket", 41, 198][column], "values" => [38, 40]}
+    ]
   end
 end
 
@@ -346,6 +433,19 @@ def verdict_text(refused, ids, confine, warnings, volumes?, arch?)
       else
         []
       end,
+      "absent" => if confine
+        numbers_in(withheld_syscalls, arch)
+      else
+        []
+      end,
+      "newest" => if confine
+        newest_allowed_syscall
+      end,
+      "guards" => if confine
+        guarded_calls(arch)
+      else
+        []
+      end,
       "warnings" => warnings
     }
   )
@@ -396,14 +496,24 @@ def enclose(facts_text)
     verdict_text(why, [nil, nil], false, [])
   else
     granted = granted?(facts)
-    verdict_text(
-      nil,
-      identity(facts),
-      not granted,
-      [],
-      field(facts, "volumes", []),
-      field(facts, "arch", "")
-    )
+    arch = field(facts, "arch", "x86_64")
+    if not granted and arch_column(arch).nil?
+      verdict_text(
+        "this node's architecture #{arch} has no syscall table, so the pod cannot be enclosed",
+        [nil, nil],
+        false,
+        []
+      )
+    else
+      verdict_text(
+        nil,
+        identity(facts),
+        not granted,
+        [],
+        field(facts, "volumes", []),
+        arch
+      )
+    end
   end
 end
 
@@ -520,7 +630,26 @@ test "an enclosed container is denied the calls that reach past it, on its own a
   assert member?(101, on("x86_64"))
   assert member?(117, on("aarch64"))
   assert length(on("x86_64")) == length(denied_syscalls)
-  assert length(on("mips")) == 0
+  unknown = answer(
+    {
+      "mode" => "enforce",
+      "can_enforce" => true,
+      "arch" => "mips",
+      "declared" => {}
+    }
+  )
+  assert contains?(unknown.refused, "mips")
+  assert unknown.enclosed == false
+  granted_unknown = answer(
+    {
+      "mode" => "enforce",
+      "can_enforce" => true,
+      "arch" => "mips",
+      "grant" => "x",
+      "declared" => {}
+    }
+  )
+  assert granted_unknown.refused.nil?
   granted = answer(
     {
       "mode" => "enforce",
@@ -531,6 +660,41 @@ test "an enclosed container is denied the calls that reach past it, on its own a
     }
   )
   assert length(granted.deny) == 0
+end
+
+test "an enclosure withholds clone3, guards clone and socket, and stops at the newest call"
+  v = answer(
+    {
+      "mode" => "enforce",
+      "can_enforce" => true,
+      "arch" => "aarch64",
+      "declared" => {}
+    }
+  )
+  assert v.absent == [435]
+  assert v.newest == newest_allowed_syscall
+  assert first(v.guards)["number"] == 220
+  assert first(v.guards)["mask"] == 2_114_060_288
+  assert last(v.guards)["values"] == [38, 40]
+  granted = answer(
+    {
+      "mode" => "enforce",
+      "can_enforce" => true,
+      "arch" => "aarch64",
+      "grant" => "x",
+      "declared" => {}
+    }
+  )
+  assert granted.absent == []
+  assert granted.newest.nil?
+  assert granted.guards == []
+end
+
+test "no denied call sits above the newest allowed call, where it could not be reached"
+  assert every?(
+    (n) -> n <= newest_allowed_syscall,
+    append(denied_numbers("x86_64"), denied_numbers("aarch64"))
+  )
 end
 
 test "every denied call names a number on some architecture and none repeats"
