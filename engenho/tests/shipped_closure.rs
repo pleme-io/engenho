@@ -48,6 +48,7 @@ const ROOTS: [&str; 3] = ["engenho", "engenho-mcp", "engenho-cluster-config-rend
 const SHIPPED: &[&str] = &[
     "engenho",
     "engenho-apiserver",
+    "engenho-blue",
     "engenho-cluster-config",
     "engenho-cluster-config-render",
     "engenho-cni",
