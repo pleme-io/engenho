@@ -608,12 +608,13 @@ async fn an_enclosed_pod_cannot_write_the_host_or_see_its_secrets_and_keeps_its_
          echo x > /tmp/scratch && echo tmp-ok; \
          (echo x > /etc/kakoi-escape) 2>/dev/null || echo etc-refused; \
          (echo x > /nix/kakoi-escape) 2>/dev/null || echo nix-refused; \
-         (ls /root) 2>/dev/null || echo root-hidden; \
-         test -d /run/secrets && (ls /run/secrets 2>/dev/null || echo secrets-hidden); \
+         {tools}/bin/ls / > /dev/null && echo ls-works; \
+         {tools}/bin/ls /root; echo ls-root=$?; \
          test -e /proc/1/status && echo pid1-visible || echo pid1-hidden; \
          test -e /proc/$$/status && echo self-visible; \
-         unshare -m true 2>/dev/null && echo unshare-allowed || echo unshare-denied; \
-         mount -t tmpfs none /tmp 2>/dev/null && echo mount-allowed || echo mount-denied"
+         {tools}/bin/unshare -m {tools}/bin/true; echo unshare=$?; \
+         {tools}/bin/mount -t tmpfs none /tmp; echo mount=$?; \
+         test -x {tools}/bin/unshare && test -x {tools}/bin/mount && echo tools-present"
     );
     let mut s = spec(&image, &["sh", "-c", &script], &[]);
     s.pod.namespace = "kakoi-test".to_string();
@@ -625,18 +626,20 @@ async fn an_enclosed_pod_cannot_write_the_host_or_see_its_secrets_and_keeps_its_
     }];
     let out = output_of(&backend, &s).await;
     assert!(!out.contains("pid1-visible"), "{out}");
-    assert!(!out.contains("unshare-allowed"), "{out}");
-    assert!(!out.contains("mount-allowed"), "{out}");
+    assert!(!out.contains("unshare=0"), "{out}");
+    assert!(!out.contains("mount=0"), "{out}");
+    assert!(!out.contains("ls-root=0"), "{out}");
+    assert!(!out.contains("not found"), "a tool never ran: {out}");
     for expected in [
         "own-ok",
         "tmp-ok",
         "etc-refused",
         "nix-refused",
-        "root-hidden",
+        "ls-works",
         "pid1-hidden",
         "self-visible",
-        "unshare-denied",
-        "mount-denied",
+        "tools-present",
+        "Operation not permitted",
     ] {
         assert!(out.contains(expected), "{expected} missing from: {out}");
     }
@@ -677,7 +680,8 @@ async fn a_pods_access_reaches_the_kernel() {
     let script = format!(
         "echo x > {open_path}/f && echo writes-ok; \
          (echo x > {shut_path}/f) 2>/dev/null || echo narrowed; \
-         test \"$(wc -l < /proc/net/dev)\" = 3 && echo only-loopback || echo host-network; \
+         n=0; while read -r line; do n=$((n+1)); done < /proc/net/dev; echo interface-lines=$n; \
+         test -d /nix/store && echo nix-store-visible; \
          test -e /nix/var/nix/daemon-socket/socket && echo nix-socket || echo no-nix-socket; \
          (echo x > /dev/shm/kakoi-shm) && echo shm-ok"
     );
@@ -701,7 +705,8 @@ async fn a_pods_access_reaches_the_kernel() {
     for expected in [
         "writes-ok",
         "narrowed",
-        "only-loopback",
+        "interface-lines=3",
+        "nix-store-visible",
         "no-nix-socket",
         "shm-ok",
     ] {
@@ -729,22 +734,32 @@ async fn a_command_run_in_an_enclosed_pod_enters_its_enclosure() {
     );
     let mut image = String::from("nix:");
     image.push_str(&tools);
-    let mut s = spec(&image, &["sleep", "30"], &[]);
+    let mut s = spec(&image, &["sleep", "30"], &[("POD_ONLY", "declared")]);
     s.pod.namespace = "kakoi-exec-test".to_string();
     let started = backend.start(&s).await.expect("start");
-    let run = |script: &str| vec!["sh".to_string(), "-c".to_string(), script.to_string()];
+    let run = |script: String| vec!["sh".to_string(), "-c".to_string(), script];
+    unsafe { std::env::set_var("KAKOI_DAEMON_ONLY", "leaked") };
     let out = backend
         .exec(
             &started.container_id,
-            &run("echo uid=$(id -u); \
+            &run(format!(
+                "echo uid=$({tools}/bin/id -u); \
+                 echo env=$POD_ONLY daemon=$KAKOI_DAEMON_ONLY; \
                  (echo x > /etc/kakoi-exec-escape) 2>/dev/null || echo etc-refused; \
-                 (ls /root) 2>/dev/null || echo root-hidden; \
+                 {tools}/bin/ls / > /dev/null && echo ls-works; \
+                 {tools}/bin/ls /root; echo ls-root=$?; \
                  test -e /proc/1/status && echo pid1-visible || echo pid1-hidden; \
-                 unshare -m true 2>/dev/null && echo unshare-allowed || echo unshare-denied"),
+                 {tools}/bin/unshare -m {tools}/bin/true; echo unshare=$?"
+            )),
         )
         .await
         .expect("exec");
-    let text = out.stdout;
+    let text = format!("{}{}", out.stdout, out.stderr);
+    assert!(text.contains("env=declared daemon=\n"), "{text}");
+    assert!(!text.contains("ls-root=0"), "{text}");
+    assert!(!text.contains("unshare=0"), "{text}");
+    assert!(!text.contains("not found"), "a tool never ran: {text}");
+    assert!(text.contains("ls-works"), "{text}");
     let uid: u32 = text
         .lines()
         .find_map(|l| l.strip_prefix("uid="))
@@ -754,12 +769,7 @@ async fn a_command_run_in_an_enclosed_pod_enters_its_enclosure() {
         uid >= 100_000,
         "the namespace's own account, not {uid}: {text}"
     );
-    for expected in [
-        "etc-refused",
-        "root-hidden",
-        "pid1-hidden",
-        "unshare-denied",
-    ] {
+    for expected in ["etc-refused", "pid1-hidden", "Operation not permitted"] {
         assert!(text.contains(expected), "{expected} missing from: {text}");
     }
     assert!(

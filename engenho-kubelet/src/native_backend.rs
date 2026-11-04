@@ -330,6 +330,8 @@ struct NativeContainer {
     grace: Duration,
     /// What it was enclosed under; a command run in it enters the same.
     verdict: Verdict,
+    /// Its declared environment; a command run in it gets this, not the daemon's.
+    env: std::collections::BTreeMap<String, String>,
     /// Where the process is in its life, and who holds it.
     process: Process,
     leaf: Option<Leaf>,
@@ -584,6 +586,16 @@ async fn terminate(mut child: tokio::process::Child, grace: Duration) -> Reaped 
         Err(e) => {
             tracing::warn!(error = %e, "waiting on a stopped native container failed");
             Reaped::Unobservable
+        }
+    }
+}
+
+impl Process {
+    /// The pid of a process still held live, whose namespaces can be joined.
+    fn live_pid(&self) -> Option<u32> {
+        match self {
+            Self::Live(child) => child.id(),
+            Self::Terminating(_) | Self::Reaped(_) => None,
         }
     }
 }
@@ -1084,6 +1096,7 @@ impl ContainerRuntime for NativeBackend {
                 program,
                 grace: spec.termination_grace.duration(),
                 verdict,
+                env: spec.env.clone(),
                 process: Process::Live(child),
                 leaf,
                 stdio,
@@ -1297,7 +1310,7 @@ impl NativeBackend {
         argv: &[String],
     ) -> Result<(tokio::process::Command, PathBuf), NativeError> {
         let target = self.exec_target(container_id, argv)?;
-        let (verdict, pid) = {
+        let (verdict, pid, env) = {
             let guard = self.state.lock().map_err(|_| NativeError::StatePoisoned)?;
             let container =
                 guard
@@ -1305,18 +1318,13 @@ impl NativeBackend {
                     .ok_or_else(|| NativeError::NoSuchContainer {
                         id: container_id.to_string(),
                     })?;
-            let pid = match &container.process {
-                Process::Live(child) => child.id(),
-                _ => None,
-            };
-            (container.verdict.clone(), pid)
+            (
+                container.verdict.clone(),
+                container.process.live_pid(),
+                container.env.clone(),
+            )
         };
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "the door: the next line passes this through kakoi::join_on_exec"
-        )]
-        let mut cmd = tokio::process::Command::new(&target);
-        cmd.args(argv.iter().skip(1));
+        let mut cmd = workload_command(&target, argv.iter().skip(1), &env);
         crate::kakoi::join_on_exec(&mut cmd, &verdict, pid).map_err(|e| NativeError::Spawn {
             program: target.clone(),
             detail: e.to_string(),
@@ -1767,6 +1775,21 @@ mod tests {
             err.contains(gone) && err.contains("ImageUnavailable"),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_live_process_names_its_pid_for_an_exec_to_join() {
+        let args = ["-c".to_string(), "sleep 5".to_string()];
+        let mut cmd = workload_command(
+            Path::new("/bin/sh"),
+            args.iter(),
+            &std::collections::BTreeMap::new(),
+        );
+        cmd.kill_on_drop(true);
+        let child = cmd.spawn().expect("spawn /bin/sh");
+        let pid = child.id();
+        assert!(pid.is_some());
+        assert_eq!(Process::Live(child).live_pid(), pid);
     }
 
     /// ★ T2.10: a workload that ignores SIGTERM is killed with SIGKILL once its grace
