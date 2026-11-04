@@ -187,12 +187,7 @@ impl OwnedChildrenReconciler for ReplicaSetController {
         let Some(owner_ref) = owner_ref_for(rs_value, "apps/v1", "ReplicaSet") else {
             return Ok(ReconcileDelta::none());
         };
-        // Pods go in the RS's OWN namespace (where owned-pod gathering
-        // looks), not the controller scope ns — same fix as deployment→RS.
-        let pod_ns = rs_value.namespace().map_or_else(
-            || self.namespace.as_deref().unwrap_or("default").to_string(),
-            |c| c.to_owned(),
-        );
+        let pod_ns = crate::owned_children::child_namespace(rs_value, self.namespace.as_deref());
         let mut commands = Vec::new();
 
         if observed < desired {

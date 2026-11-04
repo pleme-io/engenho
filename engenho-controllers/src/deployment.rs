@@ -236,13 +236,8 @@ impl OwnedChildrenReconciler for DeploymentController {
                     set_owner_reference(&mut rs_value, owner_ref.clone())?;
                     // Key the RS under the PARENT Deployment's namespace —
                     // the same namespace the blanket gathers `owned_rs` from
-                    // (by owner-ref). Using the controller's scope namespace
-                    // (`ns`, None→"default") keyed the RS where the owned-RS
-                    // query never looks → the controller never saw the RS it
-                    // created → recreate-every-tick hot loop + status thrash.
-                    let rs_ns = d_value
-                        .namespace()
-                        .map_or_else(|| ns.unwrap_or("default").to_string(), |c| c.to_owned());
+                    // (by owner-ref).
+                    let rs_ns = crate::owned_children::child_namespace(d_value, ns);
                     let rs_key =
                         ResourceKey::namespaced("apps", "v1", "ReplicaSet", &rs_ns, &rs_name);
                     commands.push(ResourceCommand::Put {

@@ -389,15 +389,7 @@ impl OwnedChildrenReconciler for StatefulSetController {
         // on it), before anything is created or deleted for it.
         let strategy = UpdateStrategy::of(sts_value)?;
         let revision = TemplateRevision::of(sts_value);
-        // Pods go in the StatefulSet's OWN namespace (where owned-pod
-        // gathering looks), not the controller scope ns — same fix as
-        // deployment→RS and replicaset→pod. Keying under the scope ns
-        // (None→"default") put pods where the owned-pod query never looked
-        // → recreate-every-tick hot loop for namespaced StatefulSets.
-        let pod_ns = sts_value.namespace().map_or_else(
-            || self.namespace.as_deref().unwrap_or("default").to_string(),
-            |c| c.to_owned(),
-        );
+        let pod_ns = crate::owned_children::child_namespace(sts_value, self.namespace.as_deref());
 
         // Every owned pod, Terminating ones included: an ordinal is an
         // identity, and a Terminating `{sts}-{n}` still holds it until its

@@ -177,6 +177,11 @@ pub const fn child_write_target(command: &ResourceCommand) -> Option<&ResourceKe
     }
 }
 
+#[must_use]
+pub fn child_namespace(parent: &Value, scope: Option<&str>) -> String {
+    parent.namespace().or(scope).unwrap_or("default").to_owned()
+}
+
 /// A Pod cloned from `parent`'s `spec.template`: `kind`/`apiVersion`
 /// stamped, `metadata.name` set to `name`, `metadata.namespace` to
 /// `namespace`, and owned by `owner`.

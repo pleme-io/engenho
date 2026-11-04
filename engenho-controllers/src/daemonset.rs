@@ -275,12 +275,7 @@ impl OwnedChildrenReconciler for DaemonSetController {
             .filter_map(|(_, n)| Self::node_name_of(n).map(String::from))
             .collect();
 
-        // Pods go in the DS's OWN namespace (where owned-pod gathering
-        // looks), not the controller scope ns.
-        let pod_ns = ds_value.namespace().map_or_else(
-            || self.namespace.as_deref().unwrap_or("default").to_string(),
-            |c| c.to_owned(),
-        );
+        let pod_ns = crate::owned_children::child_namespace(ds_value, self.namespace.as_deref());
 
         // The nodes already covered by an owned pod. A Terminating pod
         // still covers its node: its replacement would take the same name

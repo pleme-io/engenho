@@ -216,8 +216,7 @@ impl OwnedChildrenReconciler for JobController {
         let Some(owner_ref) = owner_ref_for(job_value, "batch/v1", "Job") else {
             return Ok(ReconcileDelta::none());
         };
-        let ns = self.namespace.as_deref();
-        let pod_ns = ns.unwrap_or("default");
+        let pod_ns = crate::owned_children::child_namespace(job_value, self.namespace.as_deref());
 
         let succeeded = owned
             .iter()
@@ -271,7 +270,7 @@ impl OwnedChildrenReconciler for JobController {
             let Some((pod_name, pod)) = Self::build_pod(job_value, idx, owner_ref.clone())? else {
                 break;
             };
-            let pod_key = ResourceKey::namespaced("", "v1", "Pod", pod_ns, &pod_name);
+            let pod_key = ResourceKey::namespaced("", "v1", "Pod", &pod_ns, &pod_name);
             commands.push(ResourceCommand::Put {
                 key: pod_key,
                 value: pod,
