@@ -1,6 +1,6 @@
 # Security by default
 
-A native pod is secure by what it does not say. The policy is blue: `engenho-kubelet/blue/kakoi/kakoi.b`, loaded under an empty posture. Rust states the facts and applies the verdict (`engenho-kubelet/src/kakoi.rs`).
+A native pod is secure by what it does not say. The policy is blue: `engenho-kubelet/blue/kakoi/kakoi.b`, loaded under an empty posture. Rust states the facts and applies the verdict (`engenho-kubelet/src/kakoi.rs`). The laws are `theory/KAKOI.md`; this file says what holds today.
 
 ## What a pod gets
 
@@ -12,7 +12,20 @@ A native pod is secure by what it does not say. The policy is blue: `engenho-kub
 | Processes | its own `/proc` shows only its account's processes |
 | Syscalls | a seccomp filter denies `kakoi::denied_syscalls` with `EPERM`, among them `mount` and the new mount API, `unshare`, `setns`, `ptrace`, `bpf`, `io_uring` and module loading. `clone` with a namespace flag and a kernel crypto or vsock socket answer `EPERM`. `clone3` and any call above `kakoi::newest_allowed_syscall` answer `ENOSYS`, which also closes the x32 range. A call of another architecture kills it. An architecture with no syscall table refuses the pod |
 | Its volumes | a declared mount stays writable; `emptyDir` and materialized volumes are handed to its account |
-| A command run in it | an exec or an exec probe joins its mount namespace and takes its account, capabilities and filter |
+| A command run in it | an exec or an exec probe joins its namespaces and takes its account, capabilities, filter and declared environment, never the daemon's |
+| Other namespaces | its own IPC, UTS and cgroup namespaces, and a private `/dev/shm`; host sockets such as the nix daemon's, dbus and container runtimes are hidden |
+
+## Its declared capabilities
+
+A pod may carry blue's `access` value as the annotation `kakoi.pleme.io/access`. It only narrows, so writing it takes no grant.
+
+| The access says | The pod gets |
+|---|---|
+| `effects` lacks `network` | an empty network namespace |
+| `effects` lacks `filesystem`, or a volume is not under `writes` | that volume stays read-only |
+| `writes` without `filesystem`, `listen` without `network`, or text that does not read as access | that pod is refused, by name |
+
+`kakoi::capability_rendering` holds a row for each host effect, and a test fails on an effect with none. `haibi` does not yet render this annotation from a Bluefile.
 
 ## Root is a grant
 
@@ -40,7 +53,7 @@ The etcd facade serves every Secret, so it binds only when `runtime.etcd_listen_
 
 ## What this does not do yet
 
-- **No network namespace.** A native pod shares the host's network, so it can reach whatever listens on loopback. Each surface engenho itself listens on is gated above; a workload's own listener must authenticate.
+- **The network is not yet per pod.** A pod with the network effect, which is every pod with no access value, shares the host's network, so it can reach whatever listens on loopback. Each surface engenho itself listens on is gated above; a workload's own listener must authenticate.
 - **Two pods that declare the same `runAsUser`** see and can signal each other. A pod that declares none has its namespace's account.
 - **The seccomp list is a deny-list** with a ceiling, covering x86_64 and aarch64. seccomp(2) recommends an allow-list; moby's default profile is the base to start from.
 - **macOS.** Neither identity nor enclosure applies, and each pod gets a `ConfinementNotEnforced` event. `sandbox-exec` is deprecated, and Apple's own `container` tool runs one VM per container, so Linux workloads on a Mac belong in a VM. The design is `theory/NAWABARI.md`; its code is not in `pleme-io/nawabari`, which is empty.
@@ -54,8 +67,8 @@ Read 2026-11-04 from engenho's source, against Kubernetes Pod Security Standards
 | # | Root | Where it lands |
 |---|---|---|
 | 2 | The fleet default in `nix/modules/pleme/nixos/engenho-node.nix` is `audit`, not `enforce` | each node brought across, then the default raised |
-| 3 | Host surfaces stay reachable: `/run` sockets, `/dev/shm`, abstract sockets, and `/nix/var/nix/daemon-socket` through `connect()`, which a read-only mount does not stop | kakoi's hide list, then Landlock (ABI 6 for abstract sockets, ABI 9 for pathname sockets) |
-| 4 | No network or IPC namespace: `hostNetwork` and `hostIPC` are true in effect, which fails even the Baseline standard, and `NetworkPolicy` is computed and never installed | a per-pod netns with nftables default deny; start with an empty netns for a pod that declares no ports |
+| 3 | Some host surfaces stay reachable: other `/run` sockets, and abstract sockets for a pod with the network effect | Landlock (ABI 6 for abstract sockets, ABI 9 for pathname sockets) |
+| 4 | A pod with the network effect still shares the host's network: `hostNetwork` is true in effect, which fails even the Baseline standard, and `NetworkPolicy` is computed and never installed | a per-pod netns with nftables default deny, from `egress` and `listen` |
 | 5 | Two pods with one `runAsUser` share an identity; no default `pids.max` or `memory.max` | kakoi identity and cgroup defaults |
 | 6 | `capabilities.add: NET_BIND_SERVICE`, which Restricted allows, needs the root grant, which removes the whole enclosure | kakoi: name capabilities an enclosed pod may keep |
 | 7 | `hostPID`, `hostIPC`, `readOnlyRootFilesystem`, `capabilities.drop`, `seccompProfile`, sysctls and devices are ignored or unread | kakoi facts, refused when they cannot be honoured |
