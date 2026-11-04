@@ -251,6 +251,7 @@ impl<N: MeshNetwork> Registration for N {
 
 const FORWARD_HOPS: usize = 3;
 const FORWARD_CATCH_UP: Duration = Duration::from_secs(5);
+const FORWARD_ELECTION_PAUSE: Duration = Duration::from_millis(500);
 
 /// Raft-replicated K8s resource store, over whichever [`MeshNetwork`] it
 /// was started on.
@@ -496,9 +497,15 @@ impl StoreMesh {
 
     async fn forward(&self, command: LoggedCommand) -> Result<ApplyResult, StoreError> {
         let mut hops = 0;
+        let mut waited_for_election = false;
         loop {
             let (Some(leader), Some(addr)) = self.leader_known() else {
-                return Err(StoreError::NoLeader);
+                if waited_for_election {
+                    return Err(StoreError::NoLeader);
+                }
+                waited_for_election = true;
+                self.wait_for_a_known_leader(FORWARD_CATCH_UP).await;
+                continue;
             };
             if leader == self.node_id {
                 return self
@@ -520,6 +527,10 @@ impl StoreMesh {
                 Err(refused) => refused,
             };
             match refused {
+                ForwardRefused::NotLeader { leader: None, .. } if hops < FORWARD_HOPS => {
+                    hops += 1;
+                    tokio::time::sleep(FORWARD_ELECTION_PAUSE).await;
+                }
                 ForwardRefused::NotLeader { leader: None, .. } => return Err(StoreError::NoLeader),
                 ForwardRefused::NotLeader {
                     leader: Some(_), ..
@@ -538,6 +549,12 @@ impl StoreMesh {
                 }
             }
         }
+    }
+
+    async fn wait_for_a_known_leader(&self, within: Duration) {
+        let mut metrics = self.raft.metrics();
+        let _ =
+            tokio::time::timeout(within, metrics.wait_for(|m| m.current_leader.is_some())).await;
     }
 
     async fn wait_for_another_leader(&self, than: RaftNodeId, within: Duration) {

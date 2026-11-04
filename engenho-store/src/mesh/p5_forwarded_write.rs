@@ -87,6 +87,41 @@ macro_rules! over_every_mesh {
 over_every_mesh!(a_followers_write_is_the_leaders_and_is_read_back_on_the_follower);
 
 #[tokio::test]
+async fn a_write_during_an_election_waits_for_the_leader_instead_of_failing() {
+    let mesh = std::sync::Arc::new(
+        StoreMesh::start(
+            8,
+            "in-process://8".into(),
+            InProcessRouter::new(),
+            fast_config("p5-election").unwrap(),
+        )
+        .await
+        .unwrap(),
+    );
+    let writer = {
+        let mesh = mesh.clone();
+        tokio::spawn(async move { mesh.propose(put("during-election", None)).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !writer.is_finished(),
+        "the write gave up before any election ran"
+    );
+    mesh.initialize_singleton().await.unwrap();
+    let written = tokio::time::timeout(ELECT, writer)
+        .await
+        .expect("the write hung after a leader was elected")
+        .unwrap()
+        .unwrap();
+    assert_eq!(written.op, ResourceOp::Created);
+    std::sync::Arc::into_inner(mesh)
+        .expect("the writer has finished")
+        .terminate()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn a_write_on_a_node_that_knows_no_leader_is_refused_as_no_leader() {
     let mesh = StoreMesh::start(
         7,
