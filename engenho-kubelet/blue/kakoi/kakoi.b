@@ -517,8 +517,144 @@ def enclose(facts_text)
   end
 end
 
+@doc """
+dig: The value at a path of keys, or nil where the path ends early.
+
+    dig({"a" => {"b" => 1}}, ["a", "b"]) #=> 1
+    dig({"a" => 1}, ["a", "b"]) #=> nil
+    dig(nil, ["a"]) #=> nil
+"""
+def dig(value, path)
+  if length(path) == 0
+    value
+  else
+    dig(field(value, first(path), nil), rest(path))
+  end
+end
+
+@doc """
+grant_in: The root grant an object carries for itself or for the pods it makes. A controller's own writes pass no admission, so a grant in a template has to be caught where the template arrives.
+
+    grant_in({"metadata" => {"annotations" => {"kakoi.pleme.io/root" => "x"}}}) #=> "x"
+    grant_in({"spec" => {"jobTemplate" => {"spec" => {"template" => {"metadata" => {"annotations" => {"kakoi.pleme.io/root" => "y"}}}}}}}) #=> "y"
+    grant_in({}) #=> nil
+"""
+def grant_in(object)
+  found = filter(
+    (place) -> place != nil,
+    map(
+      fn(path)
+        dig(object, append(path, ["metadata", "annotations", grant_annotation]))
+      end,
+      [[], %w[spec template], %w[spec jobTemplate spec template]]
+    )
+  )
+  if length(found) == 0
+    nil
+  else
+    first(found)
+  end
+end
+
+@doc """
+grant_holders: The groups whose members may write a root grant.
+
+    grant_holders #=> ["system:masters"]
+"""
+def grant_holders()
+  ["system:masters"]
+end
+
+@doc """
+admit: Whether a write may carry the root grant it carries. Only a holder may add or change one; a write that leaves an existing grant as it was passes, so a status update from anyone stays possible.
+
+    json_read(admit(json_stringify({"object" => {}}))).refused #=> nil
+"""
+def admit(facts_text)
+  facts = json_read(facts_text)
+  mode = field(facts, "mode", "enforce")
+  claimed = grant_in(field(facts, "object", {}))
+  groups = field(facts, "groups", [])
+  allowed = claimed.nil? or
+    claimed == grant_in(field(facts, "current", {})) or
+    any?((group) -> member?(group, grant_holders), groups)
+  why = if allowed
+    nil
+  else
+    "only #{join(grant_holders, ", ")} may write the annotation #{grant_annotation}, since it runs a pod as root on the node"
+  end
+  json_stringify(
+    {
+      "refused" => if mode == "enforce"
+        why
+      end,
+      "warning" => if mode == "audit" and why != nil
+        "would refuse under enforce: #{why}"
+      end
+    }
+  )
+end
+
 def answer(facts)
   json_read(enclose(json_stringify(facts)))
+end
+
+def granting_pod(reason)
+  {"metadata" => {"annotations" => {grant_annotation => reason}}}
+end
+
+test "only a holder may add or change a root grant, anywhere it would reach a pod"
+  on = (facts) -> json_read(admit(json_stringify(facts)))
+  assert on(
+    {"object" => granting_pod("x"), "groups" => ["system:authenticated"]}
+  ).refused != nil
+  assert on({"object" => granting_pod("x"), "groups" => []}).refused != nil
+  assert on(
+    {
+      "object" => granting_pod("x"),
+      "groups" => %w[system:masters system:authenticated]
+    }
+  ).refused.nil?
+  template = {"spec" => {"template" => granting_pod("x")}}
+  cron = {
+    "spec" => {"jobTemplate" => {"spec" => {"template" => granting_pod("x")}}}
+  }
+  assert on({"object" => template, "groups" => []}).refused != nil
+  assert on({"object" => cron, "groups" => []}).refused != nil
+  assert on(
+    {
+      "object" => {"metadata" => {"annotations" => {"a" => "b"}}},
+      "groups" => []
+    }
+  ).refused.nil?
+  assert on(
+    {
+      "object" => granting_pod("x"),
+      "current" => granting_pod("y"),
+      "groups" => []
+    }
+  ).refused != nil
+  assert on(
+    {
+      "object" => granting_pod("x"),
+      "current" => granting_pod("x"),
+      "groups" => []
+    }
+  ).refused.nil?
+end
+
+test "audit warns where enforce refuses, and off says nothing"
+  on = fn(mode)
+    json_read(
+      admit(json_stringify({"mode" => mode, "object" => granting_pod("x")}))
+    )
+  end
+  assert on("enforce").refused != nil
+  assert on("enforce").warning.nil?
+  assert on("audit").refused.nil?
+  assert contains?(on("audit").warning, "would refuse")
+  assert on("off").refused.nil?
+  assert on("off").warning.nil?
 end
 
 test "a pod that says nothing runs as the default account with nothing kept"

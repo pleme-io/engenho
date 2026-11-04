@@ -18,6 +18,8 @@ A native pod is secure by what it does not say. The policy is blue: `engenho-kub
 
 `runAsUser: 0`, `privileged`, `allowPrivilegeEscalation: true` and `capabilities.add` need the pod annotation `kakoi.pleme.io/root`, whose value is the reason. With no grant that one pod is refused, by name. A grant keeps the daemon's identity and no enclosure.
 
+Only `system:masters` may add or change a grant, on a pod or in a workload's template (`kakoi::admit`, at the API boundary). A controller's own writes pass no admission, so a grant is caught where a template arrives. Under `audit` a write that `enforce` would refuse logs a warning instead.
+
 A `runAsUser` at pod level now reaches its containers, as Kubernetes specifies. It was silently dropped before.
 
 ## Modes
@@ -51,7 +53,6 @@ Read 2026-11-04 from engenho's source, against Kubernetes Pod Security Standards
 
 | # | Root | Where it lands |
 |---|---|---|
-| 1 | A root grant is an annotation anyone who can create a pod can write. No check names who may set it | an admission rule, in blue, at the hook in `engenho-runtime/src/runtime.rs` |
 | 2 | The fleet default in `nix/modules/pleme/nixos/engenho-node.nix` is `audit`, not `enforce` | each node brought across, then the default raised |
 | 3 | Host surfaces stay reachable: `/run` sockets, `/dev/shm`, abstract sockets, and `/nix/var/nix/daemon-socket` through `connect()`, which a read-only mount does not stop | kakoi's hide list, then Landlock (ABI 6 for abstract sockets, ABI 9 for pathname sockets) |
 | 4 | No network or IPC namespace: `hostNetwork` and `hostIPC` are true in effect, which fails even the Baseline standard, and `NetworkPolicy` is computed and never installed | a per-pod netns with nftables default deny; start with an empty netns for a pod that declares no ports |

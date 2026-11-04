@@ -4,6 +4,9 @@
 //! Rust is the seam: it states the facts, reads the verdict, and applies it to
 //! the child in [`enter_on_exec`].
 
+use engenho_controllers::admission::{
+    AdmissionDecision, AdmissionError, AdmissionRequest, AdmissionWebhook,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::backend::Confinement;
@@ -136,6 +139,81 @@ impl Kakoi {
         };
         let facts = serde_json::to_string(&facts).map_err(|e| e.to_string())?;
         self.0.ask("kakoi::enclose", facts).await
+    }
+}
+
+#[derive(Serialize)]
+struct AdmitFacts<'a> {
+    mode: NativeSecurity,
+    groups: &'a [String],
+    object: &'a serde_json::Value,
+    current: Option<&'a serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct Admitted {
+    refused: Option<String>,
+    warning: Option<String>,
+}
+
+/// Who may write a root grant: `kakoi::admit`, at the API boundary. Only a
+/// write that names the annotation reaches blue, so a program that failed to
+/// load refuses grants and nothing else.
+pub struct RootGrantAdmission {
+    kakoi: Result<Kakoi, String>,
+    mode: NativeSecurity,
+}
+
+impl RootGrantAdmission {
+    /// The rule for a node in `mode`.
+    #[must_use]
+    pub fn new(mode: NativeSecurity) -> Self {
+        Self {
+            kakoi: Kakoi::start(),
+            mode,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AdmissionWebhook for RootGrantAdmission {
+    fn name(&self) -> &'static str {
+        "kakoi-root-grant"
+    }
+
+    async fn review(
+        &self,
+        request: &AdmissionRequest,
+    ) -> Result<AdmissionDecision, AdmissionError> {
+        let Some(object) = &request.value else {
+            return Ok(AdmissionDecision::Allow);
+        };
+        if !object.to_string().contains(GRANT_ANNOTATION) {
+            return Ok(AdmissionDecision::Allow);
+        }
+        let kakoi = self
+            .kakoi
+            .as_ref()
+            .map_err(|e| AdmissionError::Backend(e.clone()))?;
+        let facts = AdmitFacts {
+            mode: self.mode,
+            groups: &request.user_info.groups,
+            object,
+            current: request.current.as_ref(),
+        };
+        let facts =
+            serde_json::to_string(&facts).map_err(|e| AdmissionError::Backend(e.to_string()))?;
+        let answer: Admitted = kakoi
+            .0
+            .ask("kakoi::admit", facts)
+            .await
+            .map_err(AdmissionError::Backend)?;
+        if let Some(warning) = answer.warning {
+            tracing::warn!(user = %request.user_info.username, key = ?request.key, "{warning}");
+        }
+        Ok(answer
+            .refused
+            .map_or(AdmissionDecision::Allow, AdmissionDecision::Deny))
     }
 }
 
@@ -589,6 +667,74 @@ mod tests {
     const ALLOW: u32 = 0x7fff_0000;
     #[cfg(target_os = "linux")]
     const KILL: u32 = 0x8000_0000;
+
+    fn write_as(
+        groups: &[&str],
+        value: serde_json::Value,
+        current: Option<serde_json::Value>,
+    ) -> AdmissionRequest {
+        AdmissionRequest {
+            action: engenho_controllers::admission::AdmissionAction::Put,
+            key: engenho_store::ResourceKey::namespaced("", "v1", "Pod", "ns", "p"),
+            value: Some(value),
+            current,
+            user_info: engenho_types::auth::UserInfo {
+                username: "someone".to_string(),
+                groups: groups.iter().map(ToString::to_string).collect(),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_holder_may_write_a_root_grant_on_a_pod_or_in_a_template() {
+        let rule = RootGrantAdmission::new(NativeSecurity::Enforce);
+        let granted = serde_json::json!({"metadata": {"annotations": {GRANT_ANNOTATION: "why"}}});
+        let cron = serde_json::json!({
+            "spec": {"jobTemplate": {"spec": {"template": granted.clone()}}}
+        });
+        for object in [&granted, &cron] {
+            let refused = rule
+                .review(&write_as(&["system:authenticated"], object.clone(), None))
+                .await
+                .unwrap();
+            assert!(matches!(refused, AdmissionDecision::Deny(_)), "{refused:?}");
+            let allowed = rule
+                .review(&write_as(&["system:masters"], object.clone(), None))
+                .await
+                .unwrap();
+            assert_eq!(allowed, AdmissionDecision::Allow);
+        }
+        let unchanged = rule
+            .review(&write_as(&[], granted.clone(), Some(granted.clone())))
+            .await
+            .unwrap();
+        assert_eq!(unchanged, AdmissionDecision::Allow);
+        let plain = rule
+            .review(&write_as(&[], serde_json::json!({"metadata": {}}), None))
+            .await
+            .unwrap();
+        assert_eq!(plain, AdmissionDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn a_rule_that_failed_to_load_refuses_grants_and_nothing_else() {
+        let rule = RootGrantAdmission {
+            kakoi: Err("no program".to_string()),
+            mode: NativeSecurity::Enforce,
+        };
+        let plain = rule
+            .review(&write_as(&[], serde_json::json!({"metadata": {}}), None))
+            .await
+            .unwrap();
+        assert_eq!(plain, AdmissionDecision::Allow);
+        let granted = serde_json::json!({"metadata": {"annotations": {GRANT_ANNOTATION: "why"}}});
+        assert!(
+            rule.review(&write_as(&["system:masters"], granted, None))
+                .await
+                .is_err()
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

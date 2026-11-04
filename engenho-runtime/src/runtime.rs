@@ -415,8 +415,11 @@ impl Runtime {
             boot.service_cidr.clone(),
             Arc::new(StoreServiceIpSource::new(store.clone())),
         ));
+        let root_grant_hook: Arc<dyn AdmissionWebhook> = Arc::new(
+            engenho_kubelet::kakoi::RootGrantAdmission::new(boot.native_security),
+        );
         let admission = Arc::new(AdmissionChain::new(
-            vec![cluster_ip_hook],
+            vec![cluster_ip_hook, root_grant_hook],
             AdmissionMode::FailClosed,
         ));
 
