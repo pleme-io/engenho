@@ -10,8 +10,9 @@ A native pod is secure by what it does not say. The policy is blue: `engenho-kub
 | Privileges | `no_new_privs`, no capabilities |
 | Filesystem | its own mount namespace: the host read-only, private `/tmp` and `/var/tmp`, `/root`, `/home`, `/run/secrets`, `/etc/ssh`, `/etc/engenho`, `/var/lib`, `/var/log`, `/srv` hidden unless its own volume lives there |
 | Processes | its own `/proc` shows only its account's processes |
-| Syscalls | a seccomp filter denies `mount`, `unshare`, `setns`, `ptrace`, `bpf`, module loading and the rest of `kakoi::denied_syscalls` with `EPERM`; a call of another architecture kills it |
+| Syscalls | a seccomp filter denies `kakoi::denied_syscalls` with `EPERM`, among them `mount` and the new mount API, `unshare`, `setns`, `ptrace`, `bpf`, `io_uring` and module loading. `clone` with a namespace flag and a kernel crypto or vsock socket answer `EPERM`. `clone3` and any call above `kakoi::newest_allowed_syscall` answer `ENOSYS`, which also closes the x32 range. A call of another architecture kills it. An architecture with no syscall table refuses the pod |
 | Its volumes | a declared mount stays writable; `emptyDir` and materialized volumes are handed to its account |
+| A command run in it | an exec or an exec probe joins its mount namespace and takes its account, capabilities and filter |
 
 ## Root is a grant
 
@@ -39,7 +40,30 @@ The etcd facade serves every Secret, so it binds only when `runtime.etcd_listen_
 
 - **No network namespace.** A native pod shares the host's network, so it can reach whatever listens on loopback. Each surface engenho itself listens on is gated above; a workload's own listener must authenticate.
 - **Two pods that declare the same `runAsUser`** see and can signal each other. A pod that declares none has its namespace's account.
-- **The seccomp list is a deny-list**, covering x86_64 and aarch64; any other architecture gets no filter.
-- **macOS.** Neither identity nor enclosure applies, and each pod gets a `ConfinementNotEnforced` event. The design is `theory/NAWABARI.md`; its code is not in `pleme-io/nawabari`, which is empty.
-- **A daemon that is not root** cannot change identity, and says so the same way.
+- **The seccomp list is a deny-list** with a ceiling, covering x86_64 and aarch64. seccomp(2) recommends an allow-list; moby's default profile is the base to start from.
+- **macOS.** Neither identity nor enclosure applies, and each pod gets a `ConfinementNotEnforced` event. `sandbox-exec` is deprecated, and Apple's own `container` tool runs one VM per container, so Linux workloads on a Mac belong in a VM. The design is `theory/NAWABARI.md`; its code is not in `pleme-io/nawabari`, which is empty.
+- **A daemon that is not root** cannot enclose. On Linux the kernel still refuses a uid the pod declares that is not the daemon's.
 - **Anonymous discovery** (`/api`) still answers; RBAC limits it to discovery.
+
+## Measured against the baseline
+
+Read 2026-11-04 from engenho's source, against Kubernetes Pod Security Standards, moby's seccomp profile, seccomp(2), landlock(7), Bottlerocket, RKE2 and Apple `container`. These are the open roots, in the order that removes the most risk for a native runner on a small fleet of first-party workloads.
+
+| # | Root | Where it lands |
+|---|---|---|
+| 1 | A root grant is an annotation anyone who can create a pod can write. No check names who may set it | an admission rule, in blue, at the hook in `engenho-runtime/src/runtime.rs` |
+| 2 | The fleet default in `nix/modules/pleme/nixos/engenho-node.nix` is `audit`, not `enforce` | each node brought across, then the default raised |
+| 3 | Host surfaces stay reachable: `/run` sockets, `/dev/shm`, abstract sockets, and `/nix/var/nix/daemon-socket` through `connect()`, which a read-only mount does not stop | kakoi's hide list, then Landlock (ABI 6 for abstract sockets, ABI 9 for pathname sockets) |
+| 4 | No network or IPC namespace: `hostNetwork` and `hostIPC` are true in effect, which fails even the Baseline standard, and `NetworkPolicy` is computed and never installed | a per-pod netns with nftables default deny; start with an empty netns for a pod that declares no ports |
+| 5 | Two pods with one `runAsUser` share an identity; no default `pids.max` or `memory.max` | kakoi identity and cgroup defaults |
+| 6 | `capabilities.add: NET_BIND_SERVICE`, which Restricted allows, needs the root grant, which removes the whole enclosure | kakoi: name capabilities an enclosed pod may keep |
+| 7 | `hostPID`, `hostIPC`, `readOnlyRootFilesystem`, `capabilities.drop`, `seccompProfile`, sysctls and devices are ignored or unread | kakoi facts, refused when they cannot be honoured |
+| 8 | No API audit log; `engenho-apiserver/src/audit.rs` has only test callers | middleware in the apiserver |
+| 9 | Secrets are plaintext in the store | envelope encryption with a node-held key |
+| 10 | No image or closure verification at admission; tameshi's verifier has no caller | the admission rule, then Nix signature checks |
+| 11 | Certificates run to 2100 with no rotation | a shorter span and rotation in `engenho-apiserver/src/pki.rs` |
+| 12 | The podman backend passes `privileged` and `cap_add` straight through | the same verdict as native |
+
+Policy still written in Rust that belongs in blue: the hostPath permit, mount classification, always-allowed API paths and RBAC, audit levels, token clamping, image reference extraction, webhook matching, NetworkPolicy translation and control tiers. A second standard bidama already loads in an embedded program; a second private package needs `EmbeddedOver`, which the pinned `blue-lang-host` 0.0.125 lacks. `shisei`, `bougyo`, `kyohi` and `kousei` hold shapes to reuse.
+
+Of little value for this threat model: gVisor, Kata and Firecracker for first-party code, mesh mTLS and SPIRE before a netns exists, and user namespaces before unique uids and a netns, since namespaced capabilities widen kernel surface.
