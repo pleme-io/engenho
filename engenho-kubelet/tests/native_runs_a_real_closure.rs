@@ -609,7 +609,11 @@ async fn an_enclosed_pod_cannot_write_the_host_or_see_its_secrets_and_keeps_its_
          (echo x > /etc/kakoi-escape) 2>/dev/null || echo etc-refused; \
          (echo x > /nix/kakoi-escape) 2>/dev/null || echo nix-refused; \
          (ls /root) 2>/dev/null || echo root-hidden; \
-         test -d /run/secrets && (ls /run/secrets 2>/dev/null || echo secrets-hidden)"
+         test -d /run/secrets && (ls /run/secrets 2>/dev/null || echo secrets-hidden); \
+         test -e /proc/1/status && echo pid1-visible || echo pid1-hidden; \
+         test -e /proc/$$/status && echo self-visible; \
+         unshare -m true 2>/dev/null && echo unshare-allowed || echo unshare-denied; \
+         mount -t tmpfs none /tmp 2>/dev/null && echo mount-allowed || echo mount-denied"
     );
     let mut s = spec(&image, &["sh", "-c", &script], &[]);
     s.pod.namespace = "kakoi-test".to_string();
@@ -620,12 +624,19 @@ async fn an_enclosed_pod_cannot_write_the_host_or_see_its_secrets_and_keeps_its_
         sub_path: None,
     }];
     let out = output_of(&backend, &s).await;
+    assert!(!out.contains("pid1-visible"), "{out}");
+    assert!(!out.contains("unshare-allowed"), "{out}");
+    assert!(!out.contains("mount-allowed"), "{out}");
     for expected in [
         "own-ok",
         "tmp-ok",
         "etc-refused",
         "nix-refused",
         "root-hidden",
+        "pid1-hidden",
+        "self-visible",
+        "unshare-denied",
+        "mount-denied",
     ] {
         assert!(out.contains(expected), "{expected} missing from: {out}");
     }

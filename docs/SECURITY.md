@@ -9,6 +9,8 @@ A native pod is secure by what it does not say. The policy is blue: `engenho-kub
 | Account | its namespace's own: `100000 + blake3(namespace)`, stable and non-root |
 | Privileges | `no_new_privs`, no capabilities |
 | Filesystem | its own mount namespace: the host read-only, private `/tmp` and `/var/tmp`, `/root`, `/home`, `/run/secrets`, `/etc/ssh`, `/etc/engenho`, `/var/lib`, `/var/log`, `/srv` hidden unless its own volume lives there |
+| Processes | its own `/proc` shows only its account's processes |
+| Syscalls | a seccomp filter denies `mount`, `unshare`, `setns`, `ptrace`, `bpf`, module loading and the rest of `kakoi::denied_syscalls` with `EPERM`; a call of another architecture kills it |
 | Its volumes | a declared mount stays writable; `emptyDir` and materialized volumes are handed to its account |
 
 ## Root is a grant
@@ -35,8 +37,9 @@ The etcd facade serves every Secret, so it binds only when `runtime.etcd_listen_
 
 ## What this does not do yet
 
-- **No network or PID namespace.** A native pod shares the host's network and sees its processes. Its account limits what it can do to them, and two pods that declare the same `runAsUser` can signal each other.
-- **No seccomp filter.**
+- **No network namespace.** A native pod shares the host's network, so it can reach whatever listens on loopback. Each surface engenho itself listens on is gated above; a workload's own listener must authenticate.
+- **Two pods that declare the same `runAsUser`** see and can signal each other. A pod that declares none has its namespace's account.
+- **The seccomp list is a deny-list**, covering x86_64 and aarch64; any other architecture gets no filter.
 - **macOS.** Neither identity nor enclosure applies, and each pod gets a `ConfinementNotEnforced` event. The design is `theory/NAWABARI.md`; its code is not in `pleme-io/nawabari`, which is empty.
 - **A daemon that is not root** cannot change identity, and says so the same way.
 - **Anonymous discovery** (`/api`) still answers; RBAC limits it to discovery.

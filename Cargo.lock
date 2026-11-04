@@ -2172,6 +2172,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "miniz_oxide",
  "proptest",
  "prost",

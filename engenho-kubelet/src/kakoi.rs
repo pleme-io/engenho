@@ -30,6 +30,7 @@ struct Declared<'a> {
 
 #[derive(Serialize)]
 struct Facts<'a> {
+    arch: &'a str,
     namespace: &'a str,
     volumes: &'a [String],
     mode: NativeSecurity,
@@ -60,6 +61,9 @@ pub struct Verdict {
     /// Directories given a fresh private filesystem.
     #[serde(default)]
     pub scratch: Vec<String>,
+    /// Syscall numbers denied with `EPERM`, for this architecture.
+    #[serde(default)]
+    pub deny: Vec<u32>,
     /// What the node could not enforce, for an event a reader sees.
     #[serde(default)]
     pub warnings: Vec<String>,
@@ -91,6 +95,7 @@ impl Kakoi {
         can_enforce: bool,
     ) -> Result<Verdict, String> {
         let facts = Facts {
+            arch: std::env::consts::ARCH,
             namespace,
             volumes,
             mode,
@@ -171,6 +176,62 @@ fn cstrings(paths: impl IntoIterator<Item = String>) -> Vec<std::ffi::CString> {
         .collect()
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const AUDIT_ARCH: u32 = 0xc000_003e;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const AUDIT_ARCH: u32 = 0xc000_00b7;
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+const AUDIT_ARCH: u32 = 0;
+
+#[cfg(target_os = "linux")]
+fn stmt(code: u16, k: u32) -> libc::sock_filter {
+    libc::sock_filter {
+        code,
+        jt: 0,
+        jf: 0,
+        k,
+    }
+}
+
+/// The filter: another architecture's numbers mean other calls, so a foreign
+/// call is killed; a denied number answers `EPERM`; the rest run.
+#[cfg(target_os = "linux")]
+fn seccomp_filter(deny: &[u32]) -> Vec<libc::sock_filter> {
+    const LD_W_ABS: u16 = 0x20;
+    const JEQ_K: u16 = 0x15;
+    const RET_K: u16 = 0x06;
+    const RET_KILL_PROCESS: u32 = 0x8000_0000;
+    const RET_ERRNO_EPERM: u32 = 0x0005_0001;
+    const RET_ALLOW: u32 = 0x7fff_0000;
+    const OFFSET_NR: u32 = 0;
+    const OFFSET_ARCH: u32 = 4;
+    let mut program = vec![
+        stmt(LD_W_ABS, OFFSET_ARCH),
+        libc::sock_filter {
+            code: JEQ_K,
+            jt: 1,
+            jf: 0,
+            k: AUDIT_ARCH,
+        },
+        stmt(RET_K, RET_KILL_PROCESS),
+        stmt(LD_W_ABS, OFFSET_NR),
+    ];
+    for number in deny {
+        program.push(libc::sock_filter {
+            code: JEQ_K,
+            jt: 0,
+            jf: 1,
+            k: *number,
+        });
+        program.push(stmt(RET_K, RET_ERRNO_EPERM));
+    }
+    program.push(stmt(RET_K, RET_ALLOW));
+    program
+}
+
 /// A container's own volume path, and whether it is mounted read-only.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Volume {
@@ -228,6 +289,7 @@ pub fn enter_on_exec(
             .filter(|m| m.read_only)
             .map(|m| m.path.clone()),
     );
+    let filter = seccomp_filter(&v.deny);
     let empty = c"";
     let tmpfs = c"tmpfs";
     let root = c"/";
@@ -275,6 +337,13 @@ pub fn enter_on_exec(
                         c"mode=1777,size=256m",
                     )?;
                 }
+                rustix::mount::mount(
+                    c"proc",
+                    c"/proc",
+                    c"proc",
+                    MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC,
+                    c"hidepid=invisible",
+                )?;
                 for path in &hide {
                     rustix::mount::mount(
                         tmpfs,
@@ -308,6 +377,20 @@ pub fn enter_on_exec(
             }
             if v.no_new_privs {
                 rustix::thread::set_no_new_privs(true)?;
+            }
+            if !v.deny.is_empty() {
+                let program = libc::sock_fprog {
+                    len: filter.len() as u16,
+                    filter: filter.as_ptr().cast_mut(),
+                };
+                if libc::prctl(
+                    libc::PR_SET_SECCOMP,
+                    libc::SECCOMP_MODE_FILTER,
+                    std::ptr::from_ref(&program),
+                ) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
             }
             Ok(())
         });

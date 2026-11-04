@@ -116,6 +116,67 @@ def any?(f, xs)
 end
 
 @doc """
+denied_syscalls: What an enclosed container may never call: changing what it can see, reaching other processes or the kernel's own machinery. Each is a name and its number on x86_64 and aarch64, nil where the architecture has none.
+
+    first(denied_syscalls) #=> ["mount", 165, 40]
+"""
+def denied_syscalls()
+  [
+    ["mount", 165, 40],
+    ["umount2", 166, 39],
+    ["pivot_root", 155, 41],
+    ["chroot", 161, 51],
+    ["unshare", 272, 97],
+    ["setns", 308, 268],
+    ["ptrace", 101, 117],
+    ["process_vm_readv", 310, 270],
+    ["process_vm_writev", 311, 271],
+    ["bpf", 321, 280],
+    ["perf_event_open", 298, 241],
+    ["kexec_load", 246, 104],
+    ["kexec_file_load", 320, 294],
+    ["init_module", 175, 105],
+    ["finit_module", 313, 273],
+    ["delete_module", 176, 106],
+    ["reboot", 169, 142],
+    ["swapon", 167, 224],
+    ["swapoff", 168, 225],
+    ["acct", 163, 89],
+    ["add_key", 248, 217],
+    ["request_key", 249, 218],
+    ["keyctl", 250, 219],
+    ["userfaultfd", 323, 282],
+    ["open_by_handle_at", 304, 265],
+    ["quotactl", 179, 60],
+    ["settimeofday", 164, 170],
+    ["clock_settime", 227, 112],
+    ["adjtimex", 159, 171],
+    ["iopl", 172, nil],
+    ["ioperm", 173, nil]
+  ]
+end
+
+@doc """
+denied_numbers: The numbers of the denied calls on one architecture, none where the architecture is not known, since a wrong number would deny the wrong call.
+
+    member?(165, denied_numbers("x86_64")) #=> true
+    member?(40, denied_numbers("aarch64")) #=> true
+    denied_numbers("riscv64") #=> []
+"""
+def denied_numbers(arch)
+  column = if arch == "x86_64"
+    1
+  elsif arch == "aarch64"
+    2
+  end
+  if column.nil?
+    []
+  else
+    filter((n) -> n != nil, map((row) -> row[column], denied_syscalls))
+  end
+end
+
+@doc """
 grant_annotation: The pod annotation that grants root, its value the reason written where a reader sees it.
 
     grant_annotation #=> "kakoi.pleme.io/root"
@@ -260,7 +321,7 @@ def declared_only(facts)
   [declared["run_as_user"], declared["run_as_group"]]
 end
 
-def verdict_text(refused, ids, confine, warnings, volumes?)
+def verdict_text(refused, ids, confine, warnings, volumes?, arch?)
   own = volumes or []
   json_stringify(
     {
@@ -277,6 +338,11 @@ def verdict_text(refused, ids, confine, warnings, volumes?)
       end,
       "scratch" => if confine
         scratch_list(own)
+      else
+        []
+      end,
+      "deny" => if confine
+        denied_numbers(arch)
       else
         []
       end,
@@ -326,7 +392,8 @@ def enclose(facts_text)
       identity(facts),
       not granted,
       [],
-      field(facts, "volumes", [])
+      field(facts, "volumes", []),
+      field(facts, "arch", "")
     )
   end
 end
@@ -428,6 +495,43 @@ test "an enclosed container hides the host's private paths, except where its own
   assert member?("/run/secrets", v.hide)
   assert member?("/srv", v.hide) == false
   assert v.uid == namespace_uid("rubrica")
+end
+
+test "an enclosed container is denied the calls that reach past it, on its own architecture only"
+  on = fn(arch)
+    answer(
+      {
+        "mode" => "enforce",
+        "can_enforce" => true,
+        "arch" => arch,
+        "declared" => {}
+      }
+    ).deny
+  end
+  assert member?(101, on("x86_64"))
+  assert member?(117, on("aarch64"))
+  assert length(on("x86_64")) == length(denied_syscalls)
+  assert length(on("mips")) == 0
+  granted = answer(
+    {
+      "mode" => "enforce",
+      "can_enforce" => true,
+      "grant" => "x",
+      "arch" => "x86_64",
+      "declared" => {}
+    }
+  )
+  assert length(granted.deny) == 0
+end
+
+test "every denied call names a number on some architecture and none repeats"
+  assert every?((row) -> row[1] != nil or row[2] != nil, denied_syscalls)
+  assert length(distinct(map(first, denied_syscalls))) ==
+    length(denied_syscalls)
+  assert length(distinct(denied_numbers("x86_64"))) ==
+    length(denied_numbers("x86_64"))
+  assert length(distinct(denied_numbers("aarch64"))) ==
+    length(denied_numbers("aarch64"))
 end
 
 test "a grant is not enclosed, and neither audit nor off"
