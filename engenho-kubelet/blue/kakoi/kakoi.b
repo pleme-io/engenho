@@ -366,12 +366,21 @@ def enclose(facts_text)
   elsif mode == "off"
     verdict_text(nil, declared_only(facts), false, [])
   elsif not field(facts, "can_enforce", false)
-    verdict_text(
-      nil,
-      [nil, nil],
-      false,
-      ["this node's daemon cannot change identity, so the container runs as the daemon's own account"]
-    )
+    if field(facts, "kernel_decides", false)
+      verdict_text(
+        nil,
+        declared_only(facts),
+        false,
+        ["this node's daemon cannot change identity or enclose: the kernel refuses a uid the pod declares that is not the daemon's, and a pod that declares none runs as the daemon's own account"]
+      )
+    else
+      verdict_text(
+        nil,
+        [nil, nil],
+        false,
+        ["this node's daemon cannot change identity, so the container runs as the daemon's own account"]
+      )
+    end
   elsif mode == "audit"
     verdict_text(
       nil,
@@ -610,4 +619,36 @@ test "a node that cannot enforce never claims it did"
   assert v.uid.nil?
   assert v.no_new_privs == false
   assert contains?(first(v.warnings), "cannot change identity")
+end
+
+test "an unprivileged daemon on Linux hands a declared uid to the kernel to refuse, never its own account in its place"
+  v = answer(
+    {
+      "mode" => "enforce",
+      "can_enforce" => false,
+      "kernel_decides" => true,
+      "declared" => {"run_as_user" => 65534}
+    }
+  )
+  assert v.refused.nil?
+  assert v.uid == 65534
+  assert v.enclosed == false
+  assert contains?(first(v.warnings), "the kernel refuses")
+  silent = answer(
+    {
+      "mode" => "enforce",
+      "can_enforce" => false,
+      "kernel_decides" => true,
+      "declared" => {}
+    }
+  )
+  assert silent.uid.nil?
+  elsewhere = answer(
+    {
+      "mode" => "enforce",
+      "can_enforce" => false,
+      "declared" => {"run_as_user" => 65534}
+    }
+  )
+  assert elsewhere.uid.nil?
 end

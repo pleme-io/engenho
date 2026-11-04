@@ -35,6 +35,7 @@ struct Facts<'a> {
     volumes: &'a [String],
     mode: NativeSecurity,
     can_enforce: bool,
+    kernel_decides: bool,
     grant: Option<&'a str>,
     declared: Declared<'a>,
 }
@@ -100,6 +101,7 @@ impl Kakoi {
             volumes,
             mode,
             can_enforce,
+            kernel_decides: cfg!(target_os = "linux"),
             grant: confinement.root_grant.as_deref(),
             declared: Declared {
                 run_as_user: confinement.run_as_user,
