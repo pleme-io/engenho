@@ -295,6 +295,18 @@ in
         `withheld`: upstream's `[-]<check> failed: reason withheld`, with
         the reason only in the daemon's log.
       '';
+      nativeSecurity = optional (types.enum [ "enforce" "audit" "off" ]) ''
+        How this node treats a native container's security. `enforce`, engenho's
+        default: a pod that says nothing runs as its namespace's account,
+        enclosed, and root takes the annotation `kakoi.pleme.io/root`. `audit`
+        applies what a pod declares and records what `enforce` would refuse.
+      '';
+
+      kubeletAuth = optional (types.enum [ "required" "off" ]) ''
+        Whether the kubelet API needs its in-memory bearer token. Workloads
+        share the host's loopback, so a bind alone protects nothing.
+      '';
+
       nativeCgroups = optional (types.enum [ "delegated" "off" ]) ''
         How the `native` backend enforces a container's `resources` on Linux.
 
@@ -596,6 +608,8 @@ in
       remote_kubeconfig_publish_path = cfg.runtime.remoteKubeconfigPublishPath;
         kubelet_backend = cfg.runtime.kubeletBackend;
         native_cgroups = cfg.runtime.nativeCgroups;
+        native_security = cfg.runtime.nativeSecurity;
+        kubelet_auth = cfg.runtime.kubeletAuth;
         health_reasons = cfg.runtime.healthReasons;
         host_path_allowlist = cfg.runtime.hostPathAllowlist;
         node_manifests_dir = cfg.runtime.nodeManifestsDir;
