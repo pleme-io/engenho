@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "bluefile_b3": "b3:3b4a70e111648d12cb500a41080bc5fe7a34452bc77a77644890557a5437e489",
+  "manifest": {
+    "schema": 1,
+    "name": "sealed_kinds",
+    "version": "0.1.0",
+    "needs": {},
+    "when": "anytime",
+    "sources": {},
+    "packages": [],
+    "runs": {},
+    "tools": [],
+    "checks": {},
+    "apps": {},
+    "catalog": null
+  },
+  "sources": {}
+}

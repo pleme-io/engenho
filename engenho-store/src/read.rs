@@ -63,6 +63,7 @@
 //! [`ReadRefused::NotLinearizable`]. A follower, or a leader deposed by a
 //! partition it has not noticed, refuses rather than serves its stale head.
 
+use crate::at_rest::SealFault;
 use crate::revision::{CompactedTooOld, Revision};
 use crate::type_config::RaftNodeId;
 
@@ -156,6 +157,9 @@ pub enum ReadRefused {
     },
     #[error("this replica cannot confirm it is current; leader: {leader:?}")]
     NotLinearizable { leader: Option<RaftNodeId> },
+    /// A sealed value in the read cannot be opened on this node.
+    #[error("{fault}")]
+    SecretUnreadable { fault: SealFault },
 }
 
 engenho_substrate::impl_error_kind! {
@@ -163,6 +167,7 @@ engenho_substrate::impl_error_kind! {
         { TooLarge { .. } } => "too_large",
         { Expired { .. } } => "expired",
         { NotLinearizable { .. } } => "not_linearizable",
+        { SecretUnreadable { .. } } => "secret_unreadable",
     }
 }
 
@@ -337,7 +342,7 @@ mod tests {
                     prop_assert_eq!(compacted, floor);
                     prop_assert!(requested < floor);
                 }
-                Err(refused @ ReadRefused::NotLinearizable { .. }) => {
+                Err(refused @ (ReadRefused::NotLinearizable { .. } | ReadRefused::SecretUnreadable { .. })) => {
                     prop_assert!(false, "judge never fences; {c:?} came back {refused}");
                 }
             }

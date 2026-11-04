@@ -9,7 +9,7 @@ use engenho_controllers::admission::{
     AdmissionAction, AdmissionChain, AdmissionDecision, AdmissionRequest,
 };
 use engenho_store::{
-    ContinueToken, Revision, StoreMesh, WatchOpts,
+    ContinueToken, ListScope, Revision, SealFault, StoreMesh, WatchOpts,
     command::{Reason, ResourceCommand, ResourceOp},
     resource::ResourceKey,
     watch_backend::WATCH_CHANNEL_CAPACITY,
@@ -702,6 +702,15 @@ impl StoreBackedHandler {
         self
     }
 
+    async fn refuse_unreadable_secrets(&self, namespace: Option<&str>) -> Result<(), ApiError> {
+        let scope = ListScope::new(&self.group, &self.version, &self.kind, namespace);
+        let faults = self.store.secret_faults(scope).await;
+        match faults.first() {
+            Some((key, fault)) => Err(unreadable_secret(key, *fault, faults.len())),
+            None => Ok(()),
+        }
+    }
+
     /// Run the admission chain over a DELETE of `key`. A delete has no body,
     /// so the review carries `value: None` and the only outcome that matters
     /// is whether the chain denies: `Deny` → typed [`ApiError::Forbidden`]
@@ -1121,6 +1130,9 @@ impl ResourceHandler for StoreBackedHandler {
 
     async fn get(&self, namespace: Option<&str>, name: &str) -> Result<Value, ApiError> {
         let key = self.key(namespace, name)?;
+        if let Some(fault) = self.store.secret_fault(&key).await {
+            return Err(unreadable_secret(&key, fault, 1));
+        }
         let v = self
             .store
             .get(&key)
@@ -1148,6 +1160,7 @@ impl ResourceHandler for StoreBackedHandler {
         namespace: Option<&str>,
         sel: &Selectors,
     ) -> Result<(Vec<Value>, Revision), ApiError> {
+        self.refuse_unreadable_secrets(namespace).await?;
         // ONE catalog clone → (items, snapshot rv). The rv is
         // current_revision (dense MVCC), NOT last_applied_index — the
         // load-bearing fix. Selector filtering stays apiserver-side
@@ -1171,6 +1184,7 @@ impl ResourceHandler for StoreBackedHandler {
         limit: usize,
         continue_token: Option<ContinueToken>,
     ) -> Result<(Vec<Value>, Revision, Option<String>, Option<u64>), ApiError> {
+        self.refuse_unreadable_secrets(namespace).await?;
         // Resolve the page-series snapshot revision + the resume cursor.
         // The FIRST page (no continue token) captures the snapshot rev
         // below; every subsequent page reuses the token's snapshot rev so
@@ -1672,6 +1686,13 @@ impl StoreBackedHandler {
 /// Read a stored object's `metadata.resourceVersion` as a [`Revision`] —
 /// the CAS `expected` fallback for a subresource write whose incoming body
 /// carried no rv. `None` when absent/unparseable.
+fn unreadable_secret(key: &ResourceKey, fault: SealFault, count: usize) -> ApiError {
+    ApiError::StorageError(format!(
+        "{count} stored object(s) cannot be read, first {}: {fault}",
+        key.label()
+    ))
+}
+
 fn revision_of(value: &Value) -> Option<Revision> {
     value
         .get("metadata")

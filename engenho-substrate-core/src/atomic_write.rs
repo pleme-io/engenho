@@ -58,7 +58,59 @@ pub fn write_atomic_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<(), Ato
     write_atomic_with(path, bytes, Some(mode))
 }
 
+/// What [`write_new_atomic_mode`] found at the path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub enum WriteOnce {
+    /// The path was free and now holds the bytes, fsynced.
+    Created,
+    /// The path already held a file. It was not touched.
+    AlreadyExisted,
+}
+
+/// [`write_atomic_mode`] that can never replace an existing file: the fully
+/// written temp file is published by `link(2)`, which fails rather than
+/// overwrites. Two racing writers leave one winner's complete bytes.
+///
+/// # Errors
+///
+/// [`AtomicWriteError::Io`] for any filesystem failure other than the path
+/// already existing.
+pub fn write_new_atomic_mode(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+) -> Result<WriteOnce, AtomicWriteError> {
+    let tmp = write_temp(path, bytes, Some(mode))?;
+    match std::fs::hard_link(tmp.path(), path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Ok(WriteOnce::AlreadyExisted);
+        }
+        Err(e) => {
+            return Err(AtomicWriteError::Io(format!(
+                "link {}: {e}",
+                path.display()
+            )));
+        }
+    }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| AtomicWriteError::Io(format!("fsync {}: {e}", parent.display())))?;
+    }
+    Ok(WriteOnce::Created)
+}
+
 fn write_atomic_with(path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<(), AtomicWriteError> {
+    // Consumes `tmp`: a second publish is a MOVE ERROR, and an early return
+    // above drops it, removing the stray file.
+    write_temp(path, bytes, mode)?.publish(path)
+}
+
+fn write_temp(path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<TempPath, AtomicWriteError> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -93,9 +145,7 @@ fn write_atomic_with(path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<(),
         f.sync_all()
             .map_err(|e| AtomicWriteError::Io(format!("fsync {}: {e}", tmp.path().display())))?;
     }
-    // Consumes `tmp`: a second publish is a MOVE ERROR, and an early return
-    // above drops it, removing the stray file.
-    tmp.publish(path)
+    Ok(tmp)
 }
 
 /// A temp file that exactly ONE writer can name, publish at most once, and
@@ -205,6 +255,28 @@ mod tests {
             "engenho-substrate-atomic-{}-{suffix}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn write_once_never_replaces_an_existing_file() {
+        let path = temp_path("write-once");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            write_new_atomic_mode(&path, b"first", 0o600).unwrap(),
+            WriteOnce::Created
+        );
+        assert_eq!(
+            write_new_atomic_mode(&path, b"second", 0o600).unwrap(),
+            WriteOnce::AlreadyExisted
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

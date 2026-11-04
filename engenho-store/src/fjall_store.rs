@@ -20,14 +20,17 @@
 //!     8-byte BIG-ENDIAN (so fjall's lexicographic range order ==
 //!     numeric index order, required by `try_get_log_entries(range)`
 //!     and `get_log_state`'s "last entry"). Value =
-//!     `serde_json::to_vec(&Entry<TypeConfig>)`.
+//!     `serde_json::to_vec(&Entry<TypeConfig>)`, or for an entry that
+//!     touches a sealed kind a [`crate::at_rest`] sealed record whose
+//!     log id stays readable.
 //!   * `meta` partition — fixed string keys → serde_json bytes:
 //!     `vote`, `committed`, `last_purged`, `last_applied`,
 //!     `last_membership`, `snapshot_meta`, `snapshot_data`,
-//!     `snapshot_index`.
+//!     `snapshot_index`, `secrets_key_id`.
 //!   * `catalog` partition — the materialized state machine WITH
 //!     revision state, single key `catalog` → `serde_json::to_vec(
-//!     &ResourceCatalog)`. The catalog's hand-written Serialize
+//!     &ResourceCatalog)`, with values of a sealed kind as
+//!     [`crate::at_rest`] envelopes. The catalog's hand-written Serialize
 //!     already carries resources (value + VersionMeta),
 //!     last_applied_term/index, current_revision + compacted_revision.
 //!     The history ring is not persisted, so on load the compaction
@@ -79,6 +82,8 @@ use openraft::{
 };
 use tokio::sync::Mutex;
 
+use crate::at_rest::{EntryRefused, SealFault, SealWrites, SecretSealer, is_sealed_kind};
+use crate::command::ResourceCommand;
 use crate::mesh::StoreError;
 use crate::owned_task::TaskStop;
 use crate::state::ResourceCatalog;
@@ -104,6 +109,7 @@ const META_LAST_MEMBERSHIP: &[u8] = b"last_membership";
 const META_SNAPSHOT_META: &[u8] = b"snapshot_meta";
 const META_SNAPSHOT_DATA: &[u8] = b"snapshot_data";
 const META_SNAPSHOT_INDEX: &[u8] = b"snapshot_index";
+const META_SECRETS_KEY: &[u8] = b"secrets_key_id";
 
 /// `catalog` partition single key.
 const CATALOG_KEY: &[u8] = b"catalog";
@@ -368,6 +374,7 @@ struct FjallInner {
     log: fjall::PartitionHandle,
     meta: fjall::PartitionHandle,
     catalog: fjall::PartitionHandle,
+    sealer: SecretSealer,
     /// In-RAM mirror of the state machine — hydrated on open,
     /// kept in lockstep with the disk partitions under one lock.
     state: Mutex<MaterializedState>,
@@ -453,8 +460,8 @@ impl MaterializedState {
     ///
     /// Read leniently. A snapshot `open` cannot use is a counted hit, and the
     /// boot goes on from the blob, as the previous release's did.
-    fn adopt_newer_snapshot(&mut self, meta: &fjall::PartitionHandle) {
-        match read_snapshot_newer_than(meta, self.last_applied) {
+    fn adopt_newer_snapshot(&mut self, meta: &fjall::PartitionHandle, sealer: &SecretSealer) {
+        match read_snapshot_newer_than(meta, self.last_applied, sealer) {
             Ok(None) => {}
             Ok(Some((snapshot, catalog))) => {
                 trip!(
@@ -518,6 +525,7 @@ impl MaterializedState {
 fn read_snapshot_newer_than(
     meta: &fjall::PartitionHandle,
     image_at: Option<LogId<RNodeId>>,
+    sealer: &SecretSealer,
 ) -> Result<Option<(RSnapshotMeta, ResourceCatalog)>, SnapshotUnreadable> {
     let Some(snapshot) = meta_get_json::<RSnapshotMeta>(meta, META_SNAPSHOT_META)
         .map_err(SnapshotUnreadable::Meta)?
@@ -530,8 +538,51 @@ fn read_snapshot_newer_than(
     let data = meta
         .get(META_SNAPSHOT_DATA)?
         .ok_or(SnapshotUnreadable::DataAbsent)?;
-    let catalog = serde_json::from_slice(&data)?;
+    let mut catalog: ResourceCatalog = serde_json::from_slice(&data)?;
+    catalog.open_sealed(sealer);
     Ok(Some((snapshot, catalog)))
+}
+
+fn load_sealer(
+    path: &std::path::Path,
+    writes: SealWrites,
+    keyspace: &fjall::Keyspace,
+    meta: &fjall::PartitionHandle,
+) -> Result<SecretSealer, StoreError> {
+    let pinned = meta_get_json::<String>(meta, META_SECRETS_KEY)?
+        .map(|text| {
+            crate::at_rest::parse_key_id(&text).ok_or_else(|| {
+                StoreError::Fatal(format!("the recorded secrets key id {text:?} is malformed"))
+            })
+        })
+        .transpose()?;
+    let sealer = SecretSealer::load(path, writes, pinned);
+    if let Some(id) = sealer.pin_to_record() {
+        let bytes = serde_json::to_vec(&id.to_string())
+            .map_err(|e| StoreError::Fatal(format!("encode the secrets key id: {e}")))?;
+        meta.insert(META_SECRETS_KEY, bytes)
+            .and_then(|()| keyspace.persist(fjall::PersistMode::SyncAll))
+            .map_err(|e| StoreError::Fatal(format!("record the secrets key id: {e}")))?;
+    }
+    Ok(sealer)
+}
+
+fn refuse_unreadable_tail(
+    log: &fjall::PartitionHandle,
+    sealer: &SecretSealer,
+    last_applied: Option<u64>,
+) -> Result<(), StoreError> {
+    let from = last_applied.map_or(0, |index| index.saturating_add(1));
+    for kv in log.range(from.to_be_bytes()..) {
+        let (key, value) = kv.map_err(|e| StoreError::Fatal(format!("read the log: {e}")))?;
+        if let Some(fault) = sealer.entry_fault(&value) {
+            return Err(StoreError::SecretUnreadable {
+                subject: format!("the replay's log entry {}", be_bytes_to_u64(&key)),
+                fault,
+            });
+        }
+    }
+    Ok(())
 }
 
 // ── error mapping helpers ─────────────────────────────────────────
@@ -601,6 +652,17 @@ impl FjallStore {
     /// Returns [`StoreError::Fatal`] if the keyspace / partitions
     /// can't be opened or a persisted value can't be deserialized.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
+        Self::open_with(path, SealWrites::default())
+    }
+
+    /// [`Self::open`] with an explicit write policy for sealed kinds.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open`], and [`StoreError::SecretUnreadable`] when the entries
+    /// a boot must replay are sealed under a key this node cannot use. Nothing
+    /// is written or lost; the boot succeeds once the key is restored.
+    pub fn open_with(path: impl Into<PathBuf>, writes: SealWrites) -> Result<Self, StoreError> {
         let path = path.into();
         // ── ★ TAKE THE DIRECTORY BEFORE READING A BYTE OF IT ──────────────
         // fjall will happily open a directory a live process is already
@@ -628,6 +690,7 @@ impl FjallStore {
         let catalog = keyspace
             .open_partition(CATALOG_PARTITION, fjall::PartitionCreateOptions::default())
             .map_err(|e| StoreError::Fatal(format!("open partition {CATALOG_PARTITION}: {e}")))?;
+        let sealer = load_sealer(&path, writes, &keyspace, &meta)?;
 
         // ── hydrate the in-RAM working copy from disk ──────────────
         let mut state = MaterializedState::default();
@@ -637,6 +700,7 @@ impl FjallStore {
         {
             state.catalog = serde_json::from_slice(&bytes)
                 .map_err(|e| StoreError::Fatal(format!("decode catalog: {e}")))?;
+            state.catalog.open_sealed(&sealer);
         }
         state.vote = meta_get_json(&meta, META_VOTE)?;
         state.committed = meta_get_json(&meta, META_COMMITTED)?;
@@ -650,8 +714,13 @@ impl FjallStore {
         // Only an image written before T3.4 can be; boot it from the
         // snapshot, then count whatever still disagrees. Nothing here adds a
         // way for `open` to fail.
-        state.adopt_newer_snapshot(&meta);
+        state.adopt_newer_snapshot(&meta, &sealer);
         state.check_replay();
+        refuse_unreadable_tail(
+            &log,
+            &sealer,
+            state.last_applied.map(|applied| applied.index),
+        )?;
 
         let inner = Arc::new(FjallInner {
             _dir_lock: dir_lock,
@@ -659,6 +728,7 @@ impl FjallStore {
             log,
             meta,
             catalog,
+            sealer,
             state: Mutex::new(state),
         });
         // The ticker holds a Weak<FjallInner> so it never keeps the
@@ -683,6 +753,21 @@ impl FjallStore {
     pub async fn is_initialized(&self) -> bool {
         let s = self.inner.state.lock().await;
         s.vote.is_some() || s.last_applied.is_some()
+    }
+
+    /// What refuses this write, when it touches a sealed kind this store cannot
+    /// seal now or a sealed value it cannot open.
+    pub(crate) async fn write_refusal(&self, cmd: &ResourceCommand) -> Option<(String, SealFault)> {
+        if let Some(fault) = self.inner.sealer.write_fault()
+            && let Some(key) = cmd.keys().into_iter().find(|key| is_sealed_kind(key))
+        {
+            return Some((key.label(), fault));
+        }
+        let state = self.inner.state.lock().await;
+        state
+            .catalog
+            .unreadable_touched_by(cmd)
+            .map(|(key, fault)| (key.label(), fault))
     }
 
     /// How many times each [`ImageInconsistency`] was hit since this store
@@ -851,7 +936,11 @@ impl FjallStore {
     ) -> Result<(), StorageError<RNodeId>> {
         for e in entries {
             let idx = e.log_id.index;
-            let bytes = serde_json::to_vec(&e).map_err(|e| write_logs_err(&e))?;
+            let bytes = self
+                .inner
+                .sealer
+                .encode_entry(&e)
+                .map_err(|e| write_logs_err(&e))?;
             self.inner
                 .log
                 .insert(idx.to_be_bytes(), bytes)
@@ -942,7 +1031,10 @@ impl FjallStore {
         let applied_catalog;
         let (catalog, last_applied, last_membership) = match write {
             ImageWrite::Applied => {
-                applied_catalog = serde_json::to_vec(&state.catalog).map_err(|e| map(&e))?;
+                applied_catalog = state
+                    .catalog
+                    .to_rest_bytes(&self.inner.sealer)
+                    .map_err(|e| map(&e))?;
                 (
                     applied_catalog.as_slice(),
                     serde_json::to_vec(&state.last_applied).map_err(|e| map(&e))?,
@@ -1034,8 +1126,11 @@ impl RaftLogReader<TypeConfig> for FjallStore {
         let mut entries = Vec::new();
         for kv in self.inner.log.range(byte_range) {
             let (_, v) = kv.map_err(|e| read_logs_err(&e))?;
-            let entry: Entry<TypeConfig> =
-                serde_json::from_slice(&v).map_err(|e| read_logs_err(&e))?;
+            let entry = self
+                .inner
+                .sealer
+                .decode_entry(&v)
+                .map_err(|e| read_logs_err(&e))?;
             entries.push(entry);
         }
         Ok(entries)
@@ -1060,8 +1155,11 @@ impl RaftLogStorage<TypeConfig> for FjallStore {
             .map_err(|e| read_logs_err(&e))?;
         let last_log_id = match last_in_log {
             Some((_, v)) => {
-                let entry: Entry<TypeConfig> =
-                    serde_json::from_slice(&v).map_err(|e| read_logs_err(&e))?;
+                let entry = self
+                    .inner
+                    .sealer
+                    .decode_entry(&v)
+                    .map_err(|e| read_logs_err(&e))?;
                 Some(entry.log_id)
             }
             None => last_purged_log_id,
@@ -1227,6 +1325,10 @@ impl RaftSnapshotBuilder<TypeConfig> for FjallSnapshotBuilder {
         // the materialized catalog (carries the full revision state).
         let catalog_bytes =
             serde_json::to_vec(&state.catalog).map_err(|e| write_snapshot_err(None, &e))?;
+        let rest_bytes = state
+            .catalog
+            .to_rest_bytes(&self.store.inner.sealer)
+            .map_err(|e| write_snapshot_err(None, &e))?;
         let snapshot_index = state.snapshot_index + 1;
         let snapshot_id = format!("snap-{snapshot_index}");
         let meta = SnapshotMeta {
@@ -1242,7 +1344,7 @@ impl RaftSnapshotBuilder<TypeConfig> for FjallSnapshotBuilder {
         self.store.write_image(
             &mut state,
             &ImageWrite::Snapshot {
-                catalog: &catalog_bytes,
+                catalog: &rest_bytes,
                 meta: &meta,
                 minted: Some(snapshot_index),
             },
@@ -1308,6 +1410,13 @@ impl RaftStateMachine<TypeConfig> for FjallStore {
                     patch_error: None,
                 });
                 continue;
+            }
+            if let EntryPayload::Normal(ref logged) = entry.payload
+                && logged.command().is_sealed_placeholder()
+            {
+                return Err(write_sm_err(&EntryRefused::Placeholder {
+                    index: log_id.index,
+                }));
             }
             let (op, patch_error) = match entry.payload {
                 EntryPayload::Blank => (crate::command::ResourceOp::NoOp, None),
@@ -1412,23 +1521,36 @@ impl RaftStateMachine<TypeConfig> for FjallStore {
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<RNodeId>> {
         let bytes = snapshot.into_inner();
-        let catalog: ResourceCatalog = serde_json::from_slice(&bytes)
+        let mut catalog: ResourceCatalog = serde_json::from_slice(&bytes)
             .map_err(|e| read_snapshot_err(Some(meta.signature()), &e))?;
+        let sealer = &self.inner.sealer;
+        catalog.open_sealed(sealer);
+        let holds_sealed_kind = catalog.holds_open_sealed_kind();
+        if holds_sealed_kind && let Some(fault) = sealer.write_fault() {
+            return Err(write_snapshot_err(Some(meta.signature()), &fault));
+        }
+        let rest_bytes = if holds_sealed_kind {
+            catalog
+                .to_rest_bytes(sealer)
+                .map_err(|e| write_snapshot_err(Some(meta.signature()), &e))?
+        } else {
+            bytes
+        };
 
         // ★ The lock BEFORE the write, held until the in-RAM copy matches it.
         // A flush that took the lock between a lock-free write and the in-RAM
         // update would see the old state as unwritten and land it over the
         // snapshot: an image older than the snapshot beside it.
         let mut state = self.inner.state.lock().await;
-        // T3.4: the snapshot keys and the image they are — the received bytes
-        // as the blob, `last_applied` and `last_membership` from the meta — in
-        // one batch, so get_current_snapshot serves it after a restart and
-        // the image is never older than it. The received bytes are kept
-        // byte for byte; installing mints no snapshot counter.
+        // T3.4: the snapshot keys and the image they are — the received bytes,
+        // sealed under this node's key when they hold a sealed kind, as the
+        // blob, `last_applied` and `last_membership` from the meta — in one
+        // batch, so get_current_snapshot serves it after a restart and the
+        // image is never older than it. Installing mints no snapshot counter.
         self.write_image(
             &mut state,
             &ImageWrite::Snapshot {
-                catalog: &bytes,
+                catalog: &rest_bytes,
                 meta,
                 minted: None,
             },
@@ -1457,9 +1579,18 @@ impl RaftStateMachine<TypeConfig> for FjallStore {
         let Some(data) = data else {
             return Ok(None);
         };
+        let mut catalog: ResourceCatalog = serde_json::from_slice(&data)
+            .map_err(|e| read_snapshot_err(Some(meta.signature()), &e))?;
+        let bytes = if catalog.has_unreadable() {
+            catalog.open_sealed(&self.inner.sealer);
+            serde_json::to_vec(&catalog)
+                .map_err(|e| read_snapshot_err(Some(meta.signature()), &e))?
+        } else {
+            data.to_vec()
+        };
         Ok(Some(Snapshot {
             meta,
-            snapshot: Box::new(Cursor::new(data.to_vec())),
+            snapshot: Box::new(Cursor::new(bytes)),
         }))
     }
 }
@@ -1607,6 +1738,146 @@ mod tests {
         let state = s2.get_log_state().await.unwrap();
         assert_eq!(state.last_purged_log_id.map(|l| l.index), Some(2));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn secret_put_entry(idx: u64, name: &str) -> Entry<TypeConfig> {
+        let cmd = ResourceCommand::Put {
+            key: ResourceKey::namespaced("", "v1", "Secret", "default", name),
+            value: serde_json::json!({"stringData": {"token": "tail-canary"}}),
+            expected: None,
+            reason: Reason::Operator,
+        };
+        Entry {
+            log_id: LogId {
+                leader_id: CommittedLeaderId::new(1, 0),
+                index: idx,
+            },
+            payload: EntryPayload::Normal(crate::command::LoggedCommand::proposed(cmd)),
+        }
+    }
+
+    fn lose_the_key(store: &std::path::Path) -> (PathBuf, Vec<u8>) {
+        let path = crate::at_rest::keys_dir_for(store).join(crate::at_rest::KEY_FILE);
+        let key = std::fs::read(&path).unwrap();
+        let wrong: Vec<u8> = key.iter().map(|byte| byte ^ 0x5A).collect();
+        std::fs::write(&path, wrong).unwrap();
+        (path, key)
+    }
+
+    #[tokio::test]
+    async fn a_replay_the_key_cannot_open_refuses_the_open_by_name_and_the_right_key_recovers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("store");
+        {
+            let s = FjallStore::open(&dir).unwrap();
+            s.append_entries_durable(vec![secret_put_entry(1, "a")])
+                .unwrap();
+        }
+        let (path, key) = lose_the_key(&dir);
+        let Err(refused) = FjallStore::open(&dir) else {
+            panic!("a sealed replay opened under the wrong key");
+        };
+        assert!(
+            matches!(
+                refused,
+                StoreError::SecretUnreadable {
+                    fault: SealFault::WrongKey { .. },
+                    ..
+                }
+            ),
+            "got {refused}"
+        );
+
+        std::fs::write(&path, key).unwrap();
+        let mut s = FjallStore::open(&dir).unwrap();
+        let read = s.try_get_log_entries(..).await.unwrap();
+        assert_eq!(read, vec![secret_put_entry(1, "a")]);
+    }
+
+    #[tokio::test]
+    async fn an_applied_sealed_entry_reads_as_a_placeholder_no_store_appends_or_applies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("store");
+        let log_id = LogId {
+            leader_id: CommittedLeaderId::new(1, 0),
+            index: 1,
+        };
+        {
+            let mut s = FjallStore::open(&dir).unwrap();
+            s.append_entries_durable(vec![secret_put_entry(1, "a")])
+                .unwrap();
+            s.apply(vec![secret_put_entry(1, "a")]).await.unwrap();
+            let _ = s.flush().await.unwrap();
+        }
+        lose_the_key(&dir);
+
+        let mut s = FjallStore::open(&dir).unwrap();
+        let read = s.try_get_log_entries(..).await.unwrap();
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].log_id, log_id, "the log's shape stays readable");
+        let EntryPayload::Normal(ref logged) = read[0].payload else {
+            panic!("expected the placeholder");
+        };
+        assert!(logged.command().is_sealed_placeholder());
+
+        let state = s.get_log_state().await.unwrap();
+        assert_eq!(state.last_log_id, Some(log_id));
+
+        let appended = s.append_entries_durable(read.clone());
+        assert!(appended.is_err(), "a placeholder must never be stored");
+
+        let mut next = read[0].clone();
+        next.log_id.index = 2;
+        assert!(
+            s.apply(vec![next]).await.is_err(),
+            "a placeholder must never be applied as a no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replicated_write_over_a_value_this_node_cannot_open_is_rejected_and_stores_nothing()
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("store");
+        let key = ResourceKey::namespaced("", "v1", "Secret", "default", "a");
+        {
+            let mut s = FjallStore::open(&dir).unwrap();
+            s.apply(vec![secret_put_entry(1, "a")]).await.unwrap();
+            let _ = s.flush().await.unwrap();
+        }
+        lose_the_key(&dir);
+        let mut s = FjallStore::open(&dir).unwrap();
+        let fault = s
+            .read_catalog(|c| c.secret_fault(&key))
+            .await
+            .expect("the value cannot be opened");
+        let revision = s.current_revision().await;
+        let results = s.apply(vec![secret_put_entry(2, "a")]).await.unwrap();
+        assert_eq!(results[0].op, crate::command::ResourceOp::PatchRejected);
+        assert!(
+            results[0]
+                .patch_error
+                .as_ref()
+                .unwrap()
+                .contains(&fault.to_string())
+        );
+        assert_eq!(s.current_revision().await, revision);
+        assert!(s.get_resource(&key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_store_with_no_usable_key_refuses_to_log_a_secret_in_plaintext() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("store");
+        drop(FjallStore::open(&dir).unwrap());
+        lose_the_key(&dir);
+        let s = FjallStore::open(&dir).unwrap();
+        assert!(
+            s.append_entries_durable(vec![secret_put_entry(1, "a")])
+                .is_err()
+        );
+        s.append_entries_durable(vec![put_entry(1, "pod")])
+            .expect("an unsealed kind still logs");
     }
 
     /// ★ THE INVARIANT THE BATCHED CATALOG WRITE RESTS ON.

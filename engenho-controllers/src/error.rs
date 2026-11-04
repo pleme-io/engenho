@@ -131,7 +131,8 @@ impl ControllerError {
     /// exhaustive match with no wildcard, so a new variant does not compile
     /// (E0004) until someone says whether it may stop a sweep.
     ///
-    ///   * `Store` — Sweep, for every [`StoreError`]; see [`store_scope`].
+    ///   * `Store` — Sweep, for every [`StoreError`] but the per-key
+    ///     `SecretUnreadable`; see [`store_scope`].
     ///   * `InvalidResource`, `Shape` — Item. One object's declaration is
     ///     malformed; its neighbours' are not.
     ///   * `Internal` — Item. It wraps a controller's own work on one
@@ -153,12 +154,13 @@ impl ControllerError {
 
 /// The sweep scope of a store error: always [`ErrorScope::Sweep`].
 ///
-/// Every variant is the store failing as a whole — a proposal that did not
-/// commit, a store built wrong, a Raft core that stopped — never one key
-/// being refused. Spelled out per variant rather than as `Store(_)` so a
-/// per-key variant, if the store ever grows one, has to be placed.
+/// Every variant but `SecretUnreadable` is the store failing as a whole — a
+/// proposal that did not commit, a store built wrong, a Raft core that stopped.
+/// `SecretUnreadable` refuses one key, so it stops one item. Spelled out per
+/// variant rather than as `Store(_)` so a new variant has to be placed.
 const fn store_scope(e: &StoreError) -> ErrorScope {
     match e {
+        StoreError::SecretUnreadable { .. } => ErrorScope::Item,
         StoreError::ClientWriteFailed(_)
         | StoreError::ConfigInvalid(_)
         | StoreError::InitializeFailed(_)
@@ -189,9 +191,10 @@ const fn store_class(e: &StoreError) -> FailureKind {
         | StoreError::Persist(_)
         | StoreError::NoLeader
         | StoreError::LeaderUnreachable { .. } => FailureKind::Transient,
-        StoreError::ConfigInvalid(_) | StoreError::InitializeFailed(_) | StoreError::Fatal(_) => {
-            FailureKind::Declarative
-        }
+        StoreError::ConfigInvalid(_)
+        | StoreError::InitializeFailed(_)
+        | StoreError::Fatal(_)
+        | StoreError::SecretUnreadable { .. } => FailureKind::Declarative,
     }
 }
 
@@ -250,7 +253,8 @@ mod tests {
                     | StoreError::LeaderUnreachable { .. } => FailureKind::Transient,
                     StoreError::ConfigInvalid(_)
                     | StoreError::InitializeFailed(_)
-                    | StoreError::Fatal(_) => FailureKind::Declarative,
+                    | StoreError::Fatal(_)
+                    | StoreError::SecretUnreadable { .. } => FailureKind::Declarative,
                 },
                 ControllerError::InvalidResource(_)
                 | ControllerError::Shape(_)
@@ -273,6 +277,10 @@ mod tests {
             row(ControllerError::Store(StoreError::Fatal(m()))),
             row(ControllerError::Store(persist())),
             row(ControllerError::Store(StoreError::NoLeader)),
+            row(ControllerError::Store(StoreError::SecretUnreadable {
+                subject: m(),
+                fault: engenho_store::SealFault::KeyUnusable,
+            })),
             row(ControllerError::Store(StoreError::LeaderUnreachable {
                 leader: 1,
                 reason: m(),
@@ -302,6 +310,7 @@ mod tests {
         fn row(e: ControllerError) -> (ControllerError, ErrorScope) {
             let want = match &e {
                 ControllerError::Store(s) => match s {
+                    StoreError::SecretUnreadable { .. } => ErrorScope::Item,
                     StoreError::ClientWriteFailed(_)
                     | StoreError::ConfigInvalid(_)
                     | StoreError::InitializeFailed(_)
@@ -324,7 +333,7 @@ mod tests {
     #[test]
     fn store_errors_and_panics_stop_a_sweep_and_nothing_else_does() {
         let rows = every_scope();
-        assert_eq!(rows.len(), 14, "one row per variant");
+        assert_eq!(rows.len(), 15, "one row per variant");
         for (e, want) in rows {
             assert_eq!(e.scope(), want, "{e:?}");
         }
@@ -333,7 +342,7 @@ mod tests {
     #[test]
     fn every_error_variant_maps_to_its_retry_class() {
         let rows = every_variant();
-        assert_eq!(rows.len(), 14, "one row per variant");
+        assert_eq!(rows.len(), 15, "one row per variant");
         for (e, want) in rows {
             assert_eq!(e.classify(), want, "{e:?}");
         }

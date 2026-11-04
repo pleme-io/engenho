@@ -179,6 +179,21 @@ impl MeshEtcdStore {
     /// name a revision newer than its keys.
     async fn range_under(&self, prefix: &str) -> Result<RangeAt, StoreGone> {
         let store = self.live()?;
+        let unreadable: Vec<_> = store
+            .all_secret_faults()
+            .await
+            .into_iter()
+            .filter(|(key, _)| registry_path_under(key, prefix).is_some())
+            .collect();
+        if let Some((key, fault)) = unreadable.first() {
+            tracing::error!(
+                key = %key.label(),
+                %fault,
+                count = unreadable.len(),
+                "an etcd Range covers Secrets this node cannot open"
+            );
+            return Err(StoreGone);
+        }
         let mut hits = Vec::new();
         let read_at = store
             .for_each_resource(|key, value, meta| {
@@ -844,6 +859,74 @@ mod tests {
             ready(&mut ahead).await,
             vec![7, 8],
             "revisions 5 and 6 precede the requested start"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_range_serves_decrypted_secrets_and_refuses_those_it_cannot_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("store");
+        let start = || async {
+            let (store, _) = StoreMesh::start_or_resume(
+                1,
+                "in-process://1".into(),
+                InProcessRouter::new(),
+                default_config("facade-secrets").expect("config"),
+                &path,
+            )
+            .await
+            .expect("start");
+            assert!(
+                store
+                    .wait_for_leadership(std::time::Duration::from_secs(5))
+                    .await
+            );
+            store
+        };
+
+        let store = start().await;
+        put(
+            &store,
+            ResourceKey::namespaced("", "v1", "Secret", "default", "s"),
+            json!({"stringData": {"token": "etcd-canary"}}),
+        )
+        .await;
+        put(&store, pod("default", "web"), json!({})).await;
+        let _ = store.flush().await.expect("flush");
+        store.terminate().await.expect("terminate");
+
+        let store = Arc::new(start().await);
+        let facade = MeshEtcdStore::new(&store);
+        let read = facade
+            .range_under("/registry/secrets/default/")
+            .await
+            .expect("a readable Secret");
+        assert_eq!(read.kvs.len(), 1);
+        let served = String::from_utf8(read.kvs[0].value.clone()).expect("utf8");
+        assert!(served.contains("etcd-canary"), "{served}");
+        drop(facade);
+        Arc::into_inner(store)
+            .expect("the last handle")
+            .terminate()
+            .await
+            .expect("terminate");
+
+        std::fs::remove_file(engenho_store::keys_dir_for(&path).join(engenho_store::KEY_FILE))
+            .expect("remove the key");
+        let store = Arc::new(start().await);
+        let facade = MeshEtcdStore::new(&store);
+        assert!(
+            facade.range_under("/registry/secrets/").await.is_err(),
+            "a covered Secret it cannot open is never an empty Range"
+        );
+        assert_eq!(
+            facade
+                .range_under("/registry/pods/")
+                .await
+                .expect("pods still serve")
+                .kvs
+                .len(),
+            1
         );
     }
 

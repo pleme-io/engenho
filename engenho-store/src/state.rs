@@ -32,12 +32,14 @@
 //! revision.
 
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use engenho_types::patch::PatchType;
 
+use crate::at_rest::{SealFault, SecretSealer, is_envelope, is_sealed_kind};
 use crate::command::{
     ApplyMeta, ApplySemantics, LoggedCommand, ResourceCommand, ResourceOp, TxnCompare, TxnOp,
 };
@@ -380,6 +382,10 @@ pub(crate) struct ResourceCatalog {
     /// crate can swap it out from under the resources whose revisions it
     /// counts.
     history: WatchHistory,
+    /// Sealed values this store could not open. They hold their ciphertext and
+    /// metadata here, never in `resources`, so no read can return them as data
+    /// and every image write carries them back byte for byte.
+    unreadable: BTreeMap<ResourceKey, Unreadable>,
     /// Strategic-merge schema resolver — the [`PatchSchemaEnv`] the patch
     /// interpreter consults for per-list merge strategies. NOT part of the
     /// converged/serialized state (it's a stateless, deterministic lookup
@@ -388,6 +394,29 @@ pub(crate) struct ResourceCatalog {
     /// and reconstructed via [`Default`] on deserialize. `Arc` so `Clone` is
     /// a cheap refcount bump (the catalog is cloned on snapshot/read paths).
     patch_env: Arc<dyn PatchSchemaEnv>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RestImageError {
+    #[error(transparent)]
+    Fault(#[from] SealFault),
+    #[error("encode the catalog: {0}")]
+    Encode(#[from] serde_json::Error),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Unreadable {
+    sealed: (ResourceValue, VersionMeta),
+    fault: SealFault,
+}
+
+#[derive(Serialize)]
+struct CatalogRepr<'a> {
+    resources: Vec<(&'a ResourceKey, (Cow<'a, ResourceValue>, VersionMeta))>,
+    last_applied_term: u64,
+    last_applied_index: u64,
+    current_revision: Revision,
+    compacted_revision: Revision,
 }
 
 impl std::fmt::Debug for ResourceCatalog {
@@ -416,6 +445,7 @@ impl Default for ResourceCatalog {
             last_applied_term: 0,
             last_applied_index: 0,
             history: WatchHistory::default(),
+            unreadable: BTreeMap::new(),
             patch_env: default_patch_env(),
         }
     }
@@ -430,6 +460,7 @@ impl PartialEq for ResourceCatalog {
     /// sequence are equal even if one has compacted more of its ring.
     fn eq(&self, other: &Self) -> bool {
         self.resources == other.resources
+            && self.unreadable == other.unreadable
             && self.last_applied_term == other.last_applied_term
             && self.last_applied_index == other.last_applied_index
             && self.revision() == other.revision()
@@ -451,16 +482,9 @@ impl PartialEq for ResourceCatalog {
 // `current_revision`.
 impl Serialize for ResourceCatalog {
     fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-        let mut state = ser.serialize_struct("ResourceCatalog", 5)?;
-        let entries: Vec<(&ResourceKey, &(ResourceValue, VersionMeta))> =
-            self.resources.iter().collect();
-        state.serialize_field("resources", &entries)?;
-        state.serialize_field("last_applied_term", &self.last_applied_term)?;
-        state.serialize_field("last_applied_index", &self.last_applied_index)?;
-        state.serialize_field("current_revision", &self.history.head())?;
-        state.serialize_field("compacted_revision", &self.history.floor())?;
-        state.end()
+        self.repr(|_, value| Ok::<_, std::convert::Infallible>(Cow::Borrowed(value)))
+            .map_err(|never| match never {})?
+            .serialize(ser)
     }
 }
 
@@ -481,6 +505,21 @@ impl<'de> Deserialize<'de> for ResourceCatalog {
             _stale_floor: Revision,
         }
         let h = Helper::deserialize(de)?;
+        let mut resources = BTreeMap::new();
+        let mut unreadable = BTreeMap::new();
+        for (key, sealed) in h.resources {
+            if is_envelope(&sealed.0) {
+                unreadable.insert(
+                    key,
+                    Unreadable {
+                        sealed,
+                        fault: SealFault::Unopened,
+                    },
+                );
+            } else {
+                resources.insert(key, sealed);
+            }
+        }
         // ★ THE FLOOR ON LOAD IS THE CURRENT REVISION (T3.3).
         //
         // The floor promises "every change above me is in the ring".
@@ -497,16 +536,105 @@ impl<'de> Deserialize<'de> for ResourceCatalog {
         // `WatchHistory::loaded_at` is the only constructor that starts
         // above revision 0, and it takes no floor to believe.
         Ok(Self {
-            resources: h.resources.into_iter().collect(),
+            resources,
             last_applied_term: h.last_applied_term,
             last_applied_index: h.last_applied_index,
             history: WatchHistory::loaded_at(h.current_revision, watch_history::DEFAULT_CAPACITY),
+            unreadable,
             patch_env: default_patch_env(),
         })
     }
 }
 
 impl ResourceCatalog {
+    fn repr<'a, E>(
+        &'a self,
+        mut render: impl FnMut(&'a ResourceKey, &'a ResourceValue) -> Result<Cow<'a, ResourceValue>, E>,
+    ) -> Result<CatalogRepr<'a>, E> {
+        let mut resources = Vec::with_capacity(self.resources.len() + self.unreadable.len());
+        for (key, (value, meta)) in &self.resources {
+            resources.push((key, (render(key, value)?, *meta)));
+        }
+        if !self.unreadable.is_empty() {
+            for (key, entry) in &self.unreadable {
+                resources.push((key, (Cow::Borrowed(&entry.sealed.0), entry.sealed.1)));
+            }
+            resources.sort_by_key(|(key, _)| *key);
+        }
+        Ok(CatalogRepr {
+            resources,
+            last_applied_term: self.last_applied_term,
+            last_applied_index: self.last_applied_index,
+            current_revision: self.history.head(),
+            compacted_revision: self.history.floor(),
+        })
+    }
+
+    /// The catalog as it is stored on this node: sealed kinds encrypted when
+    /// `sealer` seals. Identical to the plain serialization when it holds none.
+    pub(crate) fn to_rest_bytes(&self, sealer: &SecretSealer) -> Result<Vec<u8>, RestImageError> {
+        let seals = sealer.seals();
+        let repr = self.repr(|key, value| {
+            if seals && is_sealed_kind(key) {
+                sealer.seal_value(key, value).map(Cow::Owned)
+            } else {
+                Ok(Cow::Borrowed(value))
+            }
+        })?;
+        Ok(serde_json::to_vec(&repr)?)
+    }
+
+    /// Open every sealed value this catalog was decoded with. What cannot be
+    /// opened stays sealed and records why.
+    pub(crate) fn open_sealed(&mut self, sealer: &SecretSealer) {
+        let sealed = std::mem::take(&mut self.unreadable);
+        for (key, mut entry) in sealed {
+            let envelope = entry.sealed.0.as_str().unwrap_or_default();
+            match sealer.open_value(&key, envelope) {
+                Ok(value) => {
+                    self.resources.insert(key, (value, entry.sealed.1));
+                }
+                Err(fault) => {
+                    tracing::error!(key = %key.label(), %fault, "a sealed value cannot be opened");
+                    entry.fault = fault;
+                    self.unreadable.insert(key, entry);
+                }
+            }
+        }
+    }
+
+    /// `true` when a value of a sealed kind is held open in this catalog.
+    pub(crate) fn holds_open_sealed_kind(&self) -> bool {
+        self.resources.keys().any(is_sealed_kind)
+    }
+
+    /// `true` when decoding left values no store has been able to open.
+    pub(crate) fn has_unreadable(&self) -> bool {
+        !self.unreadable.is_empty()
+    }
+
+    /// Why `key` cannot be read, when it is a sealed value this store could
+    /// not open.
+    pub fn secret_fault(&self, key: &ResourceKey) -> Option<SealFault> {
+        self.unreadable.get(key).map(|entry| entry.fault)
+    }
+
+    /// Every sealed value in `scope` this store could not open.
+    pub fn secret_faults(&self, scope: ListScope<'_>) -> Vec<(ResourceKey, SealFault)> {
+        scope
+            .range(&self.unreadable, None)
+            .map(|(key, entry)| (key.clone(), entry.fault))
+            .collect()
+    }
+
+    /// Every sealed value this store could not open.
+    pub fn all_secret_faults(&self) -> Vec<(ResourceKey, SealFault)> {
+        self.unreadable
+            .iter()
+            .map(|(key, entry)| (key.clone(), entry.fault))
+            .collect()
+    }
+
     /// Construct a catalog with an explicit history-ring capacity.
     /// Used by callers that want a tighter compaction window (and by
     /// tests that force compaction with a tiny capacity).
@@ -570,6 +698,11 @@ impl ResourceCatalog {
         term: u64,
         index: u64,
     ) -> ApplyOutcome {
+        if let Some((key, fault)) = self.unreadable_touched_by(cmd) {
+            self.last_applied_term = term;
+            self.last_applied_index = index;
+            return ApplyOutcome::patch_rejected(format!("{}: {fault}", key.label()));
+        }
         // Tentatively reserve the next revision; only committed if the
         // mutation is real (not a no-op).
         let rev = self.history.next_revision();
@@ -622,6 +755,18 @@ impl ResourceCatalog {
             self.history.commit(change, &outcome.extra_changes);
         }
         outcome
+    }
+
+    pub(crate) fn unreadable_touched_by<'c>(
+        &self,
+        cmd: &'c ResourceCommand,
+    ) -> Option<(&'c ResourceKey, SealFault)> {
+        if self.unreadable.is_empty() {
+            return None;
+        }
+        cmd.keys()
+            .into_iter()
+            .find_map(|key| self.secret_fault(key).map(|fault| (key, fault)))
     }
 
     /// Apply an atomic multi-key transaction — etcd `Txn` semantics.
@@ -1513,6 +1658,9 @@ impl ResourceCatalog {
         limit: usize,
         consistency: ReadConsistency,
     ) -> Result<PageAtRevision, ReadRefused> {
+        if let Some((_, entry)) = scope.range(&self.unreadable, None).next() {
+            return Err(ReadRefused::SecretUnreadable { fault: entry.fault });
+        }
         match self.read_point(consistency)? {
             ReadPoint::Head => Ok(self.list_page_at_revision(scope, after, limit)),
             ReadPoint::Past(rev) => {
@@ -1544,6 +1692,9 @@ impl ResourceCatalog {
         key: &ResourceKey,
         consistency: ReadConsistency,
     ) -> Result<Option<ResourceValue>, ReadRefused> {
+        if let Some(fault) = self.secret_fault(key) {
+            return Err(ReadRefused::SecretUnreadable { fault });
+        }
         match self.read_point(consistency)? {
             ReadPoint::Head => Ok(self.get(key).cloned()),
             ReadPoint::Past(rev) => Ok(rewind(

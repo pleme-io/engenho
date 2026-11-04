@@ -185,6 +185,45 @@ pub enum ResourceCommand {
 }
 
 impl ResourceCommand {
+    pub(crate) fn keys(&self) -> Vec<&ResourceKey> {
+        match self {
+            Self::Put { key, .. } | Self::Patch { key, .. } | Self::Delete { key, .. } => vec![key],
+            Self::Txn {
+                compares,
+                success,
+                failure,
+                ..
+            } => compares
+                .iter()
+                .map(|compare| match compare {
+                    TxnCompare::ModRevisionEq { key, .. } | TxnCompare::NotExists { key } => key,
+                })
+                .chain(success.iter().chain(failure).map(|op| match op {
+                    TxnOp::Put { key, .. } | TxnOp::Delete { key, .. } => key,
+                }))
+                .collect(),
+        }
+    }
+
+    pub(crate) fn sealed_placeholder() -> Self {
+        Self::Txn {
+            compares: Vec::new(),
+            success: Vec::new(),
+            failure: Vec::new(),
+            reason: Reason::SealedPlaceholder,
+        }
+    }
+
+    pub(crate) fn is_sealed_placeholder(&self) -> bool {
+        matches!(
+            self,
+            Self::Txn {
+                reason: Reason::SealedPlaceholder,
+                ..
+            }
+        )
+    }
+
     /// Construct an UNCONDITIONAL `Put` (no CAS precondition) — the
     /// common case for controllers + reconcilers that own the object
     /// and don't race a concurrent writer. Equivalent to the struct
@@ -414,6 +453,9 @@ pub enum Reason {
     Admission,
     /// Scheduler binding a pod to a node.
     Scheduler,
+    /// Stands in for a sealed log entry this node cannot open. Never proposed;
+    /// a store refuses to append or apply it.
+    SealedPlaceholder,
 }
 
 /// What apply emits.

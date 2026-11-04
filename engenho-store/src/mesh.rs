@@ -16,6 +16,7 @@ use openraft::raft::ClientWriteResponse;
 use openraft::{BasicNode, Config, Raft};
 use tokio::sync::mpsc;
 
+use crate::at_rest::{SealFault, SealWrites};
 use crate::command::{LoggedCommand, ResourceCommand, TxnOp};
 use crate::fjall_store::{FjallStore, Flushed, ImageTripwire};
 use crate::network::{
@@ -49,6 +50,10 @@ pub enum StoreError {
     NoLeader,
     #[error("the write was not forwarded to leader {leader}: {reason}")]
     LeaderUnreachable { leader: RaftNodeId, reason: String },
+    /// A sealed kind cannot be written, or sealed data cannot be used, on this
+    /// node. What is stored is untouched.
+    #[error("{subject}: {fault}")]
+    SecretUnreadable { subject: String, fault: SealFault },
 }
 
 engenho_substrate::impl_error_kind! {
@@ -60,6 +65,7 @@ engenho_substrate::impl_error_kind! {
         (Persist(_)) => "persist_failed",
         NoLeader => "no_leader",
         { LeaderUnreachable { .. } } => "leader_unreachable",
+        { SecretUnreadable { .. } } => "secret_unreadable",
     }
 }
 
@@ -186,6 +192,13 @@ impl StoreBackend {
         }
     }
 
+    async fn write_refusal(&self, cmd: &ResourceCommand) -> Option<(String, SealFault)> {
+        match self {
+            Self::Memory(_) => None,
+            Self::Fjall(s) => s.write_refusal(cmd).await,
+        }
+    }
+
     async fn flush(&self) -> Result<MeshFlushed, StoreError> {
         match self {
             Self::Memory(_) => Ok(MeshFlushed::Ephemeral),
@@ -308,7 +321,32 @@ impl StoreMesh {
         config: Arc<Config>,
         store_path: impl Into<std::path::PathBuf>,
     ) -> Result<Self, StoreError> {
-        let store = FjallStore::open(store_path)?;
+        Self::start_durable_with(
+            node_id,
+            listen_addr,
+            router,
+            config,
+            store_path,
+            SealWrites::default(),
+        )
+        .await
+    }
+
+    /// [`Self::start_durable`] with an explicit write policy for sealed kinds.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::start_durable`], and [`StoreError::SecretUnreadable`] per
+    /// [`FjallStore::open_with`].
+    pub async fn start_durable_with<N: MeshNetwork>(
+        node_id: RaftNodeId,
+        listen_addr: String,
+        router: N,
+        config: Arc<Config>,
+        store_path: impl Into<std::path::PathBuf>,
+        writes: SealWrites,
+    ) -> Result<Self, StoreError> {
+        let store = FjallStore::open_with(store_path, writes)?;
         Self::start_with_backend(
             node_id,
             listen_addr,
@@ -369,6 +407,7 @@ impl StoreMesh {
         router.register(node_id, tx_rpc).await;
 
         let raft_for_rpc = raft.clone();
+        let store_for_rpc = backend.clone();
         let rpc_pump = OwnedTask::spawn(async move {
             let mut admissions = tokio::task::JoinSet::new();
             while let Some(req) = rx_rpc.recv().await {
@@ -382,8 +421,9 @@ impl StoreMesh {
                     }
                     RpcRequest::Forward(command, reply) => {
                         let raft = raft_for_rpc.clone();
+                        let store = store_for_rpc.clone();
                         admissions.spawn(async move {
-                            let _ = reply.send(lead_write(&raft, node_id, command).await);
+                            let _ = reply.send(lead_write(&raft, &store, node_id, command).await);
                         });
                     }
                     RpcRequest::AppendEntries(rpc, reply) => {
@@ -468,6 +508,9 @@ impl StoreMesh {
     /// an identical `Put` or `Patch` comes back
     /// [`crate::ResourceOp::Unchanged`] with the revision untouched.
     pub async fn propose(&self, mut cmd: ResourceCommand) -> Result<ApplyResult, StoreError> {
+        if let Some((subject, fault)) = self.store.write_refusal(&cmd).await {
+            return Err(StoreError::SecretUnreadable { subject, fault });
+        }
         self.stamp_births(&mut cmd).await;
         let command = LoggedCommand::proposed(cmd);
         if self.leader_known().0 != Some(self.node_id) {
@@ -594,6 +637,23 @@ impl StoreMesh {
                 now,
             );
         }
+    }
+
+    /// Why `key` cannot be read, when it is a sealed value this node cannot
+    /// open. [`Self::get`] and the lists hold no such value, so a caller that
+    /// would otherwise answer "not found" asks here first.
+    pub async fn secret_fault(&self, key: &ResourceKey) -> Option<SealFault> {
+        self.store.read(|c| c.secret_fault(key)).await
+    }
+
+    /// Every sealed value in `scope` this node cannot open.
+    pub async fn secret_faults(&self, scope: ListScope<'_>) -> Vec<(ResourceKey, SealFault)> {
+        self.store.read(|c| c.secret_faults(scope)).await
+    }
+
+    /// Every sealed value this node cannot open.
+    pub async fn all_secret_faults(&self) -> Vec<(ResourceKey, SealFault)> {
+        self.store.read(ResourceCatalog::all_secret_faults).await
     }
 
     /// Read a single resource by typed key — synchronous catalog
@@ -1289,7 +1349,17 @@ mod p5_forwarded_write;
 #[cfg(all(test, feature = "teia-nats"))]
 mod nats_reply_tests;
 
-async fn lead_write(raft: &Raft<TypeConfig>, me: RaftNodeId, command: LoggedCommand) -> Forwarded {
+async fn lead_write(
+    raft: &Raft<TypeConfig>,
+    store: &StoreBackend,
+    me: RaftNodeId,
+    command: LoggedCommand,
+) -> Forwarded {
+    if let Some((subject, fault)) = store.write_refusal(command.command()).await {
+        return Err(ForwardRefused::Failed(
+            StoreError::SecretUnreadable { subject, fault }.to_string(),
+        ));
+    }
     match raft.client_write(command).await {
         Ok(resp) => Ok(resp.data),
         Err(e) => Err(match e.forward_to_leader() {

@@ -302,6 +302,15 @@ in
         applies what a pod declares and records what `enforce` would refuse.
       '';
 
+      secretsAtRest = optional (types.enum [ "encrypt" "off" ]) ''
+        Whether this node's store encrypts Secrets at rest. `encrypt`, engenho's
+        default: Secrets, in the state machine, the log and snapshots, are
+        written under a key generated once at `<dataDir>/store.keys/secrets-at-rest.key`.
+        Back that file up: nothing else can open them. `off` writes plaintext
+        and converts sealed values back when next written. A store reads both
+        forms either way.
+      '';
+
       kubeletAuth = optional (types.enum [ "required" "off" ]) ''
         Whether the kubelet API needs its in-memory bearer token. Workloads
         share the host's loopback, so a bind alone protects nothing.
@@ -615,6 +624,7 @@ in
         kubelet_backend = cfg.runtime.kubeletBackend;
         native_cgroups = cfg.runtime.nativeCgroups;
         native_security = cfg.runtime.nativeSecurity;
+        secrets_at_rest = cfg.runtime.secretsAtRest;
         kubelet_auth = cfg.runtime.kubeletAuth;
         api_audit = cfg.runtime.apiAudit;
         health_reasons = cfg.runtime.healthReasons;

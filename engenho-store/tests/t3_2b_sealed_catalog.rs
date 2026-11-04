@@ -84,6 +84,8 @@ const DECLARED: &[(&str, &str, Bound)] = &[
     ("QuicRouter", "bind_joinable", Bound::NotTheCatalog),
     ("QuicRouter", "join", Bound::NotTheCatalog),
     ("StoreMesh", "members", Bound::NotTheCatalog),
+    ("StoreMesh", "secret_faults", Bound::Scope),
+    ("StoreMesh", "all_secret_faults", Bound::NotTheCatalog),
 ];
 
 /// The crate's own sources, as `(path, text)`, excluding the test-only

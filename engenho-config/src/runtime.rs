@@ -186,6 +186,20 @@ pub enum NativeSecurity {
     Off,
 }
 
+/// Whether a node's store encrypts Secrets at rest.
+///
+/// `Encrypt` is the default: Secrets are written encrypted under a key the node
+/// generates once under its data directory. `Off` writes plaintext and converts
+/// sealed values back when next written. A store reads both forms either way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(missing_docs)]
+pub enum SecretsAtRest {
+    #[default]
+    Encrypt,
+    Off,
+}
+
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -403,6 +417,9 @@ pub struct RuntimeConfig {
     pub native_security: NativeSecurity,
     #[allow(missing_docs)]
     #[serde(default)]
+    pub secrets_at_rest: SecretsAtRest,
+    #[allow(missing_docs)]
+    #[serde(default)]
     pub kubelet_auth: KubeletAuth,
     #[allow(missing_docs)]
     #[serde(default)]
@@ -473,6 +490,7 @@ impl TieredConfig for RuntimeConfig {
             kubelet_backend: KubeletBackendKind::Fake,
             native_cgroups: NativeCgroups::Off,
             native_security: NativeSecurity::Enforce,
+            secrets_at_rest: SecretsAtRest::Encrypt,
             kubelet_auth: KubeletAuth::Required,
             api_audit: ApiAudit::Record,
             health_reasons: HealthReasons::Withheld,
@@ -540,6 +558,7 @@ impl TieredConfig for RuntimeConfig {
             kubelet_backend: KubeletBackendKind::PodmanApi,
             native_cgroups: NativeCgroups::Delegated,
             native_security: NativeSecurity::Enforce,
+            secrets_at_rest: SecretsAtRest::Encrypt,
             kubelet_auth: KubeletAuth::Required,
             api_audit: ApiAudit::Record,
             health_reasons: HealthReasons::Named,
@@ -605,6 +624,7 @@ impl TieredConfig for RuntimeConfig {
             kubelet_backend: self.kubelet_backend,
             native_cgroups: self.native_cgroups,
             native_security: self.native_security,
+            secrets_at_rest: self.secrets_at_rest,
             kubelet_auth: self.kubelet_auth,
             api_audit: self.api_audit,
             health_reasons: self.health_reasons,
@@ -902,6 +922,7 @@ mod tests {
             kubelet_backend: KubeletBackendKind::Fake,
             native_cgroups: NativeCgroups::Off,
             native_security: NativeSecurity::Enforce,
+            secrets_at_rest: SecretsAtRest::Encrypt,
             kubelet_auth: KubeletAuth::Required,
             api_audit: ApiAudit::Record,
             health_reasons: HealthReasons::Withheld,

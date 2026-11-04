@@ -2157,7 +2157,12 @@ async fn open_store(
     let forms = !boot.membership.joins();
     if boot.durable {
         let store_path = boot.data_dir.join(STORE_DIR);
-        let mesh = StoreMesh::start_durable(node_id, listen, router, cfg, store_path).await?;
+        let writes = match boot.secrets_at_rest {
+            engenho_config::SecretsAtRest::Encrypt => engenho_store::SealWrites::Seal,
+            engenho_config::SecretsAtRest::Off => engenho_store::SealWrites::Plain,
+        };
+        let mesh =
+            StoreMesh::start_durable_with(node_id, listen, router, cfg, store_path, writes).await?;
         let fresh = !mesh.is_initialized().await;
         if fresh && forms {
             mesh.initialize_singleton().await?;

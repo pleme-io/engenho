@@ -95,6 +95,7 @@
 // than a quiet way to hand the whole catalog and its replay ring back out.
 #![deny(private_interfaces)]
 
+pub mod at_rest;
 pub mod command;
 pub mod data_dir_lock;
 pub mod drv_committal;
@@ -136,6 +137,7 @@ mod watch_history;
 #[cfg(test)]
 mod catalog_tests;
 
+pub use at_rest::{KEY_FILE, KEYS_DIR_SUFFIX, KeyId, SealFault, SealWrites, keys_dir_for};
 pub use command::{ApplySemantics, LoggedCommand, Reason, ResourceCommand, ResourceOp};
 pub use drv_committal::{
     DRV_GROUP, DRV_KIND, DRV_VERSION, delete_drv_command, drv_resource_key, put_drv_command,

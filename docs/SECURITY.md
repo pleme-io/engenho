@@ -51,6 +51,12 @@ The kubelet API (`/exec`, `/containerLogs`, `/pods`) needs a bearer token that i
 
 The etcd facade serves every Secret, so it binds only when `runtime.etcd_listen_addr` names an address.
 
+## Secrets at rest
+
+`runtime.secrets_at_rest` is `encrypt` by default: a Secret is sealed in the state machine, the log and snapshots under `<dataDir>/store.keys/secrets-at-rest.key`, generated once per node and never regenerated. Back that file up, since nothing else opens the data. The first write of the store's image seals every Secret, and an older binary cannot read them, so going back means setting `off` and waiting for the log to purge. A LIST covering a Secret that cannot be read refuses rather than omits, and a sealed replay tail with a lost key blocks boot, by name, until the key is restored. Each node seals under its own key.
+
+It does not cover a kubelet's Secret volumes on disk, or plaintext already in old log entries, snapshots and store versions until they are purged or compacted. The Raft wire is TLS-pinned over QUIC; the off-by-default NATS transport is unchecked. The fleet holds this `off` until each node's key has a backup: `pleme.nixos.engenhoNode.secretsAtRest`.
+
 ## The API's record
 
 Every API request is recorded by default as a JSON-line `audit.k8s.io/v1` Event in `data_dir/audit/audit.log`, mode 0600, rotated at 64 MiB with 4 files kept. A denied request is recorded too. An Event has no body field, so no body or token can reach it; `engenho-apiserver/blue/audit/audit.b` decides the level. A full queue or a failed write loses that event, counts in `engenho_audit_events_total{result}` and warns, and never fails the request. `runtime.api_audit: off` configures it off. It does not yet record source addresses, and a handler that panics goes unrecorded.
@@ -76,7 +82,6 @@ Read 2026-11-04 from engenho's source, against Kubernetes Pod Security Standards
 | 5 | Two pods with one `runAsUser` share an identity; no default `pids.max` or `memory.max` | kakoi identity and cgroup defaults |
 | 6 | `capabilities.add: NET_BIND_SERVICE`, which Restricted allows, needs the root grant, which removes the whole enclosure | kakoi: name capabilities an enclosed pod may keep |
 | 7 | `hostPID`, `hostIPC`, `readOnlyRootFilesystem`, `capabilities.drop`, `seccompProfile`, sysctls and devices are ignored or unread | kakoi facts, refused when they cannot be honoured |
-| 9 | Secrets are plaintext in the store | envelope encryption with a node-held key |
 | 10 | No image or closure verification at admission; tameshi's verifier has no caller | the admission rule, then Nix signature checks |
 | 11 | Certificates run to 2100 with no rotation | a shorter span and rotation in `engenho-apiserver/src/pki.rs` |
 | 12 | The podman backend passes `privileged` and `cap_add` straight through | the same verdict as native |

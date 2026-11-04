@@ -32,8 +32,8 @@ use engenho_config::{
     ApiAudit, ClusterConfig, ConsistencyConfig, ConsistencyTierKind, ControllerEnable,
     ControllersConfig, DatapathMode, EngenhoConfig, Fabric, HealthReasons, KubeconfigVisibility,
     KubeletAuth, KubeletBackendKind, LegacyTeiaSection, NativeCgroups, NativeSecurity,
-    NetworkingConfig, RevoadaConfig, RuntimeConfig, SchedulerConfig, SharedCluster, TlsConfig,
-    TopologyConfig, TopologyStrategyKind,
+    NetworkingConfig, RevoadaConfig, RuntimeConfig, SchedulerConfig, SecretsAtRest, SharedCluster,
+    TlsConfig, TopologyConfig, TopologyStrategyKind,
 };
 
 use crate::health::Windows;
@@ -77,6 +77,7 @@ pub(crate) struct BootConfig {
     pub(crate) kubelet_backend: KubeletBackendKind,
     pub(crate) native_cgroups: NativeCgroups,
     pub(crate) native_security: NativeSecurity,
+    pub(crate) secrets_at_rest: SecretsAtRest,
     pub(crate) kubelet_auth: KubeletAuth,
     pub(crate) api_audit: ApiAudit,
     pub(crate) health_reasons: HealthReasons,
@@ -186,6 +187,7 @@ impl BootConfig {
             kubelet_backend,
             native_cgroups,
             native_security,
+            secrets_at_rest,
             kubelet_auth,
             api_audit,
             health_reasons,
@@ -214,6 +216,7 @@ impl BootConfig {
             kubelet_backend: *kubelet_backend,
             native_cgroups: *native_cgroups,
             native_security: *native_security,
+            secrets_at_rest: *secrets_at_rest,
             kubelet_auth: *kubelet_auth,
             api_audit: *api_audit,
             health_reasons: *health_reasons,
