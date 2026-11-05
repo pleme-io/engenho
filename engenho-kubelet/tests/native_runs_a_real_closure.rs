@@ -916,6 +916,68 @@ async fn a_pods_host_fields_are_refused_by_name_unless_the_node_can_honour_them(
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
+async fn a_kept_capability_binds_a_low_port_and_stays_enclosed_and_filtered() {
+    if !is_root() {
+        return;
+    }
+    let tools = closure("nixpkgs#busybox");
+    let backend = NativeBackend::new(
+        Isolation::HostProcess,
+        std::env::temp_dir().join("engenho-native-e2e-keep"),
+        Cgroups::Off,
+    );
+    let script = format!(
+        "{tools}/bin/cat /proc/self/status; \
+         {tools}/bin/timeout 1 {tools}/bin/nc -l -p 80 > /dev/null; echo bind=$?; \
+         {tools}/bin/unshare -m {tools}/bin/true; echo unshare=$?; \
+         (echo x > /etc/kakoi-keep-escape) 2>/dev/null || echo etc-refused"
+    );
+    let image = format!("nix:{tools}");
+    let run = |pod: &str, cap_add: Vec<String>| {
+        let mut s = spec(&image, &["sh", "-c", &script], &[]);
+        s.pod.namespace = "kakoi-keep".to_string();
+        s.pod.name = pod.to_string();
+        s.confinement.access = Some(r#"{"effects":["clock"]}"#.to_string());
+        s.confinement.cap_add = cap_add;
+        s.confinement.cap_drop = vec!["ALL".to_string()];
+        s
+    };
+    let kept = output_of(&backend, &run("kept", vec!["NET_BIND_SERVICE".to_string()])).await;
+    assert!(!kept.contains("not found"), "a tool never ran: {kept}");
+    let bit = "0000000000000400";
+    assert_eq!(status_field(&kept, "CapEff:"), bit, "{kept}");
+    assert_eq!(status_field(&kept, "CapPrm:"), bit, "{kept}");
+    assert_eq!(status_field(&kept, "CapAmb:"), bit, "{kept}");
+    assert_eq!(status_field(&kept, "NoNewPrivs:"), "1", "{kept}");
+    assert_eq!(status_field(&kept, "Seccomp:"), "2", "{kept}");
+    assert!(
+        status_field(&kept, "Uid:")
+            .split_whitespace()
+            .next()
+            .and_then(|u| u.parse::<u32>().ok())
+            .is_some_and(|uid| uid >= 100_000),
+        "{kept}"
+    );
+    assert!(!kept.contains("Permission denied"), "it bound 80: {kept}");
+    assert!(kept.contains("Operation not permitted"), "{kept}");
+    assert!(kept.contains("etc-refused"), "{kept}");
+
+    let bare = output_of(&backend, &run("bare", Vec::new())).await;
+    assert!(!bare.contains("not found"), "a tool never ran: {bare}");
+    assert_eq!(status_field(&bare, "CapEff:"), "0000000000000000", "{bare}");
+    assert!(bare.contains("Permission denied"), "{bare}");
+
+    let mut raw = run("raw", vec!["NET_RAW".to_string()]);
+    raw.pod.name = "raw".to_string();
+    let why = backend
+        .start(&raw)
+        .await
+        .expect_err("NET_RAW needs a grant");
+    assert!(why.to_string().contains("kakoi.pleme.io/root"), "{why}");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
 async fn a_host_services_socket_directory_is_hidden_from_an_enclosed_pod() {
     if !is_root() {
         return;

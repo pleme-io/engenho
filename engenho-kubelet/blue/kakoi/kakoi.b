@@ -457,6 +457,65 @@ def granted?(facts)
 end
 
 @doc """
+keepable_capabilities: The capabilities an enclosed pod may keep by naming them. The Restricted standard of Kubernetes allows exactly this one, and a port below 1024 reaches nothing but its own listener. Any other capability needs a grant.
+
+    keepable_capabilities #=> ["NET_BIND_SERVICE"]
+"""
+def keepable_capabilities()
+  ["NET_BIND_SERVICE"]
+end
+
+@doc """
+capability_word: A capability as a pod may spell it, in the one spelling the rest of this program reads.
+
+    capability_word("CAP_NET_BIND_SERVICE") #=> "NET_BIND_SERVICE"
+    capability_word("net_bind_service") #=> "NET_BIND_SERVICE"
+    capability_word("NET_ADMIN") #=> "NET_ADMIN"
+"""
+def capability_word(name)
+  replace(upcase(name), "CAP_", "")
+end
+
+@doc """
+kept_capabilities: What an enclosed container keeps of what it adds, as the seam's words.
+
+    kept_capabilities({"cap_add" => ["CAP_NET_BIND_SERVICE", "NET_BIND_SERVICE", "NET_ADMIN"]}) #=> ["NET_BIND_SERVICE"]
+    kept_capabilities({}) #=> []
+"""
+def kept_capabilities(declared)
+  distinct(
+    filter(
+      (c) -> member?(c, keepable_capabilities),
+      map(capability_word, field(declared, "cap_add", []))
+    )
+  )
+end
+
+@doc """
+ungranted_capabilities: What a container adds that only a grant allows.
+
+    ungranted_capabilities(["NET_BIND_SERVICE", "SYS_ADMIN", "ALL"]) #=> ["SYS_ADMIN", "ALL"]
+    ungranted_capabilities(["cap_net_bind_service"]) #=> []
+"""
+def ungranted_capabilities(caps)
+  filter((c) -> not member?(capability_word(c), keepable_capabilities), caps)
+end
+
+@doc """
+capability_conflict: The capabilities a container both adds and drops by name. `ALL` in drop is how a pod says the rest, so it conflicts with nothing.
+
+    capability_conflict({"cap_add" => ["NET_BIND_SERVICE"], "cap_drop" => ["ALL"]}) #=> []
+    capability_conflict({"cap_add" => ["NET_BIND_SERVICE"], "cap_drop" => ["CAP_NET_BIND_SERVICE"]}) #=> ["NET_BIND_SERVICE"]
+"""
+def capability_conflict(declared)
+  dropped = map(capability_word, field(declared, "cap_drop", []))
+  filter(
+    (c) -> member?(c, dropped),
+    map(capability_word, field(declared, "cap_add", []))
+  )
+end
+
+@doc """
 demands: Each thing the container declares that only a grant allows, as text naming it.
 
     demands({"run_as_user" => 0}) #=> ["runAsUser 0"]
@@ -464,6 +523,8 @@ demands: Each thing the container declares that only a grant allows, as text nam
     demands({"privileged" => true}) #=> ["privileged"]
     demands({"allow_escalation" => true}) #=> ["allowPrivilegeEscalation"]
     demands({"cap_add" => ["NET_ADMIN"]}) #=> ["capabilities.add NET_ADMIN"]
+    demands({"cap_add" => ["NET_BIND_SERVICE"]}) #=> []
+    demands({"cap_add" => ["NET_BIND_SERVICE", "SYS_ADMIN"]}) #=> ["capabilities.add SYS_ADMIN"]
     demands({"host_pid" => true}) #=> ["hostPID"]
     demands({"host_ipc" => true}) #=> ["hostIPC"]
     demands({"seccomp_profile" => "Unconfined"}) #=> ["seccompProfile Unconfined"]
@@ -471,7 +532,7 @@ demands: Each thing the container declares that only a grant allows, as text nam
     demands({"devices" => ["/dev/ttyUSB0"]}) #=> ["a device mount of /dev/ttyUSB0"]
 """
 def demands(declared)
-  caps = field(declared, "cap_add", [])
+  caps = ungranted_capabilities(field(declared, "cap_add", []))
   devices = field(declared, "devices", [])
   append(
     named_if(field(declared, "host_pid", false), ["hostPID"]),
@@ -512,11 +573,15 @@ contradiction: The reason a declaration cannot be true, or nil.
 
     contradiction({"run_as_non_root" => true, "run_as_user" => 0}) #=> "runAsNonRoot and runAsUser 0 contradict"
     contradiction({"run_as_non_root" => true}) #=> nil
+    contradiction({"cap_add" => ["NET_BIND_SERVICE"], "cap_drop" => ["NET_BIND_SERVICE"]}) #=> "capabilities.add and capabilities.drop both name NET_BIND_SERVICE"
 """
 def contradiction(declared)
+  both = capability_conflict(declared)
   if field(declared, "run_as_non_root", false) and
       field(declared, "run_as_user", -1) == 0
     "runAsNonRoot and runAsUser 0 contradict"
+  elsif length(both) != 0
+    "capabilities.add and capabilities.drop both name #{join(both, ", ")}"
   else
     outside_range(declared)
   end
@@ -716,8 +781,10 @@ def declared_only(facts)
   [declared["run_as_user"], declared["run_as_group"]]
 end
 
-def verdict_text(refused, ids, confine, warnings, volumes?, arch?, access?)
-  own = volumes or []
+def verdict_text(refused, ids, confine, warnings, facts?)
+  own = field(facts, "volumes", [])
+  arch = field(facts, "arch", "x86_64")
+  access = field(facts, "access", nil)
   json_stringify(
     {
       "refused" => refused,
@@ -725,6 +792,11 @@ def verdict_text(refused, ids, confine, warnings, volumes?, arch?, access?)
       "gid" => ids[1],
       "no_new_privs" => confine,
       "clear_caps" => confine,
+      "keep" => if confine
+        kept_capabilities(field(facts, "declared", {}))
+      else
+        []
+      end,
       "enclosed" => confine,
       "hide" => if confine
         hide_list(own)
@@ -864,9 +936,7 @@ def enclose(facts_text)
           not_applied_warning(declared),
           named_if(not granted, system_account_warning(declared))
         ),
-        field(facts, "volumes", []),
-        arch,
-        access
+        facts
       )
     end
   end
@@ -1125,6 +1195,47 @@ test "the sockets a host service answers on are hidden, and a pod's own volume s
     %w[/run/engenho /run/tailscale /run/systemd /run/udev]
   )
   assert not member?("/run/engenho", hide_list(["/run/engenho/x"]))
+end
+
+test "a kept capability stays enclosed and filtered, and anything else still needs a grant"
+  kept = answer(
+    enforced(
+      {"declared" => {"cap_add" => ["NET_BIND_SERVICE"], "cap_drop" => ["ALL"]}}
+    )
+  )
+  assert kept.refused.nil?
+  assert kept.enclosed == true
+  assert kept.clear_caps == true
+  assert kept.no_new_privs == true
+  assert kept.keep == ["NET_BIND_SERVICE"]
+  assert length(kept.deny) != 0
+  mixed = answer(
+    enforced({"declared" => {"cap_add" => %w[NET_BIND_SERVICE NET_RAW]}})
+  )
+  assert contains?(mixed.refused, "capabilities.add NET_RAW")
+  assert contains?(mixed.refused, grant_annotation)
+  assert length(answer(enforced({"declared" => {}})).keep) == 0
+  granted = answer(
+    enforced(
+      {"grant" => "x", "declared" => {"cap_add" => ["NET_BIND_SERVICE"]}}
+    )
+  )
+  assert granted.enclosed == false
+  assert length(granted.keep) == 0
+  audit = answer(
+    assoc(
+      enforced({"declared" => {"cap_add" => ["NET_BIND_SERVICE"]}}),
+      "mode",
+      "audit"
+    )
+  )
+  assert length(audit.keep) == 0
+end
+
+test "a capability added and dropped by name cannot be true, even with a grant"
+  both = {"cap_add" => ["NET_ADMIN"], "cap_drop" => ["NET_ADMIN"]}
+  assert contains?(answer(enforced({"declared" => both})).refused, "NET_ADMIN")
+  assert answer(enforced({"grant" => "x", "declared" => both})).refused != nil
 end
 
 test "a grant says what it cannot apply"

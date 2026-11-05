@@ -83,8 +83,11 @@ pub struct Verdict {
     pub gid: Option<u32>,
     /// Set `no_new_privs` on the child.
     pub no_new_privs: bool,
-    /// Clear the child's capability sets.
+    /// Clear the child's capability sets, but for [`Self::keep`].
     pub clear_caps: bool,
+    /// The capabilities the child keeps across its uid change, by blue's words.
+    #[serde(default)]
+    pub keep: Vec<String>,
     /// Give the child its own mount namespace with a read-only host.
     #[serde(default)]
     pub enclosed: bool,
@@ -442,6 +445,41 @@ fn seccomp_filter(verdict: &Verdict) -> Vec<libc::sock_filter> {
     program
 }
 
+/// A capability blue names, as the kernel knows it. A word with no row refuses
+/// the pod rather than running it with less than blue decided.
+#[cfg(target_os = "linux")]
+fn kept_capability(word: &str) -> std::io::Result<rustix::thread::CapabilitySet> {
+    match word {
+        "NET_BIND_SERVICE" => Ok(rustix::thread::CapabilitySet::NET_BIND_SERVICE),
+        other => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("kakoi named a capability this seam does not know: {other}"),
+        )),
+    }
+}
+
+/// What the child's last steps need, built before the fork so the hook allocates
+/// nothing.
+#[cfg(target_os = "linux")]
+struct Steps {
+    filter: Vec<libc::sock_filter>,
+    kept: Vec<rustix::thread::CapabilitySet>,
+}
+
+#[cfg(target_os = "linux")]
+impl Steps {
+    fn of(verdict: &Verdict) -> std::io::Result<Self> {
+        Ok(Self {
+            filter: seccomp_filter(verdict),
+            kept: verdict
+                .keep
+                .iter()
+                .map(|word| kept_capability(word))
+                .collect::<std::io::Result<_>>()?,
+        })
+    }
+}
+
 /// A container's own volume path, and whether it is mounted read-only.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Volume {
@@ -506,7 +544,7 @@ pub fn enter_on_exec(
         .try_fold(UnshareFlags::empty(), |flags, word| {
             own_namespace(word).map(|(flag, _, _)| flags | flag)
         })?;
-    let filter = seccomp_filter(&v);
+    let steps = Steps::of(&v)?;
     let empty = c"";
     let tmpfs = c"tmpfs";
     let root = c"/";
@@ -574,18 +612,22 @@ pub fn enter_on_exec(
                     )?;
                 }
             }
-            become_declared(&v, &filter)
+            become_declared(&v, &steps)
         });
     }
     Ok(())
 }
 
 /// The child's last steps before `exec`, in this one order: groups, gid, uid,
-/// capabilities, `no_new_privs`, the filter.
+/// capabilities, `no_new_privs`, the filter. A kept capability survives the uid
+/// change through `PR_SET_KEEPCAPS`, and `exec` through the ambient set.
 #[cfg(target_os = "linux")]
-fn become_declared(v: &Verdict, filter: &[libc::sock_filter]) -> std::io::Result<()> {
+fn become_declared(v: &Verdict, steps: &Steps) -> std::io::Result<()> {
     use rustix::thread::{CapabilitySet, CapabilitySets};
 
+    if !steps.kept.is_empty() {
+        rustix::thread::set_keep_capabilities(true)?;
+    }
     if let Some(gid) = v.gid {
         rustix::thread::set_thread_groups(&[])?;
         rustix::thread::set_thread_gid(rustix::fs::Gid::from_raw(gid))?;
@@ -594,23 +636,29 @@ fn become_declared(v: &Verdict, filter: &[libc::sock_filter]) -> std::io::Result
         rustix::thread::set_thread_uid(rustix::fs::Uid::from_raw(uid))?;
     }
     if v.clear_caps {
-        let none = CapabilitySet::empty();
+        let kept = steps
+            .kept
+            .iter()
+            .fold(CapabilitySet::empty(), |all, one| all | *one);
         rustix::thread::set_capabilities(
             None,
             CapabilitySets {
-                effective: none,
-                permitted: none,
-                inheritable: none,
+                effective: kept,
+                permitted: kept,
+                inheritable: kept,
             },
         )?;
+        for one in &steps.kept {
+            rustix::thread::configure_capability_in_ambient_set(*one, true)?;
+        }
     }
     if v.no_new_privs {
         rustix::thread::set_no_new_privs(true)?;
     }
     if !v.deny.is_empty() {
         let program = libc::sock_fprog {
-            len: filter.len() as u16,
-            filter: filter.as_ptr().cast_mut(),
+            len: steps.filter.len() as u16,
+            filter: steps.filter.as_ptr().cast_mut(),
         };
         #[allow(unsafe_code)]
         let installed = unsafe {
@@ -665,7 +713,7 @@ pub fn join_on_exec(
             joined.push((std::fs::File::open(format!("/proc/{pid}/ns/{file}"))?, kind));
         }
     }
-    let filter = seccomp_filter(&v);
+    let steps = Steps::of(&v)?;
     #[allow(unsafe_code)]
     unsafe {
         cmd.pre_exec(move || {
@@ -675,7 +723,7 @@ pub fn join_on_exec(
             if v.enclosed {
                 rustix::process::chdir(c"/")?;
             }
-            become_declared(&v, &filter)
+            become_declared(&v, &steps)
         });
     }
     Ok(())
@@ -1221,6 +1269,36 @@ mod tests {
         )
         .unwrap();
         assert!(plain.not_applied.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_capability_blue_names_maps_to_the_kernels_and_any_other_refuses() {
+        assert_eq!(
+            kept_capability("NET_BIND_SERVICE").unwrap(),
+            rustix::thread::CapabilitySet::NET_BIND_SERVICE
+        );
+        assert!(kept_capability("SYS_ADMIN").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_pod_keeps_the_keepable_capability_without_a_grant() {
+        let on = |cap_add: Vec<String>| async move {
+            let c = Confinement {
+                cap_add,
+                ..Confinement::default()
+            };
+            kakoi()
+                .enclose(&c, "", &[], NativeSecurity::Enforce, true)
+                .await
+                .unwrap()
+        };
+        let kept = on(vec!["NET_BIND_SERVICE".to_string()]).await;
+        assert_eq!(kept.refused, None);
+        assert!(kept.enclosed);
+        assert_eq!(kept.keep, vec!["NET_BIND_SERVICE".to_string()]);
+        let refused = on(vec!["NET_RAW".to_string()]).await;
+        assert!(refused.refused.unwrap().contains(GRANT_ANNOTATION));
     }
 
     #[tokio::test]
