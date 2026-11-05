@@ -35,6 +35,14 @@ struct Declared<'a> {
     cap_drop: &'a [String],
     read_only_root_fs: bool,
     no_new_privileges: bool,
+    host_pid: bool,
+    host_ipc: bool,
+    host_network: bool,
+    seccomp_profile: Option<&'a str>,
+    sysctls: &'a [String],
+    devices: &'a [String],
+    volume_devices: &'a [String],
+    not_applied: &'a [String],
 }
 
 #[derive(Serialize)]
@@ -146,6 +154,14 @@ impl Kakoi {
             allow_escalation,
             root_grant,
             access,
+            host_pid,
+            host_ipc,
+            host_network,
+            seccomp_profile,
+            sysctls,
+            devices,
+            volume_devices,
+            not_applied,
         } = confinement;
         let parsed = access
             .as_deref()
@@ -170,6 +186,14 @@ impl Kakoi {
                 cap_drop,
                 read_only_root_fs: *read_only_root_fs,
                 no_new_privileges: *no_new_privileges,
+                host_pid: *host_pid,
+                host_ipc: *host_ipc,
+                host_network: *host_network,
+                seccomp_profile: seccomp_profile.as_deref(),
+                sysctls,
+                devices,
+                volume_devices,
+                not_applied,
             },
         };
         let facts = serde_json::to_string(&facts).map_err(|e| e.to_string())?;
@@ -1111,6 +1135,182 @@ mod tests {
         assert_eq!(c.run_as_group, Some(7));
         assert_eq!(c.run_as_non_root, Some(true));
         assert_eq!(c.root_grant.as_deref(), Some("drops to its account"));
+    }
+
+    #[test]
+    fn every_security_field_of_a_pod_reaches_the_facts() {
+        let pod = serde_json::json!({
+            "spec": {
+                "hostPID": true,
+                "hostIPC": true,
+                "hostNetwork": true,
+                "shareProcessNamespace": true,
+                "hostUsers": false,
+                "securityContext": {
+                    "seccompProfile": {"type": "Localhost"},
+                    "sysctls": [{"name": "kernel.shm_rmid_forced", "value": "1"}],
+                    "fsGroup": 2000,
+                    "supplementalGroups": [3],
+                    "appArmorProfile": {"type": "RuntimeDefault"},
+                    "seLinuxOptions": {"level": "s0"}
+                },
+                "volumes": [
+                    {"name": "radio", "hostPath": {"path": "/dev/ttyUSB0", "type": "CharDevice"}},
+                    {"name": "disk", "hostPath": {"path": "/dev/sdz", "type": "BlockDevice"}},
+                    {"name": "data", "hostPath": {"path": "/data", "type": "Directory"}},
+                    {"name": "bare", "hostPath": {"path": "/bare"}}
+                ]
+            }
+        });
+        let c = Confinement::default()
+            .inheriting_pod(&pod)
+            .reading_container(&serde_json::json!({
+                "volumeDevices": [{"name": "b", "devicePath": "/dev/xvda"}]
+            }));
+        assert!(c.host_pid && c.host_ipc && c.host_network);
+        assert_eq!(c.seccomp_profile.as_deref(), Some("Localhost"));
+        assert_eq!(c.sysctls, vec!["kernel.shm_rmid_forced".to_string()]);
+        assert_eq!(
+            c.devices,
+            vec!["/dev/ttyUSB0".to_string(), "/dev/sdz".to_string()]
+        );
+        assert_eq!(c.volume_devices, vec!["/dev/xvda".to_string()]);
+        assert_eq!(
+            c.not_applied,
+            [
+                "fsGroup",
+                "supplementalGroups",
+                "appArmorProfile",
+                "seLinuxOptions",
+                "shareProcessNamespace",
+                "hostUsers"
+            ]
+            .map(str::to_string)
+            .to_vec()
+        );
+        let quiet = Confinement::default().inheriting_pod(&serde_json::json!({
+            "spec": {"hostUsers": true, "shareProcessNamespace": false, "hostNetwork": false,
+                     "securityContext": {"supplementalGroups": []}}
+        }));
+        assert!(quiet.not_applied.is_empty(), "{quiet:?}");
+        assert!(!quiet.host_network);
+    }
+
+    #[test]
+    fn a_containers_own_profile_wins_and_its_own_fields_are_named() {
+        let sc = serde_json::json!({
+            "seccompProfile": {"type": "RuntimeDefault"},
+            "procMount": "Unmasked",
+            "seLinuxOptions": {"level": "s0"}
+        });
+        let pod = serde_json::json!({
+            "spec": {"securityContext": {"seccompProfile": {"type": "Unconfined"}, "seLinuxOptions": {"level": "s1"}}}
+        });
+        let c = Confinement::from_pod_json(Some(&sc), "p", "c")
+            .unwrap()
+            .inheriting_pod(&pod);
+        assert_eq!(c.seccomp_profile.as_deref(), Some("RuntimeDefault"));
+        assert_eq!(
+            c.not_applied,
+            ["procMount", "seLinuxOptions"].map(str::to_string).to_vec()
+        );
+        let plain = Confinement::from_pod_json(
+            Some(&serde_json::json!({"procMount": "Default"})),
+            "p",
+            "c",
+        )
+        .unwrap();
+        assert!(plain.not_applied.is_empty());
+    }
+
+    #[tokio::test]
+    async fn blue_decides_each_new_fact_the_seam_states() {
+        let on = |c: Confinement| async move {
+            kakoi()
+                .enclose(&c, "", &[], NativeSecurity::Enforce, true)
+                .await
+                .unwrap()
+        };
+        let refused_for = [
+            (
+                Confinement {
+                    host_pid: true,
+                    ..Confinement::default()
+                },
+                "hostPID",
+            ),
+            (
+                Confinement {
+                    host_ipc: true,
+                    ..Confinement::default()
+                },
+                "hostIPC",
+            ),
+            (
+                Confinement {
+                    seccomp_profile: Some("Unconfined".into()),
+                    ..Confinement::default()
+                },
+                "Unconfined",
+            ),
+            (
+                Confinement {
+                    seccomp_profile: Some("Localhost".into()),
+                    ..Confinement::default()
+                },
+                "Localhost",
+            ),
+            (
+                Confinement {
+                    sysctls: vec!["a.b".into()],
+                    ..Confinement::default()
+                },
+                "a.b",
+            ),
+            (
+                Confinement {
+                    devices: vec!["/dev/x".into()],
+                    ..Confinement::default()
+                },
+                "/dev/x",
+            ),
+            (
+                Confinement {
+                    volume_devices: vec!["/dev/y".into()],
+                    ..Confinement::default()
+                },
+                "/dev/y",
+            ),
+            (
+                Confinement {
+                    host_network: true,
+                    access: Some(r#"{"effects":["clock"]}"#.into()),
+                    ..Confinement::default()
+                },
+                "hostNetwork",
+            ),
+        ];
+        for (confinement, name) in refused_for {
+            let refused = on(confinement).await.refused.expect(name);
+            assert!(refused.contains(name), "{refused}");
+        }
+        let fine = on(Confinement {
+            seccomp_profile: Some("RuntimeDefault".into()),
+            host_network: true,
+            ..Confinement::default()
+        })
+        .await;
+        assert_eq!(fine.refused, None);
+        assert!(fine.enclosed);
+        let told = on(Confinement {
+            not_applied: vec!["fsGroup".into()],
+            ..Confinement::default()
+        })
+        .await;
+        assert!(
+            told.warnings.iter().any(|w| w.contains("fsGroup")),
+            "{told:?}"
+        );
     }
 
     #[test]

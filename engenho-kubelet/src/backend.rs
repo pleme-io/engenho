@@ -80,6 +80,30 @@ pub struct Confinement {
     /// The blue `access` value a pod carries, as its annotation states it.
     #[serde(default)]
     pub access: Option<String>,
+    /// `hostPID`, from the pod.
+    #[serde(default)]
+    pub host_pid: bool,
+    /// `hostIPC`, from the pod.
+    #[serde(default)]
+    pub host_ipc: bool,
+    /// `hostNetwork`, from the pod.
+    #[serde(default)]
+    pub host_network: bool,
+    /// `seccompProfile.type`: the container's, else its pod's.
+    #[serde(default)]
+    pub seccomp_profile: Option<String>,
+    /// The names in the pod's `securityContext.sysctls`.
+    #[serde(default)]
+    pub sysctls: Vec<String>,
+    /// The paths of the pod's `hostPath` volumes typed as a device.
+    #[serde(default)]
+    pub devices: Vec<String>,
+    /// The `devicePath`s of the container's `volumeDevices`.
+    #[serde(default)]
+    pub volume_devices: Vec<String>,
+    /// What the pod sets that this node reads and does not apply, by field name.
+    #[serde(default)]
+    pub not_applied: Vec<String>,
 }
 
 impl Default for Confinement {
@@ -103,6 +127,14 @@ impl Default for Confinement {
             allow_escalation: None,
             root_grant: None,
             access: None,
+            host_pid: false,
+            host_ipc: false,
+            host_network: false,
+            seccomp_profile: None,
+            sysctls: Vec::new(),
+            devices: Vec::new(),
+            volume_devices: Vec::new(),
+            not_applied: Vec::new(),
         }
     }
 }
@@ -120,6 +152,18 @@ impl Confinement {
             return Self::default();
         };
         let caps = sc.capabilities.as_ref();
+        let not_applied = [
+            sc.proc_mount
+                .as_deref()
+                .is_some_and(|mount| mount != "Default")
+                .then_some("procMount"),
+            sc.app_armor_profile.is_some().then_some("appArmorProfile"),
+            sc.se_linux_options.is_some().then_some("seLinuxOptions"),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::to_string)
+        .collect();
         Self {
             privileged: sc.privileged.unwrap_or(false),
             read_only_root_fs: sc.read_only_root_filesystem.unwrap_or(false),
@@ -134,13 +178,17 @@ impl Confinement {
             allow_escalation: sc.allow_privilege_escalation,
             root_grant: None,
             access: None,
+            seccomp_profile: sc.seccomp_profile.as_ref().map(|p| p.r#type.clone()),
+            not_applied,
+            ..Self::default()
         }
     }
 
     /// Fill what the container left unset from its pod, as Kubernetes does: a
-    /// container's own field wins, and only these three exist at both levels.
-    /// Read at this one place because a backend that reads only the container
-    /// silently drops the pod's, and the workload runs as whoever the daemon is.
+    /// container's own field wins. Read at this one place because a backend that
+    /// reads only the container silently drops the pod's, and the workload runs
+    /// as whoever the daemon is. The pod's own security fields are read here too,
+    /// so none is ignored without a word.
     #[must_use]
     pub fn inheriting_pod(mut self, pod: &serde_json::Value) -> Self {
         let sc = pod.get("spec").and_then(|s| s.get("securityContext"));
@@ -164,6 +212,48 @@ impl Confinement {
             .filter(|reason| !reason.trim().is_empty())
             .map(str::to_string);
         self.access = annotation(crate::kakoi::ACCESS_ANNOTATION).map(str::to_string);
+        let spec = pod.get("spec");
+        let flag = |k: &str| {
+            spec.and_then(|s| s.get(k))
+                .and_then(serde_json::Value::as_bool)
+        };
+        self.host_pid = flag("hostPID").unwrap_or(false);
+        self.host_ipc = flag("hostIPC").unwrap_or(false);
+        self.host_network = flag("hostNetwork").unwrap_or(false);
+        self.seccomp_profile = self.seccomp_profile.or_else(|| {
+            sc.and_then(|s| s.get("seccompProfile"))
+                .and_then(|p| p.get("type"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        });
+        self.sysctls = strings_at(sc.and_then(|s| s.get("sysctls")), "name");
+        self.devices = host_path_devices(spec.and_then(|s| s.get("volumes")));
+        let set = |k: &str| {
+            sc.and_then(|s| s.get(k))
+                .is_some_and(|v| !v.is_null() && v != &serde_json::json!([]))
+        };
+        for (field, present) in [
+            ("fsGroup", set("fsGroup")),
+            ("supplementalGroups", set("supplementalGroups")),
+            ("appArmorProfile", set("appArmorProfile")),
+            ("seLinuxOptions", set("seLinuxOptions")),
+            (
+                "shareProcessNamespace",
+                flag("shareProcessNamespace") == Some(true),
+            ),
+            ("hostUsers", flag("hostUsers") == Some(false)),
+        ] {
+            if present && !self.not_applied.iter().any(|name| name == field) {
+                self.not_applied.push(field.to_string());
+            }
+        }
+        self
+    }
+
+    /// Read what only the container's own entry in the pod states.
+    #[must_use]
+    pub fn reading_container(mut self, container: &serde_json::Value) -> Self {
+        self.volume_devices = strings_at(container.get("volumeDevices"), "devicePath");
         self
     }
 
@@ -206,6 +296,32 @@ impl Confinement {
     pub fn is_kubernetes_default(&self) -> bool {
         self == &Self::default()
     }
+}
+
+fn strings_at(list: Option<&serde_json::Value>, key: &str) -> Vec<String> {
+    list.and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get(key).and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+fn host_path_devices(volumes: Option<&serde_json::Value>) -> Vec<String> {
+    volumes
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|volume| volume.get("hostPath"))
+        .filter(|path| {
+            matches!(
+                path.get("type").and_then(serde_json::Value::as_str),
+                Some("CharDevice" | "BlockDevice")
+            )
+        })
+        .filter_map(|path| path.get("path").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .collect()
 }
 
 // =================================================================

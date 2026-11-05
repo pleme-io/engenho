@@ -74,6 +74,12 @@ def hidden_paths()
     /run/podman
     /run/docker
     /run/containerd
+    /run/engenho
+    /run/tailscale
+    /run/systemd
+    /run/udev
+    /run/dhcpcd
+    /run/ssh-unix-local
   ]
 end
 
@@ -229,15 +235,34 @@ def rendered_capabilities(_facts_text)
 end
 
 @doc """
+named_if: The words when the condition holds, else none.
+
+    named_if(true, ["a"]) #=> ["a"]
+    named_if(false, ["a"]) #=> []
+"""
+def named_if(condition, words)
+  if condition
+    words
+  else
+    []
+  end
+end
+
+@doc """
 unhonoured: What a granted pod declares that a grant cannot apply, since a grant keeps no enclosure.
 
     unhonoured({"read_only_root_fs" => true}) #=> ["readOnlyRootFilesystem"]
     unhonoured({"cap_drop" => ["ALL"]}) #=> ["capabilities.drop"]
     unhonoured({"no_new_privileges" => true}) #=> ["allowPrivilegeEscalation: false"]
+    unhonoured({"seccomp_profile" => "RuntimeDefault"}) #=> ["seccompProfile RuntimeDefault"]
     unhonoured({}) #=> []
 """
 def unhonoured(declared)
   append(
+    named_if(
+      declared["seccomp_profile"] == "RuntimeDefault",
+      ["seccompProfile RuntimeDefault"]
+    ),
     if field(declared, "read_only_root_fs", false)
       ["readOnlyRootFilesystem"]
     else
@@ -439,10 +464,26 @@ demands: Each thing the container declares that only a grant allows, as text nam
     demands({"privileged" => true}) #=> ["privileged"]
     demands({"allow_escalation" => true}) #=> ["allowPrivilegeEscalation"]
     demands({"cap_add" => ["NET_ADMIN"]}) #=> ["capabilities.add NET_ADMIN"]
+    demands({"host_pid" => true}) #=> ["hostPID"]
+    demands({"host_ipc" => true}) #=> ["hostIPC"]
+    demands({"seccomp_profile" => "Unconfined"}) #=> ["seccompProfile Unconfined"]
+    demands({"seccomp_profile" => "RuntimeDefault"}) #=> []
+    demands({"devices" => ["/dev/ttyUSB0"]}) #=> ["a device mount of /dev/ttyUSB0"]
 """
 def demands(declared)
   caps = field(declared, "cap_add", [])
+  devices = field(declared, "devices", [])
   append(
+    named_if(field(declared, "host_pid", false), ["hostPID"]),
+    named_if(field(declared, "host_ipc", false), ["hostIPC"]),
+    named_if(
+      declared["seccomp_profile"] == "Unconfined",
+      ["seccompProfile Unconfined"]
+    ),
+    named_if(
+      length(devices) != 0,
+      ["a device mount of #{join(devices, ", ")}"]
+    ),
     if field(declared, "run_as_user", -1) == 0
       ["runAsUser 0"]
     else
@@ -499,17 +540,136 @@ def outside_range(declared)
 end
 
 @doc """
+unappliable: What a pod declares that this node has no way to apply, with or without a grant.
+
+    unappliable({"seccomp_profile" => "Localhost"}) #=> ["seccompProfile Localhost, since this node loads no profile from a file"]
+    unappliable({"seccomp_profile" => "Odd"}) #=> ["seccompProfile Odd, which this node does not know"]
+    unappliable({"sysctls" => ["kernel.shm_rmid_forced"]}) #=> ["securityContext.sysctls kernel.shm_rmid_forced, since this node sets none for a pod"]
+    unappliable({"volume_devices" => ["/dev/xvda"]}) #=> ["volumeDevices /dev/xvda, since this node attaches no block device"]
+    unappliable({"seccomp_profile" => "RuntimeDefault"}) #=> []
+    unappliable({"seccomp_profile" => "Unconfined"}) #=> []
+    unappliable({}) #=> []
+"""
+def unappliable(declared)
+  profile = declared["seccomp_profile"]
+  sysctls = field(declared, "sysctls", [])
+  block = field(declared, "volume_devices", [])
+  append(
+    named_if(
+      profile == "Localhost",
+      ["seccompProfile Localhost, since this node loads no profile from a file"]
+    ),
+    named_if(
+      profile != nil and
+        not member?(profile, %w[RuntimeDefault Unconfined Localhost]),
+      ["seccompProfile #{profile}, which this node does not know"]
+    ),
+    named_if(
+      length(sysctls) != 0,
+      [
+        "securityContext.sysctls #{join(sysctls, ", ")}, since this node sets none for a pod"
+      ]
+    ),
+    named_if(
+      length(block) != 0,
+      [
+        "volumeDevices #{join(block, ", ")}, since this node attaches no block device"
+      ]
+    )
+  )
+end
+
+@doc """
+namespace_account_base: Where the accounts of namespaces begin. namespace_uid adds four hex digits to it, so 65536 accounts follow.
+
+    namespace_account_base #=> 100000
+"""
+def namespace_account_base()
+  100_000
+end
+
+@doc """
+foreign_account: Why a declared id is another namespace's, or nil. The ids from namespace_account_base on belong to the namespaces that hash to them, so a pod may name only its own.
+
+    foreign_account({"namespace" => "a", "declared" => {"run_as_user" => 100001}}) #=> "runAsUser 100001 is in the range kept for namespace accounts, so it may be another namespace's identity"
+    foreign_account({"namespace" => "a", "declared" => {"run_as_group" => 165535}}) #=> "runAsGroup 165535 is in the range kept for namespace accounts, so it may be another namespace's identity"
+    foreign_account({"namespace" => "a", "declared" => {"run_as_user" => namespace_uid("a")}}) #=> nil
+    foreign_account({"declared" => {"run_as_user" => 65534}}) #=> nil
+    foreign_account({"declared" => {"run_as_user" => 165536}}) #=> nil
+    foreign_account({"declared" => {}}) #=> nil
+"""
+def foreign_account(facts)
+  declared = field(facts, "declared", {})
+  own = if field(facts, "namespace", "") != ""
+    namespace_uid(facts["namespace"])
+  end
+  foreign? = fn(id)
+    id != nil and
+      id >= namespace_account_base and
+      id < namespace_account_base + 65536 and
+      id != own
+  end
+  if foreign?(declared["run_as_user"])
+    "runAsUser #{to_s(declared["run_as_user"])} is in the range kept for namespace accounts, so it may be another namespace's identity"
+  elsif foreign?(declared["run_as_group"])
+    "runAsGroup #{to_s(declared["run_as_group"])} is in the range kept for namespace accounts, so it may be another namespace's identity"
+  end
+end
+
+@doc """
+system_account_warning: What a declared id below the first login account means. The pod keeps it, since a volume's owner may rest on it, and shares it with any host service that runs as it. An id from 1000 on is the pod's own to name.
+
+    system_account_warning({"run_as_user" => 71}) #=> ["runAsUser 71 is in the host's system range, so this pod shares that account with any host service that runs as it"]
+    system_account_warning({"run_as_user" => 999}) == [] #=> false
+    system_account_warning({"run_as_user" => 1000}) #=> []
+    system_account_warning({"run_as_user" => 0}) #=> []
+    system_account_warning({}) #=> []
+"""
+def system_account_warning(declared)
+  uid = declared["run_as_user"]
+  named_if(
+    uid != nil and uid > 0 and uid < 1000,
+    [
+      "runAsUser #{to_s(uid)} is in the host's system range, so this pod shares that account with any host service that runs as it"
+    ]
+  )
+end
+
+@doc """
+network_conflict: Why a pod's hostNetwork and its access disagree, or nil. Every pod with the network effect shares the host's network today, so hostNetwork alone changes nothing and is not refused.
+
+    network_conflict({"declared" => {"host_network" => true}, "access" => {"effects" => ["clock"]}}) #=> "hostNetwork and an access without the network effect contradict"
+    network_conflict({"declared" => {"host_network" => true}}) #=> nil
+    network_conflict({"declared" => {}, "access" => {"effects" => ["clock"]}}) #=> nil
+"""
+def network_conflict(facts)
+  declared = field(facts, "declared", {})
+  if field(declared, "host_network", false) and
+      not effect?(field(facts, "access", nil), "network")
+    "hostNetwork and an access without the network effect contradict"
+  end
+end
+
+@doc """
 refusal: Why this container may not start under an enforcing node, or nil.
 
     refusal({"declared" => {"run_as_user" => 0}}) #=> "this pod asks for runAsUser 0 and names no grant: add the annotation kakoi.pleme.io/root with its reason"
     refusal({"declared" => {"run_as_user" => 0}, "grant" => "needed"}) #=> nil
+    refusal({"declared" => {"sysctls" => ["a"]}, "grant" => "needed"}) #=> "this pod asks for securityContext.sysctls a, since this node sets none for a pod"
 """
 def refusal(facts)
   declared = field(facts, "declared", {})
   asked = demands(declared)
   impossible = contradiction(declared)
+  cannot = unappliable(declared)
   if impossible != nil
     impossible
+  elsif length(cannot) != 0
+    "this pod asks for #{join(cannot, "; ")}"
+  elsif network_conflict(facts) != nil
+    network_conflict(facts)
+  elsif not granted?(facts) and foreign_account(facts) != nil
+    foreign_account(facts)
   elsif length(asked) != 0 and not granted?(facts)
     "this pod asks for #{join(asked, ", ")} and names no grant: add the annotation #{grant_annotation} with its reason"
   end
@@ -610,6 +770,20 @@ def verdict_text(refused, ids, confine, warnings, volumes?, arch?, access?)
 end
 
 @doc """
+not_applied_warning: What the pod sets that this node reads and does not apply, for an event a reader sees.
+
+    not_applied_warning({"not_applied" => ["fsGroup", "procMount"]}) #=> ["this pod sets fsGroup, procMount, which this node does not apply"]
+    not_applied_warning({}) #=> []
+"""
+def not_applied_warning(declared)
+  unread = field(declared, "not_applied", [])
+  named_if(
+    length(unread) != 0,
+    ["this pod sets #{join(unread, ", ")}, which this node does not apply"]
+  )
+end
+
+@doc """
 enclose: The verdict for one container: refused or its identity, what it keeps, and what the node could not enforce.
 
     json_read(enclose(json_stringify({"mode" => "off", "can_enforce" => true, "declared" => {"run_as_user" => 0}}))).refused #=> nil
@@ -670,8 +844,9 @@ def enclose(facts_text)
         []
       )
     else
+      declared = field(facts, "declared", {})
       lost = if granted
-        unhonoured(field(facts, "declared", {}))
+        unhonoured(declared)
       else
         []
       end
@@ -679,13 +854,16 @@ def enclose(facts_text)
         nil,
         identity(facts),
         not granted,
-        if length(lost) == 0
-          []
-        else
-          [
-            "this pod's root grant keeps no enclosure, so #{join(lost, ", ")} is not applied"
-          ]
-        end,
+        append(
+          named_if(
+            length(lost) != 0,
+            [
+              "this pod's root grant keeps no enclosure, so #{join(lost, ", ")} is not applied"
+            ]
+          ),
+          not_applied_warning(declared),
+          named_if(not granted, system_account_warning(declared))
+        ),
         field(facts, "volumes", []),
         arch,
         access
@@ -821,6 +999,132 @@ test "an access that cannot be true refuses that pod under enforce and warns und
   audit = answer(assoc(enforced(bad), "mode", "audit"))
   assert audit.refused.nil?
   assert contains?(retsu::first(audit.warnings), "would refuse")
+end
+
+test "hostPID and hostIPC are refused by name without a grant and honoured with one"
+  each = [
+    [{"host_pid" => true}, "hostPID"],
+    [{"host_ipc" => true}, "hostIPC"],
+    [{"seccomp_profile" => "Unconfined"}, "seccompProfile Unconfined"],
+    [{"devices" => ["/dev/ttyUSB0"]}, "/dev/ttyUSB0"]
+  ]
+  assert every?(
+    fn(row)
+      refused = answer(enforced({"declared" => row[0]})).refused
+      refused != nil and
+        contains?(refused, row[1]) and
+        contains?(refused, grant_annotation)
+    end,
+    each
+  )
+  assert every?(
+    fn(row)
+      answer(enforced({"grant" => "x", "declared" => row[0]})).refused.nil?
+    end,
+    each
+  )
+end
+
+test "hostNetwork stays honoured because every pod with the network effect already shares the host, and an access without the effect contradicts it"
+  plain = answer(enforced({"declared" => {"host_network" => true}}))
+  assert plain.refused.nil?
+  assert plain.enclosed == true
+  closed = answer(
+    enforced(
+      {
+        "declared" => {"host_network" => true},
+        "access" => {"effects" => ["clock"]}
+      }
+    )
+  )
+  assert contains?(closed.refused, "hostNetwork")
+end
+
+test "what the node cannot apply is refused with or without a grant"
+  each = [
+    {"seccomp_profile" => "Localhost"},
+    {"seccomp_profile" => "Future"},
+    {"sysctls" => ["net.core.somaxconn"]},
+    {"volume_devices" => ["/dev/xvda"]}
+  ]
+  assert every?((d) -> answer(enforced({"declared" => d})).refused != nil, each)
+  assert every?(
+    (d) -> answer(enforced({"grant" => "x", "declared" => d})).refused != nil,
+    each
+  )
+end
+
+test "RuntimeDefault is what an enclosure already is, and a grant says it cannot apply it"
+  declared = {"seccomp_profile" => "RuntimeDefault"}
+  enclosed = answer(enforced({"declared" => declared}))
+  assert enclosed.refused.nil?
+  assert length(enclosed.warnings) == 0
+  granted = answer(enforced({"grant" => "x", "declared" => declared}))
+  assert granted.refused.nil?
+  assert contains?(
+    retsu::first(granted.warnings),
+    "seccompProfile RuntimeDefault"
+  )
+end
+
+test "audit names what enforce would refuse among the new fields"
+  v = answer(
+    assoc(enforced({"declared" => {"host_pid" => true}}), "mode", "audit")
+  )
+  assert v.refused.nil?
+  assert contains?(retsu::first(v.warnings), "hostPID")
+end
+
+test "a field the node reads and does not apply reaches a reader, enclosed or granted"
+  declared = {"not_applied" => ["fsGroup"]}
+  assert contains?(
+    retsu::first(answer(enforced({"declared" => declared})).warnings),
+    "fsGroup"
+  )
+  assert contains?(
+    retsu::first(
+      answer(enforced({"grant" => "x", "declared" => declared})).warnings
+    ),
+    "fsGroup"
+  )
+end
+
+test "a declared id keeps its account, inside the system range with a warning, and never another namespace's"
+  on = fn(uid)
+    answer(
+      assoc(
+        enforced({"declared" => {"run_as_user" => uid}}),
+        "namespace",
+        "own"
+      )
+    )
+  end
+  assert on(1000).uid == 1000
+  assert length(on(1000).warnings) == 0
+  assert on(71).uid == 71
+  assert contains?(retsu::first(on(71).warnings), "system range")
+  assert contains?(on(namespace_uid("other")).refused, "namespace accounts")
+  assert on(namespace_uid("own")).refused.nil?
+  granted = answer(
+    assoc(
+      enforced({"grant" => "x", "declared" => {"run_as_user" => 100_001}}),
+      "namespace",
+      "own"
+    )
+  )
+  assert granted.refused.nil?
+  granted_system = answer(
+    enforced({"grant" => "x", "declared" => {"run_as_user" => 71}})
+  )
+  assert length(granted_system.warnings) == 0
+end
+
+test "the sockets a host service answers on are hidden, and a pod's own volume still shows through"
+  assert every?(
+    (p) -> member?(p, hidden_paths),
+    %w[/run/engenho /run/tailscale /run/systemd /run/udev]
+  )
+  assert not member?("/run/engenho", hide_list(["/run/engenho/x"]))
 end
 
 test "a grant says what it cannot apply"

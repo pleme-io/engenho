@@ -850,6 +850,95 @@ async fn the_pods_run_as_user_is_the_workloads_uid_on_linux() {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn is_root() -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata("/proc/self").expect("procfs").uid() == 0
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_pods_host_fields_are_refused_by_name_unless_the_node_can_honour_them() {
+    if !is_root() {
+        return;
+    }
+    let coreutils = closure("nixpkgs#coreutils");
+    let backend = NativeBackend::new(
+        Isolation::HostProcess,
+        std::env::temp_dir().join("engenho-native-e2e-host-fields"),
+        Cgroups::Off,
+    );
+    let image = format!("nix:{coreutils}");
+    let refused = |what: &'static str, set: &dyn Fn(&mut ContainerSpec)| {
+        let mut s = spec(&image, &["cat", "/proc/self/status"], &[]);
+        s.pod.namespace = "kakoi-host-fields".to_string();
+        s.pod.name = what.replace(' ', "-").to_lowercase();
+        set(&mut s);
+        (what, s)
+    };
+    let cases = [
+        refused("hostPID", &|s| s.confinement.host_pid = true),
+        refused("hostIPC", &|s| s.confinement.host_ipc = true),
+        refused("Unconfined", &|s| {
+            s.confinement.seccomp_profile = Some("Unconfined".to_string());
+        }),
+        refused("Localhost", &|s| {
+            s.confinement.seccomp_profile = Some("Localhost".to_string());
+        }),
+        refused("kernel.shm_rmid_forced", &|s| {
+            s.confinement.sysctls = vec!["kernel.shm_rmid_forced".to_string()];
+        }),
+        refused("/dev/ttyUSB0", &|s| {
+            s.confinement.devices = vec!["/dev/ttyUSB0".to_string()];
+        }),
+    ];
+    for (name, s) in &cases {
+        let why = backend.start(s).await.expect_err(name).to_string();
+        assert!(why.contains(name), "{name}: {why}");
+    }
+
+    let mut granted = spec(&image, &["cat", "/proc/self/status"], &[]);
+    granted.pod.name = "host-pid-granted".to_string();
+    granted.confinement.host_pid = true;
+    granted.confinement.root_grant = Some("this test".to_string());
+    let out = output_of(&backend, &granted).await;
+    assert!(status_field(&out, "NoNewPrivs:").starts_with('0'), "{out}");
+
+    let mut default = spec(&image, &["cat", "/proc/self/status"], &[]);
+    default.pod.namespace = "kakoi-host-fields".to_string();
+    default.pod.name = "runtime-default".to_string();
+    default.confinement.seccomp_profile = Some("RuntimeDefault".to_string());
+    default.confinement.host_network = true;
+    let out = output_of(&backend, &default).await;
+    assert_eq!(status_field(&out, "NoNewPrivs:"), "1", "{out}");
+    assert_eq!(status_field(&out, "Seccomp:"), "2", "{out}");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_host_services_socket_directory_is_hidden_from_an_enclosed_pod() {
+    if !is_root() {
+        return;
+    }
+    let tools = closure("nixpkgs#busybox");
+    let backend = NativeBackend::new(
+        Isolation::HostProcess,
+        std::env::temp_dir().join("engenho-native-e2e-run"),
+        Cgroups::Off,
+    );
+    let script = format!(
+        "{tools}/bin/ls /run/systemd/private; echo systemd=$?; \
+         {tools}/bin/ls /run/current-system > /dev/null; echo current=$?"
+    );
+    let mut s = spec(&format!("nix:{tools}"), &["sh", "-c", &script], &[]);
+    s.pod.namespace = "kakoi-run".to_string();
+    let out = output_of(&backend, &s).await;
+    assert!(!out.contains("not found"), "a tool never ran: {out}");
+    assert!(out.contains("Permission denied"), "{out}");
+    assert!(!out.contains("systemd=0"), "{out}");
+    assert!(out.contains("current=0"), "{out}");
+}
+
 fn streaming_spec(image: &str, pod: &str, command: &[&str]) -> ContainerSpec {
     let mut s = spec(image, command, &[]);
     s.pod.name = pod.to_string();

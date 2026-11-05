@@ -1839,7 +1839,8 @@ impl Kubelet {
                         &format!("{namespace}/{name}"),
                         &cname,
                     )?
-                    .inheriting_pod(pod),
+                    .inheriting_pod(pod)
+                    .reading_container(c),
                     // Extra /etc/hosts entries; the backend fills in
                     // host.containers.internal on Linux native when needed.
                     host_add: Vec::new(),
