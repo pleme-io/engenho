@@ -1093,6 +1093,19 @@ pub trait ContainerRuntime: Send + Sync {
         self.readoption()
     }
 
+    /// Stop every container this runtime adopted from an earlier process
+    /// that no pod in `bound_pods` has claimed by starting it. `bound_pods` is
+    /// the uids of the pods here that may still start: one already terminal or
+    /// being deleted never will. A runtime that adopts nothing has nothing to
+    /// release.
+    async fn release_unclaimed(
+        &self,
+        bound_pods: &std::collections::BTreeSet<String>,
+    ) -> Result<(), KubeletError> {
+        let _ = bound_pods;
+        Ok(())
+    }
+
     #[allow(missing_docs)]
     /// What this backend would not enforce for `spec`, for an event a reader
     /// sees. Empty for a backend that has its own confinement.
@@ -1349,6 +1362,9 @@ struct FakeState {
     /// answer while a stopped process is inside its grace period. Seeded via
     /// [`FakeBackend::hold_unreaped`].
     unreaped: BTreeSet<String>,
+    /// The bound pod uids of every [`ContainerRuntime::release_unclaimed`]
+    /// call, in order.
+    releases: Vec<BTreeSet<String>>,
 }
 
 /// How a [`FakeBackend`] exec fails without the command ever answering.
@@ -1475,6 +1491,11 @@ impl FakeBackend {
     /// Snapshot of the operations log (for test assertions).
     pub async fn events(&self) -> Vec<FakeEvent> {
         self.inner.lock().await.events.clone()
+    }
+
+    /// The bound pod uids of every `release_unclaimed` call, in order.
+    pub async fn releases(&self) -> Vec<BTreeSet<String>> {
+        self.inner.lock().await.releases.clone()
     }
 
     /// Count of currently-running containers.
@@ -1644,6 +1665,11 @@ impl ContainerRuntime for FakeBackend {
 
     fn resource_enforcement(&self) -> crate::cgroup::ResourceEnforcement {
         self.resource_enforcement
+    }
+
+    async fn release_unclaimed(&self, bound_pods: &BTreeSet<String>) -> Result<(), KubeletError> {
+        self.inner.lock().await.releases.push(bound_pods.clone());
+        Ok(())
     }
 
     async fn exec(

@@ -2183,6 +2183,16 @@ fn build_backend(boot: &BootConfig) -> Result<Arc<dyn ContainerRuntime>, Runtime
         reachability.injectable(),
         boot.native_cgroups,
         boot.native_security,
+        match boot.native_workloads {
+            engenho_config::NativeWorkloads::Bound => {
+                engenho_kubelet::native_survival::WorkloadLifetime::Bound
+            }
+            engenho_config::NativeWorkloads::Outlive => {
+                engenho_kubelet::native_survival::WorkloadLifetime::Outlive {
+                    state: Area::Pods.path(&boot.data_dir).join("native"),
+                }
+            }
+        },
     )?)
 }
 

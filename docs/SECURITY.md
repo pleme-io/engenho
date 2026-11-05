@@ -121,6 +121,10 @@ It does not cover a kubelet's Secret volumes on disk, or plaintext already in ol
 
 Every API request is recorded by default as a JSON-line `audit.k8s.io/v1` Event in `data_dir/audit/audit.log`, mode 0600, rotated at 64 MiB with 4 files kept. A denied request is recorded too. An Event has no body field, so no body or token can reach it; `engenho-apiserver/blue/audit/audit.b` decides the level. A full queue or a failed write loses that event, counts in `engenho_audit_events_total{result}` and warns, and never fails the request. `runtime.api_audit: off` configures it off. It does not yet record source addresses, and a handler that panics goes unrecorded.
 
+## A workload that outlives its daemon
+
+Under `runtime.native_workloads: outlive` a process enters its enclosure once, when it starts, and the next daemon adopts it. The record under `pods/native` keeps the verdict it entered under and a digest of its spec, never the spec, so no resolved Secret reaches that disk; the directory is `0700` and each record `0600`. A pod claims its process only when kakoi answers the same today: another mode, a tightened program or a changed node replaces it, and a refusal stops it. A command run into it joins the same enclosure under the same verdict. An adopted process whose pod has gone terminal or is being deleted is stopped, which is how a closure refused at the check ends one.
+
 ## What this does not do yet
 
 - **The network is not yet per pod.** A pod with the network effect, which is every pod with no access value, shares the host's network, so it can reach whatever listens on loopback. Each surface engenho itself listens on is gated above; a workload's own listener must authenticate.
