@@ -2196,6 +2196,7 @@ dependencies = [
  "async-trait",
  "axum 0.7.9",
  "base64 0.22.1",
+ "blake3",
  "ed25519-dalek",
  "engenho-blue",
  "engenho-config",

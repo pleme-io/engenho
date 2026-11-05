@@ -797,6 +797,63 @@ async fn after_a_restart_an_adopting_runtime_keeps_the_running_container_and_its
     teardown(store, kubelet).await;
 }
 
+#[tokio::test]
+async fn only_a_pod_that_may_still_start_holds_on_to_an_adopted_container() {
+    use std::collections::BTreeSet;
+    let store = boot_store().await;
+    let backend = Arc::new(FakeBackend::new());
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), "node-A");
+
+    kubelet.tick().await.unwrap();
+    assert!(
+        backend.releases().await.is_empty(),
+        "an empty node is no evidence a workload's pod is gone"
+    );
+
+    for (name, uid, extra) in [
+        ("live", "uid-live", json!({})),
+        ("done", "uid-done", json!({"status": {"phase": "Failed"}})),
+        (
+            "going",
+            "uid-going",
+            json!({"metadata": {"deletionTimestamp": "2026-11-05T00:00:00Z"}}),
+        ),
+    ] {
+        let mut value = json!({
+            "kind": "Pod",
+            "apiVersion": "v1",
+            "metadata": {"name": name, "uid": uid},
+            "spec": {
+                "nodeName": "node-A",
+                "containers": [{"name": "main", "image": "img"}],
+            },
+        });
+        if let Some(status) = extra.get("status") {
+            value["status"] = status.clone();
+        }
+        if let Some(meta) = extra.get("metadata") {
+            value["metadata"]["deletionTimestamp"] = meta["deletionTimestamp"].clone();
+        }
+        store
+            .propose(ResourceCommand::Put {
+                key: pod_key(name),
+                value,
+                expected: None,
+                reason: Reason::Operator,
+            })
+            .await
+            .unwrap();
+    }
+    kubelet.tick().await.unwrap();
+    assert_eq!(
+        backend.releases().await.last(),
+        Some(&BTreeSet::from(["uid-live".to_string()])),
+        "a terminal pod or one being deleted never claims what it was running"
+    );
+
+    teardown(store, kubelet).await;
+}
+
 // ── T1.2 c2 — a poll that failed is not a container that never started ───
 
 /// ★ A status poll that errors used to render the container

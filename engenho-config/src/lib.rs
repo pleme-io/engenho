@@ -144,8 +144,8 @@ pub use revoada::{RevoadaConfig, TopologyConfig, TopologyStrategyKind};
 pub use runtime::{
     ApiAudit, CertRotation, ClosureLocalBuilds, DEFAULT_NODE_MANIFESTS_DIR, HealthReasons,
     KubeconfigVisibility, KubeletAuth, KubeletBackendKind, KubeletBackendRefusal, NativeCgroups,
-    NativeMounts, NativeSecurity, RESERVED_RUNTIME_CLASSES, RuntimeClassBinding, RuntimeConfig,
-    SecretsAtRest,
+    NativeMounts, NativeSecurity, NativeWorkloads, RESERVED_RUNTIME_CLASSES, RuntimeClassBinding,
+    RuntimeConfig, SecretsAtRest,
 };
 pub use scheduler::{SchedulerConfig, SchedulerStrategyKind};
 pub use teia::TeiaConfig;

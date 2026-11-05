@@ -375,7 +375,7 @@ impl Fanout {
 ///
 /// The log is written FIRST and flushed per chunk, so `kubectl logs` never
 /// shows less than an attacher saw.
-pub fn tee<R, L>(mut reader: R, mut log: L, feed: FanoutFeed)
+pub fn tee<R, L>(mut reader: R, mut log: L, feed: FanoutFeed) -> tokio::task::AbortHandle
 where
     R: AsyncRead + Send + Unpin + 'static,
     L: crate::cri_log::LogSink,
@@ -393,7 +393,8 @@ where
         }
         drop(log);
         drop(feed);
-    });
+    })
+    .abort_handle()
 }
 
 /// What an attacher reaches on a running container.

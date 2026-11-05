@@ -46,7 +46,7 @@ pub fn construction_refusal(kind: KubeletBackendKind) -> Option<BackendRefused> 
 /// A construction refusal, not an operation error: it is returned before any
 /// runtime exists, so a node configured for a refused backend never runs a
 /// pod on it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum BackendRefused {
     /// `cri` was selected and the CRI backend still silently drops part of
     /// every Pod.
@@ -62,6 +62,17 @@ pub enum BackendRefused {
         /// What the CRI backend does not do yet. Never empty.
         missing: CriGaps,
     },
+    /// `runtime.native_workloads: outlive` on a platform where a workload's
+    /// process cannot be identified across a daemon restart.
+    #[error(
+        "`runtime.native_workloads: outlive` is refused on this platform: a \
+         native workload is adopted by its pidfd and its /proc start time, \
+         which only Linux has; select `bound`"
+    )]
+    OutliveUnsupported,
+    /// The records of outliving native workloads cannot be kept.
+    #[error("the native backend cannot keep its workload records: {0}")]
+    NativeSurvival(String),
 }
 
 /// Where the native backend keeps container logs.
@@ -129,6 +140,7 @@ pub fn make_container_runtime_with_apiserver(
         NativeCgroups::default(),
         engenho_config::NativeSecurity::default(),
         engenho_config::NativeMounts::default(),
+        crate::native_survival::WorkloadLifetime::Bound,
     )
 }
 
@@ -140,6 +152,7 @@ pub fn make_container_runtime_on_node(
     native_cgroups: NativeCgroups,
     native_security: engenho_config::NativeSecurity,
     native_mounts: engenho_config::NativeMounts,
+    native_lifetime: crate::native_survival::WorkloadLifetime,
 ) -> Result<Arc<dyn ContainerRuntime>, BackendRefused> {
     make_container_runtime_with_classes(
         &NodeRuntime { kind, apiserver },
@@ -148,6 +161,7 @@ pub fn make_container_runtime_on_node(
         native_cgroups,
         native_security,
         native_mounts,
+        native_lifetime,
     )
 }
 
@@ -166,8 +180,9 @@ pub fn make_container_runtime_with_classes(
     native_cgroups: NativeCgroups,
     native_security: engenho_config::NativeSecurity,
     native_mounts: engenho_config::NativeMounts,
+    native_lifetime: crate::native_survival::WorkloadLifetime,
 ) -> Result<Arc<dyn ContainerRuntime>, BackendRefused> {
-    let build = |runtime: &NodeRuntime| {
+    let build = |runtime: &NodeRuntime, lifetime| {
         make_one_runtime(
             runtime.kind,
             podman_binary,
@@ -175,14 +190,19 @@ pub fn make_container_runtime_with_classes(
             native_cgroups,
             native_security,
             native_mounts,
+            lifetime,
         )
     };
-    let mut router = crate::runtime_class::RuntimeClassRouter::new(build(default)?).with_class(
+    let mut router = crate::runtime_class::RuntimeClassRouter::new(build(default, native_lifetime)?)
+        .with_class(
         crate::wasm_backend::WASM_RUNTIME_CLASS,
         Arc::new(crate::wasm_backend::WasmBackend::new(wasm_log_dir(), false)),
     );
     for (class, runtime) in classes {
-        router = router.with_class(class.clone(), build(runtime)?);
+        router = router.with_class(
+            class.clone(),
+            build(runtime, crate::native_survival::WorkloadLifetime::Bound)?,
+        );
     }
     Ok(Arc::new(router))
 }
@@ -194,9 +214,16 @@ fn make_one_runtime(
     native_cgroups: NativeCgroups,
     native_security: engenho_config::NativeSecurity,
     native_mounts: engenho_config::NativeMounts,
+    native_lifetime: crate::native_survival::WorkloadLifetime,
 ) -> Result<Arc<dyn ContainerRuntime>, BackendRefused> {
     if let Some(refused) = construction_refusal(kind) {
         return Err(refused);
+    }
+    if kind == KubeletBackendKind::Native
+        && !cfg!(target_os = "linux")
+        && native_lifetime != crate::native_survival::WorkloadLifetime::Bound
+    {
+        return Err(BackendRefused::OutliveUnsupported);
     }
     let runtime: Arc<dyn ContainerRuntime> = match kind {
         KubeletBackendKind::PodmanApi => {
@@ -294,7 +321,9 @@ fn make_one_runtime(
                 crate::cgroup::Cgroups::select(native_cgroups),
             )
             .with_security(native_security)
-            .with_mounts(native_mounts),
+            .with_mounts(native_mounts)
+            .with_lifetime(native_lifetime)
+            .map_err(|e| BackendRefused::NativeSurvival(e.to_string()))?,
         ),
     };
     let runtime: Arc<dyn ContainerRuntime> = match kind {
@@ -335,6 +364,7 @@ mod tests {
             NativeCgroups::default(),
             engenho_config::NativeSecurity::Enforce,
             engenho_config::NativeMounts::Off,
+            crate::native_survival::WorkloadLifetime::Bound,
         )
         .expect("constructs");
         let shown = runtime
@@ -356,6 +386,7 @@ mod tests {
             NativeCgroups::default(),
             engenho_config::NativeSecurity::Off,
             engenho_config::NativeMounts::Off,
+            crate::native_survival::WorkloadLifetime::Bound,
         )
         .expect("constructs");
         let shown = runtime
@@ -464,6 +495,7 @@ mod tests {
     fn expect_cri_refused(built: Result<Arc<dyn ContainerRuntime>, BackendRefused>) -> CriGaps {
         match built {
             Err(BackendRefused::CriIncomplete { missing }) => missing,
+            Err(other) => panic!("`cri` must be refused for its gaps, not: {other}"),
             Ok(rt) => panic!(
                 "`cri` must be refused at construction, but a `{}` runtime was built",
                 rt.name()
@@ -502,7 +534,9 @@ mod tests {
         // Pure: a config can be checked before boot, and the answer does not
         // depend on whether this host runs containerd.
         let refused = construction_refusal(KubeletBackendKind::Cri).expect("cri is refused");
-        let BackendRefused::CriIncomplete { missing } = refused;
+        let BackendRefused::CriIncomplete { missing } = &refused else {
+            panic!("cri is refused for its gaps: {refused}");
+        };
         assert_eq!(missing.as_slice(), crate::cri_backend::UNSUPPORTED);
     }
 
@@ -527,7 +561,9 @@ mod tests {
     #[test]
     fn the_refusal_tells_the_operator_every_gap_and_what_to_select() {
         let refused = construction_refusal(KubeletBackendKind::Cri).expect("cri is refused");
-        let BackendRefused::CriIncomplete { missing } = refused;
+        let BackendRefused::CriIncomplete { missing } = &refused else {
+            panic!("cri is refused for its gaps: {refused}");
+        };
         let shown = refused.to_string();
         assert!(shown.contains("`cri`"), "names the backend: {shown}");
         for gap in missing.as_slice() {
