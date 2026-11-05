@@ -1120,6 +1120,66 @@ mod tests {
     }
 
     #[test]
+    fn a_tree_can_write_only_the_default_bounds_its_controllers_carry() {
+        let full = Node::delegated();
+        let (tree, _log) = full.adopt();
+        let tree = tree.expect("adopts");
+        assert_eq!(tree.default_bounds(), vec!["memory", "pids"]);
+        assert_eq!(
+            Cgroups::Delegated(Arc::new(tree)).default_bounds(),
+            vec!["memory", "pids"]
+        );
+        let no_pids = Node::new(
+            "0::/system.slice/engenho-daemon.service\n",
+            "cpu memory",
+            &me(),
+            Some(b"1"),
+        );
+        let (tree, _log) = no_pids.adopt();
+        assert_eq!(tree.expect("adopts").default_bounds(), vec!["memory"]);
+        assert!(Cgroups::Off.default_bounds().is_empty());
+        assert!(Cgroups::Unsupported.default_bounds().is_empty());
+        assert!(
+            Cgroups::NotDelegated(CgroupError::NoUnifiedHierarchy)
+                .default_bounds()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_default_bound_reaches_its_own_knob_and_a_declared_memory_limit_wins() {
+        let node = Node::delegated();
+        let (tree, _log) = node.adopt();
+        let tree = tree.expect("adopts");
+        let limits = crate::kakoi::DefaultLimits {
+            pids_max: Some(4096),
+            memory_max: Some(1 << 30),
+        };
+        let plan = CgroupPlan::default().with_defaults(&limits);
+        assert_eq!(Knob::PidsMax.file(), "pids.max");
+        assert_eq!(
+            plan.writes().last(),
+            Some(&(Knob::PidsMax, "4096".to_string()))
+        );
+        tree.prepare("bounded", &plan).expect("prepares");
+        let leaf = |knob: &str| node.read(&[UNIT, "/workloads/bounded/", knob].concat());
+        assert_eq!(leaf("pids.max"), "4096");
+        assert_eq!(leaf("memory.max"), (1_u64 << 30).to_string());
+        let declared = CgroupPlan {
+            memory_max: Some(1 << 26),
+            ..CgroupPlan::default()
+        }
+        .with_defaults(&limits);
+        assert_eq!(declared.memory_max, Some(1 << 26));
+        assert_eq!(
+            CgroupPlan::default()
+                .with_defaults(&crate::kakoi::DefaultLimits::default())
+                .writes(),
+            Vec::new()
+        );
+    }
+
+    #[test]
     fn an_empty_plan_bounds_nothing_and_writes_nothing() {
         let empty = plan(&serde_json::json!({}));
         assert!(empty.is_empty());

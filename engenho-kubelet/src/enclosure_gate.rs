@@ -52,6 +52,7 @@ impl EnclosureGate {
                         confinement: &spec.confinement,
                         namespace: &spec.pod.namespace,
                         volumes: &[],
+                        read_only_volumes: &[],
                         resources: &spec.resources,
                     },
                     &Node {
@@ -60,6 +61,7 @@ impl EnclosureGate {
                         runtime_gate: true,
                         bounds: Vec::new(),
                         memory_bytes: 0,
+                        landlock_abi: 0,
                     },
                 )
                 .await,

@@ -719,13 +719,20 @@ impl NativeBackend {
             .get_or_init(Kakoi::start)
             .clone()
             .map_err(NativeError::Kakoi)?;
-        let volumes: Vec<String> = Self::volumes_of(spec).into_iter().map(|v| v.path).collect();
+        let all = Self::volumes_of(spec);
+        let volumes: Vec<String> = all.iter().map(|v| v.path.clone()).collect();
+        let read_only: Vec<String> = all
+            .into_iter()
+            .filter(|v| v.read_only)
+            .map(|v| v.path)
+            .collect();
         kakoi
             .enclose(
                 Asked {
                     confinement: &spec.confinement,
                     namespace: &spec.pod.namespace,
                     volumes: &volumes,
+                    read_only_volumes: &read_only,
                     resources: &spec.resources,
                 },
                 &Node::measured(self.security, self.cgroups.default_bounds()),
@@ -1897,6 +1904,56 @@ mod tests {
             "refused before the image: {shown}"
         );
         assert!(!shown.contains("  "), "{shown}");
+    }
+
+    #[test]
+    fn default_limits_join_the_plan_on_a_delegated_node_and_are_never_a_refusal_elsewhere() {
+        let limits = DefaultLimits {
+            pids_max: Some(4096),
+            memory_max: Some(1 << 30),
+        };
+        let root = tempfile::tempdir().unwrap();
+        let unit = root.path().join("sys/fs/cgroup/test.slice/engenho.service");
+        std::fs::create_dir_all(&unit).unwrap();
+        std::fs::create_dir_all(root.path().join("proc/self")).unwrap();
+        std::fs::write(
+            root.path().join("proc/self/cgroup"),
+            "0::/test.slice/engenho.service\n",
+        )
+        .unwrap();
+        std::fs::write(unit.join("cgroup.controllers"), "cpu io memory pids").unwrap();
+        std::fs::write(unit.join("cgroup.subtree_control"), "").unwrap();
+        std::fs::write(unit.join("cgroup.procs"), std::process::id().to_string()).unwrap();
+        rustix::fs::setxattr(
+            unit.as_path(),
+            "user.delegate",
+            b"1",
+            rustix::fs::XattrFlags::empty(),
+        )
+        .unwrap();
+        let cgroups = Cgroups::adopt(Box::new(crate::cgroup::HostFs::at(
+            engenho_substrate::HostRoot::at(root.path()),
+        )));
+        assert!(matches!(cgroups, Cgroups::Delegated(_)), "{cgroups:?}");
+        let delegated = NativeBackend::new(Isolation::HostProcess, "/tmp/nb-test-logs", cgroups);
+        let Ok(Admission::Bounded(_, plan)) = delegated.admit(&Resources::default(), &limits)
+        else {
+            panic!("a delegated node gives every container a leaf");
+        };
+        assert_eq!(plan.pids_max, Some(4096));
+        assert_eq!(plan.memory_max, Some(1 << 30));
+
+        let undelegated =
+            NativeBackend::new(Isolation::HostProcess, "/tmp/nb-test-logs", undelegated());
+        assert!(matches!(
+            undelegated.admit(&Resources::default(), &limits),
+            Ok(Admission::Unbounded)
+        ));
+        let off = NativeBackend::new(Isolation::HostProcess, "/tmp/nb-test-logs", Cgroups::Off);
+        assert!(matches!(
+            off.admit(&Resources::default(), &limits),
+            Ok(Admission::Unbounded)
+        ));
     }
 
     #[tokio::test]

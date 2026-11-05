@@ -1029,6 +1029,379 @@ async fn a_host_services_socket_directory_is_hidden_from_an_enclosed_pod() {
     assert!(out.contains("current=0"), "{out}");
 }
 
+#[cfg(target_os = "linux")]
+fn world_readable_dir(root: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir_in(root).expect("a directory");
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .expect("open it");
+    dir
+}
+
+#[cfg(target_os = "linux")]
+fn mount_of(path: &Path, read_only: bool) -> engenho_kubelet::pod_volume::ResolvedMount {
+    engenho_kubelet::pod_volume::ResolvedMount {
+        source: engenho_kubelet::pod_volume::MountSource::UserHostPath(path.to_path_buf()),
+        mount_path: path.to_string_lossy().to_string(),
+        read_only,
+        sub_path: None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn landlock_holds_a_pods_declared_reads_where_the_account_could_otherwise_read() {
+    if !is_root() {
+        return;
+    }
+    assert!(
+        engenho_kubelet::kakoi::landlock_abi() >= 1,
+        "this kernel test needs Landlock"
+    );
+    let tools = closure("nixpkgs#busybox");
+    let volume = world_readable_dir("/var/tmp");
+    let path = volume.path().to_string_lossy().to_string();
+    for sub in ["in", "out"] {
+        std::fs::create_dir(volume.path().join(sub)).unwrap();
+        std::fs::set_permissions(
+            volume.path().join(sub),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::write(volume.path().join(sub).join("f"), "kakoi-readable\n").unwrap();
+    }
+    let hidden = world_readable_dir("/var/lib");
+    let hidden_path = hidden.path().to_string_lossy().to_string();
+    std::fs::write(hidden.path().join("f"), "kakoi-declared\n").unwrap();
+    let backend = NativeBackend::new(
+        Isolation::HostProcess,
+        std::env::temp_dir().join("engenho-native-e2e-landlock-reads"),
+        Cgroups::Off,
+    );
+    let script = format!(
+        "{tools}/bin/cat {path}/in/f; echo in=$?; \
+         {tools}/bin/cat {path}/out/f; echo out=$?; \
+         {tools}/bin/cat {hidden_path}/f; echo declared=$?; \
+         {tools}/bin/ls /var/lib; echo varlib=$?; \
+         {tools}/bin/cat /etc/machine-id; echo machineid=$?; \
+         {tools}/bin/cat /etc/passwd > /dev/null; echo passwd=$?; \
+         {tools}/bin/ls /; echo root=$?"
+    );
+    let mut s = spec(&format!("nix:{tools}"), &["sh", "-c", &script], &[]);
+    s.pod.namespace = "kakoi-landlock-reads".to_string();
+    s.confinement.access = Some(format!(
+        r#"{{"effects":["filesystem"],"reads":["{path}/in","{hidden_path}"]}}"#
+    ));
+    s.mounts = vec![mount_of(volume.path(), true)];
+    let out = output_of(&backend, &s).await;
+    assert!(!out.contains("not found"), "a tool never ran: {out}");
+    for expected in ["in=0", "declared=0", "passwd=0", "kakoi-declared"] {
+        assert!(out.contains(expected), "{expected} missing from: {out}");
+    }
+    for refused in ["out=0", "varlib=0", "machineid=0", "root=0"] {
+        assert!(!out.contains(refused), "{refused} in: {out}");
+    }
+    assert!(
+        out.contains(&format!("{path}/out/f': Permission denied")),
+        "the kernel's own refusal: {out}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_access_without_the_process_effect_runs_nothing_it_wrote_and_a_plain_pod_still_can() {
+    if !is_root() {
+        return;
+    }
+    let tools = closure("nixpkgs#busybox");
+    let backend = NativeBackend::new(
+        Isolation::HostProcess,
+        std::env::temp_dir().join("engenho-native-e2e-landlock-exec"),
+        Cgroups::Off,
+    );
+    let run = |pod: &str, volume: &Path, access: Option<String>| {
+        let path = volume.to_string_lossy();
+        let script = format!(
+            "{tools}/bin/cp {tools}/bin/busybox {path}/busybox; echo copied=$?; \
+             {path}/busybox true; echo ran=$?; \
+             {tools}/bin/true; echo store=$?"
+        );
+        let mut s = spec(&format!("nix:{tools}"), &["sh", "-c", &script], &[]);
+        s.pod.namespace = "kakoi-landlock-exec".to_string();
+        s.pod.name = pod.to_string();
+        s.confinement.access = access;
+        s.mounts = vec![mount_of(volume, false)];
+        s
+    };
+    let open = |dir: &tempfile::TempDir| {
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o777),
+        )
+        .unwrap();
+    };
+    let plain_dir = world_readable_dir("/var/tmp");
+    open(&plain_dir);
+    let plain = output_of(&backend, &run("plain", plain_dir.path(), None)).await;
+    assert!(!plain.contains("not found"), "a tool never ran: {plain}");
+    for expected in ["copied=0", "ran=0", "store=0"] {
+        assert!(plain.contains(expected), "{expected} missing: {plain}");
+    }
+    let shut_dir = world_readable_dir("/var/tmp");
+    open(&shut_dir);
+    let path = shut_dir.path().to_string_lossy().to_string();
+    let shut = output_of(
+        &backend,
+        &run(
+            "shut",
+            shut_dir.path(),
+            Some(format!(
+                r#"{{"effects":["filesystem"],"writes":["{path}"]}}"#
+            )),
+        ),
+    )
+    .await;
+    assert!(!shut.contains("not found"), "a tool never ran: {shut}");
+    for expected in ["copied=0", "store=0", "Permission denied"] {
+        assert!(shut.contains(expected), "{expected} missing: {shut}");
+    }
+    assert!(!shut.contains("ran=0"), "{shut}");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn landlock_cuts_a_pod_off_from_the_hosts_abstract_sockets_and_keeps_its_own() {
+    use std::os::linux::net::SocketAddrExt;
+    if !is_root() {
+        return;
+    }
+    let abi = engenho_kubelet::kakoi::landlock_abi();
+    assert!(
+        abi >= 6,
+        "this kernel test needs Landlock ABI 6, found {abi}"
+    );
+    let tools = closure("nixpkgs#busybox");
+    let socat = closure("nixpkgs#socat");
+    let name = format!("kakoi-host-{}", std::process::id());
+    let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind_addr(&addr).unwrap();
+    let backend = NativeBackend::new(
+        Isolation::HostProcess,
+        std::env::temp_dir().join("engenho-native-e2e-landlock-abstract"),
+        Cgroups::Off,
+    );
+    let script = format!(
+        "{socat}/bin/socat OPEN:/dev/null ABSTRACT-CONNECT:{name}; echo host=$?; \
+         {socat}/bin/socat ABSTRACT-LISTEN:{name}-own OPEN:/dev/null & \
+         {tools}/bin/sleep 0.5; \
+         {socat}/bin/socat OPEN:/dev/null ABSTRACT-CONNECT:{name}-own; echo own=$?"
+    );
+    let mut s = spec(&format!("nix:{tools}"), &["sh", "-c", &script], &[]);
+    s.pod.namespace = "kakoi-landlock-abstract".to_string();
+    let out = output_of(&backend, &s).await;
+    assert!(!out.contains("not found"), "a tool never ran: {out}");
+    assert!(out.contains("Operation not permitted"), "{out}");
+    assert!(!out.contains("host=0"), "{out}");
+    assert!(out.contains("own=0"), "{out}");
+
+    let mut granted = spec(
+        &format!("nix:{socat}"),
+        &[
+            &format!("{socat}/bin/socat"),
+            "OPEN:/dev/null",
+            &format!("ABSTRACT-CONNECT:{name}"),
+        ],
+        &[],
+    );
+    granted.pod.name = "granted".to_string();
+    granted.confinement.root_grant = Some("this test".to_string());
+    let out = output_of(&backend, &granted).await;
+    assert!(!out.contains("Operation not permitted"), "{out}");
+    drop(listener);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_pathname_socket_is_held_only_where_the_kernel_can_and_a_weaker_kernel_says_so() {
+    if !is_root() {
+        return;
+    }
+    let abi = engenho_kubelet::kakoi::landlock_abi();
+    let tools = closure("nixpkgs#busybox");
+    let socat = closure("nixpkgs#socat");
+    let dir = world_readable_dir("/run");
+    let socket = dir.path().join("host.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    std::fs::set_permissions(&socket, std::os::unix::fs::PermissionsExt::from_mode(0o777)).unwrap();
+    let backend = NativeBackend::new(
+        Isolation::HostProcess,
+        std::env::temp_dir().join("engenho-native-e2e-landlock-pathname"),
+        Cgroups::Off,
+    );
+    let path = socket.to_string_lossy();
+    let script = format!("{socat}/bin/socat OPEN:/dev/null UNIX-CONNECT:{path}; echo connect=$?");
+    let mut s = spec(&format!("nix:{tools}"), &["sh", "-c", &script], &[]);
+    s.pod.namespace = "kakoi-landlock-pathname".to_string();
+    let warnings = backend.confinement_warnings(&s).await;
+    let out = output_of(&backend, &s).await;
+    assert!(!out.contains("not found"), "a tool never ran: {out}");
+    if abi >= 9 {
+        assert!(out.contains("Permission denied"), "{out}");
+        assert!(!out.contains("connect=0"), "{out}");
+        assert!(
+            !warnings.iter().any(|w| w.contains("ABI 9")),
+            "{warnings:?}"
+        );
+    } else {
+        assert!(out.contains("connect=0"), "the weaker state is true: {out}");
+        assert!(
+            warnings.iter().any(|w| w.contains("ABI 9")),
+            "and it is said: {warnings:?}"
+        );
+    }
+    drop(listener);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn two_pods_with_one_declared_uid_share_it_and_cannot_signal_each_other() {
+    if !is_root() {
+        return;
+    }
+    let abi = engenho_kubelet::kakoi::landlock_abi();
+    assert!(
+        abi >= 6,
+        "this kernel test needs Landlock ABI 6, found {abi}"
+    );
+    let tools = closure("nixpkgs#busybox");
+    let backend = NativeBackend::new(
+        Isolation::HostProcess,
+        std::env::temp_dir().join("engenho-native-e2e-landlock-signal"),
+        Cgroups::Off,
+    );
+    let image = format!("nix:{tools}");
+    let pod = |name: &str, script: &str| {
+        let mut s = spec(&image, &["sh", "-c", script], &[]);
+        s.pod.namespace = "kakoi-landlock-signal".to_string();
+        s.pod.name = name.to_string();
+        s.confinement.run_as_user = Some(5555);
+        s
+    };
+    let first = backend
+        .start(&pod(
+            "first",
+            &format!("echo $$; exec {tools}/bin/sleep 30"),
+        ))
+        .await
+        .expect("start");
+    let mut pid = String::new();
+    for _ in 0..250 {
+        pid = backend
+            .logs(&first.container_id, &LogOptions::default())
+            .await
+            .expect("logs")
+            .trim()
+            .to_string();
+        if !pid.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(!pid.is_empty(), "the first pod never said its pid");
+    let out = output_of(
+        &backend,
+        &pod(
+            "second",
+            &format!(
+                "echo uid=$({tools}/bin/id -u); \
+                 kill -0 {pid}; echo other=$?; \
+                 {tools}/bin/sleep 5 & kill -0 $!; echo own=$?; kill $!"
+            ),
+        ),
+    )
+    .await;
+    assert!(!out.contains("not found"), "a tool never ran: {out}");
+    assert!(out.contains("uid=5555"), "{out}");
+    assert!(out.contains("Operation not permitted"), "{out}");
+    assert!(!out.contains("other=0"), "{out}");
+    assert!(out.contains("own=0"), "{out}");
+    let inside = backend
+        .exec(
+            &first.container_id,
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("kill -0 {pid}; echo main=$?"),
+            ],
+        )
+        .await
+        .expect("exec");
+    let text = format!("{}{}", inside.stdout, inside.stderr);
+    assert!(
+        text.contains("main=0"),
+        "an exec reaches its own pod: {text}"
+    );
+    backend.stop(&first.container_id).await.expect("stop");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn postgres_initialises_serves_and_answers_inside_a_full_enclosure() {
+    if !is_root() {
+        return;
+    }
+    let tools = closure("nixpkgs#busybox");
+    let pg = closure("nixpkgs#postgresql_16^out");
+    let volume = world_readable_dir("/var/tmp");
+    std::fs::set_permissions(
+        volume.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o777),
+    )
+    .unwrap();
+    let path = volume.path().to_string_lossy().to_string();
+    let backend = NativeBackend::new(
+        Isolation::HostProcess,
+        std::env::temp_dir().join("engenho-native-e2e-postgres-enclosed"),
+        Cgroups::Off,
+    );
+    let script = format!(
+        "{pg}/bin/initdb -D {path}/d -U kakoi --locale=C -A trust > /dev/null; echo initdb=$?; \
+         {pg}/bin/postgres -D {path}/d -k /tmp -c listen_addresses='' > /dev/null 2>&1 & \
+         n=0; until {pg}/bin/pg_isready -h /tmp -q; do \
+           n=$((n+1)); test $n -gt 100 && break; {tools}/bin/sleep 0.1; \
+         done; \
+         {pg}/bin/psql -h /tmp -U kakoi -d postgres -tAc 'select 40 + 2'; echo psql=$?; \
+         kill $!; wait $!; echo stopped=$?"
+    );
+    let mut s = spec(&format!("nix:{tools}"), &["sh", "-c", &script], &[]);
+    s.pod.namespace = "kakoi-postgres".to_string();
+    s.confinement.run_as_user = Some(65_534);
+    s.mounts = vec![mount_of(volume.path(), false)];
+    let started = backend.start(&s).await.expect("start");
+    let mut out = String::new();
+    for _ in 0..1500 {
+        let st = backend
+            .status(&started.container_id)
+            .await
+            .expect("status")
+            .expect("tracked");
+        if !st.is_running() {
+            out = backend
+                .logs(&started.container_id, &LogOptions::default())
+                .await
+                .expect("logs");
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(!out.contains("not found"), "a tool never ran: {out}");
+    for expected in ["initdb=0", "42", "psql=0"] {
+        assert!(out.contains(expected), "{expected} missing from: {out}");
+    }
+}
+
 fn streaming_spec(image: &str, pod: &str, command: &[&str]) -> ContainerSpec {
     let mut s = spec(image, command, &[]);
     s.pod.name = pod.to_string();

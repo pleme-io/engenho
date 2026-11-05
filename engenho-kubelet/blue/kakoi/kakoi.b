@@ -1,7 +1,7 @@
 @moduledoc """
 kakoi (囲い) decides the enclosure of one native container: which identity it runs as and what it keeps.
 
-Secure is what a pod gets by saying nothing: a non-root account, no new privileges, no capabilities. Root is a grant the pod's declaration names with a reason. A demand the node cannot honour is refused for that one pod, or reported where the node cannot enforce anything yet. Rust hands the facts as JSON text and applies the JSON verdict; no word reaches the host.
+Secure is what a pod gets by saying nothing: a non-root account, no new privileges, no capabilities, a Landlock domain and default bounds. Root is a grant the pod's declaration names with a reason. A demand the node cannot honour is refused for that one pod, or reported where the node cannot enforce anything yet. Rust hands the facts as JSON text and applies the JSON verdict; no word reaches the host.
 
     default_uid #=> 65532
 """
@@ -185,16 +185,307 @@ access_refusal: Why an access cannot be true, or nil, as blue judges the same fi
 
     access_refusal({"writes" => ["/x"], "effects" => ["clock"]}) #=> "access writes /x without the filesystem effect"
     access_refusal({"listen" => [80], "effects" => ["clock"]}) #=> "access listens without the network effect"
+    access_refusal({"exec" => ["/x"], "effects" => ["clock"]}) #=> "access runs /x without the process effect"
+    access_refusal({"reads" => ["x"]}) #=> "access names x, which is relative"
+    access_refusal({"writes" => ["/nix/store/x"], "effects" => ["filesystem"]}) #=> "access names /nix/store/x, which is in the store"
     access_refusal({"effects" => ["clock"]}) #=> nil
     access_refusal(nil) #=> nil
 """
 def access_refusal(access)
   writes = field(access, "writes", [])
+  runs = field(access, "exec", [])
+  paths = append(field(access, "reads", []), writes, runs)
+  relative = filter((p) -> not starts_with?(p, "/"), paths)
+  stored = filter((p) -> under?(p, "/nix/store"), paths)
   if length(writes) != 0 and not effect?(access, "filesystem")
     "access writes #{join(writes, ", ")} without the filesystem effect"
   elsif length(field(access, "listen", [])) != 0 and
       not effect?(access, "network")
     "access listens without the network effect"
+  elsif length(runs) != 0 and not effect?(access, "process")
+    "access runs #{join(runs, ", ")} without the process effect"
+  elsif length(relative) != 0
+    "access names #{join(relative, ", ")}, which is relative"
+  elsif length(stored) != 0
+    "access names #{join(stored, ", ")}, which is in the store"
+  end
+end
+
+@doc """
+fs_rights_since: Each right Landlock can handle on a path, with the ABI that brought it.
+
+    retsu::first(fs_rights_since) #=> [1, "execute"]
+    last(fs_rights_since) #=> [9, "resolve-unix"]
+"""
+def fs_rights_since()
+  [
+    [1, "execute"],
+    [1, "write-file"],
+    [1, "read-file"],
+    [1, "read-dir"],
+    [1, "remove-dir"],
+    [1, "remove-file"],
+    [1, "make-char"],
+    [1, "make-dir"],
+    [1, "make-reg"],
+    [1, "make-sock"],
+    [1, "make-fifo"],
+    [1, "make-block"],
+    [1, "make-sym"],
+    [2, "refer"],
+    [3, "truncate"],
+    [5, "ioctl-dev"],
+    [9, "resolve-unix"]
+  ]
+end
+
+@doc """
+handled_rights: The rights a kernel of this ABI can hold. A right left out is a right the kernel does not mediate, which landlock_gaps says.
+
+    member?("refer", handled_rights(1)) #=> false
+    member?("refer", handled_rights(2)) #=> true
+    member?("resolve-unix", handled_rights(6)) #=> false
+    length(handled_rights(9)) #=> 17
+    handled_rights(0) #=> []
+"""
+def handled_rights(abi)
+  map(last, filter((row) -> row[0] <= abi, fs_rights_since))
+end
+
+@doc """
+scopes_of: What a process of this ABI is cut off from outside its Landlock domain. The main process and its children hold both. A command run into the pod holds only the sockets: its domain is its own, so a signal scope would stop `kill -HUP 1` and `nginx -s reload`, which is what an exec is for.
+
+    scopes_of(6, "start") #=> ["abstract-unix", "signal"]
+    scopes_of(6, "join") #=> ["abstract-unix"]
+    scopes_of(5, "start") #=> []
+"""
+def scopes_of(abi, door)
+  if abi < 6
+    []
+  elsif door == "join"
+    ["abstract-unix"]
+  else
+    %w[abstract-unix signal]
+  end
+end
+
+@doc """
+landlock_gaps: What this kernel's ABI leaves unheld for an enclosed pod, each by name, for an event a reader sees.
+
+    landlock_gaps(9) #=> []
+    landlock_gaps(6) #=> ["this node's kernel has Landlock ABI 6, so pathname unix sockets outside this pod stay reachable: that needs ABI 9"]
+    length(landlock_gaps(5)) #=> 2
+    landlock_gaps(0) #=> ["this node's kernel has no Landlock, so this pod's file rules, exec gate, abstract sockets, signals and pathname sockets are not held, and a read under a hidden path stays hidden"]
+"""
+def landlock_gaps(abi)
+  if abi < 1
+    ["this node's kernel has no Landlock, so this pod's file rules, exec gate, abstract sockets, signals and pathname sockets are not held, and a read under a hidden path stays hidden"]
+  else
+    append(
+      named_if(
+        abi < 6,
+        [
+          "this node's kernel has Landlock ABI #{to_s(abi)}, so abstract sockets and signals outside this pod stay reachable: that needs ABI 6"
+        ]
+      ),
+      named_if(
+        abi < 9,
+        [
+          "this node's kernel has Landlock ABI #{to_s(abi)}, so pathname unix sockets outside this pod stay reachable: that needs ABI 9"
+        ]
+      )
+    )
+  end
+end
+
+@doc """
+reading: The rights to read a path and what lies under it.
+
+    reading #=> ["read-file", "read-dir"]
+"""
+def reading()
+  %w[read-file read-dir]
+end
+
+@doc """
+writing: The rights to change what lies under a path. No device can be made, and a socket there can be reached.
+
+    member?("make-char", writing) #=> false
+    member?("make-block", writing) #=> false
+    member?("write-file", writing) #=> true
+    member?("resolve-unix", writing) #=> true
+"""
+def writing()
+  append(
+    reading,
+    %w[
+      write-file
+      truncate
+      remove-dir
+      remove-file
+      make-dir
+      make-reg
+      make-sock
+      make-fifo
+      make-sym
+      refer
+      resolve-unix
+    ]
+  )
+end
+
+@doc """
+safe_devices: The device nodes every program expects, the only ones an enclosed pod opens for writing.
+
+    member?("/dev/null", safe_devices) #=> true
+    member?("/dev/sda", safe_devices) #=> false
+"""
+def safe_devices()
+  %w[
+    /dev/null
+    /dev/zero
+    /dev/full
+    /dev/random
+    /dev/urandom
+    /dev/tty
+    /dev/ptmx
+    /dev/pts
+  ]
+end
+
+@doc """
+runtime_reads: What a program needs to read at all when its access narrows reads: names, certificates, the time zone, and its own limits.
+
+    member?("/etc/resolv.conf", runtime_reads) #=> true
+    member?("/etc/shadow", runtime_reads) #=> false
+"""
+def runtime_reads()
+  %w[
+    /etc/resolv.conf
+    /etc/hosts
+    /etc/nsswitch.conf
+    /etc/passwd
+    /etc/group
+    /etc/ssl
+    /etc/pki
+    /etc/localtime
+    /etc/services
+    /etc/protocols
+    /sys/fs/cgroup
+    /sys/devices/system/cpu
+  ]
+end
+
+@doc """
+read_paths: Where a pod reads. With no `reads` declared the host stays read-only and visible, less what is hidden; `reads` narrows that to itself and what a program needs at all.
+
+    read_paths(nil) #=> ["/"]
+    read_paths({"effects" => ["clock"]}) #=> ["/"]
+    last(read_paths({"reads" => ["/run/secrets/x"]})) #=> "/run/secrets/x"
+    member?("/", read_paths({"reads" => []})) #=> false
+"""
+def read_paths(access)
+  reads = field(access, "reads", nil)
+  if reads.nil?
+    ["/"]
+  else
+    append(runtime_reads, reads)
+  end
+end
+
+@doc """
+exec_paths: Where a pod may start a program. The store always, or nothing runs. A pod with no access keeps its volumes and scratch, since a chart's script in a ConfigMap and a tool an init container copied are real workloads. An access names what it runs with `exec`, and without the process effect or an `exec` list nothing writable runs.
+
+    exec_paths(nil, ["/v"], ["/tmp"]) #=> ["/nix/store", "/v", "/tmp"]
+    exec_paths({"effects" => ["clock"]}, ["/v"], ["/tmp"]) #=> ["/nix/store"]
+    exec_paths({"effects" => ["process"], "exec" => ["/opt/x"]}, ["/v"], ["/tmp"]) #=> ["/nix/store", "/opt/x"]
+    exec_paths({"effects" => ["process"]}, ["/v"], ["/tmp"]) #=> ["/nix/store"]
+"""
+def exec_paths(access, own, scratch)
+  store = ["/nix/store"]
+  if access.nil?
+    append(store, own, scratch)
+  elsif effect?(access, "process")
+    append(store, field(access, "exec", []))
+  else
+    store
+  end
+end
+
+@doc """
+landlock_rules: Each path a pod's Landlock domain allows, with the rights this kernel can hold there. A path with no right left is dropped, since the kernel refuses an empty rule.
+
+    length(filter((r) -> r["path"] == "/nix/store", landlock_rules({"landlock_abi" => 6}, [], []))) #=> 2
+    landlock_rules({"landlock_abi" => 1, "volumes" => []}, [], []) == [] #=> false
+"""
+def landlock_rules(facts, own, scratch)
+  access = field(facts, "access", nil)
+  handled = handled_rights(field(facts, "landlock_abi", 0))
+  read_only = field(facts, "read_only_volumes", [])
+  shut = narrowed(access, own)
+  writable = filter(
+    (v) -> not member?(v, read_only) and not member?(v, shut),
+    own
+  )
+  writes = if effect?(access, "filesystem")
+    field(access, "writes", [])
+  else
+    []
+  end
+  reached = if field(access, "reads", nil).nil?
+    own
+  else
+    filter((v) -> any?((r) -> under?(v, r), field(access, "reads", [])), own)
+  end
+  rule = fn(path, rights)
+    {"path" => path, "rights" => filter((r) -> member?(r, handled), rights)}
+  end
+  all = append(
+    map((p) -> rule(p, reading), read_paths(access)),
+    map((p) -> rule(p, reading), ["/nix/store"]),
+    map((p) -> rule(p, ["execute"]), exec_paths(access, own, scratch)),
+    [rule("/proc", %w[read-file read-dir write-file truncate])],
+    map(
+      (p) -> rule(p, %w[read-file write-file truncate ioctl-dev]),
+      safe_devices
+    ),
+    map((p) -> rule(p, writing), append(scratch, writable, writes)),
+    map((p) -> rule(p, ["resolve-unix"]), reached)
+  )
+  filter((r) -> length(r["rights"]) != 0, all)
+end
+
+@doc """
+landlock_of: The Landlock domain of an enclosed pod, or nil on a kernel with none.
+
+    landlock_of({"landlock_abi" => 0}, [], []) #=> nil
+    landlock_of({"landlock_abi" => 6}, [], []).scopes #=> ["abstract-unix", "signal"]
+    landlock_of({"landlock_abi" => 6}, [], []).join_scopes #=> ["abstract-unix"]
+    member?("resolve-unix", landlock_of({"landlock_abi" => 6}, [], []).handled) #=> false
+"""
+def landlock_of(facts, own, scratch)
+  abi = field(facts, "landlock_abi", 0)
+  if abi >= 1
+    {
+      "handled" => handled_rights(abi),
+      "rules" => landlock_rules(facts, own, scratch),
+      "scopes" => scopes_of(abi, "start"),
+      "join_scopes" => scopes_of(abi, "join")
+    }
+  end
+end
+
+@doc """
+visible_paths: What a pod's enclosure must not hide: its volumes, and what it declares it reads, which only a kernel with Landlock can narrow back to exactly that.
+
+    visible_paths({"landlock_abi" => 6, "access" => {"reads" => ["/run/secrets/x"]}}, ["/v"]) #=> ["/v", "/run/secrets/x"]
+    visible_paths({"landlock_abi" => 0, "access" => {"reads" => ["/run/secrets/x"]}}, ["/v"]) #=> ["/v"]
+"""
+def visible_paths(facts, own)
+  if field(facts, "landlock_abi", 0) >= 1
+    append(own, field(field(facts, "access", nil), "reads", []))
+  else
+    own
   end
 end
 
@@ -207,7 +498,7 @@ def capability_rendering()
   [
     ["network", "an empty network namespace when refused"],
     ["filesystem", "no writable volume when refused"],
-    ["process", "no kernel door yet: the engine refuses it"],
+    ["process", "Landlock runs nothing outside the store when refused"],
     ["environment", "no kernel door: engine only"],
     [
       "clock",
@@ -808,8 +1099,11 @@ def verdict_text(refused, ids, confine, warnings, facts?)
         []
       end,
       "enclosed" => confine,
+      "landlock" => if confine
+        landlock_of(facts, own, scratch_list(own))
+      end,
       "hide" => if confine
-        hide_list(own)
+        hide_list(visible_paths(facts, own))
       else
         []
       end,
@@ -1029,7 +1323,8 @@ def enclose(facts_text)
           ),
           not_applied_warning(declared),
           named_if(not granted, system_account_warning(declared)),
-          named_if(not granted, limit_gaps(field(facts, "bounds", [])))
+          named_if(not granted, limit_gaps(field(facts, "bounds", []))),
+          named_if(not granted, landlock_gaps(field(facts, "landlock_abi", 0)))
         ),
         facts
       )
@@ -1132,6 +1427,8 @@ def enforced(extra)
     "access" => field(extra, "access", nil),
     "access_invalid" => field(extra, "access_invalid", false),
     "bounds" => %w[memory pids],
+    "landlock_abi" => field(extra, "landlock_abi", 9),
+    "read_only_volumes" => field(extra, "read_only_volumes", []),
     "grant" => field(extra, "grant", nil)
   }
 end
@@ -1377,6 +1674,117 @@ test "a gate in front of a runtime judges who may ask, and leaves to the runtime
   assert gate({"host_pid" => true}).refused != nil
   assert gate({"cap_add" => ["SYS_ADMIN"]}).refused != nil
   assert gate({"cap_add" => ["NET_BIND_SERVICE"]}).refused.nil?
+end
+
+def rule_rights(v, path)
+  retsu::flat_map(
+    filter((r) -> r["path"] == path, v.landlock.rules),
+    (r) -> r["rights"]
+  )
+end
+
+test "a pod's Landlock rules follow its volumes, its scratch and the store"
+  v = answer(
+    enforced({"volumes" => %w[/data /cfg], "read_only_volumes" => ["/cfg"]})
+  )
+  assert member?("write-file", rule_rights(v, "/data"))
+  assert not member?("write-file", rule_rights(v, "/cfg"))
+  assert member?("resolve-unix", rule_rights(v, "/cfg"))
+  assert member?("write-file", rule_rights(v, "/tmp"))
+  assert member?("execute", rule_rights(v, "/nix/store"))
+  assert member?("read-file", rule_rights(v, "/nix/store"))
+  assert not member?("write-file", rule_rights(v, "/nix/store"))
+  assert member?("read-dir", rule_rights(v, "/"))
+  assert not member?("write-file", rule_rights(v, "/"))
+  assert not member?("execute", rule_rights(v, "/"))
+  assert not member?("write-file", rule_rights(v, "/etc"))
+  assert member?("write-file", rule_rights(v, "/dev/null"))
+  assert member?("execute", rule_rights(v, "/data"))
+end
+
+test "reads and writes declared narrow the rules, and exec narrows what runs"
+  v = answer(
+    enforced(
+      {
+        "volumes" => %w[/data /cfg],
+        "access" => {
+          "effects" => ["filesystem"],
+          "writes" => ["/data"],
+          "reads" => ["/run/secrets/x"]
+        }
+      }
+    )
+  )
+  assert rule_rights(v, "/") == []
+  assert member?("read-file", rule_rights(v, "/run/secrets/x"))
+  assert member?("read-file", rule_rights(v, "/etc/resolv.conf"))
+  assert member?("write-file", rule_rights(v, "/data"))
+  assert rule_rights(v, "/cfg") == []
+  assert not member?("execute", rule_rights(v, "/data"))
+  assert not member?("execute", rule_rights(v, "/tmp"))
+  assert member?("execute", rule_rights(v, "/nix/store"))
+  assert not member?("/run/secrets", v.hide)
+  closed = answer(
+    enforced(
+      {
+        "volumes" => ["/data"],
+        "access" => {"effects" => ["filesystem"], "writes" => []}
+      }
+    )
+  )
+  assert not member?("write-file", rule_rights(closed, "/data"))
+  assert member?("/run/secrets", closed.hide)
+end
+
+test "a kernel without an ABI holds what it can and says what it cannot, and no pod is refused"
+  on = fn(abi)
+    answer(enforced({"landlock_abi" => abi, "volumes" => ["/data"]}))
+  end
+  none = on(0)
+  assert none.refused.nil?
+  assert none.enclosed == true
+  assert none.landlock.nil?
+  assert contains?(retsu::first(none.warnings), "no Landlock")
+  old = on(1)
+  assert old.refused.nil?
+  assert old.landlock.scopes == []
+  assert not member?("refer", old.landlock.handled)
+  assert not member?("truncate", rule_rights(old, "/data"))
+  assert length(old.warnings) == 2
+  six = on(6)
+  assert six.landlock.scopes == %w[abstract-unix signal]
+  assert not member?("resolve-unix", rule_rights(six, "/data"))
+  assert rule_rights(six, "/data") != []
+  assert length(six.warnings) == 1
+  assert contains?(retsu::first(six.warnings), "ABI 9")
+  nine = on(9)
+  assert member?("resolve-unix", rule_rights(nine, "/data"))
+  assert length(nine.warnings) == 0
+end
+
+test "a read under a hidden path stays hidden on a kernel that could not narrow it back"
+  v = answer(
+    enforced({"landlock_abi" => 0, "access" => {"reads" => ["/run/secrets/x"]}})
+  )
+  assert member?("/run/secrets", v.hide)
+end
+
+test "a grant keeps no Landlock domain, and audit none either"
+  assert answer(enforced({"grant" => "x"})).landlock.nil?
+  assert answer(assoc(enforced({}), "mode", "audit")).landlock.nil?
+  assert answer(assoc(enforced({}), "mode", "off")).landlock.nil?
+end
+
+test "every right the rules name is one the seam knows, and no rule is empty"
+  v = answer(enforced({"volumes" => ["/data"], "read_only_volumes" => []}))
+  known = map(last, fs_rights_since)
+  assert every?(
+    fn(r)
+      length(r["rights"]) != 0 and every?((w) -> member?(w, known), r["rights"])
+    end,
+    v.landlock.rules
+  )
+  assert every?((w) -> member?(w, known), v.landlock.handled)
 end
 
 test "a grant says what it cannot apply"

@@ -57,6 +57,8 @@ struct Facts<'a> {
     bounds: &'a [&'static str],
     node_memory_bytes: u64,
     runtime_gate: bool,
+    landlock_abi: u32,
+    read_only_volumes: &'a [String],
     kernel_decides: bool,
     grant: Option<&'a str>,
     access: Option<serde_json::Value>,
@@ -91,6 +93,8 @@ pub struct Node {
     /// A container runtime applies what the pod declares and this decides only
     /// who may ask, so what the native seam cannot apply is the runtime's to judge.
     pub runtime_gate: bool,
+    /// The kernel's Landlock ABI, 0 where it has none.
+    pub landlock_abi: u32,
 }
 
 impl Node {
@@ -103,6 +107,7 @@ impl Node {
             bounds,
             memory_bytes: node_memory_bytes(),
             runtime_gate: false,
+            landlock_abi: landlock_abi(),
         }
     }
 }
@@ -116,6 +121,8 @@ pub struct Asked<'a> {
     pub namespace: &'a str,
     /// Its volume paths.
     pub volumes: &'a [String],
+    /// Those of its volumes mounted read-only.
+    pub read_only_volumes: &'a [String],
     /// Its declared resources.
     pub resources: &'a crate::backend::Resources,
 }
@@ -131,6 +138,28 @@ pub struct DefaultLimits {
     pub memory_max: Option<u64>,
 }
 
+/// One path of a Landlock domain.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+pub struct LandlockRule {
+    /// The path; one absent at the start is skipped.
+    pub path: String,
+    /// The rights it allows, by blue's words.
+    pub rights: Vec<String>,
+}
+
+/// The Landlock domain blue decided for a container.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+pub struct Landlock {
+    /// Every right this domain mediates, by blue's words.
+    pub handled: Vec<String>,
+    /// What it allows.
+    pub rules: Vec<LandlockRule>,
+    /// What the main process is cut off from.
+    pub scopes: Vec<String>,
+    /// What a command run into the pod is cut off from.
+    pub join_scopes: Vec<String>,
+}
+
 /// What `kakoi::enclose` answered.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 pub struct Verdict {
@@ -144,6 +173,9 @@ pub struct Verdict {
     pub no_new_privs: bool,
     /// Clear the child's capability sets, but for [`Self::keep`].
     pub clear_caps: bool,
+    /// Its Landlock domain, `None` on a kernel with none or a pod with no enclosure.
+    #[serde(default)]
+    pub landlock: Option<Landlock>,
     /// The bounds it gets for what it does not declare.
     #[serde(default)]
     pub limits: DefaultLimits,
@@ -204,6 +236,7 @@ impl Kakoi {
             confinement,
             namespace,
             volumes,
+            read_only_volumes,
             resources,
         } = asked;
         let Confinement {
@@ -239,6 +272,8 @@ impl Kakoi {
             bounds: &node.bounds,
             node_memory_bytes: node.memory_bytes,
             runtime_gate: node.runtime_gate,
+            landlock_abi: node.landlock_abi,
+            read_only_volumes,
             kernel_decides: cfg!(target_os = "linux"),
             grant: root_grant.as_deref(),
             access_invalid: matches!(parsed, Some(Err(_))),
@@ -349,6 +384,29 @@ impl AdmissionWebhook for RootGrantAdmission {
 #[must_use]
 pub fn can_enforce() -> bool {
     cfg!(target_os = "linux") && rustix::process::geteuid().is_root()
+}
+
+/// The kernel's Landlock ABI, 0 where it has none or Landlock is not enabled.
+#[must_use]
+pub fn landlock_abi() -> u32 {
+    #[cfg(target_os = "linux")]
+    {
+        const CREATE_RULESET_VERSION: libc::c_ulong = 1;
+        #[allow(unsafe_code)]
+        let abi = unsafe {
+            libc::syscall(
+                libc::SYS_landlock_create_ruleset,
+                std::ptr::null::<u8>(),
+                0_usize,
+                CREATE_RULESET_VERSION,
+            )
+        };
+        u32::try_from(abi).unwrap_or(0)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
 }
 
 /// The node's memory in bytes, 0 where it is not known.
@@ -540,18 +598,228 @@ fn kept_capability(word: &str) -> std::io::Result<rustix::thread::CapabilitySet>
     }
 }
 
+/// How a process comes into a pod's enclosure.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug)]
+enum Door {
+    Start,
+    Join,
+}
+
+/// A right blue names, as the kernel's bit. A word with no row refuses the pod
+/// rather than running it with less than blue decided.
+#[cfg(target_os = "linux")]
+fn landlock_right(word: &str) -> std::io::Result<u64> {
+    let bit = match word {
+        "execute" => 0,
+        "write-file" => 1,
+        "read-file" => 2,
+        "read-dir" => 3,
+        "remove-dir" => 4,
+        "remove-file" => 5,
+        "make-char" => 6,
+        "make-dir" => 7,
+        "make-reg" => 8,
+        "make-sock" => 9,
+        "make-fifo" => 10,
+        "make-block" => 11,
+        "make-sym" => 12,
+        "refer" => 13,
+        "truncate" => 14,
+        "ioctl-dev" => 15,
+        "resolve-unix" => 16,
+        other => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("kakoi named a Landlock right this seam does not know: {other}"),
+            ));
+        }
+    };
+    Ok(1_u64 << bit)
+}
+
+/// A scope blue names, as the kernel's bit.
+#[cfg(target_os = "linux")]
+fn landlock_scope(word: &str) -> std::io::Result<u64> {
+    match word {
+        "abstract-unix" => Ok(1),
+        "signal" => Ok(2),
+        other => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("kakoi named a Landlock scope this seam does not know: {other}"),
+        )),
+    }
+}
+
+/// The rights the kernel accepts on a rule whose path is not a directory.
+/// `resolve-unix` is left out: no rule names a socket itself, and a file holds
+/// nothing to resolve.
+#[cfg(target_os = "linux")]
+const LANDLOCK_FILE_RIGHTS: u64 = 1 | (1 << 1) | (1 << 2) | (1 << 14) | (1 << 15);
+
+/// A Landlock domain as the kernel takes it, built before the fork.
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+struct LandlockCalls {
+    handled: u64,
+    scoped: u64,
+    rules: Vec<(std::ffi::CString, u64)>,
+}
+
+#[cfg(target_os = "linux")]
+impl LandlockCalls {
+    fn of(landlock: &Landlock, scopes: &[String]) -> std::io::Result<Self> {
+        let rights = |words: &[String]| {
+            words.iter().try_fold(0_u64, |all, word| {
+                Ok::<_, std::io::Error>(all | landlock_right(word)?)
+            })
+        };
+        let mut rules = Vec::with_capacity(landlock.rules.len());
+        for rule in &landlock.rules {
+            let path = std::ffi::CString::new(rule.path.as_str())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+            rules.push((path, rights(&rule.rights)?));
+        }
+        Ok(Self {
+            handled: rights(&landlock.handled)?,
+            scoped: scopes.iter().try_fold(0_u64, |all, word| {
+                Ok::<_, std::io::Error>(all | landlock_scope(word)?)
+            })?,
+            rules,
+        })
+    }
+
+    /// Open each path and build the ruleset. It runs after the mounts, so a rule
+    /// holds the enclosure's own filesystems, and before the uid change, so a
+    /// path under a directory the account cannot walk still gets its rule.
+    fn ruleset(&self) -> std::io::Result<std::os::fd::OwnedFd> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        #[repr(C)]
+        struct RulesetAttr {
+            handled_access_fs: u64,
+            handled_access_net: u64,
+            scoped: u64,
+        }
+        #[repr(C, packed)]
+        struct PathBeneath {
+            allowed_access: u64,
+            parent_fd: i32,
+        }
+        const RULE_PATH_BENEATH: libc::c_long = 1;
+
+        let attr = RulesetAttr {
+            handled_access_fs: self.handled,
+            handled_access_net: 0,
+            scoped: self.scoped,
+        };
+        #[allow(unsafe_code)]
+        let raw = unsafe {
+            libc::syscall(
+                libc::SYS_landlock_create_ruleset,
+                std::ptr::from_ref(&attr),
+                std::mem::size_of::<RulesetAttr>(),
+                0_usize,
+            )
+        };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        #[allow(unsafe_code)]
+        let ruleset = unsafe {
+            std::os::fd::OwnedFd::from_raw_fd(
+                i32::try_from(raw).map_err(|_| std::io::Error::from_raw_os_error(libc::EBADF))?,
+            )
+        };
+        for (path, rights) in &self.rules {
+            let opened = rustix::fs::open(
+                path.as_c_str(),
+                rustix::fs::OFlags::PATH | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            );
+            let parent = match opened {
+                Ok(fd) => fd,
+                Err(rustix::io::Errno::NOENT | rustix::io::Errno::ACCESS) => continue,
+                Err(e) => return Err(e.into()),
+            };
+            let directory =
+                rustix::fs::FileType::from_raw_mode(rustix::fs::fstat(&parent)?.st_mode)
+                    == rustix::fs::FileType::Directory;
+            let allowed = if directory {
+                *rights
+            } else {
+                *rights & LANDLOCK_FILE_RIGHTS
+            };
+            if allowed == 0 {
+                continue;
+            }
+            let beneath = PathBeneath {
+                allowed_access: allowed,
+                parent_fd: parent.as_raw_fd(),
+            };
+            #[allow(unsafe_code)]
+            let added = unsafe {
+                libc::syscall(
+                    libc::SYS_landlock_add_rule,
+                    ruleset.as_raw_fd(),
+                    RULE_PATH_BENEATH,
+                    std::ptr::from_ref(&beneath),
+                    0_usize,
+                )
+            };
+            if added != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(ruleset)
+    }
+}
+
+/// Enter the domain, which needs `no_new_privs` first.
+#[cfg(target_os = "linux")]
+fn landlock_restrict(ruleset: &std::os::fd::OwnedFd) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    #[allow(unsafe_code)]
+    let entered = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_restrict_self,
+            ruleset.as_raw_fd(),
+            0_usize,
+        )
+    };
+    if entered != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// What the child's last steps need, built before the fork so the hook allocates
 /// nothing.
 #[cfg(target_os = "linux")]
 struct Steps {
     filter: Vec<libc::sock_filter>,
     kept: Vec<rustix::thread::CapabilitySet>,
+    landlock: Option<LandlockCalls>,
 }
 
 #[cfg(target_os = "linux")]
 impl Steps {
-    fn of(verdict: &Verdict) -> std::io::Result<Self> {
+    fn of(verdict: &Verdict, door: Door) -> std::io::Result<Self> {
         Ok(Self {
+            landlock: verdict
+                .landlock
+                .as_ref()
+                .map(|l| {
+                    LandlockCalls::of(
+                        l,
+                        match door {
+                            Door::Start => &l.scopes,
+                            Door::Join => &l.join_scopes,
+                        },
+                    )
+                })
+                .transpose()?,
             filter: seccomp_filter(verdict),
             kept: verdict
                 .keep
@@ -626,7 +894,7 @@ pub fn enter_on_exec(
         .try_fold(UnshareFlags::empty(), |flags, word| {
             own_namespace(word).map(|(flag, _, _)| flags | flag)
         })?;
-    let steps = Steps::of(&v)?;
+    let steps = Steps::of(&v, Door::Start)?;
     let empty = c"";
     let tmpfs = c"tmpfs";
     let root = c"/";
@@ -700,13 +968,19 @@ pub fn enter_on_exec(
     Ok(())
 }
 
-/// The child's last steps before `exec`, in this one order: groups, gid, uid,
-/// capabilities, `no_new_privs`, the filter. A kept capability survives the uid
-/// change through `PR_SET_KEEPCAPS`, and `exec` through the ambient set.
+/// The child's last steps before `exec`, in this one order: the Landlock ruleset,
+/// groups, gid, uid, capabilities, `no_new_privs`, the Landlock domain, the
+/// filter. A kept capability survives the uid change through `PR_SET_KEEPCAPS`,
+/// and `exec` through the ambient set.
 #[cfg(target_os = "linux")]
 fn become_declared(v: &Verdict, steps: &Steps) -> std::io::Result<()> {
     use rustix::thread::{CapabilitySet, CapabilitySets};
 
+    let ruleset = steps
+        .landlock
+        .as_ref()
+        .map(LandlockCalls::ruleset)
+        .transpose()?;
     if !steps.kept.is_empty() {
         rustix::thread::set_keep_capabilities(true)?;
     }
@@ -736,6 +1010,9 @@ fn become_declared(v: &Verdict, steps: &Steps) -> std::io::Result<()> {
     }
     if v.no_new_privs {
         rustix::thread::set_no_new_privs(true)?;
+    }
+    if let Some(ruleset) = &ruleset {
+        landlock_restrict(ruleset)?;
     }
     if !v.deny.is_empty() {
         let program = libc::sock_fprog {
@@ -795,7 +1072,7 @@ pub fn join_on_exec(
             joined.push((std::fs::File::open(format!("/proc/{pid}/ns/{file}"))?, kind));
         }
     }
-    let steps = Steps::of(&v)?;
+    let steps = Steps::of(&v, Door::Join)?;
     #[allow(unsafe_code)]
     unsafe {
         cmd.pre_exec(move || {
@@ -889,6 +1166,7 @@ mod tests {
             bounds: vec!["memory", "pids"],
             memory_bytes: 68_719_476_736,
             runtime_gate: false,
+            landlock_abi: 6,
         }
     }
 
@@ -900,6 +1178,7 @@ mod tests {
                     confinement: c,
                     namespace: "",
                     volumes,
+                    read_only_volumes: &[],
                     resources: &resources,
                 },
                 node,
@@ -1405,6 +1684,7 @@ mod tests {
                     confinement: &Confinement::default(),
                     namespace: "",
                     volumes: &[],
+                    read_only_volumes: &[],
                     resources: &resources,
                 },
                 &node(NativeSecurity::Enforce, true),
@@ -1454,6 +1734,196 @@ mod tests {
     #[test]
     fn the_node_states_its_memory() {
         assert!(node_memory_bytes() > 1 << 20);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn each_right_and_scope_is_the_kernels_bit() {
+        let rows: [(&str, u64); 17] = [
+            ("execute", 1 << 0),
+            ("write-file", 1 << 1),
+            ("read-file", 1 << 2),
+            ("read-dir", 1 << 3),
+            ("remove-dir", 1 << 4),
+            ("remove-file", 1 << 5),
+            ("make-char", 1 << 6),
+            ("make-dir", 1 << 7),
+            ("make-reg", 1 << 8),
+            ("make-sock", 1 << 9),
+            ("make-fifo", 1 << 10),
+            ("make-block", 1 << 11),
+            ("make-sym", 1 << 12),
+            ("refer", 1 << 13),
+            ("truncate", 1 << 14),
+            ("ioctl-dev", 1 << 15),
+            ("resolve-unix", 1 << 16),
+        ];
+        for (word, bit) in rows {
+            assert_eq!(landlock_right(word).unwrap(), bit, "{word}");
+        }
+        assert!(landlock_right("mount").is_err());
+        assert_eq!(landlock_scope("abstract-unix").unwrap(), 1);
+        assert_eq!(landlock_scope("signal").unwrap(), 2);
+        assert!(landlock_scope("network").is_err());
+        assert_eq!(
+            LANDLOCK_FILE_RIGHTS,
+            [
+                "execute",
+                "write-file",
+                "read-file",
+                "truncate",
+                "ioctl-dev"
+            ]
+            .iter()
+            .fold(0, |all, word| all | landlock_right(word).unwrap())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_seam_makes_blues_domain_into_the_kernels_calls_for_each_door() {
+        let v = enclosed_default().await;
+        let landlock = v.landlock.clone().expect("a domain");
+        assert!(landlock.handled.iter().any(|w| w == "execute"));
+        let start = Steps::of(&v, Door::Start).unwrap().landlock.unwrap();
+        let join = Steps::of(&v, Door::Join).unwrap().landlock.unwrap();
+        assert_eq!(start.scoped, 3);
+        assert_eq!(join.scoped, 1);
+        assert_eq!(start.handled, join.handled);
+        assert_ne!(start.handled & (1 << 13), 0, "refer is ABI 2");
+        assert_eq!(start.handled & (1 << 16), 0, "resolve-unix is ABI 9");
+        let store = start
+            .rules
+            .iter()
+            .filter(|(path, _)| path.as_bytes() == b"/nix/store")
+            .fold(0, |all, (_, rights)| all | rights);
+        assert_eq!(store, 1 | (1 << 2) | (1 << 3));
+        let unknown = Landlock {
+            handled: vec!["mount".to_string()],
+            ..Landlock::default()
+        };
+        assert!(LandlockCalls::of(&unknown, &[]).is_err());
+        let bad_scope = Landlock::default();
+        assert!(LandlockCalls::of(&bad_scope, &["network".to_string()]).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[allow(unsafe_code)]
+    #[test]
+    fn the_kernel_holds_the_domain_the_seam_builds_and_takes_no_rule_it_would_refuse() {
+        let abi = landlock_abi();
+        if abi == 0 {
+            eprintln!("this kernel has no Landlock, so this run proves nothing");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let allowed = dir.path().join("allowed");
+        let denied = dir.path().join("denied");
+        std::fs::create_dir(&allowed).unwrap();
+        std::fs::create_dir(&denied).unwrap();
+        std::fs::write(allowed.join("f"), "x").unwrap();
+        std::fs::write(denied.join("f"), "x").unwrap();
+        let single = dir.path().join("single");
+        std::fs::write(&single, "x").unwrap();
+        let text = |p: &std::path::Path| p.to_string_lossy().to_string();
+        let words = |list: &[&str]| list.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let landlock = Landlock {
+            handled: words(&["read-file", "read-dir", "write-file"]),
+            rules: vec![
+                LandlockRule {
+                    path: text(&allowed),
+                    rights: words(&["read-file", "read-dir"]),
+                },
+                LandlockRule {
+                    path: text(&single),
+                    rights: words(&["read-file", "read-dir"]),
+                },
+                LandlockRule {
+                    path: text(&dir.path().join("absent")),
+                    rights: words(&["read-file"]),
+                },
+            ],
+            ..Landlock::default()
+        };
+        let scopes = if abi >= 6 {
+            words(&["signal"])
+        } else {
+            Vec::new()
+        };
+        let calls = LandlockCalls::of(&landlock, &scopes).unwrap();
+        let path_of = |p: std::path::PathBuf| std::ffi::CString::new(text(&p)).unwrap();
+        let readable = path_of(allowed.join("f"));
+        let refused = path_of(denied.join("f"));
+        let lone = path_of(single.clone());
+        let parent = libc::pid_t::try_from(std::process::id()).unwrap();
+        unsafe {
+            let child = libc::fork();
+            assert!(child >= 0);
+            if child == 0 {
+                let Ok(ruleset) = calls.ruleset() else {
+                    libc::_exit(10);
+                };
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                    libc::_exit(11);
+                }
+                if landlock_restrict(&ruleset).is_err() {
+                    libc::_exit(12);
+                }
+                if libc::open(readable.as_ptr(), libc::O_RDONLY) < 0 {
+                    libc::_exit(13);
+                }
+                if libc::open(lone.as_ptr(), libc::O_RDONLY) < 0 {
+                    libc::_exit(14);
+                }
+                if libc::open(refused.as_ptr(), libc::O_RDONLY) >= 0
+                    || *libc::__errno_location() != libc::EACCES
+                {
+                    libc::_exit(15);
+                }
+                if abi >= 6
+                    && (libc::kill(parent, 0) == 0 || *libc::__errno_location() != libc::EPERM)
+                {
+                    libc::_exit(16);
+                }
+                libc::_exit(0);
+            }
+            let mut status = 0;
+            assert_eq!(libc::waitpid(child, &raw mut status, 0), child);
+            assert!(libc::WIFEXITED(status), "status {status}");
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_kernel_without_landlock_is_a_named_weaker_state_never_a_refusal() {
+        let mut bare = node(NativeSecurity::Enforce, true);
+        bare.landlock_abi = 0;
+        let none = verdict_of(&Confinement::default(), &[], &bare).await;
+        assert_eq!(none.refused, None);
+        assert!(none.enclosed);
+        assert_eq!(none.landlock, None);
+        assert!(
+            none.warnings.iter().any(|w| w.contains("no Landlock")),
+            "{none:?}"
+        );
+        let six = enclosed_default().await;
+        assert!(six.warnings.iter().any(|w| w.contains("ABI 9")), "{six:?}");
+        assert!(
+            !six.warnings.iter().any(|w| w.contains("needs ABI 6")),
+            "{six:?}"
+        );
+        let mut nine = node(NativeSecurity::Enforce, true);
+        nine.landlock_abi = 9;
+        let nine = verdict_of(&Confinement::default(), &[], &nine).await;
+        assert!(nine.warnings.is_empty(), "{nine:?}");
+    }
+
+    #[test]
+    fn this_kernels_abi_reads_as_a_number() {
+        let abi = landlock_abi();
+        assert!(abi < 1000, "{abi}");
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(abi, 0);
     }
 
     #[tokio::test]
