@@ -288,6 +288,10 @@ impl std::fmt::Display for BackOffMessage<'_> {
 /// whose closure is not in the store and could not be realised.
 pub const IMAGE_UNAVAILABLE: &str = "ImageUnavailable";
 
+/// The pod `status.reason` of a native pod whose closure the node does not
+/// trust ([`crate::closure_trust`]).
+pub const CLOSURE_UNTRUSTED: &str = "ClosureUntrusted";
+
 /// Why a pod's image cannot exist on this node.
 struct ImageUnavailable<'a> {
     path: &'a std::path::Path,
@@ -830,6 +834,9 @@ pub struct Kubelet {
     /// ([`crate::closure_store`]). Defaults to [`UnmanagedClosures`], which
     /// checks, fetches and roots nothing — the behaviour before it existed.
     closures: Arc<dyn crate::closure_store::ClosureStore>,
+    /// The check on a closure before its pod's first start; `None` checks
+    /// nothing, as on a backend that runs no closure.
+    closure_trust: Option<Arc<crate::closure_trust::ClosureTrust>>,
     /// Where lifecycle events go. Defaults to the null sink so emission is
     /// safe to add to a code path before the plumbing exists — the
     /// alternative being an `Option` check at every call site.
@@ -917,6 +924,7 @@ impl Kubelet {
             volume_pending: Mutex::new(crate::backoff::VolumePendingLedger::default()),
             events: Arc::new(engenho_controllers::event_recorder::NullEventSink),
             closures: Arc::new(crate::closure_store::UnmanagedClosures),
+            closure_trust: None,
             sweep: Sweep::new(
                 KUBELET_COMPONENT,
                 engenho_controllers::event_recorder::Reason::Failed,
@@ -987,6 +995,16 @@ impl Kubelet {
         closures: Arc<dyn crate::closure_store::ClosureStore>,
     ) -> Self {
         self.closures = closures;
+        self
+    }
+
+    /// Builder: the check on a closure before its pod's first start.
+    #[must_use]
+    pub fn with_closure_trust(
+        mut self,
+        trust: Arc<crate::closure_trust::ClosureTrust>,
+    ) -> Self {
+        self.closure_trust = Some(trust);
         self
     }
 
@@ -2913,6 +2931,11 @@ impl Kubelet {
                         .fail_image_unavailable(key, value, &path, &detail, report)
                         .await;
                 }
+                if let Some(why) = self.check_pod_closures(key, value).await {
+                    return self
+                        .fail_pod_image(key, value, CLOSURE_UNTRUSTED, why, report)
+                        .await;
+                }
                 self.start_bound_pod(key, value, report, soonest_requeue)
                     .await
             }
@@ -3020,6 +3043,32 @@ impl Kubelet {
         None
     }
 
+    /// Ask whether each closure `value` names may run. Warnings become events;
+    /// `Some(why)` is the first refusal.
+    async fn check_pod_closures(&self, key: &ResourceKey, value: &Value) -> Option<String> {
+        let trust = self.closure_trust.as_ref()?;
+        let closures: BTreeSet<std::path::PathBuf> = crate::closure_store::pod_closures(value)
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect();
+        for closure in closures {
+            let verdict = trust.check(&closure).await;
+            for warning in verdict.warnings {
+                warn!(pod = %key.label(), %warning, "closure check");
+                self.emit(
+                    key,
+                    engenho_controllers::event_recorder::Reason::ConfinementNotEnforced,
+                    warning,
+                )
+                .await;
+            }
+            if verdict.refused.is_some() {
+                return verdict.refused;
+            }
+        }
+        None
+    }
+
     /// Publish a pod whose image cannot exist `Failed` with reason
     /// `ImageUnavailable`, every container `Waiting{ImageUnavailable}` naming
     /// the path. Terminal: a controller that keeps one pod per slot replaces
@@ -3033,9 +3082,21 @@ impl Kubelet {
         detail: &str,
         report: &mut ReconcileReport,
     ) -> Result<(), ControllerError> {
+        let message = ImageUnavailable { path, detail }.to_string();
+        self.fail_pod_image(key, value, IMAGE_UNAVAILABLE, message, report)
+            .await
+    }
+
+    /// Publish a pod whose image may not start `Failed` with `reason`.
+    async fn fail_pod_image(
+        &self,
+        key: &ResourceKey,
+        value: &Value,
+        reason: &str,
+        message: String,
+        report: &mut ReconcileReport,
+    ) -> Result<(), ControllerError> {
         use engenho_types::curated_enums::PodPhase;
-        let why = ImageUnavailable { path, detail };
-        let message = why.to_string();
         let statuses: Vec<ContainerStatusOut> = value
             .pointer("/spec/containers")
             .and_then(Value::as_array)
@@ -3046,7 +3107,7 @@ impl Kubelet {
                 name: name.to_string(),
                 ready: false,
                 state: ContainerState::Waiting {
-                    reason: IMAGE_UNAVAILABLE.to_string(),
+                    reason: reason.to_string(),
                     message: Some(message.clone()),
                 },
                 container_id: None,
@@ -3055,10 +3116,10 @@ impl Kubelet {
             .collect();
         let mut desired = Self::build_pod_status(value, PodPhase::Failed, &statuses, None);
         if let Some(status) = desired.as_object_mut() {
-            status.insert("reason".into(), Value::from(IMAGE_UNAVAILABLE));
+            status.insert("reason".into(), Value::from(reason));
             status.insert("message".into(), Value::from(message.clone()));
         }
-        warn!(pod = %key.label(), %why, "pod image unavailable; published Failed");
+        warn!(pod = %key.label(), reason, %message, "pod image may not start; published Failed");
         self.emit(
             key,
             engenho_controllers::event_recorder::Reason::Failed,

@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "bluefile_b3": "b3:26dfaa82afffeb5c4ebb3c09c1471e0d475ed6152a5305ba69187d40d2e5a6f6",
+  "manifest": {
+    "schema": 1,
+    "name": "trust",
+    "version": "0.1.0",
+    "needs": {},
+    "when": "anytime",
+    "sources": {},
+    "packages": [],
+    "runs": {},
+    "tools": [],
+    "checks": {},
+    "apps": {},
+    "catalog": null
+  },
+  "sources": {}
+}

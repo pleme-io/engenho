@@ -49,6 +49,7 @@ pub mod backoff;
 pub mod blue_worker;
 pub mod cgroup;
 pub mod closure_store;
+pub mod closure_trust;
 pub mod config_bridge;
 pub mod cri;
 pub mod cri_backend;

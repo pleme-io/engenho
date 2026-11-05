@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "3c9f82e892b553c38f76c0dbccefef497f3d51c929d41043621fc4c2a4216622",
+  "cargo_lock_sha256": "0c9c0d69ddcf360327723c00e5981d417b5d4656710de3d7a8360bb53bc9fb89",
   "manifest_sha256": {
     "Cargo.toml": "b7831c83652e430ff4cdbd564cd820492554e57af1d967a2c4872795b4a7a40f",
     "engenho-apiserver/Cargo.toml": "9067f6fa2bc2ae377fa39f17105775d0a8026c554d3fca62b7a1ceb850381307",
@@ -21,7 +21,7 @@
     "engenho-kube-client/Cargo.toml": "91708a8a8ec2457678a3dcb977c6145d09b82a0930e609381cce93af4a1c7b3e",
     "engenho-kube-codegen/Cargo.toml": "2fd91bb5b562a4adbd5f8298595155bcdbb51c52070e49b2efc47cc805a070ea",
     "engenho-kube-proto/Cargo.toml": "7545b21650bdbf36fa4b0592ee3659069a39555f10174f42142bf337b1f1c00b",
-    "engenho-kubelet/Cargo.toml": "3a1a936ceaac9ffa5f624927d05a4cf446de7cd4d334cea3222705a61791531c",
+    "engenho-kubelet/Cargo.toml": "10dc2a98dd1b6e0109666b0c8c0b324c146da4339a546f66e99cc2ab3dadc97b",
     "engenho-mcp/Cargo.toml": "a73d0471a92fe4eeb98d75f5ca945aeafcf56c6034e36f47d06bbf980ed9e369",
     "engenho-oracle/Cargo.toml": "9b0da2a6c1d469c28eb0617b8d71df0b0bf6db7751596956e0bb74a6ac979984",
     "engenho-revoada/Cargo.toml": "08cfd6e45e8acfb75f3073e3a70a9a11a9c33575c43509d0199b1e73bb8012f9",
@@ -8122,6 +8122,19 @@
             "package_key": "base64-0.22.1",
             "kind": "normal",
             "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "ed25519_dalek",
+            "package_key": "ed25519-dalek-2.2.0",
+            "kind": "normal",
+            "features": [
+              "pem",
+              "pkcs8"
+            ],
             "uses_default_features": true,
             "optional": false,
             "target": null,

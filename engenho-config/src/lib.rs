@@ -142,7 +142,7 @@ pub use networking::{DatapathMode, NetworkingConfig, ResolvedDatapath, parse_ipv
 pub use node_local::{ListenerAddrRejection, LoopbackAddr, NodeLocalListener};
 pub use revoada::{RevoadaConfig, TopologyConfig, TopologyStrategyKind};
 pub use runtime::{
-    ApiAudit, DEFAULT_NODE_MANIFESTS_DIR, HealthReasons, KubeconfigVisibility, KubeletAuth,
+    ApiAudit, ClosureLocalBuilds, DEFAULT_NODE_MANIFESTS_DIR, HealthReasons, KubeconfigVisibility, KubeletAuth,
     KubeletBackendKind, KubeletBackendRefusal, NativeCgroups, NativeSecurity, RuntimeConfig,
     SecretsAtRest,
 };

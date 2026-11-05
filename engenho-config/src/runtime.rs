@@ -186,6 +186,19 @@ pub enum NativeSecurity {
     Off,
 }
 
+/// Whether a closure built on this node stands with no signature.
+///
+/// `Trust` is the default: a local build has no signature to offer, and it runs
+/// with a warning. `Refuse` holds it to the signature any other path needs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(missing_docs)]
+pub enum ClosureLocalBuilds {
+    #[default]
+    Trust,
+    Refuse,
+}
+
 /// Whether a node's store encrypts Secrets at rest.
 ///
 /// `Encrypt` is the default: Secrets are written encrypted under a key the node
@@ -415,6 +428,16 @@ pub struct RuntimeConfig {
     #[allow(missing_docs)]
     #[serde(default)]
     pub native_security: NativeSecurity,
+    /// The mode of the closure check; absent follows `native_security`.
+    #[serde(default)]
+    pub closure_signatures: Option<NativeSecurity>,
+    /// The keys a closure's signature counts under, each `name:base64`; empty
+    /// trusts what the node's Nix store trusts.
+    #[serde(default)]
+    pub closure_trusted_keys: Vec<String>,
+    #[allow(missing_docs)]
+    #[serde(default)]
+    pub closure_local_builds: ClosureLocalBuilds,
     #[allow(missing_docs)]
     #[serde(default)]
     pub secrets_at_rest: SecretsAtRest,
@@ -490,6 +513,9 @@ impl TieredConfig for RuntimeConfig {
             kubelet_backend: KubeletBackendKind::Fake,
             native_cgroups: NativeCgroups::Off,
             native_security: NativeSecurity::Enforce,
+            closure_signatures: None,
+            closure_trusted_keys: Vec::new(),
+            closure_local_builds: ClosureLocalBuilds::Trust,
             secrets_at_rest: SecretsAtRest::Encrypt,
             kubelet_auth: KubeletAuth::Required,
             api_audit: ApiAudit::Record,
@@ -558,6 +584,9 @@ impl TieredConfig for RuntimeConfig {
             kubelet_backend: KubeletBackendKind::PodmanApi,
             native_cgroups: NativeCgroups::Delegated,
             native_security: NativeSecurity::Enforce,
+            closure_signatures: None,
+            closure_trusted_keys: Vec::new(),
+            closure_local_builds: ClosureLocalBuilds::Trust,
             secrets_at_rest: SecretsAtRest::Encrypt,
             kubelet_auth: KubeletAuth::Required,
             api_audit: ApiAudit::Record,
@@ -624,6 +653,9 @@ impl TieredConfig for RuntimeConfig {
             kubelet_backend: self.kubelet_backend,
             native_cgroups: self.native_cgroups,
             native_security: self.native_security,
+            closure_signatures: self.closure_signatures,
+            closure_trusted_keys: self.closure_trusted_keys.clone(),
+            closure_local_builds: self.closure_local_builds,
             secrets_at_rest: self.secrets_at_rest,
             kubelet_auth: self.kubelet_auth,
             api_audit: self.api_audit,
@@ -922,6 +954,9 @@ mod tests {
             kubelet_backend: KubeletBackendKind::Fake,
             native_cgroups: NativeCgroups::Off,
             native_security: NativeSecurity::Enforce,
+            closure_signatures: None,
+            closure_trusted_keys: Vec::new(),
+            closure_local_builds: ClosureLocalBuilds::Trust,
             secrets_at_rest: SecretsAtRest::Encrypt,
             kubelet_auth: KubeletAuth::Required,
             api_audit: ApiAudit::Record,
@@ -1424,6 +1459,35 @@ mod health_reasons_tests {
         }
         assert!(
             EngenhoConfig::from_yaml_with_defaults("runtime:\n  health_reasons: loud\n").is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod closure_trust_tests {
+    use super::{ClosureLocalBuilds, NativeSecurity};
+    use crate::EngenhoConfig;
+
+    #[test]
+    fn the_check_follows_native_security_and_trusts_the_store_by_default() {
+        let cfg = EngenhoConfig::from_yaml_with_defaults("{}").unwrap();
+        assert_eq!(cfg.runtime.closure_signatures, None);
+        assert!(cfg.runtime.closure_trusted_keys.is_empty());
+        assert_eq!(cfg.runtime.closure_local_builds, ClosureLocalBuilds::Trust);
+    }
+
+    #[test]
+    fn it_can_be_configured_off_alone_and_its_keys_declared() {
+        let cfg = EngenhoConfig::from_yaml_with_defaults(
+            "runtime:\n  closure_signatures: off\n  closure_trusted_keys: [\"k:1\"]\n  closure_local_builds: refuse\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.runtime.closure_signatures, Some(NativeSecurity::Off));
+        assert_eq!(cfg.runtime.closure_trusted_keys, ["k:1"]);
+        assert_eq!(cfg.runtime.closure_local_builds, ClosureLocalBuilds::Refuse);
+        assert!(
+            EngenhoConfig::from_yaml_with_defaults("runtime:\n  closure_local_builds: maybe\n")
+                .is_err()
         );
     }
 }

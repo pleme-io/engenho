@@ -62,6 +62,24 @@ A podman or CRI node puts `kakoi::enclose` in front of its runtime (`engenho-kub
 
 Only the refusal crosses. A pod that says nothing keeps the image's own user and the runtime's namespaces, and its `kakoi.pleme.io/access` narrowing is not rendered on a runtime yet. What a runtime applies by itself, such as `sysctls` or a `Localhost` profile, stays its own to judge; who may ask for root, a capability, `hostPID` or `hostIPC` is still kakoi's.
 
+## A closure is checked before it runs
+
+Before a native pod's first start the kubelet reads every path of each closure the pod names from the node's own store (`nix path-info --recursive --json`) and verifies each signature with ed25519 (`engenho-kubelet/src/closure_trust.rs`). `engenho-kubelet/blue/trust/trust.b` decides. The kubelet is the door, not admission, because a store is per node, a closure may be realised only at that moment, and a controller's write passes no admission. A pod already running is not checked again.
+
+| A path stands on | Under `enforce` |
+|---|---|
+| a signature that verifies under a trusted key | it runs |
+| a content address | it runs |
+| a build on this node (Nix's `ultimate`), with `runtime.closure_local_builds: trust`, the default | it runs, and a `ConfinementNotEnforced` event says how many paths |
+| nothing, a key this node does not trust, or a signature that does not verify | that pod is `Failed` with reason `ClosureUntrusted`, naming the path |
+| a store that cannot be read | that pod is `Failed` with reason `ClosureUntrusted`, naming why |
+
+`audit` runs it and names what `enforce` would refuse; `off` does not read the store. `runtime.closure_signatures` sets this check apart; absent, it follows `runtime.native_security`. `runtime.closure_trusted_keys` replaces the keys the node's Nix store trusts, for a node that wants fewer.
+
+Local builds are trusted by default because of what the house runs. Measured on plo 2026-11-04 across the five closures its manifests name, through this code: 306 paths, 92 verified under a trusted key, 212 built on plo, 2 content-addressed, 0 on nothing. Three of the five are local builds at the top, so requiring a signature would refuse the house's workloads. `closure_local_builds: refuse` is the setting for a node whose builds are all signed.
+
+It does not check an OCI image. `TameshiAttestationWebhook` has no caller and no registry producer: root 10 below.
+
 ## Modes
 
 `runtime.native_security`:
@@ -107,7 +125,7 @@ Read 2026-11-04 from engenho's source, against Kubernetes Pod Security Standards
 |---|---|---|
 | 2 | The fleet default in `nix/modules/pleme/nixos/engenho-node.nix` is `audit`, not `enforce` | each node brought across, then the default raised |
 | 4 | A pod with the network effect still shares the host's network: `hostNetwork` is true in effect, which fails even the Baseline standard, and `NetworkPolicy` is computed and never installed | a per-pod netns with nftables default deny, from `egress` and `listen` |
-| 10 | No image or closure verification at admission; tameshi's verifier has no caller | the admission rule, then Nix signature checks |
+| 10 | An OCI image a pod names is not verified; `TameshiAttestationWebhook` has no caller and no registry producer | a registry verifier behind `SignatureVerifier` |
 | 11 | Certificates run to 2100 with no rotation | a shorter span and rotation in `engenho-apiserver/src/pki.rs` |
 
 Policy still written in Rust that belongs in blue: the hostPath permit, mount classification, always-allowed API paths and RBAC, audit levels, token clamping, image reference extraction, webhook matching, NetworkPolicy translation and control tiers. A second standard bidama already loads in an embedded program; a second private package needs `EmbeddedOver`, which the pinned `blue-lang-host` 0.0.125 lacks. `shisei`, `bougyo`, `kyohi` and `kousei` hold shapes to reuse.

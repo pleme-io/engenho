@@ -39,6 +39,7 @@ http-body-util     = { workspace = true }
 # writing the materialized files. Same 0.22 line the apiserver + kube-client
 # already pin (single closure).
 base64             = "0.22"
+ed25519-dalek      = { workspace = true }
 libc               = "0.2"
 rustix             = { version = "1", features = ["fs", "param", "pty", "termios", "process", "system", "thread", "mount"] }
 # SPDY/3 header blocks are zlib with a preset dictionary. Pure Rust, already

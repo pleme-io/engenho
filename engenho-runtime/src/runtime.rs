@@ -4320,10 +4320,24 @@ fn build_kubelet(
         _ => Arc::new(engenho_kubelet::UnmanagedClosures),
     };
 
+    let kubelet = Kubelet::new(store.clone(), backend.clone(), boot.node_name.clone())
+        .with_event_sink(events)
+        .with_closure_store(closures);
+    let kubelet = match boot.kubelet_backend {
+        CfgBackendKind::Native => kubelet.with_closure_trust(Arc::new(
+            engenho_kubelet::closure_trust::ClosureTrust::new(
+                Arc::new(engenho_kubelet::closure_trust::NixStoreVerifier::discover(
+                    boot.closure_trusted_keys.clone(),
+                )),
+                boot.closure_signatures,
+                boot.closure_trusted_keys.clone(),
+                boot.closure_local_builds,
+            ),
+        )),
+        _ => kubelet,
+    };
     Arc::new(
-        Kubelet::new(store.clone(), backend.clone(), boot.node_name.clone())
-            .with_event_sink(events)
-            .with_closure_store(closures)
+        kubelet
             .with_sa_projector(sa_projector)
             .with_volume_materializer(csi_materializer)
             // Deny-all unless this node named prefixes. Load-bearing for the

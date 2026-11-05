@@ -302,6 +302,21 @@ in
         applies what a pod declares and records what `enforce` would refuse.
       '';
 
+      closureSignatures = optional (types.enum [ "enforce" "audit" "off" ]) ''
+        The mode of the check on the Nix closure a pod names. Absent follows
+        `nativeSecurity`.
+      '';
+
+      closureTrustedKeys = optional (types.listOf types.str) ''
+        The keys a closure's signature counts under, each `name:base64`. Empty
+        or absent trusts what the node's Nix store trusts.
+      '';
+
+      closureLocalBuilds = optional (types.enum [ "trust" "refuse" ]) ''
+        Whether a closure built on this node stands with no signature. `trust`,
+        engenho's default, runs it with a warning.
+      '';
+
       secretsAtRest = optional (types.enum [ "encrypt" "off" ]) ''
         Whether this node's store encrypts Secrets at rest. `encrypt`, engenho's
         default: Secrets, in the state machine, the log and snapshots, are
@@ -624,6 +639,9 @@ in
         kubelet_backend = cfg.runtime.kubeletBackend;
         native_cgroups = cfg.runtime.nativeCgroups;
         native_security = cfg.runtime.nativeSecurity;
+        closure_signatures = cfg.runtime.closureSignatures;
+        closure_trusted_keys = cfg.runtime.closureTrustedKeys;
+        closure_local_builds = cfg.runtime.closureLocalBuilds;
         secrets_at_rest = cfg.runtime.secretsAtRest;
         kubelet_auth = cfg.runtime.kubeletAuth;
         api_audit = cfg.runtime.apiAudit;

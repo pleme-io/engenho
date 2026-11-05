@@ -23,6 +23,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -49,6 +50,38 @@ engenho_substrate::impl_error_kind! {
     }
 }
 
+/// What a store says about one path of what an image names.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PathAttestation {
+    /// The path.
+    pub path: String,
+    /// Built on this node, so it has no signature to offer.
+    pub ultimate: bool,
+    /// Its address is a hash of its content, so it proves itself.
+    pub content_addressed: bool,
+    /// The key names its signatures claim.
+    pub claimed: Vec<String>,
+    /// Each known key, `name:base64`, one of its signatures verifies under.
+    pub verified_by: Vec<String>,
+}
+
+/// What a verifier found for one image.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Attestation {
+    /// The keys the store itself trusts, `name:base64`.
+    pub store_keys: Vec<String>,
+    /// Every path the image needs.
+    pub paths: Vec<PathAttestation>,
+}
+
+impl Attestation {
+    /// Whether every path has a signature that verifies.
+    #[must_use]
+    pub fn all_verified(&self) -> bool {
+        !self.paths.is_empty() && self.paths.iter().all(|p| !p.verified_by.is_empty())
+    }
+}
+
 /// Pluggable signature verifier — checks an image / artifact
 /// reference has a valid signature against the verifier's trust
 /// store.
@@ -57,14 +90,23 @@ pub trait SignatureVerifier: Send + Sync {
     /// Verifier identifier for telemetry.
     fn name(&self) -> &'static str;
 
+    /// The signature facts of `image_ref`. They are facts, not a verdict: the
+    /// caller decides what they mean.
+    ///
+    /// # Errors
+    /// [`VerifierError::Backend`] on backend failure;
+    /// [`VerifierError::InvalidRef`] on malformed input.
+    async fn attest(&self, image_ref: &str) -> Result<Attestation, VerifierError>;
+
     /// True if `image_ref` is verifiably signed. False if explicitly
     /// unsigned. Returns Err for backend failures the caller
     /// decides how to interpret.
     ///
     /// # Errors
-    /// [`VerifierError::Backend`] on backend failure;
-    /// [`VerifierError::InvalidRef`] on malformed input.
-    async fn verify(&self, image_ref: &str) -> Result<bool, VerifierError>;
+    /// As [`Self::attest`].
+    async fn verify(&self, image_ref: &str) -> Result<bool, VerifierError> {
+        Ok(self.attest(image_ref).await?.all_verified())
+    }
 }
 
 // =================================================================
@@ -114,7 +156,7 @@ impl SignatureVerifier for FakeSignatureVerifier {
         "fake"
     }
 
-    async fn verify(&self, image_ref: &str) -> Result<bool, VerifierError> {
+    async fn attest(&self, image_ref: &str) -> Result<Attestation, VerifierError> {
         let mut state = self.inner.lock().await;
         state.calls.push(image_ref.to_string());
         if let Some(msg) = state.fail_with.take() {
@@ -123,7 +165,19 @@ impl SignatureVerifier for FakeSignatureVerifier {
         if image_ref.is_empty() {
             return Err(VerifierError::InvalidRef("empty".into()));
         }
-        Ok(state.signed.contains(image_ref))
+        let verified_by = if state.signed.contains(image_ref) {
+            vec!["fake:key".to_string()]
+        } else {
+            Vec::new()
+        };
+        Ok(Attestation {
+            store_keys: vec!["fake:key".to_string()],
+            paths: vec![PathAttestation {
+                path: image_ref.to_string(),
+                verified_by,
+                ..PathAttestation::default()
+            }],
+        })
     }
 }
 
@@ -433,6 +487,21 @@ mod tests {
         };
         let r = w.review(&req).await.unwrap();
         assert!(matches!(r, AdmissionDecision::Deny(reason) if reason.contains("bad:1")));
+    }
+
+    #[test]
+    fn an_attestation_is_verified_only_when_every_path_is_and_there_is_one() {
+        let path = |key: &[&str]| PathAttestation {
+            verified_by: key.iter().map(ToString::to_string).collect(),
+            ..PathAttestation::default()
+        };
+        let of = |paths| Attestation {
+            store_keys: Vec::new(),
+            paths,
+        };
+        assert!(!of(vec![]).all_verified());
+        assert!(of(vec![path(&["k"])]).all_verified());
+        assert!(!of(vec![path(&["k"]), path(&[])]).all_verified());
     }
 
     #[test]

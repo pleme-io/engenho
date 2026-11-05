@@ -55,6 +55,30 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// Find a Nix tool on this host: the variable `env`, then the system and
+/// default profiles (a daemon's `PATH` often has neither), then `PATH`.
+#[must_use]
+pub fn find_nix_tool(env: &str, tool: &str) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(p) = std::env::var_os(env) {
+        candidates.push(PathBuf::from(p));
+    }
+    candidates.push(Path::new("/run/current-system/sw/bin").join(tool));
+    candidates.push(Path::new("/nix/var/nix/profiles/default/bin").join(tool));
+    if let Some(user) = std::env::var_os("USER") {
+        candidates.push(
+            Path::new("/etc/profiles/per-user")
+                .join(user)
+                .join("bin")
+                .join(tool),
+        );
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        candidates.extend(std::env::split_paths(&path).map(|d| d.join(tool)));
+    }
+    candidates.into_iter().find(|p| p.is_file())
+}
+
 /// The name of one GC root: `<pod-uid>.<container>`, filesystem-safe.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RootName(String);
@@ -198,25 +222,7 @@ impl NixClosureStore {
     /// then `PATH`. `None` when there is none.
     #[must_use]
     pub fn discover(root_dir: impl Into<PathBuf>) -> Option<Self> {
-        let mut candidates: Vec<PathBuf> = Vec::new();
-        if let Some(p) = std::env::var_os("ENGENHO_NIX_STORE_BIN") {
-            candidates.push(PathBuf::from(p));
-        }
-        candidates.push(PathBuf::from("/run/current-system/sw/bin/nix-store"));
-        candidates.push(PathBuf::from("/nix/var/nix/profiles/default/bin/nix-store"));
-        if let Some(user) = std::env::var_os("USER") {
-            let mut p = PathBuf::from("/etc/profiles/per-user");
-            p.push(user);
-            p.push("bin/nix-store");
-            candidates.push(p);
-        }
-        if let Some(path) = std::env::var_os("PATH") {
-            candidates.extend(std::env::split_paths(&path).map(|d| d.join("nix-store")));
-        }
-        candidates
-            .into_iter()
-            .find(|p| p.is_file())
-            .map(|bin| Self::new(root_dir, bin))
+        find_nix_tool("ENGENHO_NIX_STORE_BIN", "nix-store").map(|bin| Self::new(root_dir, bin))
     }
 
     /// Where the roots live.

@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use engenho_config::{
-    ApiAudit, ClusterConfig, ConsistencyConfig, ConsistencyTierKind, ControllerEnable,
+    ApiAudit, ClosureLocalBuilds, ClusterConfig, ConsistencyConfig, ConsistencyTierKind, ControllerEnable,
     ControllersConfig, DatapathMode, EngenhoConfig, Fabric, HealthReasons, KubeconfigVisibility,
     KubeletAuth, KubeletBackendKind, LegacyTeiaSection, NativeCgroups, NativeSecurity,
     NetworkingConfig, RevoadaConfig, RuntimeConfig, SchedulerConfig, SecretsAtRest, SharedCluster,
@@ -77,6 +77,9 @@ pub(crate) struct BootConfig {
     pub(crate) kubelet_backend: KubeletBackendKind,
     pub(crate) native_cgroups: NativeCgroups,
     pub(crate) native_security: NativeSecurity,
+    pub(crate) closure_signatures: NativeSecurity,
+    pub(crate) closure_trusted_keys: Vec<String>,
+    pub(crate) closure_local_builds: ClosureLocalBuilds,
     pub(crate) secrets_at_rest: SecretsAtRest,
     pub(crate) kubelet_auth: KubeletAuth,
     pub(crate) api_audit: ApiAudit,
@@ -187,6 +190,9 @@ impl BootConfig {
             kubelet_backend,
             native_cgroups,
             native_security,
+            closure_signatures,
+            closure_trusted_keys,
+            closure_local_builds,
             secrets_at_rest,
             kubelet_auth,
             api_audit,
@@ -216,6 +222,9 @@ impl BootConfig {
             kubelet_backend: *kubelet_backend,
             native_cgroups: *native_cgroups,
             native_security: *native_security,
+            closure_signatures: closure_signatures.unwrap_or(*native_security),
+            closure_trusted_keys: closure_trusted_keys.clone(),
+            closure_local_builds: *closure_local_builds,
             secrets_at_rest: *secrets_at_rest,
             kubelet_auth: *kubelet_auth,
             api_audit: *api_audit,
