@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "bluefile_b3": "b3:cf54fc938d2323f3b4aebb37eb1131c664ceb3b3ec55ade5305133449aa89b5b",
+  "manifest": {
+    "schema": 1,
+    "name": "pki",
+    "version": "0.1.0",
+    "needs": {},
+    "when": "anytime",
+    "sources": {},
+    "packages": [],
+    "runs": {},
+    "tools": [],
+    "checks": {},
+    "apps": {},
+    "catalog": null
+  },
+  "sources": {}
+}

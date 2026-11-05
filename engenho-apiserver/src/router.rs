@@ -153,6 +153,8 @@ pub struct RouterState {
     /// `None` ⇒ nothing is recorded. The runtime installs one unless
     /// `runtime.api_audit` says `off`.
     pub audit_log: Option<Arc<crate::audit::AuditLog>>,
+    /// What became of leaf certificate renewals, when this node renews.
+    pub cert_renewals: Option<Arc<crate::pki_rotation::RenewalCounts>>,
     pub api_face: engenho_types::ApiFace,
 }
 
@@ -186,6 +188,7 @@ impl RouterState {
             health_reasons: crate::health::FailureReasons::default(),
             metrics_source: None,
             audit_log: None,
+            cert_renewals: None,
             api_face: engenho_types::ApiFace::VENDORED,
         }
     }
@@ -273,6 +276,13 @@ impl RouterState {
 
     /// Install the API audit log. Builder style, before any clone of this
     /// state, because [`build`] reads it once.
+    #[must_use]
+    pub fn with_cert_renewals(mut self, counts: Arc<crate::pki_rotation::RenewalCounts>) -> Self {
+        self.cert_renewals = Some(counts);
+        self
+    }
+
+    /// Serve this node's API audit log.
     #[must_use]
     pub fn with_audit_log(mut self, log: Arc<crate::audit::AuditLog>) -> Self {
         self.audit_log = Some(log);

@@ -122,6 +122,7 @@ engenho_controllers::closed_enum! {
         CsiRegistrar,
         CniStatus,
         NodeManifests,
+        CertRenewal,
         NodeLifecycle,
         Kubelet,
         HorizontalPodAutoscaler,
@@ -187,6 +188,7 @@ impl Driver {
             | Self::CsiRegistrar
             | Self::CniStatus
             | Self::NodeManifests
+            | Self::CertRenewal
             | Self::Kubelet => Placement::EveryNode,
         }
     }
@@ -218,6 +220,7 @@ impl Driver {
             Self::CsiRegistrar => "csi-registrar",
             Self::CniStatus => "cni-status",
             Self::NodeManifests => "node-manifests",
+            Self::CertRenewal => "cert-renewal",
             Self::NodeLifecycle => "node-lifecycle",
             Self::Kubelet => "kubelet",
             Self::HorizontalPodAutoscaler => "hpa",
@@ -245,7 +248,9 @@ impl Driver {
             | Self::CniStatus
             | Self::NodeLifecycle
             // Its only memory is a skip cache; losing it costs one full pass.
-            | Self::NodeManifests => TickState::Stateless,
+            | Self::NodeManifests
+            // What it holds lives in the renewer, which a respawn keeps.
+            | Self::CertRenewal => TickState::Stateless,
             // The `local` pod map lives across ticks.
             Self::Kubelet
             // The registered-handler map (a std Mutex) drives
@@ -294,6 +299,7 @@ impl Driver {
             | Self::CsiRegistrar
             | Self::CniStatus
             | Self::NodeManifests
+            | Self::CertRenewal
             | Self::NodeLifecycle
             | Self::Kubelet => None,
         }
@@ -610,6 +616,7 @@ impl Child {
                 | Driver::ServedCapability
                 | Driver::CniStatus
                 | Driver::NodeManifests
+                | Driver::CertRenewal
                 | Driver::NodeLifecycle
                 | Driver::Scheduler
                 | Driver::NetworkPolicy

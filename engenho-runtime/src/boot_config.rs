@@ -29,11 +29,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use engenho_config::{
-    ApiAudit, ClosureLocalBuilds, ClusterConfig, ConsistencyConfig, ConsistencyTierKind, ControllerEnable,
-    ControllersConfig, DatapathMode, EngenhoConfig, Fabric, HealthReasons, KubeconfigVisibility,
-    KubeletAuth, KubeletBackendKind, LegacyTeiaSection, NativeCgroups, NativeSecurity,
-    NetworkingConfig, RevoadaConfig, RuntimeConfig, SchedulerConfig, SecretsAtRest, SharedCluster,
-    TlsConfig, TopologyConfig, TopologyStrategyKind,
+    ApiAudit, CertRotation, ClosureLocalBuilds, ClusterConfig, ConsistencyConfig,
+    ConsistencyTierKind, ControllerEnable, ControllersConfig, DatapathMode, EngenhoConfig, Fabric,
+    HealthReasons, KubeconfigVisibility, KubeletAuth, KubeletBackendKind, LegacyTeiaSection,
+    NativeCgroups, NativeSecurity, NetworkingConfig, RevoadaConfig, RuntimeConfig, SchedulerConfig,
+    SecretsAtRest, SharedCluster, TlsConfig, TopologyConfig, TopologyStrategyKind,
 };
 
 use crate::health::Windows;
@@ -83,6 +83,7 @@ pub(crate) struct BootConfig {
     pub(crate) secrets_at_rest: SecretsAtRest,
     pub(crate) kubelet_auth: KubeletAuth,
     pub(crate) api_audit: ApiAudit,
+    pub(crate) cert_rotation: CertRotation,
     pub(crate) health_reasons: HealthReasons,
     /// `runtime.podman_binary`, read with `kubelet_backend`.
     pub(crate) podman_binary: Option<String>,
@@ -196,6 +197,7 @@ impl BootConfig {
             secrets_at_rest,
             kubelet_auth,
             api_audit,
+            cert_rotation,
             health_reasons,
             podman_binary,
             host_path_allowlist,
@@ -228,6 +230,7 @@ impl BootConfig {
             secrets_at_rest: *secrets_at_rest,
             kubelet_auth: *kubelet_auth,
             api_audit: *api_audit,
+            cert_rotation: *cert_rotation,
             health_reasons: *health_reasons,
             podman_binary: podman_binary.clone(),
             host_path_allowlist: host_path_allowlist.clone(),

@@ -50,6 +50,7 @@ pub mod params;
 pub mod pki;
 pub mod pki_files;
 pub mod pki_inventory;
+pub mod pki_rotation;
 pub mod pod_logs;
 pub mod pod_stream;
 pub mod printer;
@@ -101,7 +102,8 @@ pub use params::{
 };
 pub use pki::{
     ClientMaterial, ClusterCa, PkiError, SanEntry, SanParseError, ServerSanInputs, TlsMaterial,
-    VerifiedClientCert, client_verifier, issue_admin_client_material, issue_server_material,
+    VerifiedClientCert, client_verifier, issue_admin_client_material,
+    issue_admin_client_material_leased, issue_server_material, issue_server_material_leased,
     load_or_generate_ca, load_shared_ca, parse_client_cert,
 };
 pub use pki_files::PkiFile;

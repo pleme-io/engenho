@@ -1029,6 +1029,7 @@ components:
         - csi_registrar
         - cni_status
         - node_manifests
+        - cert_renewal
         - node_lifecycle
         - kubelet
         - horizontal_pod_autoscaler
@@ -1057,6 +1058,7 @@ components:
         - csi_registrar
         - cni_status
         - node_manifests
+        - cert_renewal
         - node_lifecycle
         - kubelet
         - horizontal_pod_autoscaler

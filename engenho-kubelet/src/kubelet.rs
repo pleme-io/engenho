@@ -1000,10 +1000,7 @@ impl Kubelet {
 
     /// Builder: the check on a closure before its pod's first start.
     #[must_use]
-    pub fn with_closure_trust(
-        mut self,
-        trust: Arc<crate::closure_trust::ClosureTrust>,
-    ) -> Self {
+    pub fn with_closure_trust(mut self, trust: Arc<crate::closure_trust::ClosureTrust>) -> Self {
         self.closure_trust = Some(trust);
         self
     }

@@ -281,15 +281,19 @@ fn build_server_config(material: &TlsMaterial) -> Result<rustls::ServerConfig, S
     };
 
     let builder = rustls::ServerConfig::builder();
-    let mut config = match &material.client_verifier {
+    let builder = match &material.client_verifier {
         // OPTIONAL mTLS — requests a client cert, verifies against the CA,
         // allow_unauthenticated keeps no-cert clients connecting.
         Some(verifier) => builder.with_client_cert_verifier(verifier.clone()),
         // No client auth (the pre-authn floor).
         None => builder.with_no_client_auth(),
-    }
-    .with_single_cert(cert_chain, key)
-    .map_err(|e| ServerError::Tls(std::io::Error::other(format!("with_single_cert: {e}"))))?;
+    };
+    let mut config = match &material.live_cert {
+        Some(live) => builder.with_cert_resolver(live.clone()),
+        None => builder.with_single_cert(cert_chain, key).map_err(|e| {
+            ServerError::Tls(std::io::Error::other(format!("with_single_cert: {e}")))
+        })?,
+    };
 
     // Same ALPN as `RustlsConfig::from_pem` so HTTP/2 + HTTP/1.1 both work.
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];

@@ -186,6 +186,19 @@ pub enum NativeSecurity {
     Off,
 }
 
+/// Whether a node renews its leaf certificates.
+///
+/// `Renew` is the default: each leaf has a bounded span and is renewed while
+/// the node serves. `Off` issues leaves valid to 2100 and never renews them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(missing_docs)]
+pub enum CertRotation {
+    #[default]
+    Renew,
+    Off,
+}
+
 /// Whether a closure built on this node stands with no signature.
 ///
 /// `Trust` is the default: a local build has no signature to offer, and it runs
@@ -449,6 +462,9 @@ pub struct RuntimeConfig {
     pub api_audit: ApiAudit,
     #[allow(missing_docs)]
     #[serde(default)]
+    pub cert_rotation: CertRotation,
+    #[allow(missing_docs)]
+    #[serde(default)]
     pub health_reasons: HealthReasons,
     /// Optional explicit podman binary path.
     ///
@@ -519,6 +535,7 @@ impl TieredConfig for RuntimeConfig {
             secrets_at_rest: SecretsAtRest::Encrypt,
             kubelet_auth: KubeletAuth::Required,
             api_audit: ApiAudit::Record,
+            cert_rotation: CertRotation::Renew,
             health_reasons: HealthReasons::Withheld,
             podman_binary: None,
             host_path_allowlist: Vec::new(),
@@ -590,6 +607,7 @@ impl TieredConfig for RuntimeConfig {
             secrets_at_rest: SecretsAtRest::Encrypt,
             kubelet_auth: KubeletAuth::Required,
             api_audit: ApiAudit::Record,
+            cert_rotation: CertRotation::Renew,
             health_reasons: HealthReasons::Named,
             podman_binary: None,
             host_path_allowlist: Vec::new(),
@@ -659,6 +677,7 @@ impl TieredConfig for RuntimeConfig {
             secrets_at_rest: self.secrets_at_rest,
             kubelet_auth: self.kubelet_auth,
             api_audit: self.api_audit,
+            cert_rotation: self.cert_rotation,
             health_reasons: self.health_reasons,
             // No "unset" sentinel on an enum whose safe arm is also a
             // meaningful value, so the overlay's value wins — same rule as
@@ -960,6 +979,7 @@ mod tests {
             secrets_at_rest: SecretsAtRest::Encrypt,
             kubelet_auth: KubeletAuth::Required,
             api_audit: ApiAudit::Record,
+            cert_rotation: CertRotation::Renew,
             health_reasons: HealthReasons::Withheld,
             podman_binary: None,
             host_path_allowlist: Vec::new(),
@@ -1489,5 +1509,21 @@ mod closure_trust_tests {
             EngenhoConfig::from_yaml_with_defaults("runtime:\n  closure_local_builds: maybe\n")
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod cert_rotation_tests {
+    use super::CertRotation;
+    use crate::EngenhoConfig;
+
+    #[test]
+    fn it_renews_by_default_and_can_be_configured_off() {
+        let cfg = EngenhoConfig::from_yaml_with_defaults("{}").unwrap();
+        assert_eq!(cfg.runtime.cert_rotation, CertRotation::Renew);
+        let cfg =
+            EngenhoConfig::from_yaml_with_defaults("runtime:\n  cert_rotation: off\n").unwrap();
+        assert_eq!(cfg.runtime.cert_rotation, CertRotation::Off);
+        assert!(EngenhoConfig::from_yaml_with_defaults("runtime:\n  cert_rotation: x\n").is_err());
     }
 }

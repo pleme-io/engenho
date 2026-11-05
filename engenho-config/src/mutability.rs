@@ -279,6 +279,7 @@ fn build() -> Vec<LeafSpec> {
         secrets_at_rest => restart,
         kubelet_auth => restart,
         api_audit => restart,
+        cert_rotation => restart,
         health_reasons => restart,
         podman_binary => restart,
         host_path_allowlist => restart,

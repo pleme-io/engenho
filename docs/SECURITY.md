@@ -62,6 +62,21 @@ A podman or CRI node puts `kakoi::enclose` in front of its runtime (`engenho-kub
 
 Only the refusal crosses. A pod that says nothing keeps the image's own user and the runtime's namespaces, and its `kakoi.pleme.io/access` narrowing is not rendered on a runtime yet. What a runtime applies by itself, such as `sysctls` or a `Localhost` profile, stays its own to judge; who may ask for root, a capability, `hostPID` or `hostIPC` is still kakoi's.
 
+## Certificates renew themselves
+
+`engenho-apiserver/blue/pki/pki.b` names each leaf's lease. The server leaf lasts 90 days and renews every 30; the admin client leaf lasts a year and renews every 90. A leaf belongs to the period the clock is in, so a restart within one period issues the same bytes. The `cert-renewal` driver asks on every node, swaps the server leaf under the live listener with no restart (`engenho-apiserver/src/pki_rotation.rs`), and rewrites `pki/admin.crt`, `pki/admin.key` and each published kubeconfig in place.
+
+A failure keeps the leaf already held, warns and counts in `engenho_cert_renewals_total{result}`, and the next tick tries again. A lease that cannot be read at boot issues a leaf valid to 2100 rather than stopping the API. `runtime.cert_rotation: off` issues leaves valid to 2100 and never renews.
+
+The CA stays, to 2100, and an existing data directory is read as it is: its first boot issues bounded leaves from the same CA and key.
+
+| A client | Sees |
+|---|---|
+| holding a published kubeconfig at its path | the file rewritten with a new client leaf; nothing to do |
+| pinning the CA only | a new serial and dates on the same key; nothing to do |
+| holding a kubeconfig copied before this change | a client leaf valid to 2100 that keeps authenticating, since nothing revokes it; only a reseed of the CA retires it |
+| holding a kubeconfig copied after this change | a client leaf with at most a year to run, and at least 275 days from the renewal that wrote it; copy it again before then, or a handshake fails as expired |
+
 ## A closure is checked before it runs
 
 Before a native pod's first start the kubelet reads every path of each closure the pod names from the node's own store (`nix path-info --recursive --json`) and verifies each signature with ed25519 (`engenho-kubelet/src/closure_trust.rs`). `engenho-kubelet/blue/trust/trust.b` decides. The kubelet is the door, not admission, because a store is per node, a closure may be realised only at that moment, and a controller's write passes no admission. A pod already running is not checked again.
@@ -126,7 +141,7 @@ Read 2026-11-04 from engenho's source, against Kubernetes Pod Security Standards
 | 2 | The fleet default in `nix/modules/pleme/nixos/engenho-node.nix` is `audit`, not `enforce` | each node brought across, then the default raised |
 | 4 | A pod with the network effect still shares the host's network: `hostNetwork` is true in effect, which fails even the Baseline standard, and `NetworkPolicy` is computed and never installed | a per-pod netns with nftables default deny, from `egress` and `listen` |
 | 10 | An OCI image a pod names is not verified; `TameshiAttestationWebhook` has no caller and no registry producer | a registry verifier behind `SignatureVerifier` |
-| 11 | Certificates run to 2100 with no rotation | a shorter span and rotation in `engenho-apiserver/src/pki.rs` |
+| 11 | The CA runs to 2100, and a client leaf copied before rotation stays valid with nothing to revoke it | CA rollover and a revocation list |
 
 Policy still written in Rust that belongs in blue: the hostPath permit, mount classification, always-allowed API paths and RBAC, audit levels, token clamping, image reference extraction, webhook matching, NetworkPolicy translation and control tiers. A second standard bidama already loads in an embedded program; a second private package needs `EmbeddedOver`, which the pinned `blue-lang-host` 0.0.125 lacks. `shisei`, `bougyo`, `kyohi` and `kousei` hold shapes to reuse.
 

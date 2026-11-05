@@ -40,6 +40,7 @@
 //! | `engenho_controller_last_tick_timestamp_seconds{controller}` | the [`MetricsSource`] |
 //! | `engenho_would_reject_total{gate,reason}` | the rollout-gate ledger |
 //! | `engenho_audit_events_total{result}` | the [`crate::audit::AuditLog`], when one is on |
+//! | `engenho_cert_renewals_total{result}` | the [`crate::pki_rotation::CertRenewer`], when one is on |
 //!
 //! ★ NAMES ARE UPSTREAM'S WHERE UPSTREAM HAS ONE. `etcd_object_counts` is
 //! the name kube-apiserver published this gauge under, and
@@ -444,6 +445,9 @@ pub async fn render_state(state: &crate::router::RouterState) -> String {
     families.push(would_reject_family(&state.would_reject.snapshot()));
     if let Some(log) = &state.audit_log {
         families.push(audit_family(log.counts()));
+    }
+    if let Some(counts) = &state.cert_renewals {
+        families.push(crate::pki_rotation::renewals_family(counts));
     }
     render(&families)
 }

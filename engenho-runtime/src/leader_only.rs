@@ -221,6 +221,7 @@ mod tests {
             Driver::CniStatus,
             Driver::CsiRegistrar,
             Driver::NodeManifests,
+            Driver::CertRenewal,
             Driver::NetworkPolicy,
         ] {
             assert_eq!(driver.placement(), Placement::EveryNode, "{driver:?}");

@@ -236,6 +236,9 @@ async fn full_scrape() -> String {
     let audit_dir = tempfile::tempdir().expect("tempdir");
     let state = RouterState::new(vec![])
         .with_metrics_source(Arc::new(FixedMetrics(snapshot)))
+        .with_cert_renewals(Arc::new(
+            engenho_apiserver::pki_rotation::RenewalCounts::default(),
+        ))
         .with_audit_log(Arc::new(engenho_apiserver::audit::AuditLog::open(
             audit_dir.path().join("audit"),
             engenho_apiserver::audit::AuditLimits::default(),

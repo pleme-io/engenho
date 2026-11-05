@@ -331,6 +331,13 @@ in
         share the host's loopback, so a bind alone protects nothing.
       '';
 
+      certRotation = optional (types.enum [ "renew" "off" ]) ''
+        Whether this node renews its leaf certificates while it serves. `renew`,
+        engenho's default: the server leaf lasts 90 days and the admin client
+        leaf a year, each renewed well before it ends, and the CA is kept. `off`
+        issues leaves valid to 2100.
+      '';
+
       apiAudit = optional (types.enum [ "record" "off" ]) ''
         Whether the apiserver records who did what. `record`, engenho's default:
         JSON lines of `audit.k8s.io/v1` Events under `dataDir/audit`, mode 0600,
@@ -645,6 +652,7 @@ in
         secrets_at_rest = cfg.runtime.secretsAtRest;
         kubelet_auth = cfg.runtime.kubeletAuth;
         api_audit = cfg.runtime.apiAudit;
+        cert_rotation = cfg.runtime.certRotation;
         health_reasons = cfg.runtime.healthReasons;
         host_path_allowlist = cfg.runtime.hostPathAllowlist;
         node_manifests_dir = cfg.runtime.nodeManifestsDir;

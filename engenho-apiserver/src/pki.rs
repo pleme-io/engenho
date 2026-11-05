@@ -46,6 +46,7 @@ use rustls::server::WebPkiClientVerifier;
 use rustls::server::danger::ClientCertVerifier;
 
 use crate::pki_files::PkiFile;
+use crate::pki_rotation::{Lease, LiveCert};
 
 /// Everything that can go wrong building or loading the cluster PKI.
 #[derive(Debug, thiserror::Error)]
@@ -93,6 +94,10 @@ pub enum PkiError {
     /// it silently on exactly the machines where entropy is scarce.
     #[error("could not obtain entropy for the cluster PKI seed: {0}")]
     Entropy(String),
+
+    /// A lease or a leaf's material did not read.
+    #[error("certificate renewal: {0}")]
+    Renewal(String),
 }
 
 engenho_substrate::impl_error_kind! {
@@ -103,6 +108,7 @@ engenho_substrate::impl_error_kind! {
         (Entropy(_)) => "entropy",
         (ClientVerifier(_)) => "client_verifier",
         (DeterministicKey(_)) => "deterministic_key",
+        (Renewal(_)) => "renewal",
     }
 }
 
@@ -242,16 +248,6 @@ fn cluster_keypair(ctx: &str, cluster_seed: &[u8; CLUSTER_SEED_LEN]) -> Result<K
     Ok(KeyPair::try_from(&pkcs8)?)
 }
 
-/// ~10-year CA validity in days. The CA is the long-lived root that an
-/// operator's kubeconfig pins; a decade keeps it from silently expiring
-/// under a local single-node engenho.
-const CA_VALIDITY_DAYS: i64 = 3650;
-/// Server-cert validity. Re-issued every boot, so a year is generous.
-const SERVER_VALIDITY_DAYS: i64 = 365;
-/// Admin CLIENT-cert validity. Re-issued each boot (cheap) but persisted so
-/// the operator's kubeconfig stays stable; matches the server-cert horizon.
-const CLIENT_VALIDITY_DAYS: i64 = 365;
-
 /// The CA the cluster signs server certs with. Holds the parsed params
 /// (DN + key-usages, needed to act as an issuer) + the keypair (the
 /// signing material) + the canonical `ca.crt` PEM bytes (exactly what a
@@ -331,6 +327,9 @@ pub struct TlsMaterial {
     /// with no client auth (`with_no_client_auth`) — the pre-authn behavior,
     /// kept for the plaintext-floor + tests that don't exercise mTLS.
     pub client_verifier: Option<std::sync::Arc<dyn ClientCertVerifier>>,
+    /// The leaf the listener presents, when it can be swapped under it. With
+    /// `None` the listener holds this material's leaf for its whole life.
+    pub live_cert: Option<std::sync::Arc<LiveCert>>,
 }
 
 /// The admin CLIENT-cert material: a leaf cert + private key PEM the
@@ -552,7 +551,7 @@ fn generate_and_persist_ca(
     params
         .distinguished_name
         .push(DnType::CommonName, "engenho-ca");
-    set_validity(&mut params, CA_VALIDITY_DAYS);
+    set_validity(&mut params, &Lease::standing(1))?;
     // Fixed serial (rcgen randomizes by default) — the last randomness source
     // after the key + validity, so the CA cert is fully deterministic.
     params.serial_number = Some(SerialNumber::from(1u64));
@@ -589,6 +588,20 @@ pub fn issue_server_material(
     ca: &ClusterCa,
     san: &ServerSanInputs<'_>,
 ) -> Result<TlsMaterial, PkiError> {
+    issue_server_material_leased(ca, san, &Lease::standing(2))
+}
+
+/// [`issue_server_material`], for the span `lease` names.
+///
+/// # Errors
+///
+/// As [`issue_server_material`]; [`PkiError::Renewal`] for a lease that does
+/// not read as a time.
+pub fn issue_server_material_leased(
+    ca: &ClusterCa,
+    san: &ServerSanInputs<'_>,
+    lease: &Lease,
+) -> Result<TlsMaterial, PkiError> {
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::NoCa;
     params.distinguished_name = DistinguishedName::new();
@@ -600,10 +613,10 @@ pub fn issue_server_material(
         KeyUsagePurpose::KeyEncipherment,
     ];
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    set_validity(&mut params, SERVER_VALIDITY_DAYS);
+    set_validity(&mut params, lease)?;
     params.subject_alt_names = build_sans(san)?;
     let sans = params.subject_alt_names.iter().map(render_san).collect();
-    params.serial_number = Some(SerialNumber::from(2u64));
+    params.serial_number = Some(SerialNumber::from(lease.serial));
 
     let leaf_key = cluster_keypair(CTX_SERVER, &ca.cluster_seed)?;
     let issuer = ca.issuer()?;
@@ -623,6 +636,7 @@ pub fn issue_server_material(
         // No client verifier by default — the runtime attaches the OPTIONAL
         // verifier via [`TlsMaterial::with_client_verifier`] when it wants mTLS.
         client_verifier: None,
+        live_cert: None,
     })
 }
 
@@ -636,6 +650,13 @@ impl TlsMaterial {
         verifier: std::sync::Arc<dyn ClientCertVerifier>,
     ) -> Self {
         self.client_verifier = Some(verifier);
+        self
+    }
+
+    /// Present `live` instead of this material's own leaf (builder style).
+    #[must_use]
+    pub fn with_live_cert(mut self, live: std::sync::Arc<LiveCert>) -> Self {
+        self.live_cert = Some(live);
         self
     }
 }
@@ -655,6 +676,19 @@ impl TlsMaterial {
 ///
 /// [`PkiError::Crypto`] if rcgen can't generate / sign the client leaf.
 pub fn issue_admin_client_material(ca: &ClusterCa) -> Result<ClientMaterial, PkiError> {
+    issue_admin_client_material_leased(ca, &Lease::standing(3))
+}
+
+/// [`issue_admin_client_material`], for the span `lease` names.
+///
+/// # Errors
+///
+/// As [`issue_admin_client_material`]; [`PkiError::Renewal`] for a lease that
+/// does not read as a time.
+pub fn issue_admin_client_material_leased(
+    ca: &ClusterCa,
+    lease: &Lease,
+) -> Result<ClientMaterial, PkiError> {
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::NoCa;
     params.distinguished_name = DistinguishedName::new();
@@ -671,9 +705,9 @@ pub fn issue_admin_client_material(ca: &ClusterCa) -> Result<ClientMaterial, Pki
     ];
     // clientAuth (NOT serverAuth) — this cert authenticates a CLIENT.
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
-    set_validity(&mut params, CLIENT_VALIDITY_DAYS);
+    set_validity(&mut params, lease)?;
     // No SANs: a client cert is identified by its Subject, not a SAN.
-    params.serial_number = Some(SerialNumber::from(3u64));
+    params.serial_number = Some(SerialNumber::from(lease.serial));
 
     let leaf_key = cluster_keypair(CTX_CLIENT, &ca.cluster_seed)?;
     let issuer = ca.issuer()?;
@@ -878,22 +912,15 @@ fn build_sans(san: &ServerSanInputs<'_>) -> Result<Vec<SanType>, PkiError> {
     Ok(sans)
 }
 
-/// Set `not_before` = now, `not_after` = now + `days`.
-fn set_validity(params: &mut CertificateParams, _days: i64) {
-    // Deterministic FIXED window — NOT `now()`-relative — so the emitted certs
-    // (and therefore the kubeconfig) are byte-identical on every fresh boot.
-    // A wide fixed span [2020-01-01 .. 2100-01-01] keeps every cert valid for
-    // the realistic life of a local cluster. The per-role `_days` horizon is
-    // intentionally unused: a deterministic local cluster re-derives identical
-    // certs each boot, so staggered expiry would only break the determinism
-    // (a `now()+days` not_after differs every boot). An EXPOSED cluster that
-    // wants rotation drives it through cofre + a re-seed, not a clock here.
-    let not_before = time::OffsetDateTime::from_unix_timestamp(1_577_836_800)
-        .expect("2020-01-01T00:00:00Z is a valid timestamp");
-    let not_after = time::OffsetDateTime::from_unix_timestamp(4_102_444_800)
-        .expect("2100-01-01T00:00:00Z is a valid timestamp");
-    params.not_before = not_before;
-    params.not_after = not_after;
+/// Set a certificate's span from its lease.
+fn set_validity(params: &mut CertificateParams, lease: &Lease) -> Result<(), PkiError> {
+    let at = |unix: i64| {
+        time::OffsetDateTime::from_unix_timestamp(unix)
+            .map_err(|e| PkiError::Renewal(e.to_string()))
+    };
+    params.not_before = at(lease.not_before)?;
+    params.not_after = at(lease.not_after)?;
+    Ok(())
 }
 
 // ── filesystem helpers (typed io errors, unix perms) ───────────────────
@@ -1148,7 +1175,7 @@ mod tests {
         params
             .distinguished_name
             .push(DnType::CommonName, "engenho-ca");
-        set_validity(&mut params, CA_VALIDITY_DAYS);
+        set_validity(&mut params, &Lease::standing(1)).unwrap();
         params.serial_number = Some(SerialNumber::from(1u64));
         let cert = params.self_signed(&legacy_key).unwrap();
         std::fs::write(pki.join("ca.crt"), cert.pem()).unwrap();

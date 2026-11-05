@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use engenho_apiserver::pki_rotation::{CertRenewer, Leases, OwnedSans};
 use engenho_apiserver::{
     ApiServer, ChainAuthenticator, ClientMaterial, PkiFile, RbacAuthorizer, RouterHandlerSink,
     RouterState, SanEntry, ServerSanInputs, StoreRbacEnv, TlsMaterial, client_verifier,
@@ -14,7 +15,8 @@ use engenho_apiserver::{
 use engenho_config::leaf::{flatten, nest};
 use engenho_config::mutability::{self, Mutability, RespawnSet};
 use engenho_config::{
-    EngenhoConfig, KubeconfigVisibility, KubeletBackendKind as CfgBackendKind, ResolvedDatapath,
+    CertRotation, EngenhoConfig, KubeconfigVisibility, KubeletBackendKind as CfgBackendKind,
+    ResolvedDatapath,
 };
 use engenho_controllers::{
     Controller, ControllerError, ControllerType, CrdController, CronJobController,
@@ -95,7 +97,7 @@ pub struct Runtime {
     /// Where this boot's kubeconfigs went (or the latest republish's).
     publish: Vec<PublishRecord>,
     /// What publishing them again takes.
-    publisher: Publisher,
+    publisher: Arc<Publisher>,
     /// The SANs the apiserver's certificate was issued with; `None` with
     /// TLS off. The certificate itself lives only in memory.
     server_sans: Option<Vec<String>>,
@@ -381,7 +383,8 @@ impl Runtime {
             tls,
             ca_cert_pem,
             admin: admin_material,
-        } = issue_pki(boot, listen_addr)?;
+            renewer: cert_renewer,
+        } = issue_pki(boot, listen_addr).await?;
         let server_sans = tls.as_ref().map(|t| t.sans.clone());
 
         // Load-or-generate the bootstrap admin BEARER token (a second admin
@@ -503,6 +506,10 @@ impl Runtime {
         // kubelet exists. RouterState is Arc-backed: this clone shares the SAME
         // handler ArcSwap the apiserver dispatches on, so a `register()` here is
         // visible to in-flight requests (identical mechanism to the CRD sink).
+        let router_state = match &cert_renewer {
+            Some(renewer) => router_state.with_cert_renewals(renewer.counts()),
+            None => router_state,
+        };
         let router_state_for_logs = router_state.clone();
 
         rec.enter(BootPhase::BindApiserver)?;
@@ -522,7 +529,12 @@ impl Runtime {
         //     CLIENT-CERT user (→ `kubectl auth whoami` = engenho-admin /
         //     system:masters). Without it (shouldn't happen when TLS is on) it
         //     falls back to the anonymous-token kubeconfig.
-        let publisher = Publisher::new(bound_addr, ca_cert_pem, admin_material);
+        let publisher = Arc::new(Publisher::new(
+            bound_addr,
+            ca_cert_pem,
+            admin_material,
+            boot.clone(),
+        ));
         let publish = match publisher.publish(boot) {
             Ok(records) => records,
             Err(err) => {
@@ -548,6 +560,10 @@ impl Runtime {
             &handler_sink,
             &router_state_for_logs,
             windows,
+            crate::cert_renewal::CertRenewalController::new(cert_renewer, {
+                let publisher = publisher.clone();
+                Arc::new(move |admin: &ClientMaterial| publisher.renewed(admin))
+            }),
         );
         let children = spawn_children(&parts);
         info!(count = children.len(), "children spawned");
@@ -1016,7 +1032,7 @@ struct Assembled {
     parts: Parts,
     health: Arc<Health>,
     publish: Vec<PublishRecord>,
-    publisher: Publisher,
+    publisher: Arc<Publisher>,
     server_sans: Option<Vec<String>>,
 }
 
@@ -1027,29 +1043,68 @@ struct Assembled {
 struct Publisher {
     bound_addr: SocketAddr,
     ca_pem: Option<String>,
-    admin: Option<ClientMaterial>,
+    latest: std::sync::Mutex<PublishedFrom>,
+}
+
+/// What the latest publish went by: a renewal publishes to where it did.
+struct PublishedFrom {
+    admin: Option<Arc<ClientMaterial>>,
+    boot: BootConfig,
 }
 
 impl Publisher {
-    const fn new(
+    fn new(
         bound_addr: SocketAddr,
         ca_pem: Option<String>,
         admin: Option<ClientMaterial>,
+        boot: BootConfig,
     ) -> Self {
         Self {
             bound_addr,
             ca_pem,
-            admin,
+            latest: std::sync::Mutex::new(PublishedFrom {
+                admin: admin.map(Arc::new),
+                boot,
+            }),
         }
     }
 
     /// Publish every kubeconfig `boot` asks for. With TLS off there is
     /// nothing to hand kubectl, and every target says so.
     fn publish(&self, boot: &BootConfig) -> Result<Vec<PublishRecord>, RuntimeError> {
+        let mut latest = self
+            .latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        latest.boot = boot.clone();
         self.ca_pem.as_deref().map_or_else(
             || Ok(PublishRecord::all_skipped(SkipReason::TlsDisabled)),
-            |ca_pem| write_boot_kubeconfig(boot, self.bound_addr, ca_pem, self.admin.as_ref()),
+            |ca_pem| write_boot_kubeconfig(boot, self.bound_addr, ca_pem, latest.admin.as_deref()),
         )
+    }
+
+    /// Persist a renewed admin leaf and publish it where the latest publish
+    /// went. A failure leaves the held leaf in use.
+    fn renewed(&self, admin: &ClientMaterial) -> Result<(), String> {
+        let boot = {
+            let latest = self
+                .latest
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            latest.boot.clone()
+        };
+        persist_admin_material(&boot.data_dir, admin).map_err(|e| e.to_string())?;
+        {
+            let mut latest = self
+                .latest
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            latest.admin = Some(Arc::new(ClientMaterial {
+                cert_pem: admin.cert_pem.clone(),
+                key_pem: admin.key_pem.clone(),
+            }));
+        }
+        self.publish(&boot).map(|_| ()).map_err(|e| e.to_string())
     }
 }
 
@@ -1139,6 +1194,8 @@ struct IssuedPki {
     ca_cert_pem: Option<String>,
     /// The admin client cert, for the admin-cert kubeconfig.
     admin: Option<ClientMaterial>,
+    /// What renews both leaves; absent with TLS or rotation off.
+    renewer: Option<Arc<engenho_apiserver::pki_rotation::CertRenewer>>,
 }
 
 /// Step 5a of the boot: load-or-generate the cluster CA persisted in
@@ -1149,7 +1206,7 @@ struct IssuedPki {
 /// For authn: also issue + persist the admin CLIENT cert and build the
 /// OPTIONAL client-cert verifier (rooted at the SAME CA) the server material
 /// carries.
-fn issue_pki(boot: &BootConfig, listen_addr: SocketAddr) -> Result<IssuedPki, RuntimeError> {
+async fn issue_pki(boot: &BootConfig, listen_addr: SocketAddr) -> Result<IssuedPki, RuntimeError> {
     let ApiserverTls::SelfIssued { extra_sans } = &boot.tls else {
         return Ok(IssuedPki::default());
     };
@@ -1172,27 +1229,50 @@ fn issue_pki(boot: &BootConfig, listen_addr: SocketAddr) -> Result<IssuedPki, Ru
     // nobody. See `RuntimeError::ExtraSan` for why this is checked here
     // and not lazily at handshake time.
     let extra_sans = server_sans(extra_sans, &boot.advertise_address)?;
-    let material = issue_server_material(
-        &ca,
-        &ServerSanInputs {
-            node_name: &boot.node_name,
-            listen_ip,
-            extra_sans: &extra_sans,
-        },
-    )
-    .map_err(|e| RuntimeError::Server(e.into()))?;
     // OPTIONAL client-cert verifier (allow_unauthenticated): existing
     // token/anonymous kubectl keeps connecting; a presented cert is
     // verified against the CA before the handshake completes.
     let verifier = client_verifier(&ca).map_err(|e| RuntimeError::Server(e.into()))?;
     // Issue + persist the admin client cert (for the operator's
     // kubeconfig + `kubectl auth whoami → engenho-admin`).
-    let admin = issue_admin_client_material(&ca).map_err(|e| RuntimeError::Server(e.into()))?;
+    let ca_cert_pem = ca.cert_pem().to_string();
+    let (material, admin, renewer) = match boot.cert_rotation {
+        CertRotation::Renew => {
+            let first = CertRenewer::issue_first(
+                Arc::new(ca),
+                OwnedSans {
+                    node_name: boot.node_name.clone(),
+                    listen_ip,
+                    extra_sans,
+                },
+                Leases::start(),
+                crate::cert_renewal::unix_now(),
+            )
+            .await
+            .map_err(|e| RuntimeError::Server(e.into()))?;
+            (first.server, first.client, Some(Arc::new(first.renewer)))
+        }
+        CertRotation::Off => {
+            let material = issue_server_material(
+                &ca,
+                &ServerSanInputs {
+                    node_name: &boot.node_name,
+                    listen_ip,
+                    extra_sans: &extra_sans,
+                },
+            )
+            .map_err(|e| RuntimeError::Server(e.into()))?;
+            let admin =
+                issue_admin_client_material(&ca).map_err(|e| RuntimeError::Server(e.into()))?;
+            (material, admin, None)
+        }
+    };
     persist_admin_material(&boot.data_dir, &admin)?;
     Ok(IssuedPki {
         tls: Some(material.with_client_verifier(verifier)),
-        ca_cert_pem: Some(ca.cert_pem().to_string()),
+        ca_cert_pem: Some(ca_cert_pem),
         admin: Some(admin),
+        renewer,
     })
 }
 
@@ -3691,6 +3771,8 @@ struct Parts {
     /// serves): the node-manifests driver applies through it, so a node's
     /// declared objects take the path `kubectl apply --server-side` takes.
     router: RouterState,
+    /// Renews this node's leaves; it holds them, so a respawn keeps them.
+    cert_renewal: crate::cert_renewal::CertRenewalController,
 }
 
 /// A child's shared piece built afresh before it is respawned
@@ -3713,6 +3795,7 @@ impl Parts {
         handler_sink: &Arc<dyn DynamicHandlerSink>,
         router: &RouterState,
         windows: Windows,
+        cert_renewal: crate::cert_renewal::CertRenewalController,
     ) -> Self {
         let ns = boot.controllers_namespace.clone();
         let csi_drivers = engenho_kubelet::DriverTable::new();
@@ -3740,6 +3823,7 @@ impl Parts {
             kubelet: Arc::new(ArcSwap::new(kubelet)),
             kubelet_endpoint: KubeletEndpoint::default(),
             router: router.clone(),
+            cert_renewal,
         }
     }
 
@@ -4061,6 +4145,7 @@ impl Parts {
                     self.router.clone(),
                 ),
             ),
+            Driver::CertRenewal => self.watch(driver, self.cert_renewal.clone()),
             Driver::NodeLifecycle => self.watch(
                 driver,
                 engenho_controllers::node_lifecycle::NodeLifecycleController::new(store.clone()),
@@ -4324,16 +4409,16 @@ fn build_kubelet(
         .with_event_sink(events)
         .with_closure_store(closures);
     let kubelet = match boot.kubelet_backend {
-        CfgBackendKind::Native => kubelet.with_closure_trust(Arc::new(
-            engenho_kubelet::closure_trust::ClosureTrust::new(
+        CfgBackendKind::Native => {
+            kubelet.with_closure_trust(Arc::new(engenho_kubelet::closure_trust::ClosureTrust::new(
                 Arc::new(engenho_kubelet::closure_trust::NixStoreVerifier::discover(
                     boot.closure_trusted_keys.clone(),
                 )),
                 boot.closure_signatures,
                 boot.closure_trusted_keys.clone(),
                 boot.closure_local_builds,
-            ),
-        )),
+            )))
+        }
         _ => kubelet,
     };
     Arc::new(
@@ -4769,6 +4854,58 @@ mod tests {
 
     use shikumi::TieredConfig;
 
+    #[test]
+    fn a_renewed_admin_leaf_is_persisted_and_republished_and_a_failure_says_so() {
+        let cfg = ephemeral_test_config();
+        let boot = BootConfig::read(&cfg).unwrap();
+        let publisher = Publisher::new(
+            "127.0.0.1:6443".parse().unwrap(),
+            Some("ca".to_string()),
+            Some(ClientMaterial {
+                cert_pem: "old-cert".to_string(),
+                key_pem: "old-key".to_string(),
+            }),
+            boot.clone(),
+        );
+        publisher.publish(&boot).unwrap();
+        let path = data_dir_kubeconfig(&boot);
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        publisher
+            .renewed(&ClientMaterial {
+                cert_pem: "new-cert".to_string(),
+                key_pem: "new-key".to_string(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(PkiFile::AdminCert.path(&boot.data_dir)).unwrap(),
+            "new-cert"
+        );
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_ne!(before, after);
+        publisher.publish(&boot).unwrap();
+        assert_eq!(
+            after,
+            std::fs::read_to_string(&path).unwrap(),
+            "a republish holds it"
+        );
+
+        let mut gone = boot.clone();
+        let file = boot.data_dir.join("a-file");
+        std::fs::write(&file, "").unwrap();
+        gone.data_dir = file.join("under");
+        publisher.publish(&gone).unwrap_err();
+        assert!(
+            publisher
+                .renewed(&ClientMaterial {
+                    cert_pem: "c".to_string(),
+                    key_pem: "k".to_string(),
+                })
+                .is_err()
+        );
+    }
+
     fn ephemeral_test_config() -> EngenhoConfig {
         let mut cfg = EngenhoConfig::prescribed_default();
         cfg.runtime.listen_addr = "127.0.0.1:0".into();
@@ -4848,11 +4985,11 @@ mod tests {
         // driver set — which is what added served_capability, then
         // volume_snapshot (19 → 20), then pvc_protection (20 → 21, W9),
         // node_manifests (21 → 22), node_lifecycle (22 → 23), and hpa
-        // (23 → 24, LEAVES.md EH1).
+        // (23 → 24, LEAVES.md EH1), and cert_renewal (24 → 25).
         // Every driver in the catalog is on in this config, so it is also the
         // catalog's size.
-        assert_eq!(running_drivers(&rt), 24);
-        assert_eq!(Driver::ALL.len(), 24);
+        assert_eq!(running_drivers(&rt), 25);
+        assert_eq!(Driver::ALL.len(), 25);
         rt.shutdown().await.unwrap();
     }
 
@@ -5202,11 +5339,11 @@ mod tests {
     #[tokio::test]
     async fn disabling_service_routing_drops_one_driver() {
         // Gating works: turning off enable.service_routing removes exactly
-        // one spawned driver (24 → 23).
+        // one spawned driver (25 → 24).
         let mut cfg = ephemeral_test_config();
         cfg.controllers.enable.service_routing = false;
         let rt = Runtime::start(cfg).await.unwrap();
-        assert_eq!(running_drivers(&rt), 23);
+        assert_eq!(running_drivers(&rt), 24);
         assert!(
             rt.children()
                 .get(Child::Driver(Driver::ServiceRouting))
@@ -5279,6 +5416,7 @@ mod tests {
             )],
             Driver::CniStatus => vec![file!("engenho-controllers/src/cni_status.rs")],
             Driver::NodeManifests => vec![file!("engenho-runtime/src/node_manifests.rs")],
+            Driver::CertRenewal => vec![file!("engenho-runtime/src/cert_renewal.rs")],
             Driver::NodeLifecycle => vec![file!("engenho-controllers/src/node_lifecycle.rs")],
             Driver::Kubelet => vec![file!("engenho-kubelet/src/kubelet.rs")],
             Driver::HorizontalPodAutoscaler => vec![file!("engenho-controllers/src/hpa.rs")],

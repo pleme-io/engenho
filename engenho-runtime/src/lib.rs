@@ -141,6 +141,7 @@ pub mod layout;
 pub mod lifecycle;
 
 mod boot_config;
+mod cert_renewal;
 mod child;
 mod dormant;
 mod entropy;
