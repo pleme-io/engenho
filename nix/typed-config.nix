@@ -363,6 +363,26 @@ in
 
         Has no effect on macOS, where nothing is enforced.
       '';
+      nativeWorkloads = optional (types.enum [ "bound" "outlive" ]) ''
+        Whether a `native` workload's process outlives the daemon that
+        started it.
+
+        `bound` (engenho's default): the daemon's unit keeps
+        `KillMode=control-group`, so stopping or restarting it ends every
+        workload, and the next daemon starts each one again.
+
+        `outlive` (Linux only): this module sets `KillMode=process` (and
+        `DelegateSubgroup=supervisor` with delegated cgroups), so a stop,
+        restart or crash of the daemon ends only the daemon. Each workload is
+        recorded under `<dataDir>/pods/native` with its pid, the kernel's start
+        time for it and the boot it ran in; the next daemon adopts every
+        recorded workload whose process is still that one, claims it for its
+        pod when the spec is unchanged, replaces it when the spec changed,
+        and stops it when no pod bound to the node is its own. A process in
+        a workload cgroup leaf that no record names is killed before anything
+        starts. Only a terminal or a stdin the daemon held is not carried
+        across: such a workload is stopped and started again.
+      '';
       podmanPackage = mkOption {
         type = types.nullOr types.package;
         default = pkgs.podman or null;
@@ -653,6 +673,7 @@ in
         kubelet_auth = cfg.runtime.kubeletAuth;
         api_audit = cfg.runtime.apiAudit;
         cert_rotation = cfg.runtime.certRotation;
+        native_workloads = cfg.runtime.nativeWorkloads;
         health_reasons = cfg.runtime.healthReasons;
         host_path_allowlist = cfg.runtime.hostPathAllowlist;
         node_manifests_dir = cfg.runtime.nodeManifestsDir;

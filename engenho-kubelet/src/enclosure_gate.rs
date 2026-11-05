@@ -121,6 +121,13 @@ impl ContainerRuntime for EnclosureGate {
         self.inner.resource_enforcement()
     }
 
+    async fn release_unclaimed(
+        &self,
+        claimants: &std::collections::BTreeSet<String>,
+    ) -> Result<(), KubeletError> {
+        self.inner.release_unclaimed(claimants).await
+    }
+
     async fn exec(&self, container_id: &str, argv: &[String]) -> Result<ExecOutcome, KubeletError> {
         self.inner.exec(container_id, argv).await
     }
@@ -316,6 +323,10 @@ mod tests {
         assert_eq!(gate.readoption(), Readoption::AdoptsRunning);
         assert_eq!(gate.readoption_of(None), Readoption::AdoptsRunning);
         assert_eq!(gate.resource_enforcement(), fake.resource_enforcement());
+
+        let bound = std::collections::BTreeSet::from(["uid-a".to_string()]);
+        gate.release_unclaimed(&bound).await.unwrap();
+        assert_eq!(fake.releases().await, vec![bound]);
 
         let id = gate
             .start(&spec(Confinement::default()))

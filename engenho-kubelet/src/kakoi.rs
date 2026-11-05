@@ -67,7 +67,7 @@ struct Facts<'a> {
 }
 
 /// A call refused with `EPERM` for what its first argument asks.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Guard {
     /// The syscall number.
     pub number: u32,
@@ -128,7 +128,7 @@ pub struct Asked<'a> {
 }
 
 /// The bounds a pod gets for what it does not declare.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DefaultLimits {
     /// `pids.max`, where this node can write it.
     #[serde(default)]
@@ -139,7 +139,7 @@ pub struct DefaultLimits {
 }
 
 /// One path of a Landlock domain.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LandlockRule {
     /// The path; one absent at the start is skipped.
     pub path: String,
@@ -148,7 +148,7 @@ pub struct LandlockRule {
 }
 
 /// The Landlock domain blue decided for a container.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Landlock {
     /// Every right this domain mediates, by blue's words.
     pub handled: Vec<String>,
@@ -161,7 +161,7 @@ pub struct Landlock {
 }
 
 /// What `kakoi::enclose` answered.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Verdict {
     /// Why this container may not start.
     pub refused: Option<String>,
@@ -212,6 +212,21 @@ pub struct Verdict {
     /// What the node could not enforce, for an event a reader sees.
     #[serde(default)]
     pub warnings: Vec<String>,
+}
+
+impl Verdict {
+    /// Whether a process entered under `self` runs under what `other` decides.
+    /// A warning describes the node; it encloses nothing.
+    #[must_use]
+    pub fn encloses_as(&self, other: &Self) -> bool {
+        Self {
+            warnings: Vec::new(),
+            ..self.clone()
+        } == Self {
+            warnings: Vec::new(),
+            ..other.clone()
+        }
+    }
 }
 
 /// The `kakoi` program.

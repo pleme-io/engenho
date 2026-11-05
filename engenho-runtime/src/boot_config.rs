@@ -32,8 +32,8 @@ use engenho_config::{
     ApiAudit, CertRotation, ClosureLocalBuilds, ClusterConfig, ConsistencyConfig,
     ConsistencyTierKind, ControllerEnable, ControllersConfig, DatapathMode, EngenhoConfig, Fabric,
     HealthReasons, KubeconfigVisibility, KubeletAuth, KubeletBackendKind, LegacyTeiaSection,
-    NativeCgroups, NativeSecurity, NetworkingConfig, RevoadaConfig, RuntimeConfig, SchedulerConfig,
-    SecretsAtRest, SharedCluster, TlsConfig, TopologyConfig, TopologyStrategyKind,
+    NativeCgroups, NativeSecurity, NativeWorkloads, NetworkingConfig, RevoadaConfig, RuntimeConfig,
+    SchedulerConfig, SecretsAtRest, SharedCluster, TlsConfig, TopologyConfig, TopologyStrategyKind,
 };
 
 use crate::health::Windows;
@@ -84,6 +84,7 @@ pub(crate) struct BootConfig {
     pub(crate) kubelet_auth: KubeletAuth,
     pub(crate) api_audit: ApiAudit,
     pub(crate) cert_rotation: CertRotation,
+    pub(crate) native_workloads: NativeWorkloads,
     pub(crate) health_reasons: HealthReasons,
     /// `runtime.podman_binary`, read with `kubelet_backend`.
     pub(crate) podman_binary: Option<String>,
@@ -198,6 +199,7 @@ impl BootConfig {
             kubelet_auth,
             api_audit,
             cert_rotation,
+            native_workloads,
             health_reasons,
             podman_binary,
             host_path_allowlist,
@@ -231,6 +233,7 @@ impl BootConfig {
             kubelet_auth: *kubelet_auth,
             api_audit: *api_audit,
             cert_rotation: *cert_rotation,
+            native_workloads: *native_workloads,
             health_reasons: *health_reasons,
             podman_binary: podman_binary.clone(),
             host_path_allowlist: host_path_allowlist.clone(),
