@@ -77,6 +77,7 @@ pub mod node_info;
 /// Re-exported so every existing `engenho_kubelet::node_lease::…` path still
 /// resolves (★★ MODULARIZE, DON'T DELETE).
 pub use engenho_controllers::node_lease;
+pub mod enclosure_gate;
 pub mod kakoi;
 pub mod pod_volume;
 pub mod podman_api;

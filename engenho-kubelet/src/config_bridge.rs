@@ -243,6 +243,15 @@ pub fn make_container_runtime_on_node(
             .with_security(native_security),
         ),
     };
+    let runtime: Arc<dyn ContainerRuntime> = match kind {
+        KubeletBackendKind::PodmanApi | KubeletBackendKind::Podman | KubeletBackendKind::Cri => {
+            Arc::new(crate::enclosure_gate::EnclosureGate::new(
+                runtime,
+                native_security,
+            ))
+        }
+        KubeletBackendKind::Native | KubeletBackendKind::Fake => runtime,
+    };
     Ok(Arc::new(
         crate::runtime_class::RuntimeClassRouter::new(runtime).with_class(
             crate::wasm_backend::WASM_RUNTIME_CLASS,
@@ -254,6 +263,57 @@ pub fn make_container_runtime_on_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn asks_for_privilege() -> crate::backend::ContainerSpec {
+        crate::backend::ContainerSpec {
+            name: "default/p/c".to_string(),
+            image: "img".to_string(),
+            confinement: crate::backend::Confinement {
+                privileged: true,
+                ..crate::backend::Confinement::default()
+            },
+            ..crate::backend::ContainerSpec::default()
+        }
+    }
+
+    #[allow(clippy::disallowed_methods)]
+    #[tokio::test]
+    async fn a_podman_node_refuses_a_privileged_pod_with_no_grant_before_podman_runs() {
+        let runtime = make_container_runtime_on_node(
+            KubeletBackendKind::Podman,
+            Some("/nonexistent/podman"),
+            None,
+            NativeCgroups::default(),
+            engenho_config::NativeSecurity::Enforce,
+        )
+        .expect("constructs");
+        let shown = runtime
+            .start(&asks_for_privilege())
+            .await
+            .expect_err("refused")
+            .to_string();
+        assert!(shown.contains(crate::kakoi::GRANT_ANNOTATION), "{shown}");
+        assert!(!shown.contains("/nonexistent/podman"), "{shown}");
+    }
+
+    #[allow(clippy::disallowed_methods)]
+    #[tokio::test]
+    async fn a_podman_node_with_security_off_hands_the_pod_to_podman() {
+        let runtime = make_container_runtime_on_node(
+            KubeletBackendKind::Podman,
+            Some("/nonexistent/podman"),
+            None,
+            NativeCgroups::default(),
+            engenho_config::NativeSecurity::Off,
+        )
+        .expect("constructs");
+        let shown = runtime
+            .start(&asks_for_privilege())
+            .await
+            .expect_err("no podman here")
+            .to_string();
+        assert!(!shown.contains(crate::kakoi::GRANT_ANNOTATION), "{shown}");
+    }
 
     use crate::cri_backend::CriGap;
 

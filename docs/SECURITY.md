@@ -35,6 +35,12 @@ Only `system:masters` may add or change a grant, on a pod or in a workload's tem
 
 A `runAsUser` at pod level now reaches its containers, as Kubernetes specifies. It was silently dropped before.
 
+## A pod on a container runtime
+
+A podman or CRI node puts `kakoi::enclose` in front of its runtime (`engenho-kubelet/src/enclosure_gate.rs`), so a pod that asks for `runAsUser: 0`, `privileged`, `allowPrivilegeEscalation: true` or `capabilities.add` gets the verdict a native pod gets: refused by name with no grant under `enforce`, a `ConfinementNotEnforced` event under `audit`, silence under `off`. With a grant the runtime receives what the pod declares. A pod that declares nothing never reaches blue, so a program that failed to load refuses only what it decides.
+
+Only the refusal crosses. A pod that says nothing keeps the image's own user and the runtime's namespaces, and its `kakoi.pleme.io/access` narrowing is not rendered on a runtime yet.
+
 ## Modes
 
 `runtime.native_security`:
@@ -84,7 +90,6 @@ Read 2026-11-04 from engenho's source, against Kubernetes Pod Security Standards
 | 7 | `hostPID`, `hostIPC`, `readOnlyRootFilesystem`, `capabilities.drop`, `seccompProfile`, sysctls and devices are ignored or unread | kakoi facts, refused when they cannot be honoured |
 | 10 | No image or closure verification at admission; tameshi's verifier has no caller | the admission rule, then Nix signature checks |
 | 11 | Certificates run to 2100 with no rotation | a shorter span and rotation in `engenho-apiserver/src/pki.rs` |
-| 12 | The podman backend passes `privileged` and `cap_add` straight through | the same verdict as native |
 
 Policy still written in Rust that belongs in blue: the hostPath permit, mount classification, always-allowed API paths and RBAC, audit levels, token clamping, image reference extraction, webhook matching, NetworkPolicy translation and control tiers. A second standard bidama already loads in an embedded program; a second private package needs `EmbeddedOver`, which the pinned `blue-lang-host` 0.0.125 lacks. `shisei`, `bougyo`, `kyohi` and `kousei` hold shapes to reuse.
 
