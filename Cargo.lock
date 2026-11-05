@@ -1767,7 +1767,7 @@ dependencies = [
 
 [[package]]
 name = "engenho"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1794,7 +1794,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-apiserver"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1845,7 +1845,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-blue"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "blue-lang-host",
  "serde",
@@ -1855,7 +1855,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-cluster-config"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "indoc",
  "serde",
@@ -1866,7 +1866,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-cluster-config-render"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "anyhow",
  "clap",
@@ -1878,7 +1878,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-cni"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "async-trait",
  "engenho-substrate",
@@ -1892,7 +1892,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-config"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "blake3",
  "figment",
@@ -1907,7 +1907,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-control-client"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "bytes",
  "engenho-config",
@@ -1924,7 +1924,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-control-server"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1953,7 +1953,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-control-types"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1976,7 +1976,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-controllers"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2001,7 +2001,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-csi"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "async-trait",
  "engenho-csi",
@@ -2028,7 +2028,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-diff"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "async-trait",
  "engenho-apiserver",
@@ -2044,7 +2044,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-etcd"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "async-stream",
  "bytes",
@@ -2064,7 +2064,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-fonte"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2097,7 +2097,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-fonte-cli"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "async-trait",
  "clap",
@@ -2113,7 +2113,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-kube-client"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2135,7 +2135,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-kube-codegen"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "anyhow",
  "clap",
@@ -2148,7 +2148,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-kube-proto"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "blake3",
  "bytes",
@@ -2165,7 +2165,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-kubelet"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2206,7 +2206,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-mcp"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2232,7 +2232,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-oracle"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "serde",
  "serde_json",
@@ -2240,7 +2240,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-revoada"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2270,7 +2270,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-runtime"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2313,7 +2313,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-scheduler"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2331,7 +2331,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-serve"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "axum 0.7.9",
  "bytes",
@@ -2350,7 +2350,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-store"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2376,7 +2376,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-substrate"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2390,7 +2390,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-substrate-core"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "blake3",
  "serde",
@@ -2401,7 +2401,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-substrate-incubator"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2416,7 +2416,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-substrate-props"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "engenho-substrate",
  "engenho-substrate-incubator",
@@ -2429,7 +2429,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-sui-typescape"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "engenho-substrate",
  "engenho-substrate-props",
@@ -2442,7 +2442,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-teia"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -2461,7 +2461,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-types"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2481,7 +2481,7 @@ dependencies = [
 
 [[package]]
 name = "engenho-unit"
-version = "0.53.153"
+version = "0.53.154"
 dependencies = [
  "engenho-substrate-core",
  "rustix 1.1.4",
