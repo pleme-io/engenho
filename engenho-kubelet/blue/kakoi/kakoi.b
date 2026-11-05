@@ -726,14 +726,19 @@ def refusal(facts)
   declared = field(facts, "declared", {})
   asked = demands(declared)
   impossible = contradiction(declared)
-  cannot = unappliable(declared)
+  gate = field(facts, "runtime_gate", false)
+  cannot = if gate
+    []
+  else
+    unappliable(declared)
+  end
   if impossible != nil
     impossible
   elsif length(cannot) != 0
     "this pod asks for #{join(cannot, "; ")}"
   elsif network_conflict(facts) != nil
     network_conflict(facts)
-  elsif not granted?(facts) and foreign_account(facts) != nil
+  elsif not gate and not granted?(facts) and foreign_account(facts) != nil
     foreign_account(facts)
   elsif length(asked) != 0 and not granted?(facts)
     "this pod asks for #{join(asked, ", ")} and names no grant: add the annotation #{grant_annotation} with its reason"
@@ -792,6 +797,11 @@ def verdict_text(refused, ids, confine, warnings, facts?)
       "gid" => ids[1],
       "no_new_privs" => confine,
       "clear_caps" => confine,
+      "limits" => if confine
+        default_limits(facts)
+      else
+        {}
+      end,
       "keep" => if confine
         kept_capabilities(field(facts, "declared", {}))
       else
@@ -838,6 +848,90 @@ def verdict_text(refused, ids, confine, warnings, facts?)
       end,
       "warnings" => warnings
     }
+  )
+end
+
+@doc """
+larger: The larger of two numbers.
+
+    larger(1, 2) #=> 2
+    larger(2, 1) #=> 2
+"""
+def larger(a, b)
+  if a > b
+    a
+  else
+    b
+  end
+end
+
+@doc """
+default_pids_max: The tasks a pod that declares nothing may hold, which stops a fork bomb from taking the node. Kubernetes has no field for it, so every enclosed pod gets it. A postgres with a connection per task and a JVM with its thread pools sit far below this.
+
+    default_pids_max #=> 4096
+"""
+def default_pids_max()
+  4096
+end
+
+@doc """
+default_memory_bytes: The memory a pod that declares no limit may hold: a quarter of the node, so one runaway pod cannot exhaust it and a real workload still has room, and never under 1 GiB. A node that states no size gets 4 GiB.
+
+    default_memory_bytes(68_719_476_736) #=> 17_179_869_184
+    default_memory_bytes(2_147_483_648) #=> 1_073_741_824
+    default_memory_bytes(0) #=> 4_294_967_296
+"""
+def default_memory_bytes(node_bytes)
+  if node_bytes <= 0
+    4_294_967_296
+  else
+    larger(floor(node_bytes / 4), 1_073_741_824)
+  end
+end
+
+@doc """
+default_limits: The bounds an enclosed pod gets for what it does not declare, among those this node can write. A declared limit stands, and a request above the default lifts it, since a pod is promised what it requests.
+
+    default_limits({"bounds" => %w[memory pids], "node_memory_bytes" => 8_589_934_592, "declared" => {}}) == {"pids_max" => 4096, "memory_max" => 2_147_483_648} #=> true
+    default_limits({"bounds" => %w[memory pids], "node_memory_bytes" => 8_589_934_592, "declared" => {"memory_limit" => 1}}).memory_max #=> nil
+    default_limits({"bounds" => %w[memory pids], "node_memory_bytes" => 8_589_934_592, "declared" => {"memory_request" => 4_294_967_296}}).memory_max #=> 4_294_967_296
+    default_limits({"bounds" => ["memory"], "declared" => {}}).pids_max #=> nil
+    default_limits({"bounds" => [], "declared" => {}}).memory_max #=> nil
+"""
+def default_limits(facts)
+  bounds = field(facts, "bounds", [])
+  declared = field(facts, "declared", {})
+  {
+    "pids_max" => if member?("pids", bounds)
+      default_pids_max
+    end,
+    "memory_max" => if member?("memory", bounds) and
+        field(declared, "memory_limit", 0) <= 0
+      larger(
+        default_memory_bytes(field(facts, "node_memory_bytes", 0)),
+        field(declared, "memory_request", 0)
+      )
+    end
+  }
+end
+
+@doc """
+limit_gaps: What an enclosed pod goes without on a node that cannot write its default bounds.
+
+    limit_gaps(%w[memory pids]) #=> []
+    limit_gaps(["memory"]) #=> ["this node cannot write pids.max, so this pod's tasks have no default bound"]
+    length(limit_gaps([])) #=> 2
+"""
+def limit_gaps(bounds)
+  append(
+    named_if(
+      not member?("memory", bounds),
+      ["this node cannot write memory.max, so this pod's memory has no default bound"]
+    ),
+    named_if(
+      not member?("pids", bounds),
+      ["this node cannot write pids.max, so this pod's tasks have no default bound"]
+    )
   )
 end
 
@@ -934,7 +1028,8 @@ def enclose(facts_text)
             ]
           ),
           not_applied_warning(declared),
-          named_if(not granted, system_account_warning(declared))
+          named_if(not granted, system_account_warning(declared)),
+          named_if(not granted, limit_gaps(field(facts, "bounds", [])))
         ),
         facts
       )
@@ -1036,6 +1131,7 @@ def enforced(extra)
     "volumes" => field(extra, "volumes", []),
     "access" => field(extra, "access", nil),
     "access_invalid" => field(extra, "access_invalid", false),
+    "bounds" => %w[memory pids],
     "grant" => field(extra, "grant", nil)
   }
 end
@@ -1236,6 +1332,51 @@ test "a capability added and dropped by name cannot be true, even with a grant"
   both = {"cap_add" => ["NET_ADMIN"], "cap_drop" => ["NET_ADMIN"]}
   assert contains?(answer(enforced({"declared" => both})).refused, "NET_ADMIN")
   assert answer(enforced({"grant" => "x", "declared" => both})).refused != nil
+end
+
+test "an enclosed pod that declares nothing is bounded, a declared limit stands, and a grant and audit stay unbounded"
+  plain = answer(assoc(enforced({}), "node_memory_bytes", 68_719_476_736))
+  assert plain.limits.pids_max == default_pids_max
+  assert plain.limits.memory_max == 17_179_869_184
+  declared = answer(enforced({"declared" => {"memory_limit" => 67_108_864}}))
+  assert declared.limits.memory_max.nil?
+  assert declared.limits.pids_max == default_pids_max
+  requested = answer(
+    assoc(
+      enforced({"declared" => {"memory_request" => 34_359_738_368}}),
+      "node_memory_bytes",
+      68_719_476_736
+    )
+  )
+  assert requested.limits.memory_max == 34_359_738_368
+  granted = answer(enforced({"grant" => "x"}))
+  assert granted.limits == {}
+  audit = answer(assoc(enforced({}), "mode", "audit"))
+  assert audit.limits == {}
+end
+
+test "a node that cannot write a default bound says so and never refuses the pod"
+  v = answer(assoc(enforced({}), "bounds", []))
+  assert v.refused.nil?
+  assert v.enclosed == true
+  assert v.limits.memory_max.nil?
+  assert length(filter((w) -> contains?(w, "default bound"), v.warnings)) == 2
+  granted = answer(assoc(enforced({"grant" => "x"}), "bounds", []))
+  assert length(granted.warnings) == 0
+end
+
+test "a gate in front of a runtime judges who may ask, and leaves to the runtime what only the native seam cannot apply"
+  gate = fn(declared)
+    answer(assoc(enforced({"declared" => declared}), "runtime_gate", true))
+  end
+  assert gate({"sysctls" => ["a.b"]}).refused.nil?
+  assert gate({"seccomp_profile" => "Localhost"}).refused.nil?
+  assert gate({"volume_devices" => ["/dev/x"]}).refused.nil?
+  assert gate({"run_as_user" => 100_001}).refused.nil?
+  assert gate({"run_as_user" => 0}).refused != nil
+  assert gate({"host_pid" => true}).refused != nil
+  assert gate({"cap_add" => ["SYS_ADMIN"]}).refused != nil
+  assert gate({"cap_add" => ["NET_BIND_SERVICE"]}).refused.nil?
 end
 
 test "a grant says what it cannot apply"

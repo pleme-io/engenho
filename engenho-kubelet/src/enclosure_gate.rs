@@ -15,7 +15,7 @@ use crate::backend::{
     LogRead, Readoption,
 };
 use crate::error::KubeletError;
-use crate::kakoi::{Kakoi, NativeSecurity, Verdict};
+use crate::kakoi::{Asked, Kakoi, NativeSecurity, Node, Verdict};
 
 /// A runtime whose starts pass `kakoi::enclose` first.
 pub struct EnclosureGate {
@@ -47,7 +47,21 @@ impl EnclosureGate {
         };
         Some(
             kakoi
-                .enclose(&spec.confinement, &spec.pod.namespace, &[], self.mode, true)
+                .enclose(
+                    Asked {
+                        confinement: &spec.confinement,
+                        namespace: &spec.pod.namespace,
+                        volumes: &[],
+                        resources: &spec.resources,
+                    },
+                    &Node {
+                        mode: self.mode,
+                        can_enforce: true,
+                        runtime_gate: true,
+                        bounds: Vec::new(),
+                        memory_bytes: 0,
+                    },
+                )
                 .await,
         )
     }

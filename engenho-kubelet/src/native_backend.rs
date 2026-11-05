@@ -84,7 +84,7 @@ use crate::cgroup::{
 use crate::cri::{ExitDisposition, RunState};
 use crate::error::KubeletError;
 use crate::image_source::ImageSource;
-use crate::kakoi::{Kakoi, NativeSecurity, Verdict};
+use crate::kakoi::{Asked, DefaultLimits, Kakoi, NativeSecurity, Node, Verdict};
 use crate::pod_volume::BindSource;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -719,16 +719,16 @@ impl NativeBackend {
             .get_or_init(Kakoi::start)
             .clone()
             .map_err(NativeError::Kakoi)?;
+        let volumes: Vec<String> = Self::volumes_of(spec).into_iter().map(|v| v.path).collect();
         kakoi
             .enclose(
-                &spec.confinement,
-                &spec.pod.namespace,
-                &Self::volumes_of(spec)
-                    .into_iter()
-                    .map(|v| v.path)
-                    .collect::<Vec<_>>(),
-                self.security,
-                crate::kakoi::can_enforce(),
+                Asked {
+                    confinement: &spec.confinement,
+                    namespace: &spec.pod.namespace,
+                    volumes: &volumes,
+                    resources: &spec.resources,
+                },
+                &Node::measured(self.security, self.cgroups.default_bounds()),
             )
             .await
             .map_err(NativeError::Kakoi)
@@ -784,7 +784,11 @@ impl NativeBackend {
         &self.cgroups
     }
 
-    fn admit(&self, resources: &Resources) -> Result<Admission, NativeError> {
+    fn admit(
+        &self,
+        resources: &Resources,
+        limits: &DefaultLimits,
+    ) -> Result<Admission, NativeError> {
         let (Cgroups::Delegated(_) | Cgroups::NotDelegated(_)) = &self.cgroups else {
             return Ok(Admission::Unbounded);
         };
@@ -792,7 +796,10 @@ impl NativeBackend {
         // A delegated tree gives every container a leaf, bounded or not: the
         // leaf is also what its CPU and memory are read from.
         if let Cgroups::Delegated(tree) = &self.cgroups {
-            return Ok(Admission::Bounded(Arc::clone(tree), plan));
+            return Ok(Admission::Bounded(
+                Arc::clone(tree),
+                plan.with_defaults(limits),
+            ));
         }
         if plan.is_empty() {
             return Ok(Admission::Unbounded);
@@ -971,11 +978,11 @@ impl ContainerRuntime for NativeBackend {
     }
 
     async fn start(&self, spec: &ContainerSpec) -> Result<ContainerStatus, KubeletError> {
-        let admission = self.admit(&spec.resources)?;
         let verdict = self.verdict_for(spec).await?;
         if let Some(why) = verdict.refused.clone() {
             return Err(NativeError::Refused(why).into());
         }
+        let admission = self.admit(&spec.resources, &verdict.limits)?;
         let closure = Self::closure_of(spec)?;
         let argv = spec.argv();
         let program = Self::resolve_program(&closure, &argv)?;
@@ -1877,7 +1884,7 @@ mod tests {
         let limited = declaring(&serde_json::json!({ "limits": { "memory": "64Mi" } }));
         let Err(NativeError::ResourcesUnenforceable(Unenforceable::NotDelegated(
             crate::cgroup::CgroupError::NotDelegated { why, .. },
-        ))) = b.admit(&limited.resources)
+        ))) = b.admit(&limited.resources, &DefaultLimits::default())
         else {
             panic!("a limit this node cannot enforce is refused as NotDelegated");
         };
@@ -1898,7 +1905,7 @@ mod tests {
         let weighted =
             declaring(&serde_json::json!({ "requests": { "cpu": "1", "memory": "1Mi" } }));
         assert!(matches!(
-            b.admit(&weighted.resources),
+            b.admit(&weighted.resources, &DefaultLimits::default()),
             Ok(Admission::Unbounded)
         ));
         let shown = b
@@ -1931,7 +1938,7 @@ mod tests {
                 "limits": { "memory": "64Mi", "cpu": "512Quatloos" }
             }));
             assert!(matches!(
-                b.admit(&declared.resources),
+                b.admit(&declared.resources, &DefaultLimits::default()),
                 Ok(Admission::Unbounded)
             ));
             let shown = b

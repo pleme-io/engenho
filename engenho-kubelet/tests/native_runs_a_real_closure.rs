@@ -523,6 +523,34 @@ async fn a_limited_container_joins_its_leaf_before_it_runs_and_the_leaf_goes_whe
 }
 
 #[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_enclosed_pod_that_declares_nothing_gets_its_default_bounds_in_its_leaf() {
+    if !is_root() {
+        return;
+    }
+    let coreutils = closure("nixpkgs#coreutils");
+    let root = tempfile::tempdir().unwrap();
+    let unit = delegated_unit(root.path());
+    let cgroups = Cgroups::adopt(Box::new(DirectoryCgroupfs::at(root.path())));
+    assert!(matches!(cgroups, Cgroups::Delegated(_)), "{cgroups:?}");
+    let backend = NativeBackend::new(
+        Isolation::HostProcess,
+        std::env::temp_dir().join("engenho-native-e2e-default-bounds"),
+        cgroups,
+    );
+    let mut s = spec(&format!("nix:{coreutils}"), &["sleep", "2"], &[]);
+    s.pod.namespace = "kakoi-default-bounds".to_string();
+    let started = backend.start(&s).await.expect("start");
+    let leaf = unit.join("workloads").join(&started.container_id);
+    let at = |knob: &str| std::fs::read_to_string(leaf.join(knob)).unwrap();
+    assert_eq!(at("pids.max"), "4096");
+    let memory: u64 = at("memory.max").parse().unwrap();
+    assert!(memory >= 1 << 30, "{memory}");
+    assert_eq!(at("memory.swap.max"), "0");
+    backend.stop(&started.container_id).await.expect("stop");
+}
+
+#[cfg(target_os = "linux")]
 async fn output_of(backend: &NativeBackend, s: &engenho_kubelet::backend::ContainerSpec) -> String {
     let started = backend.start(s).await.expect("start");
     for _ in 0..250 {

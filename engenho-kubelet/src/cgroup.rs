@@ -67,6 +67,7 @@ pub enum Knob {
     CpuMax,
     CpuWeight,
     MemoryMin,
+    PidsMax,
 }
 
 impl Knob {
@@ -79,6 +80,7 @@ impl Knob {
             Self::CpuMax => "cpu.max",
             Self::CpuWeight => "cpu.weight",
             Self::MemoryMin => "memory.min",
+            Self::PidsMax => "pids.max",
         }
     }
 
@@ -104,6 +106,7 @@ pub struct CgroupPlan {
     pub cpu_max: Option<CpuMax>,
     pub cpu_weight: Option<u64>,
     pub memory_min: Option<u64>,
+    pub pids_max: Option<u64>,
 }
 
 impl CgroupPlan {
@@ -115,6 +118,15 @@ impl CgroupPlan {
     #[must_use]
     pub const fn bounds(&self) -> bool {
         self.memory_max.is_some() || self.cpu_max.is_some()
+    }
+
+    /// The bounds kakoi gives what the pod did not declare. A declared memory
+    /// limit stands whatever the default says.
+    #[must_use]
+    pub fn with_defaults(mut self, limits: &crate::kakoi::DefaultLimits) -> Self {
+        self.memory_max = self.memory_max.or(limits.memory_max);
+        self.pids_max = limits.pids_max;
+        self
     }
 
     #[must_use]
@@ -133,6 +145,9 @@ impl CgroupPlan {
         }
         if let Some(bytes) = self.memory_min {
             writes.push((Knob::MemoryMin, bytes.to_string()));
+        }
+        if let Some(tasks) = self.pids_max {
+            writes.push((Knob::PidsMax, tasks.to_string()));
         }
         writes
     }
@@ -160,6 +175,7 @@ impl TryFrom<&Resources> for CgroupPlan {
                 .map(|quota_us| CpuMax { quota_us }),
             cpu_weight: r.cpu_weight(),
             memory_min: r.memory_request_bytes.value().and_then(positive),
+            pids_max: None,
         })
     }
 }
@@ -450,12 +466,14 @@ pub struct PreparedLeaf {
 pub struct CgroupTree {
     fs: Box<dyn CgroupFs>,
     unit: PathBuf,
+    controllers: Vec<&'static str>,
 }
 
 impl CgroupTree {
     pub fn adopt(fs: Box<dyn CgroupFs>) -> Result<Self, CgroupError> {
         let unit = unit_cgroup(fs.as_ref())?;
-        let enable = delegated_controllers(fs.as_ref(), &unit)?.to_string();
+        let controllers = delegated_controllers(fs.as_ref(), &unit)?;
+        let enable = controllers.to_string();
         let supervisor = unit.join(SUPERVISOR);
         let workloads = unit.join(WORKLOADS);
         ensure_dir(fs.as_ref(), &supervisor)?;
@@ -467,9 +485,22 @@ impl CgroupTree {
         write(fs.as_ref(), &unit.join(SUBTREE_CONTROL), &enable)?;
         ensure_dir(fs.as_ref(), &workloads)?;
         write(fs.as_ref(), &workloads.join(SUBTREE_CONTROL), &enable)?;
-        let tree = Self { fs, unit };
+        let tree = Self {
+            fs,
+            unit,
+            controllers: controllers.0,
+        };
         tree.sweep()?;
         Ok(tree)
+    }
+
+    /// The default bounds this tree can write, in kakoi's words.
+    #[must_use]
+    pub fn default_bounds(&self) -> Vec<&'static str> {
+        ["memory", "pids"]
+            .into_iter()
+            .filter(|c| self.controllers.contains(c))
+            .collect()
     }
 
     #[must_use]
@@ -636,6 +667,15 @@ impl Cgroups {
                 );
                 Self::NotDelegated(e)
             }
+        }
+    }
+
+    /// The default bounds this node can write, for kakoi's facts.
+    #[must_use]
+    pub fn default_bounds(&self) -> Vec<&'static str> {
+        match self {
+            Self::Delegated(tree) => tree.default_bounds(),
+            Self::NotDelegated(_) | Self::Off | Self::Unsupported => Vec::new(),
         }
     }
 

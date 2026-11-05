@@ -43,6 +43,8 @@ struct Declared<'a> {
     devices: &'a [String],
     volume_devices: &'a [String],
     not_applied: &'a [String],
+    memory_limit: Option<i64>,
+    memory_request: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -52,6 +54,9 @@ struct Facts<'a> {
     volumes: &'a [String],
     mode: NativeSecurity,
     can_enforce: bool,
+    bounds: &'a [&'static str],
+    node_memory_bytes: u64,
+    runtime_gate: bool,
     kernel_decides: bool,
     grant: Option<&'a str>,
     access: Option<serde_json::Value>,
@@ -72,6 +77,60 @@ pub struct Guard {
     pub values: Vec<u32>,
 }
 
+/// What this node can do for a pod, as `kakoi::enclose` reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Node {
+    /// How this node treats a native container's security.
+    pub mode: NativeSecurity,
+    /// Whether this daemon can change a child's identity.
+    pub can_enforce: bool,
+    /// The default bounds this node can write: `memory`, `pids`.
+    pub bounds: Vec<&'static str>,
+    /// The node's memory in bytes, 0 where it is not known.
+    pub memory_bytes: u64,
+    /// A container runtime applies what the pod declares and this decides only
+    /// who may ask, so what the native seam cannot apply is the runtime's to judge.
+    pub runtime_gate: bool,
+}
+
+impl Node {
+    /// The node this daemon runs on, whose cgroups can write `bounds`.
+    #[must_use]
+    pub fn measured(mode: NativeSecurity, bounds: Vec<&'static str>) -> Self {
+        Self {
+            mode,
+            can_enforce: can_enforce(),
+            bounds,
+            memory_bytes: node_memory_bytes(),
+            runtime_gate: false,
+        }
+    }
+}
+
+/// What one container asks of its enclosure.
+#[derive(Clone, Copy, Debug)]
+pub struct Asked<'a> {
+    /// Its declared security.
+    pub confinement: &'a Confinement,
+    /// Its pod's namespace.
+    pub namespace: &'a str,
+    /// Its volume paths.
+    pub volumes: &'a [String],
+    /// Its declared resources.
+    pub resources: &'a crate::backend::Resources,
+}
+
+/// The bounds a pod gets for what it does not declare.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+pub struct DefaultLimits {
+    /// `pids.max`, where this node can write it.
+    #[serde(default)]
+    pub pids_max: Option<u64>,
+    /// `memory.max`, where this node can write it and the pod declares no limit.
+    #[serde(default)]
+    pub memory_max: Option<u64>,
+}
+
 /// What `kakoi::enclose` answered.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 pub struct Verdict {
@@ -85,6 +144,9 @@ pub struct Verdict {
     pub no_new_privs: bool,
     /// Clear the child's capability sets, but for [`Self::keep`].
     pub clear_caps: bool,
+    /// The bounds it gets for what it does not declare.
+    #[serde(default)]
+    pub limits: DefaultLimits,
     /// The capabilities the child keeps across its uid change, by blue's words.
     #[serde(default)]
     pub keep: Vec<String>,
@@ -137,14 +199,13 @@ impl Kakoi {
     ///
     /// # Errors
     /// The program's error, or an answer that does not read.
-    pub async fn enclose(
-        &self,
-        confinement: &Confinement,
-        namespace: &str,
-        volumes: &[String],
-        mode: NativeSecurity,
-        can_enforce: bool,
-    ) -> Result<Verdict, String> {
+    pub async fn enclose(&self, asked: Asked<'_>, node: &Node) -> Result<Verdict, String> {
+        let Asked {
+            confinement,
+            namespace,
+            volumes,
+            resources,
+        } = asked;
         let Confinement {
             privileged,
             read_only_root_fs,
@@ -173,8 +234,11 @@ impl Kakoi {
             arch: std::env::consts::ARCH,
             namespace,
             volumes,
-            mode,
-            can_enforce,
+            mode: node.mode,
+            can_enforce: node.can_enforce,
+            bounds: &node.bounds,
+            node_memory_bytes: node.memory_bytes,
+            runtime_gate: node.runtime_gate,
             kernel_decides: cfg!(target_os = "linux"),
             grant: root_grant.as_deref(),
             access_invalid: matches!(parsed, Some(Err(_))),
@@ -197,6 +261,8 @@ impl Kakoi {
                 devices,
                 volume_devices,
                 not_applied,
+                memory_limit: resources.memory_limit_bytes.value(),
+                memory_request: resources.memory_request_bytes.value(),
             },
         };
         let facts = serde_json::to_string(&facts).map_err(|e| e.to_string())?;
@@ -283,6 +349,22 @@ impl AdmissionWebhook for RootGrantAdmission {
 #[must_use]
 pub fn can_enforce() -> bool {
     cfg!(target_os = "linux") && rustix::process::geteuid().is_root()
+}
+
+/// The node's memory in bytes, 0 where it is not known.
+#[must_use]
+pub fn node_memory_bytes() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        let info = rustix::system::sysinfo();
+        u64::try_from(info.totalram)
+            .unwrap_or(0)
+            .saturating_mul(u64::from(info.mem_unit))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
 }
 
 /// A filesystem the host already has, as `/proc/self/mountinfo` states it.
@@ -800,18 +882,49 @@ mod tests {
         Kakoi::start().expect("kakoi loads")
     }
 
-    #[cfg(target_os = "linux")]
-    async fn enclosed_verdict() -> Verdict {
+    fn node(mode: NativeSecurity, can_enforce: bool) -> Node {
+        Node {
+            mode,
+            can_enforce,
+            bounds: vec!["memory", "pids"],
+            memory_bytes: 68_719_476_736,
+            runtime_gate: false,
+        }
+    }
+
+    async fn verdict_of(c: &Confinement, volumes: &[String], node: &Node) -> Verdict {
+        let resources = crate::backend::Resources::default();
         kakoi()
             .enclose(
-                &Confinement::default(),
-                "",
-                &[],
-                NativeSecurity::Enforce,
-                true,
+                Asked {
+                    confinement: c,
+                    namespace: "",
+                    volumes,
+                    resources: &resources,
+                },
+                node,
             )
             .await
             .unwrap()
+    }
+
+    async fn enclosed_default() -> Verdict {
+        verdict_of(
+            &Confinement::default(),
+            &[],
+            &node(NativeSecurity::Enforce, true),
+        )
+        .await
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn enclosed_verdict() -> Verdict {
+        verdict_of(
+            &Confinement::default(),
+            &[],
+            &node(NativeSecurity::Enforce, true),
+        )
+        .await
     }
 
     #[cfg(target_os = "linux")]
@@ -848,12 +961,7 @@ mod tests {
         let volumes = ["/data".to_string(), "/cfg".to_string()];
         let on = |c: Confinement| {
             let volumes = volumes.clone();
-            async move {
-                kakoi()
-                    .enclose(&c, "", &volumes, NativeSecurity::Enforce, true)
-                    .await
-                    .unwrap()
-            }
+            async move { verdict_of(&c, &volumes, &node(NativeSecurity::Enforce, true)).await }
         };
         let closed = on(confined(r#"{"effects":["filesystem"],"writes":["/data"]}"#)).await;
         assert!(closed.namespaces.iter().any(|n| n == "net"));
@@ -1137,16 +1245,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_pod_that_says_nothing_is_enclosed_by_default() {
-        let v = kakoi()
-            .enclose(
-                &Confinement::default(),
-                "",
-                &[],
-                NativeSecurity::Enforce,
-                true,
-            )
-            .await
-            .unwrap();
+        let v = enclosed_default().await;
         assert_eq!(v.refused, None);
         assert_eq!((v.uid, v.gid), (Some(65532), Some(65532)));
         assert!(v.no_new_privs && v.clear_caps);
@@ -1158,16 +1257,10 @@ mod tests {
             run_as_user: Some(0),
             ..Confinement::default()
         };
-        let refused = kakoi()
-            .enclose(&c, "", &[], NativeSecurity::Enforce, true)
-            .await
-            .unwrap();
+        let refused = verdict_of(&c, &[], &node(NativeSecurity::Enforce, true)).await;
         assert!(refused.refused.unwrap().contains("kakoi.pleme.io/root"));
         c.root_grant = Some("drops to the unit's account".to_string());
-        let granted = kakoi()
-            .enclose(&c, "", &[], NativeSecurity::Enforce, true)
-            .await
-            .unwrap();
+        let granted = verdict_of(&c, &[], &node(NativeSecurity::Enforce, true)).await;
         assert_eq!(granted.refused, None);
         assert_eq!(granted.uid, Some(0));
     }
@@ -1288,10 +1381,7 @@ mod tests {
                 cap_add,
                 ..Confinement::default()
             };
-            kakoi()
-                .enclose(&c, "", &[], NativeSecurity::Enforce, true)
-                .await
-                .unwrap()
+            verdict_of(&c, &[], &node(NativeSecurity::Enforce, true)).await
         };
         let kept = on(vec!["NET_BIND_SERVICE".to_string()]).await;
         assert_eq!(kept.refused, None);
@@ -1302,12 +1392,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_pod_with_no_limit_is_bounded_by_default_and_a_declared_one_stands() {
+        let v = enclosed_default().await;
+        assert_eq!(v.limits.pids_max, Some(4096));
+        assert_eq!(v.limits.memory_max, Some(17_179_869_184));
+        let resources = crate::backend::Resources::from_container_json(&serde_json::json!({
+            "resources": {"limits": {"memory": "64Mi"}}
+        }));
+        let declared = kakoi()
+            .enclose(
+                Asked {
+                    confinement: &Confinement::default(),
+                    namespace: "",
+                    volumes: &[],
+                    resources: &resources,
+                },
+                &node(NativeSecurity::Enforce, true),
+            )
+            .await
+            .unwrap();
+        assert_eq!(declared.limits.memory_max, None);
+        assert_eq!(declared.limits.pids_max, Some(4096));
+        let mut blind = node(NativeSecurity::Enforce, true);
+        blind.bounds.clear();
+        let blind = verdict_of(&Confinement::default(), &[], &blind).await;
+        assert_eq!(blind.refused, None);
+        assert_eq!(blind.limits, DefaultLimits::default());
+        assert!(
+            blind.warnings.iter().any(|w| w.contains("pids.max")),
+            "{blind:?}"
+        );
+        assert!(
+            blind.warnings.iter().any(|w| w.contains("memory.max")),
+            "{blind:?}"
+        );
+    }
+
+    #[test]
+    fn a_default_bound_lands_in_the_plan_and_a_declared_limit_wins() {
+        use crate::cgroup::{CgroupPlan, Knob};
+        let limits = DefaultLimits {
+            pids_max: Some(4096),
+            memory_max: Some(1 << 30),
+        };
+        let plan = CgroupPlan::default().with_defaults(&limits);
+        assert_eq!(plan.memory_max, Some(1 << 30));
+        assert!(plan.writes().contains(&(Knob::PidsMax, "4096".to_string())));
+        assert!(
+            plan.writes()
+                .contains(&(Knob::MemorySwapMax, "0".to_string()))
+        );
+        let declared = CgroupPlan {
+            memory_max: Some(1 << 26),
+            ..CgroupPlan::default()
+        }
+        .with_defaults(&limits);
+        assert_eq!(declared.memory_max, Some(1 << 26));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_node_states_its_memory() {
+        assert!(node_memory_bytes() > 1 << 20);
+    }
+
+    #[tokio::test]
+    async fn a_runtime_gate_leaves_to_its_runtime_what_only_the_native_seam_cannot_apply() {
+        let mut gate = node(NativeSecurity::Enforce, true);
+        gate.runtime_gate = true;
+        for c in [
+            Confinement {
+                sysctls: vec!["a.b".into()],
+                ..Confinement::default()
+            },
+            Confinement {
+                seccomp_profile: Some("Localhost".into()),
+                ..Confinement::default()
+            },
+            Confinement {
+                run_as_user: Some(100_001),
+                ..Confinement::default()
+            },
+        ] {
+            assert_eq!(verdict_of(&c, &[], &gate).await.refused, None, "{c:?}");
+        }
+        let root = Confinement {
+            host_pid: true,
+            ..Confinement::default()
+        };
+        assert!(verdict_of(&root, &[], &gate).await.refused.is_some());
+    }
+
+    #[tokio::test]
     async fn blue_decides_each_new_fact_the_seam_states() {
         let on = |c: Confinement| async move {
-            kakoi()
-                .enclose(&c, "", &[], NativeSecurity::Enforce, true)
-                .await
-                .unwrap()
+            verdict_of(&c, &[], &node(NativeSecurity::Enforce, true)).await
         };
         let refused_for = [
             (
@@ -1408,16 +1587,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_node_that_cannot_enforce_says_so_and_changes_nothing() {
-        let v = kakoi()
-            .enclose(
-                &Confinement::default(),
-                "",
-                &[],
-                NativeSecurity::Enforce,
-                false,
-            )
-            .await
-            .unwrap();
+        let v = verdict_of(
+            &Confinement::default(),
+            &[],
+            &node(NativeSecurity::Enforce, false),
+        )
+        .await;
         assert_eq!(v.uid, None);
         assert!(!v.no_new_privs);
         assert_eq!(v.warnings.len(), 1);
