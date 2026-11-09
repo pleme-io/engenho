@@ -13,7 +13,7 @@
 # `pitr-lab/mysql-0` started twice a second). Implementations and tests of
 # the runtime itself carry a targeted allow.
 #
-# ── One door per process (theory/KAKOI.md, law 5) ─────────────────────────
+# ── One door per process ──────────────────────────────────────────────────
 # A pod's process enters through kakoi: `workload_command` then `enter_on_exec`
 # to start it, `NativeBackend::exec_command` then `join_on_exec` to run a command
 # in it. A bare spawn elsewhere runs as the daemon, unconfined, which is how exec
@@ -21,6 +21,6 @@
 # targeted allow that says so.
 disallowed-methods = [
   { path = "engenho_kubelet::backend::ContainerRuntime::start", reason = "start containers through Kubelet::launch, which asks the start curve first (T2.4)" },
-  { path = "tokio::process::Command::new", reason = "a pod's process enters through kakoi (theory/KAKOI.md law 5); a node tool carries a targeted allow" },
-  { path = "std::process::Command::new", reason = "a pod's process enters through kakoi (theory/KAKOI.md law 5); a node tool carries a targeted allow" },
+  { path = "tokio::process::Command::new", reason = "a pod's process enters through kakoi; a node tool carries a targeted allow" },
+  { path = "std::process::Command::new", reason = "a pod's process enters through kakoi; a node tool carries a targeted allow" },
 ]

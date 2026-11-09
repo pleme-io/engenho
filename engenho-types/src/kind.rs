@@ -3,7 +3,7 @@
 //! Every Kubernetes resource kind in engenho-types implements this trait.
 //! It is the substrate that the rest of engenho (apiserver registry,
 //! datastore, controller-manager, scheduler) consumes — type-axis at L0
-//! of the test pyramid (theory/ENGENHO.md §V.1).
+//! of the test pyramid.
 //!
 //! The trait is intentionally narrow. Wire surfaces (JSON / protobuf /
 //! Server-Side-Apply / Strategic-Merge-Patch / JSON-Patch) are layered on
@@ -43,8 +43,7 @@ pub enum Scope {
 ///
 /// Implementors are emitted by `forge-gen --backend kube-resource` from
 /// upstream OpenAPI v3. Hand-authoring an `impl KubeResource for X` for
-/// any K8s upstream kind is a CI-rejected anti-pattern — see
-/// `theory/ENGENHO.md` §IV (the non-negotiable rule).
+/// any K8s upstream kind is a CI-rejected anti-pattern (the non-negotiable rule).
 pub trait KubeResource: serde::Serialize + serde::de::DeserializeOwned + Clone {
     /// Group/Version/Kind for this resource.
     const GVK: GroupVersionKind;

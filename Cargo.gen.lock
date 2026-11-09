@@ -2,7 +2,7 @@
   "schema_version": 2,
   "cargo_lock_sha256": "c7360669a9f63b0c78f1669fe324ed01c5fc342448a9b872ef5951935e7f1582",
   "manifest_sha256": {
-    "Cargo.toml": "d01aaf53747fb0992b8dcf03e85650b2ed3872884ceb76335a1154d81133e927",
+    "Cargo.toml": "d0ad8e7feeb0951b19d422f29192693935a81093b66949fc899e40e653d5e235",
     "engenho-apiserver/Cargo.toml": "9067f6fa2bc2ae377fa39f17105775d0a8026c554d3fca62b7a1ceb850381307",
     "engenho-blue/Cargo.toml": "189fb47c512d35e4aea021453b404938920f29e3e0dd19dcf7741ee9ccd6b14e",
     "engenho-cluster-config-render/Cargo.toml": "5f5f6d40c2b9a572f18418d12e568412517972684259f34a9aa3d34de0a5dc8c",
@@ -19,13 +19,13 @@
     "engenho-fonte-cli/Cargo.toml": "370c6b06297206379f4ad84b91baa3c51796f1a5b8563d7ce127752cc59f1612",
     "engenho-fonte/Cargo.toml": "a074bc92449afc5b002c35965f1c0e8f86754064d7bf7e6d86cb7c496c5bfd1e",
     "engenho-kube-client/Cargo.toml": "91708a8a8ec2457678a3dcb977c6145d09b82a0930e609381cce93af4a1c7b3e",
-    "engenho-kube-codegen/Cargo.toml": "dee2568ffa6cfcffaa0e690e52e1ddea241714f94541850f674e16b4d165e2ac",
-    "engenho-kube-proto/Cargo.toml": "7545b21650bdbf36fa4b0592ee3659069a39555f10174f42142bf337b1f1c00b",
+    "engenho-kube-codegen/Cargo.toml": "7c7002a740b63972a9c02397068472bb1096363deef6f1e32ca3169df577c204",
+    "engenho-kube-proto/Cargo.toml": "9e8634861b58e3c953099309b71d4cbd22f3eabf495dab9da1d054f0dbe1a6bb",
     "engenho-kubelet/Cargo.toml": "10dc2a98dd1b6e0109666b0c8c0b324c146da4339a546f66e99cc2ab3dadc97b",
     "engenho-mcp/Cargo.toml": "a73d0471a92fe4eeb98d75f5ca945aeafcf56c6034e36f47d06bbf980ed9e369",
     "engenho-oracle/Cargo.toml": "9b0da2a6c1d469c28eb0617b8d71df0b0bf6db7751596956e0bb74a6ac979984",
     "engenho-revoada/Cargo.toml": "08cfd6e45e8acfb75f3073e3a70a9a11a9c33575c43509d0199b1e73bb8012f9",
-    "engenho-runtime/Cargo.toml": "1fdf07e98f14a68bbad795afeae5da543cd6e991c5f8692d22fec4f4d2e40d38",
+    "engenho-runtime/Cargo.toml": "9fd0d0e0d4e7845a2a472147b4f7376d9e2747016ff4917dfc3aef21deec5c82",
     "engenho-scheduler/Cargo.toml": "b8e178bbb3012942524cd91c4f5e3c1160e11d2ec81eb81ce5f18bd1504426d1",
     "engenho-serve/Cargo.toml": "e91e4b03ebb3c2537969e30bce65f374c368c8e5a668006970524d2687023cd6",
     "engenho-store/Cargo.toml": "273289f403e635a092fbdc62b93cc16fb34424552154017d435e2d4da1c912d4",
@@ -37,7 +37,7 @@
     "engenho-teia/Cargo.toml": "c0b840a05f7e1a944503ea3701d4f1f2a4e3656b3c334d9029e8ceb6ee8cbbcc",
     "engenho-types/Cargo.toml": "ed835cbe693033a0b05c49550da9b34545d51a477a28a053bd0a86878bc917c3",
     "engenho-unit/Cargo.toml": "c50c84e16c1c00b4114eb42306bd59b21ce535cb6d4c67237ba9ddb2c68be3e3",
-    "engenho/Cargo.toml": "99f5aa512d4dbd227658b8abae14cd29e4526c6690fa28b563118d6c73754b6a"
+    "engenho/Cargo.toml": "41b636d176cd33e1d574d054f4f821b578b0610cd189e3d67c95b72b5c249802"
   },
   "target_resolves": {
     "base": {

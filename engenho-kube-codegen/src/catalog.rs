@@ -10,7 +10,7 @@
 //!      while expanding coverage incrementally. Adding a new kind is
 //!      one row in this table.
 //!
-//! Per theory/ENGENHO.md §M0.0.4 the eventual full set is ~150 kinds
+//! At M0.0.4 the eventual full set is ~150 kinds
 //! across ~16 API groups. This file's `KIND_CATALOG` is the M0.0.1
 //! subset (well-known kinds every test cluster uses).
 

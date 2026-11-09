@@ -33,7 +33,7 @@ impl ClusterConfig {
     /// [`crate::K3sServerConfig`] — every emitted byte flows
     /// through `serde_yaml::to_string` on a typed struct, NOT
     /// `formatdoc!` of K8s YAML (closes the ★★ TYPED-EMISSION
-    /// violation per `pleme-io/theory/TYPED-EMISSION.md`).
+    /// violation).
     #[must_use]
     pub fn render_k3s_config_yaml(&self) -> String {
         let net = &self.network;

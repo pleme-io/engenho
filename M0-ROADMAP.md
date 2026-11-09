@@ -1,7 +1,6 @@
 # engenho M0→M5 ROADMAP — the complete, distributed k3s replacement
 
-> **Status:** canonical execution spec (2026-06-06). The destination + theory
-> live in [`theory/ENGENHO.md`](../theory/ENGENHO.md); this file is the
+> **Status:** canonical execution spec (2026-06-06). This file is the
 > **path** — the dependency-ordered, gate-checked build order an operator +
 > agents execute against. `src/main.rs` points here. Resume by finding the
 > first phase whose exit-gate is not green and continuing from its first

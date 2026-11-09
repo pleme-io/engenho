@@ -1,11 +1,10 @@
 # M0 — generation pipeline + kubectl-conformant single-node
 
-> Companion to [`pleme-io/theory/ENGENHO.md`](https://github.com/pleme-io/theory/blob/main/ENGENHO.md)
-> §X. The theory doc owns the *destination*; this doc owns the
-> *step-by-step path-down* for milestone M0 inside this repo.
+> This doc owns the *step-by-step path-down* for milestone M0
+> inside this repo.
 >
 > **Phase semantics.** Each substep is a discrete PR with a passing
-> CI gate (L0-L4 of theory/ENGENHO.md §V). Skipping a substep is a
+> CI gate (L0-L4 of the test pyramid). Skipping a substep is a
 > drift signal — the build either passes its tests or it doesn't ship.
 
 ---
@@ -14,7 +13,7 @@
 
 - `KubeResource` typed contract (`kind.rs`).
 - `meta/v1` types — ObjectMeta, TypeMeta, ListMeta. BTreeMap-everywhere
-  for byte-deterministic serialization (theory/ENGENHO.md §VI.4).
+  for byte-deterministic serialization.
 - API path helpers (`api.rs`).
 - Vendored Kubernetes v1.34 OpenAPI v3 schemas (core/v1, apps/v1, rbac/v1).
 - BLAKE3-attested `MANIFEST.yaml` + verification test.
@@ -108,7 +107,7 @@ generator output. CI gate ensures regeneration produces no diff.
 **Test gates.**
 
 - L0-L4 retained.
-- **Determinism gate** (theory/ENGENHO.md §VI.1) — `kube-forge generate
+- **Determinism gate** — `kube-forge generate
   --check` returns 0 iff regenerated source == tree source byte-for-byte.
 
 **Compounding unlock.** Adding any other kind to engenho-types is now
@@ -134,7 +133,7 @@ modules for every kind in every vendored OpenAPI schema (~16 groups,
 
 ## M0.1 — `engenho-datastore` + `engenho-apiserver` (kubectl handshake)
 
-Scope per theory/ENGENHO.md §X, M0.1 row. ~10-14 weeks of focused work.
+~10-14 weeks of focused work.
 
 The load-bearing single milestone of the entire engenho program. Every
 downstream component (controllers, scheduler, kubelet, kube-proxy)
@@ -144,19 +143,19 @@ depends on the apiserver working. Build it first; build it well.
 
 ## M0.2 — controller-manager + scheduler
 
-Per theory/ENGENHO.md §X. ~8-10 weeks.
+~8-10 weeks.
 
 ---
 
 ## M0.3 — kubelet (CRI client + pod lifecycle)
 
-Per theory/ENGENHO.md §X. ~10-14 weeks.
+~10-14 weeks.
 
 ---
 
 ## M0.4 — networking + DNS + local-path (single-node complete)
 
-Per theory/ENGENHO.md §X. ~6-8 weeks. **End of M0 — engenho is a
+~6-8 weeks. **End of M0 — engenho is a
 complete single-node Kubernetes distribution ready for `rio`.**
 
 ---
@@ -164,15 +163,15 @@ complete single-node Kubernetes distribution ready for `rio`.**
 ## Cross-cutting invariants (every milestone)
 
 1. **Generation over hand-authoring.** Any K8s resource type touched by
-   hand is a CI-rejected anti-pattern per theory/ENGENHO.md §IV.
+   hand is a CI-rejected anti-pattern.
    Generator-extension is the only valid fix path.
 2. **Tameshi attestation chain.** Every release artifact ships with a
    BLAKE3 receipt covering inputs → outputs.
 3. **shigoto for all work graphs.** Every reconciliation loop is a
-   `shigoto::Dag` per theory/SHIGOTO.md.
+   `shigoto::Dag`.
 4. **NixAST for emitted Nix.** No `format!()`-of-Nix in any emitter.
 5. **Determinism.** Every output is bit-reproducible from the same
-   inputs (theory/ENGENHO.md §VI).
+   inputs.
 6. **Tatara daemon supervision.** Every long-running engenho subsystem
    runs under tatara's `defguest` daemon mode per
    [tatara/docs/daemon-supervision.md](https://github.com/pleme-io/tatara/blob/main/docs/daemon-supervision.md).

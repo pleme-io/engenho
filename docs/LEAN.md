@@ -4,8 +4,7 @@
 > composition compounds to the leanest Rust-native Kubernetes
 > runtime that can pass v1.34 conformance.**
 >
-> Read [`pleme-io/theory/ENGENHO.md`](../../theory/ENGENHO.md) first
-> for the long-form theory. This doc is the operating decision
+> This doc is the operating decision
 > matrix — every Kubernetes subsystem, what we own vs what we
 > compose, and the source of the choice.
 
@@ -128,7 +127,6 @@ vendored OpenAPI source on both client (engenho-types) and server
   - [`pleme-io/kasou`](https://github.com/pleme-io/kasou) — Apple VZ wrapper (already used)
 
 - **Engenho own**:
-  - [`ENGENHO.md`](../../theory/ENGENHO.md) — destination doc
   - [`engenho-mcp/`](../engenho-mcp/) — MCP operator surface (shipped 2026-05-21)
   - [`engenho-cluster-config/`](../engenho-cluster-config/) — typed bootstrap config (shipped)
   - [`engenho-types/`](../engenho-types/) — typed resource catalog (M0.0 scaffold; M0.0.2+ in flight)

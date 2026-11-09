@@ -8,7 +8,7 @@
 //!
 //!   * **`--check`** — re-emit + diff against the on-disk source.
 //!     Exits non-zero on drift. Used by CI to enforce the determinism
-//!     contract (theory/ENGENHO.md §VI.1).
+//!     contract.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

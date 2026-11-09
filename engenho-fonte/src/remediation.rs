@@ -1,8 +1,7 @@
 //! Typed remediation policy — routes [`AnomalyEvent`]s to typed
 //! responses.
 //!
-//! Maps 1:1 to the Viggy Method's RemediationPolicy enum
-//! (`pleme-io/theory/CONTINUOUS-SOLUTION-MACHINE.md` §III.5): every
+//! Maps 1:1 to the Viggy Method's RemediationPolicy enum: every
 //! drift event the AnomalyChain records flows through an
 //! [`AnomalyRouter`] that picks a typed [`RemediationPolicy`] based
 //! on the event kind + asks the routed handler to act.

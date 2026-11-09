@@ -160,7 +160,7 @@ pub enum Outcome {
 | fold | no source column here |
 
 See [the other doc](OTHER.md), [the crate](../engenho-a/), [upstream](https://example.com/x/y.rs)
-and [a sibling repository](../../theory/THEORY.md).
+and [a sibling repository](../../sibling/README.md).
 Members: `engenho-a/src/lib.rs::Tracker::ingest` and `engenho-a/src/lib.rs::Outcome::Reached`.
 Prose with slashes: `start/status/stop/remove`.
 
@@ -259,7 +259,7 @@ engenho-gone/src/lib.rs::Nothing in a fence is not read: `engenho-gone/src/lib.r
 (deftest "prose with slashes, URLs and links that leave the repository are not paths"
   (assert (= (length (src:line-refs "docs/CATALOG.md" 1 "`start/status/stop/remove` `a/b` `~/x/y.rs` `/etc/z.toml`")) 0)
     "no path in prose, a bare a/b, a home path or an absolute path")
-  (assert (equal? (src:resolve-link "docs/CATALOG.md" "../../theory/THEORY.md") "")
+  (assert (equal? (src:resolve-link "docs/CATALOG.md" "../../sibling/README.md") "")
     "a link that climbs out of the repository resolves to nothing")
   (assert (equal? (src:resolve-link "docs/CATALOG.md" "../engenho-a/src/") "engenho-a/src/")
     "a link into the repository resolves from the document's directory"))

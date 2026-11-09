@@ -243,7 +243,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: clippy-ubuntu
-      - name: one door per process (theory/KAKOI.md law 5)
+      - name: one door per process
         run: cargo clippy -p engenho-kubelet --all-targets --all-features --locked -- -A warnings -A clippy::all -D clippy::disallowed_methods
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
         continue-on-error: true

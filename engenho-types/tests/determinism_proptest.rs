@@ -1,6 +1,6 @@
 //! Determinism property tests — the §VI.4 contract surfaced as proptest.
 //!
-//! Per theory/ENGENHO.md §VI.4, all SSA-merge / serialization paths must
+//! All SSA-merge / serialization paths must
 //! be byte-deterministic given identical inputs. Upstream Go's
 //! strategic-merge-patch has known order-dependent edge cases driven by
 //! Go map iteration order; engenho avoids this by `BTreeMap`-everywhere.

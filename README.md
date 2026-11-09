@@ -40,23 +40,17 @@ with no caller. The ledger names all of it.
 > from upstream OpenAPI v3 via `kube-forge` (Pillar 12). Caixa M2/M3
 > slots reconciled natively without Helm. Secrets flow through cofre.
 > Pods can be OCI containers OR WASI preview 2 components
-> (`runtimeClassName: wasm`, engenho-kubelet's `WasmBackend`). The
-> destination doc —
-> [`pleme-io/theory/ENGENHO.md`](https://github.com/pleme-io/theory/blob/main/ENGENHO.md)
-> — is canonical; read it before touching anything load-bearing.
+> (`runtimeClassName: wasm`, engenho-kubelet's `WasmBackend`).
 
 **Repo docs:**
 - [`CLAUDE.md`](./CLAUDE.md) — agent-facing repo guide (architecture, build, anti-patterns)
 - [`docs/M0-ROADMAP.md`](./docs/M0-ROADMAP.md) — local M0.0.1 → M0.0.4 path-down
-- [`theory/ENGENHO.md`](https://github.com/pleme-io/theory/blob/main/ENGENHO.md) — destination, typed surface, compatibility contract, phases
-- [`theory/ENGENHO-LOCAL.md`](https://github.com/pleme-io/theory/blob/main/ENGENHO-LOCAL.md) — the canonical operator local-dev path: kasou + kikai → working k8s cluster on every `nix run .#rebuild`
 
 ## Quick start — the canonical path
 
 The default first way to run engenho is via the kasou + kikai
 substrate: a typed kasou-managed Linux VM on macOS, running k3s
-today as a 1:1 wire-compat bridge → engenho once M0.4 ships. Full
-spec at [`theory/ENGENHO-LOCAL.md`](https://github.com/pleme-io/theory/blob/main/ENGENHO-LOCAL.md).
+today as a 1:1 wire-compat bridge → engenho once M0.4 ships.
 
 One Nix declaration on the operator's `nodes/<host>/engenho-local.nix`:
 
@@ -94,7 +88,7 @@ nix build                    # hermetic release build via substrate's
 ./result/bin/engenho         # M0.0 placeholder — prints destination pointer
 ```
 
-## Architecture (target — theory/ENGENHO.md §II.1)
+## Architecture (target)
 
 ```
 engenho (workspace root)
@@ -256,7 +250,7 @@ clears? Reproduce by leaving a controller attached for hours, then plot
 Ports measured on the live node: only `6443` listens. `10250` (kubelet),
 `10248`, `10256`, `10257`, `10259`, `2379`/`2381` (etcd) are all closed.
 
-## Wire compatibility (theory/ENGENHO.md §III)
+## Wire compatibility
 
 **Status column added 2026-08-29 — the rows below are the TARGET wire
 contracts; only the first is realised.**
@@ -289,7 +283,7 @@ distribution to pass.
 | `nix-ast` | All emitted Nix (deploy.yaml fragments etc.) typed |
 | `pleme-actions` | CI workflows migrate to `pleme-io/rust-ci-action@v1` |
 
-## Phases (theory/ENGENHO.md §X)
+## Phases
 
 | Phase | Scope | Target |
 |---|---|---|

@@ -4,7 +4,7 @@
 //! Today's only backend is [`K3sRenderer`] (the existing render fns
 //! promoted into a trait impl). The trait exists so:
 //!
-//! 1. When engenho-native lands (theory/ENGENHO.md M0.4+), a second
+//! 1. When engenho-native lands (M0.4+), a second
 //!    `EngenhoNativeRenderer` slots in without touching the consumer
 //!    (`nixos-k3s-vm` swaps the renderer; the typed schema stays put).
 //! 2. Test-only renderers (e.g. "emit JSON diff vs golden") attach
@@ -20,7 +20,7 @@ use crate::manifest::Manifest;
 ///
 /// `K3sRenderer` produces the existing config.yaml + cmdline + manifests
 /// targeting k3s. Future `EngenhoNativeRenderer` will produce engenho's
-/// own typed init config (TBD shape — see theory/ENGENHO.md §IX).
+/// own typed init config (TBD shape).
 pub trait ClusterConfigRenderer {
     /// Human-readable name of the runtime this renderer targets.
     /// Used in operator-visible logs + the generated artifacts'
@@ -87,7 +87,7 @@ impl ClusterConfigRenderer for EngenhoNativeRenderer {
 
     fn render_config_yaml(&self, _cfg: &ClusterConfig) -> String {
         // engenho-native consumes a different on-disk config shape
-        // (TBD per theory/ENGENHO.md §IX — typed via tatara-lisp's
+        // (TBD — typed via tatara-lisp's
         // defguest daemon-supervision form, not a YAML file). Until
         // M0.4 lands the actual renderer, callers MUST NOT instantiate
         // this renderer; the build-time selection in nixos-k3s-vm

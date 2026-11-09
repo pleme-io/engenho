@@ -11,7 +11,6 @@
 > [`DISTRIBUTED.md`](DISTRIBUTED.md) · [`FABRIC.md`](FABRIC.md) ·
 > [`CONSISTENCY-FABRIC.md`](CONSISTENCY-FABRIC.md) ·
 > [`MANY-FACES.md`](MANY-FACES.md) · [`RESILIENCE.md`](RESILIENCE.md).
-> Canonical destination: [`../../theory/ENGENHO.md`](../../theory/ENGENHO.md).
 
 ## The thesis
 

@@ -1,8 +1,8 @@
 //! # engenho-kube-codegen
 //!
 //! Reads vendored Kubernetes OpenAPI v3 JSON + emits typed Rust source
-//! into `engenho-types/src/generated_v1_34/`. Per theory/ENGENHO.md
-//! §IV the load-bearing invariant: no hand-authored K8s resource
+//! into `engenho-types/src/generated_v1_34/`. The
+//! load-bearing invariant: no hand-authored K8s resource
 //! types — every kind is generated bit-reproducibly from upstream.
 //!
 //! ## What's generated today (M0.0.1 first pass)

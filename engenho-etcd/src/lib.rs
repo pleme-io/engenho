@@ -101,7 +101,7 @@ pub mod pb {
     /// `authpb` — role/user messages. Present only because `etcdserverpb`
     /// imports it. No `Auth` service is implemented or mounted, and the
     /// façade authenticates no caller at all (see the crate docs);
-    /// theory/ENGENHO.md §III.2's permission-denied stubs are design only.
+    /// the permission-denied stubs are design only.
     pub mod authpb {
         include!(concat!(env!("OUT_DIR"), "/authpb.rs"));
     }

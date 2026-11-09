@@ -3476,7 +3476,7 @@ const UID_NAMESPACE: &str = "engenho.pleme.io/resource-uid/v1";
 ///
 /// ## Why this is derived and not random
 ///
-/// engenho's store is attested (`theory/ENGENHO.md` §VI.1, the determinism
+/// engenho's store is attested (the determinism
 /// contract): replaying the same command sequence must reproduce the same
 /// bytes. A `uuid::new_v4()` would break that — the uid is part of the object,
 /// the object is part of the hash chain, so a random uid makes every replay

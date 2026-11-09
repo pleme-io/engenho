@@ -1,7 +1,7 @@
 //! Property tests pinning the determinism contract on ObjectMeta /
 //! TypeMeta / ListMeta + the GVK path-construction injectivity rule.
 //!
-//! These are the L1 (proptest) layer of theory/ENGENHO.md §V.2 — every
+//! These are the L1 (proptest) layer of the test pyramid — every
 //! load-bearing data shape carries a property test that an example
 //! test would silently miss (e.g. "two different inputs producing the
 //! same output," "round-trip drift after N transformations").
@@ -110,7 +110,7 @@ proptest! {
 
 // ─── invariant 2: byte-determinism across runs ──────────────────────
 // Serializing the SAME object twice in the same process MUST produce
-// identical bytes — this is theory/ENGENHO.md §VI.4's load-bearing
+// identical bytes — this is the load-bearing
 // claim for SSA merge. The BTreeMap choice (vs HashMap) is what makes
 // this true; the proptest pins it across all generated shapes.
 

@@ -1,31 +1,22 @@
 # engenho — typed, attested, Rust-native Kubernetes runtime
 
 > **★★★ CSE / Knowable Construction.** This repo operates under
-> **Constructive Substrate Engineering** — canonical specification at
-> [`pleme-io/theory/CONSTRUCTIVE-SUBSTRATE-ENGINEERING.md`](https://github.com/pleme-io/theory/blob/main/CONSTRUCTIVE-SUBSTRATE-ENGINEERING.md).
+> **Constructive Substrate Engineering**.
 > The Compounding Directive (operational rules: solve once,
 > load-bearing fixes only, idiom-first, models stay current, direction
 > beats velocity) is in the org-level pleme-io/CLAUDE.md ★★★ section.
 >
-> **Destination doc:** [`pleme-io/theory/ENGENHO.md`](https://github.com/pleme-io/theory/blob/main/ENGENHO.md).
-> Read it before touching anything load-bearing — typed surface in §II,
-> wire-compat in §III, compounding hierarchy in §IV, testing pyramid in
-> §V, determinism contract in §VI, verifiability surface in §VII, caixa
-> integration in §VIII, tatara integration in §IX, phases in §X,
-> open questions in §XII, anti-patterns + risks in Appendix B.
->
 > **Lean engineering rationale:** [`docs/LEAN.md`](./docs/LEAN.md) —
 > the decision matrix for every K8s subsystem (what engenho owns, what
 > it composes from Rust OSS, what it consumes from pleme-io shared
-> libs). Read after ENGENHO.md.
+> libs).
 >
 > **Local roadmap:** [`docs/M0-ROADMAP.md`](./docs/M0-ROADMAP.md) — the
 > M0.0.1 → M0.0.4 step-by-step inside this repo.
 
 The runtime layer of pleme-io's Pillar 7 (Kubernetes control). Pangea
 declares; magma realizes (cloud); **engenho runs the land** (containers
-on real hardware). Sibling primitive to magma; never duplicates scope —
-see theory/ENGENHO.md §XI.1.a for the explicit boundary table.
+on real hardware). Sibling primitive to magma; never duplicates scope.
 
 ## Architecture
 
@@ -55,8 +46,8 @@ See [`README.md`](./README.md) for the target workspace shape. Today
 
 ## The non-negotiable rule
 
-**No hand-authored Kubernetes resource types.** Per theory/ENGENHO.md
-§IV, every K8s kind is mechanically emitted by `kube-forge` from
+**No hand-authored Kubernetes resource types.** Every K8s kind is
+mechanically emitted by `kube-forge` from
 upstream OpenAPI v3. Hand-authoring a `Pod` / `Deployment` / `Service`
 struct is a CI-rejected anti-pattern — extend the generator instead.
 
@@ -67,9 +58,7 @@ is deleted and replaced by generator output. After M0.0.3, the rule
 holds forever.
 
 Same shape as Crossplane's ban on `format!()` of Go syntax
-([`pleme-io/theory/CONSTRUCTIVE-CROSSPLANE-PROVIDERS.md`](https://github.com/pleme-io/theory/blob/main/CONSTRUCTIVE-CROSSPLANE-PROVIDERS.md))
-and NixAST's ban on string-concat of Nix
-([`pleme-io/theory/NIX-AST.md`](https://github.com/pleme-io/theory/blob/main/NIX-AST.md)).
+and NixAST's ban on string-concat of Nix.
 
 ## Consumers' needs are engenho's backlog
 
@@ -90,8 +79,7 @@ statically-linked binary, no second daemon, no sidecar, no shell. When you
 add a capability the default is that it lives in this workspace, in Rust,
 in-process — reached by a trait call, not by a socket or a subprocess.
 
-Destination: [`pleme-io/theory/BUTAI.md`](https://github.com/pleme-io/theory/blob/main/BUTAI.md)
-§1. What is still outside the binary today:
+What is still outside the binary today:
 [`docs/PITR-READINESS.md`](./docs/PITR-READINESS.md) §4.
 
 **For a new capability, in order:**
@@ -151,8 +139,7 @@ first read as "Flux is broken".
 **The exception is a world-fact, never a convenience.** `engenho → CRI →
 containerd` stays reachable **by design, permanently** — not because butai
 cannot replace it, but because a cluster we do not own may already run it and
-because upstream publishes OCI images rather than Nix derivations. Per
-[`MIRAGEM`](https://github.com/pleme-io/theory/blob/main/MIRAGEM.md), a limit
+because upstream publishes OCI images rather than Nix derivations. A limit
 phrased in terms of *our own* abstractions is ours to dissolve; one phrased as
 a fact about *the world* gets typed. "We shell out to podman" is ours. "Docker
 Hub serves images" is not. Deleting the CRI backend to chase a purity number
@@ -407,7 +394,7 @@ every leg over it blind.
 - **engenho** is the placeholder binary that today prints the destination
   pointer. At M0.1 it composes apiserver + datastore; later milestones
   add controllers / scheduler / kubelet / kube-proxy / DNS / local-path
-  / CA. Per theory/ENGENHO.md §IX, the binary's main loop is
+  / CA. The binary's main loop is
   `tatara_reconciler::run(processes)` — engenho describes the cluster
   as typed processes, tatara runs them.
 
@@ -469,22 +456,21 @@ the signal.
   serde, never sprintf strings.
 - **Bypassing cofre for secrets.** Kubelet must materialize secrets
   through cofre; no plaintext k8s `Secret` object in flight.
-- **Embedding upstream Go.** Engenho ships zero vendored Go (theory/ENGENHO.md §I).
+- **Embedding upstream Go.** Engenho ships zero vendored Go.
   This bans copying an implementation, not owning a capability — see
   "One binary" above for the distinction.
 - **A second daemon, sidecar or `Command::new` for a capability** a Rust
   trait impl could serve. The two shell-outs that remain are tracked, not
-  precedent: podman (theory/BUTAI.md M0–M8) and helm
+  precedent: podman (the single-binary roadmap, M0–M8) and helm
   (`engenho-fonte/src/caixa_helm_installer.rs`).
-- **Hand-rolled work-graph orchestration.** Use `shigoto::Dag` per
-  pleme-io/theory/SHIGOTO.md.
+- **Hand-rolled work-graph orchestration.** Use `shigoto::Dag`.
 - **Shell scripts beyond 3-line glue.** Tatara-lisp via `tatara-script`
   for anything more complex.
 
 ## Phases
 
 See [`docs/M0-ROADMAP.md`](./docs/M0-ROADMAP.md) for the M0.0.1 → M0.0.4
-local step-by-step; theory/ENGENHO.md §X for the M0–M5 fleet-wide arc.
+local step-by-step; [`M0-ROADMAP.md`](./M0-ROADMAP.md) for the M0–M5 arc.
 
 ## License
 

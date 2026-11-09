@@ -14,8 +14,8 @@
 //! ★ THE SERVICE SPLIT IS UPSTREAM'S. What is served today is `KV` (reads
 //! only), `Watch` and `Maintenance`. This crate implements no `Lease`,
 //! `Cluster` or `Auth` service, and the runtime mounts none, so a call to
-//! one gets the transport's bare `Unimplemented`. `theory/ENGENHO.md`
-//! §III.2 is the DESIGN target — "what the upstream kube-apiserver actually
+//! one gets the transport's bare `Unimplemented`. The DESIGN target is
+//! "what the upstream kube-apiserver actually
 //! calls", with the full write path, `Lease`, and `Auth` as
 //! permission-denied stubs — and this file does not reach it.
 //!

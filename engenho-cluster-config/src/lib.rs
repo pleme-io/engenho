@@ -16,8 +16,8 @@
 //!    in nix's module system and easy in Rust. [`ClusterConfig::validate`]
 //!    runs at deserialize time and fails closed.
 //!
-//! 2. **Render parity.** k3s today, engenho tomorrow (theory/ENGENHO.md
-//!    §X). When engenho-native lands, the same typed config drives the
+//! 2. **Render parity.** k3s today, engenho tomorrow.
+//!    When engenho-native lands, the same typed config drives the
 //!    native renderer instead of the k3s-flag emitter. Keeping the schema
 //!    in Rust means the migration is a renderer swap, not a re-modeling.
 //!

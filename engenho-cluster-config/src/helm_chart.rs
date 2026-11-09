@@ -1,7 +1,7 @@
 //! Typed `HelmChart` CRD (k3s' `helm.cattle.io/v1` resource).
 //!
-//! Closes the remaining 22 `formatdoc!` sites in `render.rs` per
-//! `pleme-io/theory/TYPED-EMISSION.md`. Every emitted byte flows
+//! Closes the remaining 22 `formatdoc!` sites in `render.rs` (TYPED-EMISSION).
+//! Every emitted byte flows
 //! through `serde_yaml::to_string` on a typed struct.
 
 use std::collections::BTreeMap;

@@ -214,9 +214,7 @@ distinctive behavior of distributed engenho:
 - **Non-clashing** — "Swarm" is Docker; "Federation" is K8s v1
   legacy. "Revoada" is undefended in the K8s lexicon.
 
-Canonical spec: this doc. Long-form theory once `revoada` proves out:
-`pleme-io/theory/REVOADA.md` (companion to ENGENHO.md, MAGMA.md,
-TERRENO.md).
+Canonical spec: this doc.
 
 ## Layer mapping to crates
 
@@ -338,5 +336,4 @@ manages itself.
 ---
 
 **Status**: design freeze; R0 scaffold next session.
-**Companion docs**: [LEAN.md](LEAN.md) (lean library strategy),
-[../theory/ENGENHO.md](https://github.com/pleme-io/theory/blob/main/ENGENHO.md) (engenho destination).
+**Companion docs**: [LEAN.md](LEAN.md) (lean library strategy).

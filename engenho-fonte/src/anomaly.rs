@@ -14,7 +14,7 @@
 //!
 //! ## Why a typed chain (not a metric or alert)
 //!
-//! The Viggy Method (`pleme-io/theory/CONTINUOUS-SOLUTION-MACHINE.md`)
+//! The Viggy Method
 //! is built on the premise that drift is a *typed value* the
 //! substrate proves something about — not a numeric symptom waiting
 //! for a human to triage. AnomalyChain is the typed surface for that

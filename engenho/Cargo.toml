@@ -1,6 +1,6 @@
 [package]
 name = "engenho"
-description = "Typed, attested, Rust-native Kubernetes runtime. The engine that runs the land (terreno). Pillar 7 runtime half; sibling to magma. Spec: theory/ENGENHO.md."
+description = "Typed, attested, Rust-native Kubernetes runtime. The engine that runs the land (terreno). Pillar 7 runtime half; sibling to magma."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

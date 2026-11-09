@@ -9,7 +9,7 @@ second node).
 
 **aldeia** (Brazilian-Portuguese *village*: many houses, one settlement) is the
 name of the one cluster: its `cluster.name` and its kube context
-(`theory/NAMING.md`, The Swarm 群).
+(The Swarm 群).
 
 ## 0. Destination
 

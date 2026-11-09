@@ -2,7 +2,7 @@
 //!
 //! The typed Kubernetes resource catalog for engenho.
 //!
-//! Per `pleme-io/theory/ENGENHO.md` §II.1, every Kubernetes kind is a
+//! Every Kubernetes kind is a
 //! `#[derive(KubeResource, TataraDomain)]` struct mechanically emitted by
 //! `forge-gen` from upstream OpenAPI v3 (Pillar 12 — generation over
 //! composition). The non-negotiable rule of this crate: **no hand-authored
@@ -43,7 +43,7 @@
 //! `forge-gen --backend kube-resource` must emit by M0.0.3. The kind itself
 //! is then deleted from the tree and replaced by the generator's output.
 //!
-//! ## Ship gate (theory/ENGENHO.md §XIII)
+//! ## Ship gate
 //!
 //! Engenho ships ONLY when Sonobuoy `--mode=certified-conformance`
 //! passes on Kubernetes 1.34 with zero skips. Until M4 lands, the kasou
@@ -99,7 +99,7 @@ pub use spec_int::SpecInt;
 /// vendored OpenAPI schemas under `vendor/openapi/v1.34.0/` or the
 /// generated kinds in [`generated_v1_34`].
 ///
-/// Per `theory/ENGENHO.md` §XIII the ship gate is Kubernetes 1.34
+/// The ship gate is Kubernetes 1.34
 /// conformance — this const is the compile-time anchor for that surface.
 pub const KUBE_VERSION: &str = ApiFace::VENDORED.version().git_version();
 

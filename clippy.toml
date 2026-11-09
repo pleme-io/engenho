@@ -1,6 +1,5 @@
 # engenho — TYPED EMISSION (with-format-ban) clippy gate, SCOPED.
 #
-# Canonical rule: https://github.com/pleme-io/theory/blob/main/TYPED-EMISSION.md
 # Substrate helper: pleme-io/substrate/lib/build/rust/format-ban.{nix,clippy.toml}
 #
 # ── Why this root config carries NO `disallowed-macros` entry ──────────

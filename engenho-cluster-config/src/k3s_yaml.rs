@@ -1,6 +1,5 @@
 //! Typed k3s server config — the AST that replaces the previous
-//! `formatdoc!`-based emitter (★★ TYPED-EMISSION violation per
-//! `pleme-io/theory/TYPED-EMISSION.md`).
+//! `formatdoc!`-based emitter (★★ TYPED-EMISSION violation).
 //!
 //! Every k3s `config.yaml` field gets a typed equivalent here. The
 //! emitter is `serde_yaml::to_string`; round-trips through the

@@ -107,8 +107,7 @@ pub struct GitopsSource {
 /// The renderer emits the Kubernetes `Secret` manifest with a
 /// placeholder; sops-nix's activation script substitutes the actual
 /// value at `/var/lib/rancher/k3s/server/manifests/<secret>.yaml`
-/// before k3s auto-applies. See `theory/SAGUAO.md` §III for the
-/// secret-materialization shape.
+/// before k3s auto-applies.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct SecretRef {

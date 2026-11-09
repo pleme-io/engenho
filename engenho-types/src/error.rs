@@ -152,8 +152,8 @@ impl ApiStatusKind {
 
 /// Retry classification — the typed decision a controller makes per
 /// failure. This IS `shigoto_types::failure::FailureKind`, the canonical
-/// convergence primitive (theory/CONVERGENCE-ADOPTION.md;
-/// theory/FAILURE-CLASSIFICATION.md). `KubeError::classify` is a consumer
+/// convergence primitive.
+/// `KubeError::classify` is a consumer
 /// of the fleet-wide Transient/Declarative split — not a hand-rolled
 /// mirror of it. Re-exported so the classify return type stays nameable
 /// as `engenho_types::error::FailureKind`.

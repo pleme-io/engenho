@@ -4,8 +4,7 @@
 point-in-time-recovery drill — *snapshot → restore → verify* — run on engenho,
 and what is still missing if not.
 
-It does **not** restate the single-binary roadmap; that is
-[`theory/BUTAI.md`](https://github.com/pleme-io/theory/blob/main/BUTAI.md)
+It does **not** restate the single-binary roadmap
 (M0–M8). §4 here records only the parts of it that bear on a drill.
 
 ---
@@ -201,7 +200,7 @@ go red and the four asserting restraint stay green.
 
 | gap | bearing on PITR | owner |
 |---|---|---|
-| **container runtime** — podman (remote CLI) or an external CRI | a drill's containers are started by something engenho does not contain. On darwin this is also the `podman rm` reclaim trap | `theory/BUTAI.md` M0–M8 |
+| **container runtime** — podman (remote CLI) or an external CRI | a drill's containers are started by something engenho does not contain. On darwin this is also the `podman rm` reclaim trap | the single-binary roadmap, M0–M8 |
 | **CNI** — absent entirely; pod IP is parsed out of `podman inspect` | a NetworkPolicy applies and enforces nothing. Irrelevant to a single-node drill, disqualifying for a multi-tenant one | `docs/CNI-CSI-PROGRAMME.md` |
 | **helm** — one shell-out, `engenho-fonte/src/caixa_helm_installer.rs:138` | only if the drill is delivered as a chart | unowned |
 

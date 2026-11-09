@@ -33,7 +33,7 @@ meta group, the move state machine, allocation tables), FLEET-DESIGN.md's
 shape is the destination and this document's rows grade today's code
 against it.
 
-Tiers, from [theory/UNREPRESENTABILITY.md](https://github.com/pleme-io/theory/blob/main/UNREPRESENTABILITY.md):
+Tiers:
 
 | Tier | Meaning | The test |
 |---|---|---|

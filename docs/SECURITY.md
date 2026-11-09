@@ -1,6 +1,6 @@
 # Security by default
 
-A native pod is secure by what it does not say. The policy is blue: `engenho-kubelet/blue/kakoi/kakoi.b`, loaded under an empty posture. Rust states the facts and applies the verdict (`engenho-kubelet/src/kakoi.rs`). The laws are `theory/KAKOI.md`; this file says what holds today.
+A native pod is secure by what it does not say. The policy is blue: `engenho-kubelet/blue/kakoi/kakoi.b`, loaded under an empty posture. Rust states the facts and applies the verdict (`engenho-kubelet/src/kakoi.rs`). This file says what holds today.
 
 ## What a pod gets
 
@@ -128,7 +128,7 @@ Every API request is recorded by default as a JSON-line `audit.k8s.io/v1` Event 
 - **A kernel below Landlock ABI 6** leaves abstract sockets and signals unscoped, and one with no Landlock leaves every file rule unheld. Each is a `ConfinementNotEnforced` event naming what is missing, never a refused pod.
 - **A pod with no access** may run what it wrote to a volume or its scratch, since a chart's ConfigMap script and an init container's copied tool are real workloads. An access value closes that.
 - **The seccomp list is a deny-list** with a ceiling, covering x86_64 and aarch64. seccomp(2) recommends an allow-list; moby's default profile is the base to start from.
-- **macOS.** Neither identity nor enclosure applies, and each pod gets a `ConfinementNotEnforced` event. `sandbox-exec` is deprecated, and Apple's own `container` tool runs one VM per container, so Linux workloads on a Mac belong in a VM. The design is `theory/NAWABARI.md`; its code is not in `pleme-io/nawabari`, which is empty.
+- **macOS.** Neither identity nor enclosure applies, and each pod gets a `ConfinementNotEnforced` event. `sandbox-exec` is deprecated, and Apple's own `container` tool runs one VM per container, so Linux workloads on a Mac belong in a VM. The macOS enclosure is designed but not built; `pleme-io/nawabari` is empty.
 - **A daemon that is not root** cannot enclose. On Linux the kernel still refuses a uid the pod declares that is not the daemon's.
 - **Anonymous discovery** (`/api`) still answers; RBAC limits it to discovery.
 

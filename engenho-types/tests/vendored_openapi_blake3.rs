@@ -1,13 +1,13 @@
 //! Vendored OpenAPI v3 BLAKE3 manifest verification.
 //!
-//! Per theory/ENGENHO.md §VI.1, every byte the forge-gen → engenho-types
+//! Every byte the forge-gen → engenho-types
 //! pipeline consumes is BLAKE3-attested. This test reads the manifest
 //! and **recomputes** the BLAKE3 of every vendored file, asserting the
 //! on-disk content matches the manifest declaration byte-for-byte.
 //!
 //! Failure mode: someone replaced an upstream schema without updating
 //! the manifest. The diff surfaces here, in CI, at L1 of the test pyramid
-//! (theory/ENGENHO.md §V.2 — unit tests).
+//! (unit tests).
 //!
 //! This is the seed verification that locks the input substrate before
 //! M0.0.3 wires up the generator itself. After M0.0.3, the generator
@@ -77,7 +77,7 @@ fn every_vendored_file_present_with_declared_size() {
 /// re-saves that change line endings, accidental edits, or upstream
 /// schema swaps — surfaces here.
 ///
-/// This test is the M0 instantiation of theory/ENGENHO.md §VI.1's
+/// This test is the M0 instantiation of the
 /// "generated source is bit-reproducible" contract. At M0.0.3 the same
 /// test gates forge-gen's output (regenerate from these schemas → same
 /// generated source byte-for-byte).
@@ -100,7 +100,7 @@ fn every_vendored_file_blake3_matches_manifest() {
 fn manifest_declares_kubernetes_1_34() {
     // Tightening invariant: engenho ships ONLY when Sonobuoy
     // --mode=certified-conformance passes on the 1.34 surface with
-    // zero skips (theory/ENGENHO.md §III.1 + §XIII Ship Gate). A
+    // zero skips (the ship gate). A
     // manifest bump to a different minor must be a deliberate edit
     // reviewed alongside the corresponding conformance-pass evidence.
     //

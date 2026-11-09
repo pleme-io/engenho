@@ -10,7 +10,7 @@ homepage.workspace     = true
 readme.workspace       = true
 categories.workspace   = true
 keywords.workspace     = true
-description = "Kubernetes protobuf wire codec for the engenho apiserver HTTP boundary. Compiles the vendored go-to-protobuf generated.proto set (core/apps/rbac + apimachinery) into a FileDescriptorSet via protox (no protoc), then converts the `runtime.Unknown`-framed K8s protobuf wire format <-> serde_json::Value through prost-reflect DynamicMessage. The downstream JSON-Value pipeline (handler/store/admission/read-back) is untouched. Per theory/ENGENHO.md §VI.1 — generation over composition (Pillar 12); proto descriptors ARE the typed serializer."
+description = "Kubernetes protobuf wire codec for the engenho apiserver HTTP boundary. Compiles the vendored go-to-protobuf generated.proto set (core/apps/rbac + apimachinery) into a FileDescriptorSet via protox (no protoc), then converts the `runtime.Unknown`-framed K8s protobuf wire format <-> serde_json::Value through prost-reflect DynamicMessage. The downstream JSON-Value pipeline (handler/store/admission/read-back) is untouched. Generation over composition (Pillar 12); proto descriptors ARE the typed serializer."
 
 [lib]
 path = "src/lib.rs"

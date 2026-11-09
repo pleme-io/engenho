@@ -175,8 +175,7 @@ pub enum PlacementPolicy {
 // Fleet-wide dispatcher-catalog registration for the engenho
 // fabric's placement policy surface. Sixth consumer class adopting
 // gen-platform's typed-dispatcher catamorphism (after gen / caixa /
-// wasm-platform / cofre / shigoto). See
-// theory/UNIFIED-COMPUTING-MODEL.md §VI.
+// wasm-platform / cofre / shigoto).
 gen_platform::register_dispatcher!("engenho.placement-policy", PlacementPolicy);
 
 /// Reconciliation cadence — how often the fabric runs a convergence

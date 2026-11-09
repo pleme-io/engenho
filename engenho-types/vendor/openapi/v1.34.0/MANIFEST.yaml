@@ -1,6 +1,6 @@
 # engenho-types — vendored Kubernetes OpenAPI v3 manifest (v1.34)
 #
-# Per theory/ENGENHO.md §VI.1 ("Determinism contract — generated source"),
+# Per the determinism contract for generated source,
 # every byte the forge-gen → engenho-types pipeline consumes is
 # BLAKE3-attested. Any drift between this manifest and the on-disk file
 # contents is caught by `cargo test --features openapi-roundtrip` in CI.
@@ -22,7 +22,7 @@
 #   4. `cargo test --features openapi-roundtrip` must pass — proves every
 #      kind still serializes round-trip against the new schema.
 #   5. `cargo run -p forge-gen -- engenho-types --check` (M0.0.3+) must
-#      regenerate source bit-for-bit (theory/ENGENHO.md §VI.1).
+#      regenerate source bit-for-bit.
 #   6. Update the conformance-target assertion in
 #      tests/vendored_openapi_blake3.rs.
 ---

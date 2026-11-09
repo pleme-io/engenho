@@ -32,7 +32,6 @@ the day the native controllers cover its tree, with no repo change.
 | `Inventory` + GVKNN diff | shipped, unused | `magma-converge/src/inventory.rs` |
 | `DriftPolicy` + ignore paths | shipped, unused | `magma-converge/src/drift.rs` |
 | `Artifact` (BLAKE3 content address + provenance) | shipped | `magma-converge/src/artifact.rs` |
-| The CRD→primitive mapping | written | `theory/FLUXCD-CONVERGENCE.md` §II–III |
 
 ## 2. The controllers
 

@@ -355,7 +355,7 @@ Keep `substrate::maquina`. From now on, a state machine exists only as the imple
 - The etcd façade stays on, read-only and loopback-only until it has mutual TLS (T4.9). T3.2b and T3.8 fix it.
 - **ryn is one trust domain.** Native workloads run as the operator's UID and share the host's filesystem and loopback. They can already read the store's files and anything else the operator can.
   - A 0600 socket or a mutual-TLS key on disk is readable by that same UID, so neither isolates anything.
-  - The real boundary is a separate identity per workload, from BUTAI's supervisor (theory/BUTAI.md §1, gated by edge 12).
+  - The real boundary is a separate identity per workload, from BUTAI's supervisor (gated by edge 12).
   - Until then, ryn hosts only workloads the operator would run by hand.
   - T4.2 is the highest-severity *remote* escalation path, not the only escalation path.
 

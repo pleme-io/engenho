@@ -87,13 +87,13 @@ engenho-csi            = { path = "engenho-csi", version = "0.53.159" }
 engenho-etcd           = { path = "engenho-etcd", version = "0.53.159" }
 
 # Pleme-io sibling-directory path deps for typed-dispatcher
-# catalog integration (theory/UNIFIED-COMPUTING-MODEL.md §VI).
+# catalog integration.
 gen-platform = "0.1"
 gen-types = "0.1"
 
 # Convergence primitive — engenho-types' KubeError::classify consumes the
-# canonical Transient/Declarative split (theory/CONVERGENCE-ADOPTION.md;
-# theory/FAILURE-CLASSIFICATION.md) instead of hand-rolling FailureClass.
+# canonical Transient/Declarative split
+# instead of hand-rolling FailureClass.
 shigoto-types = "0.1"
 
 axum                   = "0.7"
