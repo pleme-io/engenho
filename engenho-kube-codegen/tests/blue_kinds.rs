@@ -42,7 +42,10 @@ fn every_selected_kind_is_a_record_with_a_catalog_row() {
         "role_binding",
     ] {
         assert!(src.contains(&format!("\nrecord {record}(")), "{record}");
-        assert!(src.contains(&format!("    {record}: {{")), "{record} catalog row");
+        assert!(
+            src.contains(&format!("    {record}: {{")),
+            "{record} catalog row"
+        );
     }
 }
 

@@ -443,7 +443,8 @@ A record refuses an unknown field and a missing one. A Kubernetes field the sche
     catalog.deployment.plural #=> \"deployments\"
     wire_names.api_group #=> \"apiGroup\"";
 
-const CATALOG_DOC: &str = "catalog: each kind's apiVersion, kind, plural and scope, keyed by its record.
+const CATALOG_DOC: &str =
+    "catalog: each kind's apiVersion, kind, plural and scope, keyed by its record.
 
     catalog.role_binding.api_version #=> \"rbac.authorization.k8s.io/v1\"
     catalog.config_map.scope #=> :namespaced";
@@ -453,7 +454,8 @@ const UNSET_DOC: &str = "unset: each record's optional fields at their empty val
     unset.container.ports #=> []
     unset.object_meta.name #=> nil";
 
-const WIRE_DOC: &str = "wire_names: the Kubernetes spelling of every field whose blue name differs from it.
+const WIRE_DOC: &str =
+    "wire_names: the Kubernetes spelling of every field whose blue name differs from it.
 
     wire_names.container_port #=> \"containerPort\"
     wire_names.match_labels #=> \"matchLabels\"";
@@ -489,10 +491,7 @@ fn record_test(r: &BlueRecord) -> Sexp {
                 args.push(map(given));
                 format!("{} builds from unset and its required fields", r.name)
             };
-            (
-                title,
-                call(&predicate, [call(&r.name, [Sexp::List(args)])]),
-            )
+            (title, call(&predicate, [call(&r.name, [Sexp::List(args)])]))
         }
         None => (
             format!("{} is not an empty map", r.name),
@@ -507,9 +506,15 @@ pub fn blue_forms(records: &[BlueRecord]) -> Result<Vec<Sexp>> {
     for r in records {
         forms.push(documented(&record_doc(r)?, record_form(r)));
     }
-    forms.push(documented(CATALOG_DOC, define("catalog", catalog_form(records))));
+    forms.push(documented(
+        CATALOG_DOC,
+        define("catalog", catalog_form(records)),
+    ));
     forms.push(documented(UNSET_DOC, define("unset", unset_form(records))));
-    forms.push(documented(WIRE_DOC, define("wire_names", wire_form(records)?)));
+    forms.push(documented(
+        WIRE_DOC,
+        define("wire_names", wire_form(records)?),
+    ));
     forms.extend(records.iter().map(record_test));
     Ok(forms)
 }
@@ -568,8 +573,7 @@ mod tests {
             true,
             &selected,
         );
-        let by: BTreeMap<&str, &BlueField> =
-            fields.iter().map(|f| (f.name.as_str(), f)).collect();
+        let by: BTreeMap<&str, &BlueField> = fields.iter().map(|f| (f.name.as_str(), f)).collect();
         assert!(!by.contains_key("api_version"));
         assert_eq!(by["name"].ty, BlueType::Value("Str"));
         assert!(by["name"].required);
@@ -577,10 +581,7 @@ mod tests {
             by["ports"].ty,
             BlueType::List(Box::new(BlueType::Record("container_port".into())))
         );
-        assert_eq!(
-            by["env"].ty,
-            BlueType::List(Box::new(BlueType::Object))
-        );
+        assert_eq!(by["env"].ty, BlueType::List(Box::new(BlueType::Object)));
         assert_eq!(by["limits"].ty, BlueType::Value("Map"));
         assert_eq!(by["port"].ty, BlueType::Any);
         assert_eq!(by["size"].ty, BlueType::Value("Str"));
@@ -615,7 +616,11 @@ mod tests {
                 kind: None,
             },
         ];
-        let names: Vec<String> = order(records).unwrap().into_iter().map(|r| r.name).collect();
+        let names: Vec<String> = order(records)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
         assert_eq!(names, ["b", "a"]);
     }
 
