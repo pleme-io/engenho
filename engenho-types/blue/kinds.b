@@ -797,3 +797,173 @@ def wire_names()
     working_dir: "workingDir"
   }
 end
+
+test "config_map builds from unset"
+  assert config_map?(config_map(**unset.config_map))
+end
+
+test "container_port builds from unset and its required fields"
+  assert container_port?(
+    container_port(**unset.container_port, container_port: 1)
+  )
+end
+
+test "env_var builds from unset and its required fields"
+  assert env_var?(env_var(**unset.env_var, name: "x"))
+end
+
+test "volume_mount builds from unset and its required fields"
+  assert volume_mount?(
+    volume_mount(**unset.volume_mount, mount_path: "x", name: "x")
+  )
+end
+
+test "container builds from unset and its required fields"
+  assert container?(container(**unset.container, name: "x"))
+end
+
+test "deployment builds from unset"
+  assert deployment?(deployment(**unset.deployment))
+end
+
+test "label_selector_requirement builds from unset and its required fields"
+  assert label_selector_requirement?(
+    label_selector_requirement(
+      **unset.label_selector_requirement,
+      key: "x",
+      operator: "x"
+    )
+  )
+end
+
+test "label_selector builds from unset"
+  assert label_selector?(label_selector(**unset.label_selector))
+end
+
+test "pod_template_spec builds from unset"
+  assert pod_template_spec?(pod_template_spec(**unset.pod_template_spec))
+end
+
+test "deployment_spec is not an empty map"
+  assert not deployment_spec?({})
+end
+
+test "deployment_strategy builds from unset"
+  assert deployment_strategy?(deployment_strategy(**unset.deployment_strategy))
+end
+
+test "ip_block builds from unset and its required fields"
+  assert ip_block?(ip_block(**unset.ip_block, cidr: "x"))
+end
+
+test "local_object_reference builds from unset"
+  assert local_object_reference?(
+    local_object_reference(**unset.local_object_reference)
+  )
+end
+
+test "network_policy builds from unset"
+  assert network_policy?(network_policy(**unset.network_policy))
+end
+
+test "network_policy_peer builds from unset"
+  assert network_policy_peer?(network_policy_peer(**unset.network_policy_peer))
+end
+
+test "network_policy_port builds from unset"
+  assert network_policy_port?(network_policy_port(**unset.network_policy_port))
+end
+
+test "network_policy_egress_rule builds from unset"
+  assert network_policy_egress_rule?(
+    network_policy_egress_rule(**unset.network_policy_egress_rule)
+  )
+end
+
+test "network_policy_ingress_rule builds from unset"
+  assert network_policy_ingress_rule?(
+    network_policy_ingress_rule(**unset.network_policy_ingress_rule)
+  )
+end
+
+test "network_policy_spec builds from unset"
+  assert network_policy_spec?(network_policy_spec(**unset.network_policy_spec))
+end
+
+test "owner_reference builds from unset and its required fields"
+  assert owner_reference?(
+    owner_reference(
+      **unset.owner_reference,
+      api_version: "x",
+      kind: "x",
+      name: "x",
+      uid: "x"
+    )
+  )
+end
+
+test "object_meta builds from unset"
+  assert object_meta?(object_meta(**unset.object_meta))
+end
+
+test "object_reference builds from unset"
+  assert object_reference?(object_reference(**unset.object_reference))
+end
+
+test "pod_spec builds from unset and its required fields"
+  assert pod_spec?(pod_spec(**unset.pod_spec, containers: []))
+end
+
+test "policy_rule builds from unset and its required fields"
+  assert policy_rule?(policy_rule(**unset.policy_rule, verbs: []))
+end
+
+test "resource_requirements builds from unset"
+  assert resource_requirements?(
+    resource_requirements(**unset.resource_requirements)
+  )
+end
+
+test "role builds from unset"
+  assert role?(role(**unset.role))
+end
+
+test "role_ref builds from unset and its required fields"
+  assert role_ref?(
+    role_ref(**unset.role_ref, api_group: "x", kind: "x", name: "x")
+  )
+end
+
+test "subject builds from unset and its required fields"
+  assert subject?(subject(**unset.subject, kind: "x", name: "x"))
+end
+
+test "role_binding is not an empty map"
+  assert not role_binding?({})
+end
+
+test "rolling_update_deployment builds from unset"
+  assert rolling_update_deployment?(
+    rolling_update_deployment(**unset.rolling_update_deployment)
+  )
+end
+
+test "secret builds from unset"
+  assert secret?(secret(**unset.secret))
+end
+
+test "service builds from unset"
+  assert service?(service(**unset.service))
+end
+
+test "service_account builds from unset"
+  assert service_account?(service_account(**unset.service_account))
+end
+
+test "service_port builds from unset and its required fields"
+  assert service_port?(service_port(**unset.service_port, port: 1))
+end
+
+test "service_spec builds from unset"
+  assert service_spec?(service_spec(**unset.service_spec))
+end

@@ -89,6 +89,18 @@ impl BlueType {
         }
     }
 
+    fn sample(&self) -> Option<Sexp> {
+        match self {
+            BlueType::Value("Str") => Some(text("x")),
+            BlueType::Value("Int") => Some(Sexp::Atom(Atom::Int(1))),
+            BlueType::Value("Bool") => Some(Sexp::Atom(Atom::Bool(true))),
+            BlueType::Value("Float") => Some(Sexp::Atom(Atom::Float(1.0))),
+            BlueType::Value(_) | BlueType::Object => Some(map([])),
+            BlueType::List(_) => Some(Sexp::List(vec![sym("list")])),
+            BlueType::Record(_) | BlueType::Any => None,
+        }
+    }
+
     fn holds_empty(&self) -> bool {
         matches!(self, BlueType::List(_) | BlueType::Value("Map"))
     }
@@ -446,6 +458,50 @@ const WIRE_DOC: &str = "wire_names: the Kubernetes spelling of every field whose
     wire_names.container_port #=> \"containerPort\"
     wire_names.match_labels #=> \"matchLabels\"";
 
+fn assertion(expr: Sexp) -> Sexp {
+    Sexp::List(vec![
+        sym("blue-assert"),
+        Sexp::Quote(Box::new(expr.clone())),
+        expr,
+    ])
+}
+
+fn record_test(r: &BlueRecord) -> Sexp {
+    let predicate = format!("{}?", r.name);
+    let required: Option<Vec<(Sexp, Sexp)>> = r
+        .fields
+        .iter()
+        .filter(|f| f.required)
+        .map(|f| Some((kw(&f.name), f.ty.sample()?)))
+        .collect();
+    let (title, expr) = match required {
+        Some(given) => {
+            let mut args = vec![
+                sym("blue-kwargs"),
+                Sexp::List(vec![
+                    sym("blue-splice"),
+                    Sexp::List(vec![sym("blue-field"), sym("unset"), kw(&r.name)]),
+                ]),
+            ];
+            let title = if given.is_empty() {
+                format!("{} builds from unset", r.name)
+            } else {
+                args.push(map(given));
+                format!("{} builds from unset and its required fields", r.name)
+            };
+            (
+                title,
+                call(&predicate, [call(&r.name, [Sexp::List(args)])]),
+            )
+        }
+        None => (
+            format!("{} is not an empty map", r.name),
+            call("not", [call(&predicate, [map([])])]),
+        ),
+    };
+    Sexp::List(vec![sym("deftest"), text(&title), assertion(expr)])
+}
+
 pub fn blue_forms(records: &[BlueRecord]) -> Result<Vec<Sexp>> {
     let mut forms = vec![call(MODULEDOC_HEAD, [text(MODULEDOC)])];
     for r in records {
@@ -454,6 +510,7 @@ pub fn blue_forms(records: &[BlueRecord]) -> Result<Vec<Sexp>> {
     forms.push(documented(CATALOG_DOC, define("catalog", catalog_form(records))));
     forms.push(documented(UNSET_DOC, define("unset", unset_form(records))));
     forms.push(documented(WIRE_DOC, define("wire_names", wire_form(records)?)));
+    forms.extend(records.iter().map(record_test));
     Ok(forms)
 }
 
