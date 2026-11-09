@@ -102,6 +102,7 @@ not (
         | binary(=status_subresource_parity)
     )
 )
+& not (package(=engenho-kubelet) & binary(=wasm_backend_blue_component))
 '''
 
 # Defined on the default profile, so every other profile inherits it after its
@@ -109,6 +110,14 @@ not (
 [[profile.default.overrides]]
 filter = 'package(=engenho-diff) & kind(=test)'
 test-group = 'live-oracle'
+
+[profile.blue-component]
+# blue's real engine component served as a wasm pod (SUBSTRATE L1.1). Its
+# fixture builds blue's wasm toolchain with nix, which on a cold CI runner
+# took over 10 minutes per run (test.yml run 42582121522: the whole suite went
+# from 148 s to 685 s). So the PR gate leaves it out by name above and
+# deep-test.yml runs it as its own leg; it is never skipped silently.
+default-filter = 'package(=engenho-kubelet) & binary(=wasm_backend_blue_component)'
 
 [profile.oracle]
 # Every integration binary in engenho-diff, a superset of the four names that

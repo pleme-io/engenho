@@ -117,6 +117,10 @@ jobs:
         run: >-
           cargo nextest run --workspace --all-targets --all-features
           --locked --no-fail-fast --no-tests=fail
+      - name: blue's engine component as a wasm pod (nextest profile blue-component)
+        run: >-
+          cargo nextest run --profile blue-component -p engenho-kubelet
+          --all-features --locked --no-fail-fast --no-tests=fail
       # nextest does not run doctests; kept on cargo as its own leg for the
       # same reason as in test.yml.
       - name: cargo test --doc
