@@ -185,8 +185,8 @@ S1 to S4.
 8. **A node that advertises no runtime** (§3) is not judged on runtime. The
    construction: a Node written by an older build, or a boot through
    `start_with_backend`. Refusing such a node would strand every pod on a
-   node registered before this change until it re-registers, which is the
-   mis-scoped refusal UNREPRESENTABILITY §II.2.1 warns about; every
+   node registered before this change until it re-registers, which is a
+   mis-scoped refusal; every
    `Runtime::start` boot now advertises, so the window closes on restart.
 9. **GPU and house are declared, not measured** (§3). A wrong label places
    a pod wrongly; measuring devices at registration is owed.

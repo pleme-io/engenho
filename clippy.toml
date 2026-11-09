@@ -10,7 +10,7 @@
 # is a BLUNT, all-or-nothing lint — it cannot distinguish a wire
 # `format!("/apis/{g}/{v}")` (banned) from an `anyhow` error-context
 # `format!("read {path}")` or a test-helper `format!("s-{i:02}")`
-# (both legitimate per TYPED-EMISSION.md's allowed surfaces).
+# (both legitimate).
 #
 # clippy also reads exactly ONE `clippy.toml` per crate, resolved by
 # walking up from the crate's manifest to the first config found; a

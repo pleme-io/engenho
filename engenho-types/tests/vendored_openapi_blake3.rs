@@ -111,7 +111,7 @@ fn manifest_declares_kubernetes_1_34() {
     let raw = fs::read_to_string(manifest_path()).expect("read MANIFEST.yaml");
     assert!(
         raw.contains("kubernetes_version: 1.34"),
-        "vendored manifest must target k8s 1.34 per ENGENHO.md §III.1"
+        "vendored manifest must target k8s 1.34"
     );
 }
 

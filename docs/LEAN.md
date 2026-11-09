@@ -56,7 +56,7 @@ proved at scale.
 - **Reimplement CNI from scratch.** cilium owns eBPF; engenho's value is in the typed CNI manifest shape, not the dataplane.
 - **Use k8s-openapi.** Their macro-driven approach is incompatible with the typescape's `#[derive(TataraDomain)]` pattern. engenho-types is typed-first.
 - **Build its own etcd.** SeaORM-backed datastore over sqlite/postgres is the kine pattern; we adopt it.
-- **Vendor Go.** Per ENGENHO.md §I, zero Go in the binary.
+- **Vendor Go.** Zero Go in the binary.
 - **Use OpenSSL.** rustls everywhere; FedRAMP-friendly by construction.
 
 ## What engenho's typed surface compounds toward
@@ -72,7 +72,7 @@ Each typed primitive in `engenho-types` unlocks:
 ## Conformance plan
 
 CNCF Certified Kubernetes Software Conformance v1.34 — zero
-skips — is the M0.4 ship gate per ENGENHO.md §XIII.
+skips — is the M0.4 ship gate.
 
 | Conformance category | Engenho's path |
 |---|---|
@@ -118,7 +118,7 @@ vendored OpenAPI source on both client (engenho-types) and server
 
 - **Pleme-io**:
   - [`pleme-io/shigoto`](https://github.com/pleme-io/shigoto) — typed Dag for controllers + scheduler
-  - [`pleme-io/tatara`](https://github.com/pleme-io/tatara) — convergence engine (7 execution drivers); engenho IS a tatara binary per ENGENHO.md §IX
+  - [`pleme-io/tatara`](https://github.com/pleme-io/tatara) — convergence engine (7 execution drivers); engenho IS a tatara binary
   - [`pleme-io/sekiban`](https://github.com/pleme-io/sekiban) — admission webhook + integrity gates
   - [`pleme-io/kensa`](https://github.com/pleme-io/kensa) — compliance + continuous attestation
   - [`pleme-io/cofre`](https://github.com/pleme-io/cofre) — zero-plaintext secrets

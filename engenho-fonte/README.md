@@ -148,7 +148,7 @@ warning. Each tick is logged in that universe's words, so a mock tick reads
 ## Pillar alignment
 
 Per `pleme-io/CLAUDE.md` Pillar 7 (Kubernetes control rendered from typescape)
-+ the Viggy Method (CONTINUOUS-SOLUTION-MACHINE.md):
++ the Viggy Method:
 
 - **CONTINUOUS CONVERGENCE**: every Conduit tick is one beat of the seven-beat
   Viggy convergence loop (Observe → Diff → Classify → Decide → Act → Attest → Tick).
