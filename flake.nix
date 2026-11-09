@@ -60,6 +60,9 @@
         "the_pods_run_as_user_is_the_workloads_uid_on_linux"
         # engenho-kubelet/tests/native_runs_postgres.rs
         "postgres_runs_natively_under_the_kubelet_from_a_nix_closure"
+        # engenho-kubelet/tests/wasm_backend_blue_component.rs
+        "blues_engine_component_serves_a_blue_program_as_a_wasm_pod"
+        "without_its_program_bundle_the_component_fails_fast_by_name"
       ];
       sandboxSkips =
         if oracleBinaries == [ ]
