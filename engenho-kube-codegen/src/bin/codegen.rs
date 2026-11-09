@@ -17,8 +17,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use engenho_kube_codegen::{
-    KIND_CATALOG, KindEntry, OpenApiDoc, SchemaView, emit_catalog, emit_kind_typed, emit_module,
-    emit_shared_module, format_source, shared_substructs,
+    KIND_CATALOG, KindEntry, emit_blue_kinds, emit_catalog, emit_kind_typed, emit_module,
+    emit_shared_module, format_source, schemas, shared_substructs,
 };
 
 #[derive(Parser, Debug)]
@@ -40,26 +40,9 @@ struct Args {
     /// Exit non-zero on drift. Used by CI.
     #[arg(long)]
     check: bool,
-}
 
-fn schema_path_for_group(schema_dir: &std::path::Path, group: &str) -> PathBuf {
-    let fname = match group {
-        "" => "api__v1_openapi.json",
-        "apps" => "apis__apps__v1_openapi.json",
-        "rbac.authorization.k8s.io" => "apis__rbac.authorization.k8s.io__v1_openapi.json",
-        "batch" => "apis__batch__v1_openapi.json",
-        "networking.k8s.io" => "apis__networking.k8s.io__v1_openapi.json",
-        "policy" => "apis__policy__v1_openapi.json",
-        "storage.k8s.io" => "apis__storage.k8s.io__v1_openapi.json",
-        "scheduling.k8s.io" => "apis__scheduling.k8s.io__v1_openapi.json",
-        "coordination.k8s.io" => "apis__coordination.k8s.io__v1_openapi.json",
-        "node.k8s.io" => "apis__node.k8s.io__v1_openapi.json",
-        "autoscaling" => "apis__autoscaling__v2_openapi.json",
-        other => panic!(
-            "no vendored OpenAPI schema for group {other:?} — extend codegen::schema_path_for_group"
-        ),
-    };
-    schema_dir.join(fname)
+    #[arg(long)]
+    blue: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -83,37 +66,8 @@ fn main() -> Result<()> {
         by_module.entry(e.module).or_default().push(e);
     }
 
-    // Cache loaded OpenAPI docs per group so we don't re-parse. Opaque
-    // kinds carry no schema (their group may have no vendored doc), so
-    // they're skipped — `schema_path_for_group` only sees schema-backed
-    // groups.
-    let mut docs: BTreeMap<&'static str, OpenApiDoc> = BTreeMap::new();
-    for entry in KIND_CATALOG {
-        if entry.opaque {
-            continue;
-        }
-        if !docs.contains_key(entry.group) {
-            let path = schema_path_for_group(&args.schema, entry.group);
-            let doc = OpenApiDoc::load(&path)
-                .with_context(|| format!("load schema for group {:?}", entry.group))?;
-            docs.insert(entry.group, doc);
-        }
-    }
-
-    // Merge every group's components.schemas into one map so the typed
-    // emitter can resolve $refs across groups (e.g. apps Deployment →
-    // core PodTemplateSpec). BTreeMap → deterministic; first writer wins
-    // (identical schema keys across files carry identical bodies).
-    let mut schemas: BTreeMap<String, SchemaView> = BTreeMap::new();
-    for doc in docs.values() {
-        for (key, shape) in &doc.components.schemas {
-            schemas.entry(key.clone()).or_insert_with(|| SchemaView {
-                description: shape.description.clone(),
-                properties: shape.properties.clone(),
-                required: shape.required.clone(),
-            });
-        }
-    }
+    let docs = schemas::load_docs(&args.schema)?;
+    let schemas = schemas::merge(&docs);
 
     // Per-module emission. Each module gets `<module>/{kind}.rs` files
     // + a `<module>/mod.rs` that re-exports them.
@@ -242,6 +196,24 @@ fn main() -> Result<()> {
             .with_context(|| format!("create {}", args.output.display()))?;
         std::fs::write(&top_target, top_mod)
             .with_context(|| format!("write {}", top_target.display()))?;
+    }
+
+    if let Some(blue_target) = &args.blue {
+        let blue_src = emit_blue_kinds(&schemas)?;
+        if args.check {
+            let existing = std::fs::read_to_string(blue_target).unwrap_or_default();
+            if existing != blue_src {
+                eprintln!("DRIFT: {}", blue_target.display());
+                drift = true;
+            }
+        } else {
+            if let Some(dir) = blue_target.parent() {
+                std::fs::create_dir_all(dir)
+                    .with_context(|| format!("create {}", dir.display()))?;
+            }
+            std::fs::write(blue_target, blue_src)
+                .with_context(|| format!("write {}", blue_target.display()))?;
+        }
     }
 
     if args.check && drift {

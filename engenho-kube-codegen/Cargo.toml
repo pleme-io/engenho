@@ -24,6 +24,8 @@ clap        = { version = "4.5", features = ["derive"] }
 # it depend on whichever rustfmt happens to be on PATH.
 prettyplease = "0.2"
 syn          = { version = "2.0", features = ["full", "parsing"] }
+blue-lang-fmt    = "0.0.173"
+blue-lang-syntax = "0.0.173"
 
 [[bin]]
 name = "engenho-kube-codegen"

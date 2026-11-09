@@ -33,12 +33,17 @@
 
 pub mod catalog;
 pub mod emit;
+#[allow(missing_docs)]
+pub mod emit_blue;
 pub mod emit_typed;
 pub mod openapi;
+#[allow(missing_docs)]
+pub mod schemas;
 pub mod types;
 
 pub use catalog::{KIND_CATALOG, KindEntry, Subresource};
 pub use emit::{emit_catalog, emit_kind, emit_kind_typed, emit_module, emit_shared_module};
+pub use emit_blue::emit_blue_kinds;
 pub use emit_typed::{SchemaView, shared_substructs};
 pub use openapi::{KindShape, OpenApiDoc};
 
