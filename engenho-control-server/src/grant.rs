@@ -246,7 +246,25 @@ mod tests {
             DeclaredView::Automation("tend".into())
         );
         assert_eq!(declared(Some("agent:")), DeclaredView::Unknown);
+        assert_eq!(declared(Some("automation:")), DeclaredView::Unknown);
         assert_eq!(declared(Some("root")), DeclaredView::Unknown);
         assert_eq!(declared(None), DeclaredView::Unknown);
+    }
+
+    #[test]
+    fn a_local_peer_without_a_pid_is_attested_with_pid_minus_one() {
+        let unknown = Peer::Local(PeerCred {
+            uid: DAEMON,
+            gid: 20,
+            pid: None,
+        });
+        assert!(matches!(
+            unknown.attested().unwrap(),
+            AttestedView::LocalUid { pid: -1, .. }
+        ));
+        assert!(matches!(
+            attested(DAEMON),
+            AttestedView::LocalUid { pid: 7, .. }
+        ));
     }
 }
