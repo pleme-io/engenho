@@ -241,7 +241,7 @@
       "[dependencies.reqwest] features = [rustls-tls, json, stream] with default features on; fixed in pleme-io/sui 66a289f, not in any release as of 0.1.219")
     (list "object_store" "0.13.2" "clean"
       "[dependencies.reqwest] default-features = false, features = [rustls-tls-native-roots, http2]")
-    (list "tameshi" "0.1.3" "clean"
+    (list "tameshi" "0.1.11" "clean"
       "[dependencies.reqwest] default-features = false, features = [json, rustls-tls]")))
 
 (define tls:KINDS (list "asks" "clean"))
