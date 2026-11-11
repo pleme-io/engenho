@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "a85ac0b8f60224a98ea89dd60559b502b8199930913c9258f1c90dfcdb18e687",
+  "cargo_lock_sha256": "36aab8a2794226dbb6a928bb7bad37ba6acebaa63664674732de578c3508591f",
   "manifest_sha256": {
     "Cargo.toml": "da57d578b95cb2b90d761c5acf453333c1b25b84bae44121918dc9f4486165da",
     "engenho-apiserver/Cargo.toml": "9067f6fa2bc2ae377fa39f17105775d0a8026c554d3fca62b7a1ceb850381307",
@@ -13933,7 +13933,7 @@
           },
           {
             "name": "hashbrown",
-            "package_key": "hashbrown-0.17.1",
+            "package_key": "hashbrown-0.16.1",
             "kind": "normal",
             "features": [
               "default-hasher",
@@ -17132,21 +17132,9 @@
         ]
       },
       "hashbrown-0.17.1": {
-        "runtime_dependencies": [
-          {
-            "name": "foldhash",
-            "package_key": "foldhash-0.2.0",
-            "kind": "normal",
-            "features": [],
-            "uses_default_features": false,
-            "optional": true,
-            "target": null,
-            "tree": "target"
-          }
-        ],
+        "runtime_dependencies": [],
         "build_dependencies": [],
         "features": [
-          "default-hasher",
           "inline-more"
         ]
       },
@@ -21912,7 +21900,7 @@
         "runtime_dependencies": [
           {
             "name": "heck",
-            "package_key": "heck-0.5.0",
+            "package_key": "heck-0.4.1",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
