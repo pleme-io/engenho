@@ -79,7 +79,36 @@ pub fn apply(group: &str, version: &str, kind: &str, body: &mut Value) {
 /// not-the-type-I-handle path and does nothing, silently.
 fn default_secret(body: &mut Value) {
     if let Some(obj) = body.as_object_mut() {
+        fold_string_data(obj);
         fill_str(obj, "type", "Opaque");
+    }
+}
+
+fn fold_string_data(obj: &mut Map<String, Value>) {
+    use base64::Engine as _;
+    let Some(string_data) = obj.remove("stringData") else {
+        return;
+    };
+    let Value::Object(string_data) = string_data else {
+        return;
+    };
+    if string_data.is_empty() {
+        return;
+    }
+    if !matches!(obj.get("data"), Some(Value::Object(_))) {
+        obj.insert("data".into(), Value::Object(Map::new()));
+    }
+    if let Some(Value::Object(data)) = obj.get_mut("data") {
+        for (key, value) in string_data {
+            let text = match value {
+                Value::String(s) => s,
+                other => other.to_string(),
+            };
+            data.insert(
+                key,
+                Value::String(base64::engine::general_purpose::STANDARD.encode(text.as_bytes())),
+            );
+        }
     }
 }
 
@@ -334,6 +363,46 @@ mod secret_and_service {
         });
         apply("", "v1", "Secret", &mut b);
         assert_eq!(b["type"], json!("kubernetes.io/dockerconfigjson"));
+    }
+
+    #[test]
+    fn string_data_is_folded_into_data_and_never_stored() {
+        let mut b = json!({
+            "apiVersion": "v1", "kind": "Secret",
+            "metadata": {"name": "fleet-delivery-git", "namespace": "flux-system"},
+            "type": "Opaque",
+            "stringData": {"username": "x-access-token", "password": "t0k"}
+        });
+        apply("", "v1", "Secret", &mut b);
+        assert!(b.get("stringData").is_none(), "got: {b}");
+        assert_eq!(b["data"]["username"], json!("eC1hY2Nlc3MtdG9rZW4="));
+        assert_eq!(b["data"]["password"], json!("dDBr"));
+    }
+
+    #[test]
+    fn string_data_overwrites_the_same_data_key_and_keeps_the_others() {
+        let mut b = json!({
+            "apiVersion": "v1", "kind": "Secret",
+            "metadata": {"name": "s"},
+            "data": {"password": "b2xk", "ca.crt": "Y2E="},
+            "stringData": {"password": "new"}
+        });
+        apply("", "v1", "Secret", &mut b);
+        assert!(b.get("stringData").is_none(), "got: {b}");
+        assert_eq!(b["data"]["password"], json!("bmV3"));
+        assert_eq!(b["data"]["ca.crt"], json!("Y2E="));
+    }
+
+    #[test]
+    fn an_empty_string_data_leaves_data_absent() {
+        let mut b = json!({
+            "apiVersion": "v1", "kind": "Secret",
+            "metadata": {"name": "s"},
+            "stringData": {}
+        });
+        apply("", "v1", "Secret", &mut b);
+        assert!(b.get("stringData").is_none(), "got: {b}");
+        assert!(b.get("data").is_none(), "got: {b}");
     }
 
     #[test]
