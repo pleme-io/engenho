@@ -30,7 +30,7 @@ use engenho_control_types::wire::HttpParts;
 use engenho_control_types::{AuthorityTier, CATALOG, ControlError, OperationSpec, ParamLocation};
 use rmcp::handler::server::router::tool::ToolRoute;
 use rmcp::handler::server::tool::ToolCallContext;
-use rmcp::model::{CallToolResult, Content, JsonObject, Tool};
+use rmcp::model::{CallToolResult, ContentBlock, JsonObject, Tool};
 
 use crate::server::EngenhoMcp;
 use crate::writer::Authority;
@@ -129,7 +129,7 @@ pub fn route(row: &'static OperationSpec) -> ToolRoute<EngenhoMcp> {
         // Found the way `engenho ctl` finds it, at each call: a daemon that
         // restarts elsewhere is followed.
         let socket = resolve_socket(None).path;
-        Box::pin(async move { Ok(call(&socket, row, arguments, ceiling).await) })
+        Box::pin(async move { Ok(call(&socket, row, arguments, ceiling).await.into()) })
     })
 }
 
@@ -183,7 +183,7 @@ pub async fn call(
         Err(err) => return failed(&err),
     };
     match client.send(row.id, request).await {
-        Ok(reply) => CallToolResult::success(vec![Content::text(
+        Ok(reply) => CallToolResult::success(vec![ContentBlock::text(
             String::from_utf8_lossy(&reply.body).into_owned(),
         )]),
         Err(ClientError::Control(err)) => refused(&err),
@@ -197,12 +197,12 @@ fn refused(err: &ControlError) -> CallToolResult {
         ControlError::Refused(refusal) => serde_json::to_string_pretty(refusal),
         ControlError::Blind(blind) => serde_json::to_string_pretty(blind),
     };
-    CallToolResult::error(vec![Content::text(body.unwrap_or_else(|e| e.to_string()))])
+    CallToolResult::error(vec![ContentBlock::text(body.unwrap_or_else(|e| e.to_string()))])
 }
 
 /// No answer from the daemon: blind, never an empty result.
 fn failed(err: &ClientError) -> CallToolResult {
-    CallToolResult::error(vec![Content::text(
+    CallToolResult::error(vec![ContentBlock::text(
         serde_json::json!({
             "outcome": "blind",
             "reason": "runtime_unavailable",

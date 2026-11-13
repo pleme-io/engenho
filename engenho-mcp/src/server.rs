@@ -1,4 +1,4 @@
-//! rmcp 0.15 server scaffold — wires the `ClusterReader` trait
+//! rmcp 3 server scaffold — wires the `ClusterReader` trait
 //! into the tool router via `#[tool_router]` + `#[tool_handler]`.
 //!
 //! The canonical pleme-io shape: tools return `String` (JSON-encoded
@@ -15,7 +15,7 @@ use std::sync::Arc;
 use rmcp::{
     ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ServerCapabilities, ServerInfo},
+    model::{ServerCapabilities, ServerConfig},
     schemars, tool, tool_handler, tool_router,
 };
 use serde::{Deserialize, Serialize};
@@ -287,14 +287,13 @@ impl EngenhoMcp {
     }
 }
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for EngenhoMcp {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some(INSTRUCTIONS.into()),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::default();
+        info.instructions = Some(INSTRUCTIONS.into());
+        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info
     }
 }
 
@@ -421,6 +420,16 @@ mod tests {
         assert!(
             !mutate.iter().any(|n| n.starts_with("control_reinit")),
             "a destructive operation is a tool: {mutate:?}"
+        );
+    }
+
+    #[test]
+    fn the_handler_serves_the_router_that_carries_the_control_tools() {
+        let mcp = server();
+        assert!(ServerHandler::get_tool(&mcp, "cluster_status").is_some());
+        assert!(
+            ServerHandler::get_tool(&mcp, "control_runtime_show").is_some(),
+            "the handler serves a router without the control tools"
         );
     }
 
