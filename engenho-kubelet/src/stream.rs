@@ -375,9 +375,10 @@ impl Fanout {
 ///
 /// The log is written FIRST and flushed per chunk, so `kubectl logs` never
 /// shows less than an attacher saw.
-pub fn tee<R>(mut reader: R, mut log: tokio::fs::File, feed: FanoutFeed)
+pub fn tee<R, L>(mut reader: R, mut log: L, feed: FanoutFeed)
 where
     R: AsyncRead + Send + Unpin + 'static,
+    L: crate::cri_log::LogSink,
 {
     tokio::spawn(async move {
         let mut buf = vec![0u8; CHUNK];
@@ -385,14 +386,12 @@ where
             match reader.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if let Err(e) = log.write_all(&buf[..n]).await {
-                        tracing::warn!(error = %e, "container log write failed");
-                    }
-                    let _ = log.flush().await;
+                    log.append(&buf[..n]);
                     feed.send(&buf[..n]);
                 }
             }
         }
+        drop(log);
         drop(feed);
     });
 }
@@ -475,6 +474,28 @@ mod tests {
             out.extend(c);
         }
         out
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_attacher_never_sees_a_byte_the_log_does_not_yet_hold() {
+        use crate::cri_log::{LogStream, framed_sink};
+        let dir = tempfile::tempdir().expect("tempdir");
+        for round in 0..400 {
+            let path = dir.path().join(format!("{round}.log"));
+            let file = std::fs::File::create(&path).expect("log");
+            let (sink, _) = framed_sink(Arc::new(std::sync::Mutex::new(file)), LogStream::Stdout);
+            let (feed, fan) = fanout();
+            let mut attacher = fan.subscribe();
+            let (mut writer, reader) = tokio::io::duplex(64);
+            tee(reader, sink, feed);
+            writer.write_all(b"seen\n").await.expect("write");
+            assert_eq!(attacher.recv().await.expect("chunk"), b"seen\n");
+            let logged = std::fs::read_to_string(&path).expect("read log");
+            assert!(
+                logged.ends_with(" stdout F seen\n"),
+                "round {round}: the attacher saw a line the log did not hold: {logged:?}"
+            );
+        }
     }
 
     #[tokio::test]

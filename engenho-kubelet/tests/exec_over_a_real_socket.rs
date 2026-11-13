@@ -119,16 +119,8 @@ fn cat_container(log_dir: &std::path::Path) -> AttachPoint {
     let log_err = log.try_clone().expect("log clone");
     let (out_feed, out) = stream::fanout();
     let (err_feed, err) = stream::fanout();
-    stream::tee(
-        child.stdout.take().expect("stdout"),
-        tokio::fs::File::from_std(log),
-        out_feed,
-    );
-    stream::tee(
-        child.stderr.take().expect("stderr"),
-        tokio::fs::File::from_std(log_err),
-        err_feed,
-    );
+    stream::tee(child.stdout.take().expect("stdout"), log, out_feed);
+    stream::tee(child.stderr.take().expect("stderr"), log_err, err_feed);
     let stdin = child.stdin.take().map(stream::pump_writer);
     tokio::spawn(async move {
         let _ = child.wait().await;

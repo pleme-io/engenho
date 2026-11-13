@@ -13,7 +13,7 @@
 //! records back into the text `kubectl logs` prints, and says how far it
 //! consumed so a follow resumes on a record boundary.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -276,42 +276,55 @@ pub fn render(buf: &[u8], opts: RenderOptions, ended: bool) -> Rendered {
 /// A shared CRI log file several streams append whole records to.
 pub type SharedLog = Arc<Mutex<std::fs::File>>;
 
-/// A pipe whose write end takes one stream's raw output; a thread frames
-/// what arrives into records appended to `log`, each stamped when it was
-/// read. The returned receiver turns `true` once the write end has closed and
-/// the last record is on disk.
-///
-/// # Errors
-///
-/// The pipe or the thread could not be created.
+pub trait LogSink: Send + 'static {
+    fn append(&mut self, bytes: &[u8]);
+}
+
+impl LogSink for std::fs::File {
+    fn append(&mut self, bytes: &[u8]) {
+        if let Err(e) = self.write_all(bytes) {
+            tracing::warn!(error = %e, "container log write failed");
+        }
+    }
+}
+
+pub struct FramedLog {
+    log: SharedLog,
+    enc: RecordEncoder,
+    out: Vec<u8>,
+    done: tokio::sync::watch::Sender<bool>,
+}
+
+impl LogSink for FramedLog {
+    fn append(&mut self, bytes: &[u8]) {
+        self.enc.push(bytes, SystemTime::now(), &mut self.out);
+        append(&self.log, &mut self.out);
+    }
+}
+
+impl Drop for FramedLog {
+    fn drop(&mut self) {
+        self.enc.finish(SystemTime::now(), &mut self.out);
+        append(&self.log, &mut self.out);
+        let _ = self.done.send(true);
+    }
+}
+
+#[must_use]
 pub fn framed_sink(
     log: SharedLog,
     stream: LogStream,
-) -> std::io::Result<(std::fs::File, tokio::sync::watch::Receiver<bool>)> {
-    let (mut reader, writer) = std::io::pipe()?;
-    let (done_tx, done_rx) = tokio::sync::watch::channel(false);
-    std::thread::Builder::new()
-        .name(["log-", stream.as_str()].concat())
-        .spawn(move || {
-            let mut enc = RecordEncoder::new(stream);
-            let mut buf = vec![0u8; MAX_RECORD];
-            let mut out = Vec::new();
-            loop {
-                let n = match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => n,
-                };
-                enc.push(&buf[..n], SystemTime::now(), &mut out);
-                append(&log, &mut out);
-            }
-            enc.finish(SystemTime::now(), &mut out);
-            append(&log, &mut out);
-            let _ = done_tx.send(true);
-        })?;
-    Ok((
-        std::fs::File::from(std::os::fd::OwnedFd::from(writer)),
+) -> (FramedLog, tokio::sync::watch::Receiver<bool>) {
+    let (done, done_rx) = tokio::sync::watch::channel(false);
+    (
+        FramedLog {
+            log,
+            enc: RecordEncoder::new(stream),
+            out: Vec::new(),
+            done,
+        },
         done_rx,
-    ))
+    )
 }
 
 fn append(log: &SharedLog, out: &mut Vec<u8>) {

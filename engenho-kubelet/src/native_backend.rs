@@ -515,18 +515,14 @@ fn wire_stdio(
     child: &mut tokio::process::Child,
     pty: Option<crate::pty::Pty>,
     declared: crate::backend::ContainerStdio,
-    log: std::fs::File,
-    log_err: std::fs::File,
+    log: crate::cri_log::FramedLog,
+    log_err: crate::cri_log::FramedLog,
 ) -> std::io::Result<crate::stream::AttachPoint> {
     use crate::stream::{AttachPoint, fanout, pump_resizes, pump_writer, tee};
     let (out_feed, stdout) = fanout();
     if let Some(pty) = pty {
         let master = pty.into_master()?;
-        tee(
-            tokio::fs::File::from_std(master.reader),
-            tokio::fs::File::from_std(log),
-            out_feed,
-        );
+        tee(tokio::fs::File::from_std(master.reader), log, out_feed);
         drop(log_err);
         let stdin = declared
             .stdin
@@ -541,12 +537,12 @@ fn wire_stdio(
     }
     let (err_feed, stderr) = fanout();
     match child.stdout.take() {
-        Some(r) => tee(r, tokio::fs::File::from_std(log), out_feed),
-        None => drop(out_feed),
+        Some(r) => tee(r, log, out_feed),
+        None => drop((log, out_feed)),
     }
     match child.stderr.take() {
-        Some(r) => tee(r, tokio::fs::File::from_std(log_err), err_feed),
-        None => drop(err_feed),
+        Some(r) => tee(r, log_err, err_feed),
+        None => drop((log_err, err_feed)),
     }
     let stdin = child.stdin.take().map(pump_writer);
     Ok(AttachPoint {
@@ -1022,14 +1018,10 @@ impl ContainerRuntime for NativeBackend {
         // The log is CRI records, stamped as each line arrives: what
         // `timestamps`, `sinceSeconds` and `sinceTime` read.
         let shared = Arc::new(std::sync::Mutex::new(file));
-        let framed = |stream| {
-            crate::cri_log::framed_sink(Arc::clone(&shared), stream).map_err(|e| NativeError::Log {
-                path: log_path.clone(),
-                detail: e.to_string(),
-            })
-        };
-        let (log, out_written) = framed(crate::cri_log::LogStream::Stdout)?;
-        let (log_err, err_written) = framed(crate::cri_log::LogStream::Stderr)?;
+        let (log, out_written) =
+            crate::cri_log::framed_sink(Arc::clone(&shared), crate::cri_log::LogStream::Stdout);
+        let (log_err, err_written) =
+            crate::cri_log::framed_sink(shared, crate::cri_log::LogStream::Stderr);
 
         let mut cmd = workload_command(&program, argv.iter().skip(1), &spec.env);
         let pty = if spec.stdio.tty {
