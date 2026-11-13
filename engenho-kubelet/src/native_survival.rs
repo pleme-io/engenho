@@ -465,6 +465,10 @@ mod tests {
         let spec = ContainerSpec {
             image: "nix:/nix/store/a-x".into(),
             env: BTreeMap::from([("DB_PASSWORD".to_string(), "hunter2-sealed".to_string())]),
+            pod: crate::backend::PodIdentity {
+                uid: "u-1".into(),
+                ..crate::backend::PodIdentity::default()
+            },
             ..ContainerSpec::default()
         };
         let record = Record {
@@ -497,7 +501,6 @@ mod tests {
         assert_eq!(read.verdict.uid, Some(65532));
         assert!(read.runs(&spec), "the digest reads back");
         let mut other = spec.clone();
-        other.pod.uid = "u-1".into();
         other.env.insert("DB_PASSWORD".into(), "rotated".into());
         assert!(!read.runs(&other), "a rotated value changes the digest");
     }
