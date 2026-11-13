@@ -54,6 +54,8 @@ pub enum StoreError {
     /// node. What is stored is untouched.
     #[error("{subject}: {fault}")]
     SecretUnreadable { subject: String, fault: SealFault },
+    #[error("the store directory was still held {within:?} after terminate")]
+    DirectoryStillHeld { within: Duration },
 }
 
 engenho_substrate::impl_error_kind! {
@@ -66,6 +68,7 @@ engenho_substrate::impl_error_kind! {
         NoLeader => "no_leader",
         { LeaderUnreachable { .. } } => "leader_unreachable",
         { SecretUnreadable { .. } } => "secret_unreadable",
+        { DirectoryStillHeld { .. } } => "directory_still_held",
     }
 }
 
@@ -209,7 +212,16 @@ impl StoreBackend {
                 .map_err(|e| StoreError::Persist(Box::new(e))),
         }
     }
+
+    fn release_witness(&self) -> Option<crate::fjall_store::ReleaseWitness> {
+        match self {
+            Self::Memory(_) => None,
+            Self::Fjall(s) => Some(s.release_witness()),
+        }
+    }
 }
+
+pub const DIRECTORY_RELEASE_WITHIN: Duration = Duration::from_secs(10);
 
 /// How [`StoreMesh::quiesce`] left each background task the mesh owns.
 ///
@@ -1301,16 +1313,19 @@ impl StoreMesh {
     /// ERROR rather than read as a clean stop.
     ///
     /// The flush runs after `Raft::shutdown`, when raft no longer drives
-    /// applies. Not guaranteed on return: openraft's state-machine worker
-    /// holds a store clone and `Raft::shutdown` does not join it, so that
-    /// clone is released when that worker next runs, not necessarily before
-    /// this returns; an entry it applies after the flush is durable in the
-    /// log and replayed on the next boot.
+    /// applies. openraft's state-machine worker holds a store clone and
+    /// `Raft::shutdown` does not join it; an entry it applies after the flush
+    /// is durable in the log and replayed on the next boot. A durable store
+    /// returns only once that last clone, and with it the directory lock, is
+    /// gone.
     ///
     /// # Errors
     ///
-    /// [`StoreError::Persist`] if the final flush cannot be written.
+    /// [`StoreError::Persist`] if the final flush cannot be written;
+    /// [`StoreError::DirectoryStillHeld`] if the directory lock outlives
+    /// [`DIRECTORY_RELEASE_WITHIN`].
     pub async fn terminate(self) -> Result<(), StoreError> {
+        let witness = self.store.release_witness();
         self.router.deregister(self.node_id).await;
         let quiesced = self.quiesce().await;
         if quiesced.any_panicked() {
@@ -1327,7 +1342,15 @@ impl StoreMesh {
             ?flushed,
             "store flushed at terminate"
         );
-        Ok(())
+        drop(self);
+        match witness {
+            Some(w) if !w.released(DIRECTORY_RELEASE_WITHIN).await => {
+                Err(StoreError::DirectoryStillHeld {
+                    within: DIRECTORY_RELEASE_WITHIN,
+                })
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -1339,6 +1362,9 @@ mod p3_fault_router_partition;
 
 #[cfg(test)]
 mod p3_durable_vote;
+
+#[cfg(test)]
+mod terminate_releases_the_directory;
 
 #[cfg(all(test, feature = "mesh-quic"))]
 mod p4_learner_join;

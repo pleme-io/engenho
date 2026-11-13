@@ -70,7 +70,7 @@ impl FailureClass {
     const fn of_store(error: &StoreError) -> Self {
         match error {
             // The raft configuration is built from ours: it fails the same way.
-            StoreError::ConfigInvalid(_) => Self::Hold,
+            StoreError::ConfigInvalid(_) | StoreError::DirectoryStillHeld { .. } => Self::Hold,
             // `Fatal` is what a store another process holds reports, and what
             // an unreadable keyspace reports. The first clears when that
             // process exits; the second costs one attempt a minute.

@@ -167,7 +167,8 @@ const fn store_scope(e: &StoreError) -> ErrorScope {
         | StoreError::Fatal(_)
         | StoreError::Persist(_)
         | StoreError::NoLeader
-        | StoreError::LeaderUnreachable { .. } => ErrorScope::Sweep,
+        | StoreError::LeaderUnreachable { .. }
+        | StoreError::DirectoryStillHeld { .. } => ErrorScope::Sweep,
     }
 }
 
@@ -194,7 +195,8 @@ const fn store_class(e: &StoreError) -> FailureKind {
         StoreError::ConfigInvalid(_)
         | StoreError::InitializeFailed(_)
         | StoreError::Fatal(_)
-        | StoreError::SecretUnreadable { .. } => FailureKind::Declarative,
+        | StoreError::SecretUnreadable { .. }
+        | StoreError::DirectoryStillHeld { .. } => FailureKind::Declarative,
     }
 }
 
@@ -254,7 +256,8 @@ mod tests {
                     StoreError::ConfigInvalid(_)
                     | StoreError::InitializeFailed(_)
                     | StoreError::Fatal(_)
-                    | StoreError::SecretUnreadable { .. } => FailureKind::Declarative,
+                    | StoreError::SecretUnreadable { .. }
+                    | StoreError::DirectoryStillHeld { .. } => FailureKind::Declarative,
                 },
                 ControllerError::InvalidResource(_)
                 | ControllerError::Shape(_)
@@ -284,6 +287,9 @@ mod tests {
             row(ControllerError::Store(StoreError::LeaderUnreachable {
                 leader: 1,
                 reason: m(),
+            })),
+            row(ControllerError::Store(StoreError::DirectoryStillHeld {
+                within: std::time::Duration::from_secs(1),
             })),
             row(ControllerError::InvalidResource(m())),
             row(ControllerError::Shape(shape_error())),
@@ -317,7 +323,8 @@ mod tests {
                     | StoreError::Fatal(_)
                     | StoreError::Persist(_)
                     | StoreError::NoLeader
-                    | StoreError::LeaderUnreachable { .. } => ErrorScope::Sweep,
+                    | StoreError::LeaderUnreachable { .. }
+                    | StoreError::DirectoryStillHeld { .. } => ErrorScope::Sweep,
                 },
                 ControllerError::InvalidResource(_)
                 | ControllerError::Shape(_)
@@ -333,7 +340,7 @@ mod tests {
     #[test]
     fn store_errors_and_panics_stop_a_sweep_and_nothing_else_does() {
         let rows = every_scope();
-        assert_eq!(rows.len(), 15, "one row per variant");
+        assert_eq!(rows.len(), 16, "one row per variant");
         for (e, want) in rows {
             assert_eq!(e.scope(), want, "{e:?}");
         }
@@ -342,7 +349,7 @@ mod tests {
     #[test]
     fn every_error_variant_maps_to_its_retry_class() {
         let rows = every_variant();
-        assert_eq!(rows.len(), 15, "one row per variant");
+        assert_eq!(rows.len(), 16, "one row per variant");
         for (e, want) in rows {
             assert_eq!(e.classify(), want, "{e:?}");
         }

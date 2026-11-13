@@ -636,7 +636,26 @@ fn read_snapshot_err(
     }
 }
 
+pub(crate) struct ReleaseWitness(std::sync::Weak<FjallInner>);
+
+impl ReleaseWitness {
+    pub(crate) async fn released(&self, within: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        while self.0.strong_count() > 0 {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        true
+    }
+}
+
 impl FjallStore {
+    pub(crate) fn release_witness(&self) -> ReleaseWitness {
+        ReleaseWitness(Arc::downgrade(&self.inner))
+    }
+
     /// Open or create the keyspace at `path`, open all partitions,
     /// then hydrate the in-RAM [`MaterializedState`] from the
     /// persisted `catalog` + `meta` partitions.
