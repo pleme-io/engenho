@@ -2,14 +2,15 @@
 //! well-formed input.
 
 use engenho_substrate::{NodeId, Placement, Plantio, Stage, StageId, WorkloadShape};
+use engenho_substrate_props::proptest_with_env;
 use proptest::prelude::*;
-// plantio_topo.rs uses unwrap_or(128) — keeps its own ProptestConfig.
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 
 /// Generate a Plantio with N stages where stage `i` may depend on
 /// any subset of stages `0..i` — this guarantees DAG (no cycles).
-fn acyclic_plantio_strategy(max_n: usize) -> impl Strategy<Value = Plantio> {
-    (1usize..max_n)
+fn acyclic_plantio_strategy(sizes: Range<usize>) -> impl Strategy<Value = Plantio> {
+    sizes
         .prop_flat_map(|n| {
             // For each stage i, pick a subset of {0..i} as deps.
             let dep_maps = (0..n)
@@ -42,25 +43,17 @@ fn acyclic_plantio_strategy(max_n: usize) -> impl Strategy<Value = Plantio> {
         })
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: std::env::var("PROPTEST_CASES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(128),
-        ..ProptestConfig::default()
-    })]
-
+proptest_with_env! {
     /// Every acyclic Plantio passes validate().
     #[test]
-    fn acyclic_plantio_validates(plantio in acyclic_plantio_strategy(16)) {
+    fn acyclic_plantio_validates(plantio in acyclic_plantio_strategy(1..16)) {
         prop_assert!(plantio.validate().is_ok());
     }
 
     /// topo_sort produces stages in dependency order — every
     /// stage appears AFTER everything it depends_on.
     #[test]
-    fn topo_sort_respects_dependency_order(plantio in acyclic_plantio_strategy(16)) {
+    fn topo_sort_respects_dependency_order(plantio in acyclic_plantio_strategy(1..16)) {
         let order = plantio.topo_sort().unwrap();
         let position: BTreeMap<StageId, usize> = order
             .iter()
@@ -85,7 +78,7 @@ proptest! {
 
     /// topo_sort produces every stage exactly once.
     #[test]
-    fn topo_sort_returns_all_stages(plantio in acyclic_plantio_strategy(16)) {
+    fn topo_sort_returns_all_stages(plantio in acyclic_plantio_strategy(1..16)) {
         let order = plantio.topo_sort().unwrap();
         prop_assert_eq!(order.len(), plantio.len());
         let unique: BTreeSet<StageId> = order.into_iter().collect();
@@ -98,15 +91,17 @@ proptest! {
     /// Cycle injection produces PlantioError::Cycle.
     #[test]
     fn cycle_injection_detected(
-        plantio in acyclic_plantio_strategy(8),
+        plantio in acyclic_plantio_strategy(2..8),
         a_idx in 0usize..8,
-        b_idx in 0usize..8,
+        step in 0usize..8,
     ) {
-        prop_assume!(plantio.len() >= 2);
         let stage_ids: Vec<StageId> = plantio.stages.keys().cloned().collect();
-        let a = stage_ids[a_idx % stage_ids.len()].clone();
-        let b = stage_ids[b_idx % stage_ids.len()].clone();
-        prop_assume!(a != b);
+        let n = stage_ids.len();
+        let a_pos = a_idx % n;
+        let b_pos = (a_pos + 1 + step % (n - 1)) % n;
+        let a = stage_ids[a_pos].clone();
+        let b = stage_ids[b_pos].clone();
+        prop_assert_ne!(&a, &b);
         let mut p2 = plantio.clone();
         // Force A → B and B → A (cycle).
         p2.stages.get_mut(&a).unwrap().depends_on.insert(b.clone());
@@ -121,14 +116,14 @@ proptest! {
 
     /// compile_jobs emits exactly one job per stage.
     #[test]
-    fn compile_jobs_one_per_stage(plantio in acyclic_plantio_strategy(16)) {
+    fn compile_jobs_one_per_stage(plantio in acyclic_plantio_strategy(1..16)) {
         let jobs = plantio.compile_jobs().unwrap();
         prop_assert_eq!(jobs.len(), plantio.len());
     }
 
     /// Plantio serde round-trips.
     #[test]
-    fn plantio_serde_round_trip(plantio in acyclic_plantio_strategy(8)) {
+    fn plantio_serde_round_trip(plantio in acyclic_plantio_strategy(1..8)) {
         let bytes = serde_json::to_vec(&plantio).unwrap();
         let back: Plantio = serde_json::from_slice(&bytes).unwrap();
         prop_assert_eq!(back, plantio);

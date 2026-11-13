@@ -89,6 +89,17 @@ pub fn proptest_cases() -> u32 {
         .unwrap_or(256)
 }
 
+pub const REJECTS_PER_CASE_DIVISOR: u32 = 4;
+
+#[must_use]
+pub fn proptest_config(cases: u32) -> ::proptest::test_runner::Config {
+    ::proptest::test_runner::Config {
+        cases,
+        max_global_rejects: (cases / REJECTS_PER_CASE_DIVISOR).max(1),
+        ..::proptest::test_runner::Config::default()
+    }
+}
+
 /// Run an async block on a fresh tokio runtime. The async property-test
 /// pattern repeats verbatim in ledger / broadcast_ledger / watched_cache
 /// and will appear in every future async property file — extracted per
@@ -159,10 +170,7 @@ pub fn block_on<F: std::future::Future>(f: F) -> F::Output {
 macro_rules! proptest_with_env {
     ($($body:tt)*) => {
         ::proptest::proptest! {
-            #![proptest_config(::proptest::test_runner::Config {
-                cases: $crate::proptest_cases(),
-                ..::proptest::test_runner::Config::default()
-            })]
+            #![proptest_config($crate::proptest_config($crate::proptest_cases()))]
             $($body)*
         }
     };

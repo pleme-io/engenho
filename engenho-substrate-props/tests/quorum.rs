@@ -20,11 +20,10 @@ proptest_with_env! {
     /// K distinct emitters with IDENTICAL evidence → Reached.
     #[test]
     fn k_distinct_same_evidence_reaches_quorum(
-        threshold in threshold_in(1..16),
-        n_emitters in 1usize..16,
+        (threshold, n_emitters) in threshold_in(1..16)
+            .prop_flat_map(|t| (Just(t), t.get()..16)),
         evidence_byte in any::<u8>(),
     ) {
-        prop_assume!(n_emitters >= threshold.get());
         let mut tracker = QuorumTracker::new(ReceiptKind::Drv, [7u8; 32], threshold);
         for emitter in 0..n_emitters {
             tracker.ingest(&receipt(emitter as u8, evidence_byte));
@@ -37,11 +36,10 @@ proptest_with_env! {
     /// Below-threshold ingestion stays Pending.
     #[test]
     fn below_threshold_stays_pending(
-        threshold in threshold_in(2..16),
-        n_emitters in 0usize..16,
+        (threshold, n_emitters) in threshold_in(2..16)
+            .prop_flat_map(|t| (Just(t), 0..t.get())),
         evidence_byte in any::<u8>(),
     ) {
-        prop_assume!(n_emitters < threshold.get());
         let mut tracker = QuorumTracker::new(ReceiptKind::Drv, [7u8; 32], threshold);
         for emitter in 0..n_emitters {
             tracker.ingest(&receipt(emitter as u8, evidence_byte));
