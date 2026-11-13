@@ -2172,6 +2172,7 @@ mod tests {
         let mut child = tokio::process::Command::new("/bin/sh")
             .args(["-c", script])
             .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .expect("spawn /bin/sh");
         let stdout = child.stdout.take().expect("stdout is piped");
