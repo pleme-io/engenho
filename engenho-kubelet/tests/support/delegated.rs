@@ -28,7 +28,20 @@ impl CgroupFs for DirectoryCgroupfs {
         self.host.create_dir(path)
     }
     fn remove_dir(&self, path: &Path) -> std::io::Result<()> {
-        std::fs::remove_dir_all(self.root.resolve(path))
+        let dir = self.root.resolve(path);
+        let members = std::fs::read_to_string(dir.join("cgroup.procs")).unwrap_or_default();
+        let live = members
+            .split_whitespace()
+            .filter_map(|pid| pid.parse::<i32>().ok())
+            .filter_map(rustix::process::Pid::from_raw)
+            .any(|pid| rustix::process::test_kill_process(pid).is_ok());
+        let children = std::fs::read_dir(&dir)?
+            .flatten()
+            .any(|entry| entry.path().is_dir());
+        if live || children {
+            return Err(rustix::io::Errno::BUSY.into());
+        }
+        std::fs::remove_dir_all(dir)
     }
     fn subdirs(&self, path: &Path) -> std::io::Result<Vec<String>> {
         self.host.subdirs(path)

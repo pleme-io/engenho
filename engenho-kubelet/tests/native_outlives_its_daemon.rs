@@ -454,16 +454,24 @@ async fn an_occupied_leaf_no_record_names_is_killed_and_an_adopted_or_empty_one_
         std::fs::read_to_string(adopted.join("cgroup.procs")).is_ok_and(|p| !p.trim().is_empty())
     })
     .await;
+    let pid = node.recorded_pid(&id).expect("recorded");
+    std::fs::write(adopted.join("cgroup.procs"), pid.to_string()).expect("the kernel lists it");
     drop(first);
-    for (name, procs) in [("stray", "424242\n"), ("vacant", "")] {
-        std::fs::create_dir_all(workloads.join(name)).expect("leaf");
-        std::fs::write(workloads.join(name).join("cgroup.procs"), procs).expect("procs");
-    }
+    let stray = workloads.join("stray");
+    std::fs::create_dir_all(&stray).expect("leaf");
+    std::fs::write(stray.join("cgroup.procs"), std::process::id().to_string()).expect("procs");
+    let vacant = workloads.join("vacant");
+    std::fs::create_dir_all(vacant.join("nested")).expect("a child cgroup keeps it");
+    std::fs::write(vacant.join("cgroup.procs"), "").expect("procs");
 
     let second = node.on_cgroups(root.path());
     let killed = |leaf: &Path| std::fs::read_to_string(leaf.join("cgroup.kill")).ok();
-    assert_eq!(killed(&workloads.join("stray")).as_deref(), Some("1"));
-    assert_eq!(killed(&workloads.join("vacant")), None);
+    assert!(
+        adopted.is_dir() && stray.is_dir() && vacant.is_dir(),
+        "an occupied leaf survives the sweep"
+    );
+    assert_eq!(killed(&stray).as_deref(), Some("1"));
+    assert_eq!(killed(&vacant), None);
     assert_eq!(
         killed(&adopted),
         None,
