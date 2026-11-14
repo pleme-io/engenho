@@ -1666,4 +1666,84 @@ mod tests {
         assert_eq!(next_wake(&panicked, &mut failures), None);
         assert_eq!(failures.count(), 1);
     }
+
+    #[derive(Default)]
+    struct Recorded(Mutex<Vec<String>>);
+
+    struct Fields<'a>(&'a mut String);
+
+    impl tracing::field::Visit for Fields<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.push_str(&format!("{}={value:?} ", field.name()));
+        }
+    }
+
+    struct Recorder(Arc<Recorded>);
+
+    impl tracing::Subscriber for Recorder {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut line = format!("{} ", event.metadata().level());
+            event.record(&mut Fields(&mut line));
+            self.0.0.lock().unwrap().push(line);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    fn logged(f: impl FnOnce()) -> Vec<String> {
+        let recorded = Arc::new(Recorded::default());
+        tracing::subscriber::with_default(Recorder(recorded.clone()), f);
+        let lines = recorded.0.lock().unwrap().clone();
+        lines
+    }
+
+    #[test]
+    fn a_failed_tick_is_logged_with_its_retry_in_milliseconds() {
+        let transient = logged(|| {
+            log_tick(
+                "probe",
+                &Answer::Transient.result(),
+                Some(Duration::from_millis(1500)),
+            );
+        });
+        assert_eq!(transient.len(), 1, "{transient:?}");
+        assert!(transient[0].starts_with("WARN "), "{transient:?}");
+        assert!(transient[0].contains("after_ms=1500 "), "{transient:?}");
+
+        let declarative = logged(|| log_tick("probe", &Answer::Declarative.result(), None));
+        assert_eq!(declarative.len(), 1, "{declarative:?}");
+        assert!(declarative[0].starts_with("ERROR "), "{declarative:?}");
+    }
+
+    #[test]
+    fn millis_is_whole_milliseconds_and_saturates() {
+        assert_eq!(millis(Duration::from_millis(1500)), 1500);
+        assert_eq!(millis(Duration::from_micros(2999)), 2);
+        assert_eq!(millis(Duration::MAX), u64::MAX);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_driver_hands_out_the_heartbeat_it_records_into_and_ticks_its_controller() {
+        let router = engenho_store::InProcessRouter::new();
+        let cfg = engenho_store::default_config("watch-driver-handle").unwrap();
+        let store = Arc::new(
+            StoreMesh::start(1, "in-process://1".into(), router, cfg)
+                .await
+                .unwrap(),
+        );
+        let probe = Arc::try_unwrap(Probe::new(Answer::Requeue(REQUEUE_AFTER)))
+            .unwrap_or_else(|_| unreachable!("a fresh probe has one owner"));
+        let driver = WatchDriver::new(probe, store, WatchDriverConfig::default());
+        assert!(Arc::ptr_eq(&driver.heartbeat(), &driver.beat));
+        let outcome = driver.tick_once().await.expect("the probe requeues");
+        assert_eq!(outcome.result.requeue_after(), Some(REQUEUE_AFTER));
+    }
 }
