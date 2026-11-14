@@ -139,6 +139,24 @@ async fn a_nix_closure_runs_as_a_native_process_and_its_output_is_readable() {
         "hello from a closure",
         "the workload's actual stdout must come back"
     );
+    let read = backend
+        .read_log(&started.container_id, &LogOptions::default())
+        .await
+        .expect("a log read");
+    assert_eq!(read.text, logs);
+    assert!(read.cursor > 0, "the cursor is past what was read");
+    let after = backend
+        .read_log(
+            &started.container_id,
+            &LogOptions {
+                from_byte: Some(read.cursor),
+                ..LogOptions::default()
+            },
+        )
+        .await
+        .expect("a resumed read");
+    assert_eq!(after.text, "");
+    assert_eq!(after.cursor, read.cursor);
 
     backend.remove(&started.container_id).await.expect("remove");
     assert!(
@@ -1579,4 +1597,28 @@ async fn a_native_log_is_stamped_per_line_and_filtered_by_since() {
         on_disk.lines().all(|l| l.contains(" stdout F ")),
         "the file is CRI records: {on_disk:?}"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_exec_killed_by_a_signal_has_no_exit_code() {
+    let tools = closure("nixpkgs#busybox");
+    let backend = NativeBackend::new(
+        Isolation::HostProcess,
+        std::env::temp_dir().join("engenho-native-e2e-exec-signal"),
+        Cgroups::Off,
+    );
+    let started = backend
+        .start(&spec(&format!("nix:{tools}"), &["sleep", "30"], &[]))
+        .await
+        .expect("start");
+    let out = backend
+        .exec(
+            &started.container_id,
+            &["sh".to_string(), "-c".to_string(), "kill -9 $$".to_string()],
+        )
+        .await
+        .expect("exec");
+    assert_eq!(out.exit_code, -1, "{out:?}");
+    backend.stop(&started.container_id).await.expect("stop");
 }

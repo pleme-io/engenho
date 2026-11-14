@@ -2055,4 +2055,121 @@ mod tests {
             RunState::Unknown
         );
     }
+
+    fn another_group_than(gid: u32) -> u32 {
+        rustix::process::getgroups()
+            .expect("getgroups")
+            .into_iter()
+            .map(rustix::fs::Gid::as_raw)
+            .find(|g| *g != gid)
+            .expect("the test account belongs to a second group")
+    }
+
+    fn gid_of(path: &Path) -> u32 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path).expect("stat").gid()
+    }
+
+    #[test]
+    fn chown_tree_reaches_every_entry_below_and_never_through_a_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let tree = root.path().join("tree");
+        std::fs::create_dir_all(tree.join("nested")).unwrap();
+        std::fs::write(tree.join("nested/file"), "x").unwrap();
+        std::fs::write(outside.path().join("kept"), "x").unwrap();
+        std::os::unix::fs::symlink(outside.path(), tree.join("link")).unwrap();
+        let before = gid_of(&outside.path().join("kept"));
+        let target = another_group_than(gid_of(&tree));
+        chown_tree(&tree, rustix::process::getuid().as_raw(), target).expect("chown");
+        for path in [tree.clone(), tree.join("nested"), tree.join("nested/file")] {
+            assert_eq!(gid_of(&path), target, "{}", path.display());
+        }
+        assert_eq!(gid_of(&outside.path().join("kept")), before);
+        assert!(chown_tree(&root.path().join("absent"), 0, 0).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_containers_own_storage_is_handed_to_its_account_and_a_host_path_is_not() {
+        use crate::pod_volume::{MountSource, ResolvedMount, VolumeMaterializer};
+        let root = tempfile::tempdir().unwrap();
+        let empty_dir = root.path().join("empty");
+        let host = root.path().join("host");
+        std::fs::create_dir_all(&empty_dir).unwrap();
+        std::fs::create_dir_all(&host).unwrap();
+        let files = std::collections::BTreeMap::from([("k".to_string(), b"v".to_vec())]);
+        let materialized = crate::pod_volume::PodmanVolumeMaterializer::new()
+            .with_data_root(root.path().join("volumes"))
+            .materialize_files("ns", "pod", "cfg", &files)
+            .await
+            .expect("materializes");
+        let MountSource::Materialized(dir) = &materialized else {
+            panic!("a configMap materializes into a directory");
+        };
+        let config = dir.path().to_path_buf();
+        let mount = |source, mount_path: &str, read_only| ResolvedMount {
+            source,
+            mount_path: mount_path.to_string(),
+            read_only,
+            sub_path: None,
+        };
+        let mut s = spec("nix:/nix/store/aaa-pkg", &[]);
+        s.mounts = vec![
+            mount(
+                MountSource::EmptyDirHostDir(empty_dir.clone()),
+                "/scratch",
+                false,
+            ),
+            mount(materialized, "/etc/cfg", true),
+            mount(MountSource::UserHostPath(host.clone()), "/host", false),
+        ];
+        assert_eq!(
+            NativeBackend::volumes_of(&s),
+            vec![
+                crate::kakoi::Volume {
+                    path: "/scratch".into(),
+                    read_only: false,
+                },
+                crate::kakoi::Volume {
+                    path: "/etc/cfg".into(),
+                    read_only: true,
+                },
+                crate::kakoi::Volume {
+                    path: "/host".into(),
+                    read_only: false,
+                },
+            ]
+        );
+        let host_gid = gid_of(&host);
+        let target = another_group_than(host_gid);
+        let verdict = Verdict {
+            uid: Some(rustix::process::getuid().as_raw()),
+            gid: Some(target),
+            ..Verdict::default()
+        };
+        NativeBackend::hand_over_volumes(&s, &verdict).expect("hands over");
+        assert_eq!(gid_of(&empty_dir), target);
+        assert_eq!(gid_of(&config), target);
+        assert_eq!(gid_of(&config.join("k")), target);
+        assert_eq!(gid_of(&host), host_gid, "a host path is left alone");
+
+        std::fs::remove_dir_all(&empty_dir).unwrap();
+        let err = NativeBackend::hand_over_volumes(&s, &verdict).expect_err("gone");
+        assert!(err.to_string().contains("empty"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn the_confinement_warnings_are_the_verdicts_and_a_field_not_applied_is_one() {
+        let b = NativeBackend::new(Isolation::HostProcess, "/tmp/nb-test-logs", Cgroups::Off);
+        let mut s = spec("nix:/nix/store/aaa-pkg", &[]);
+        s.confinement.not_applied = vec!["fsGroup".into()];
+        let warnings = b.confinement_warnings(&s).await;
+        let said = match b.verdict_for(&s).await {
+            Ok(verdict) => verdict.warnings,
+            Err(e) => vec![e.to_string()],
+        };
+        assert_eq!(warnings, said);
+        assert!(!warnings.is_empty());
+        assert!(warnings.iter().all(|w| w.len() > 10), "{warnings:?}");
+    }
 }
