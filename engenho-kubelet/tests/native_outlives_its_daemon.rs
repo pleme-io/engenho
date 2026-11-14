@@ -9,6 +9,7 @@
     reason = "drives the native runtime directly; no kubelet in the loop"
 )]
 
+use engenho_kubelet::backend::Resources;
 use engenho_kubelet::backend::{ContainerRuntime, ContainerSpec, LogOptions, PodIdentity};
 use engenho_kubelet::cgroup::Cgroups;
 use engenho_kubelet::cri::RunState;
@@ -19,6 +20,9 @@ use engenho_kubelet::{KubeletError, Readoption};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+#[path = "support/delegated.rs"]
+mod delegated;
 
 fn closure(attr: &str) -> String {
     let out = std::process::Command::new("nix")
@@ -94,6 +98,24 @@ impl Node {
             .with_security(security)
             .with_lifetime(lifetime)
             .expect("the state directory is writable")
+    }
+
+    fn record(&self, id: &str) -> Option<serde_json::Value> {
+        let bytes = std::fs::read(self.state.join([id, ".json"].concat())).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    fn on_cgroups(&self, root: &Path) -> NativeBackend {
+        NativeBackend::new(
+            Isolation::HostProcess,
+            &self.logs,
+            Cgroups::adopt(Box::new(delegated::DirectoryCgroupfs::at(root))),
+        )
+        .with_security(NativeSecurity::Enforce)
+        .with_lifetime(WorkloadLifetime::Outlive {
+            state: self.state.clone(),
+        })
+        .expect("the state directory is writable")
     }
 
     fn recorded_pid(&self, id: &str) -> Option<u32> {
@@ -399,4 +421,135 @@ async fn a_command_run_into_an_adopted_workload_joins_its_enclosure() {
 
     second.stop(&id).await.expect("stop");
     until("the workload stops", || start_time(pid).is_none()).await;
+}
+
+fn running_with(marker: &str) -> bool {
+    std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| start_time(*pid).is_some())
+        .any(|pid| {
+            std::fs::read(Path::new("/proc").join(pid.to_string()).join("cmdline"))
+                .is_ok_and(|cmdline| String::from_utf8_lossy(&cmdline).contains(marker))
+        })
+}
+
+#[tokio::test]
+async fn an_occupied_leaf_no_record_names_is_killed_and_an_adopted_or_empty_one_is_not() {
+    let bash = closure("nixpkgs#bash^out");
+    let node = Node::new();
+    let root = tempfile::tempdir().expect("tempdir");
+    let unit = delegated::delegated_unit(root.path());
+    let first = node.on_cgroups(root.path());
+    let mut ticker = spec(&bash, "uid-1", &[]);
+    ticker.resources = Resources::from_container_json(&serde_json::json!({
+        "resources": { "limits": { "memory": "64Mi" } }
+    }));
+    let id = first.start(&ticker).await.expect("start").container_id;
+    let workloads = unit.join("workloads");
+    let adopted = workloads.join(&id);
+    until("the workload joins its leaf", || {
+        std::fs::read_to_string(adopted.join("cgroup.procs")).is_ok_and(|p| !p.trim().is_empty())
+    })
+    .await;
+    drop(first);
+    for (name, procs) in [("stray", "424242\n"), ("vacant", "")] {
+        std::fs::create_dir_all(workloads.join(name)).expect("leaf");
+        std::fs::write(workloads.join(name).join("cgroup.procs"), procs).expect("procs");
+    }
+
+    let second = node.on_cgroups(root.path());
+    let killed = |leaf: &Path| std::fs::read_to_string(leaf.join("cgroup.kill")).ok();
+    assert_eq!(killed(&workloads.join("stray")).as_deref(), Some("1"));
+    assert_eq!(killed(&workloads.join("vacant")), None);
+    assert_eq!(
+        killed(&adopted),
+        None,
+        "an adopted workload's leaf is its record's"
+    );
+    second.stop(&id).await.expect("stop");
+}
+
+#[tokio::test]
+async fn a_workload_with_stdin_or_a_terminal_is_recorded_unadoptable_and_ends_with_its_daemon() {
+    let bash = closure("nixpkgs#bash^out");
+    for (stdin, tty) in [(true, false), (false, true), (false, false)] {
+        let node = Node::new();
+        let daemon = node.daemon("outlive");
+        let mut s = spec(&bash, "uid-1", &[]);
+        s.stdio.stdin = stdin;
+        s.stdio.tty = tty;
+        let id = daemon.start(&s).await.expect("start").container_id;
+        let record = node.record(&id).expect("recorded");
+        let outlives = !stdin && !tty;
+        assert_eq!(record["adoptable"], outlives, "stdin={stdin} tty={tty}");
+        let pid = node.recorded_pid(&id).expect("pid");
+        drop(daemon);
+        if outlives {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(start_time(pid).is_some(), "it outlives its daemon");
+            node.daemon("outlive").stop(&id).await.expect("stop");
+        } else {
+            until(
+                "a workload that cannot outlive ends with its daemon",
+                || start_time(pid).is_none(),
+            )
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_dropped_daemon_stops_reading_what_its_workloads_print() {
+    let bash = closure("nixpkgs#bash^out");
+    let node = Node::new();
+    let daemon = node.daemon("outlive");
+    let id = daemon
+        .start(&spec(&bash, "uid-1", &[]))
+        .await
+        .expect("start")
+        .container_id;
+    let log = node.logs.join(&id);
+    let size = || std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0);
+    until("the workload prints", || size() > 0).await;
+    drop(daemon);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let before = size();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        size(),
+        before,
+        "no reader is left behind by the dropped daemon"
+    );
+    node.daemon("outlive").stop(&id).await.expect("stop");
+}
+
+#[tokio::test]
+async fn a_workload_whose_record_cannot_be_kept_is_killed() {
+    let bash = closure("nixpkgs#bash^out");
+    let node = Node::new();
+    let daemon = node.daemon("outlive");
+    let marker = format!("unrecorded-{}", std::process::id());
+    let mut s = spec(&bash, "uid-1", &[]);
+    s.command = vec![
+        "bash".to_string(),
+        "-c".to_string(),
+        format!("echo started; while sleep 0.1; do echo {marker}; done"),
+    ];
+    std::fs::create_dir_all(
+        node.state
+            .join("house_ticker-0_ticker.json")
+            .join("occupied"),
+    )
+    .expect("block the record path");
+    daemon
+        .start(&s)
+        .await
+        .expect_err("a workload whose record cannot be kept does not start");
+    until("the unrecorded workload is killed", || {
+        !running_with(&marker)
+    })
+    .await;
 }

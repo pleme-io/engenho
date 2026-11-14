@@ -19,12 +19,16 @@
 
 use engenho_kubelet::backend::Resources;
 use engenho_kubelet::backend::{ContainerRuntime, ContainerSpec, LogOptions, PodIdentity};
-use engenho_kubelet::cgroup::{CgroupFs, Cgroups, HostFs};
+use engenho_kubelet::cgroup::Cgroups;
 use engenho_kubelet::cri::{ExitDisposition, RunState};
 use engenho_kubelet::native_backend::{Isolation, NativeBackend};
-use engenho_substrate::HostRoot;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::path::Path;
+
+#[path = "support/delegated.rs"]
+mod delegated;
+use delegated::{DirectoryCgroupfs, delegated_unit};
 
 /// Realise a closure and return its store path.
 fn closure(attr: &str) -> String {
@@ -459,70 +463,6 @@ async fn a_workload_ignoring_sigterm_is_sigkilled_after_the_pods_grace_and_reape
         .await
         .expect("a reaped process's record may go");
     assert!(backend.status(&id).await.expect("status").is_none());
-}
-
-#[derive(Debug)]
-struct DirectoryCgroupfs {
-    host: HostFs,
-    root: HostRoot,
-}
-
-impl DirectoryCgroupfs {
-    fn at(root: &Path) -> Self {
-        Self {
-            host: HostFs::at(HostRoot::at(root)),
-            root: HostRoot::at(root),
-        }
-    }
-}
-
-impl CgroupFs for DirectoryCgroupfs {
-    fn read(&self, path: &Path) -> std::io::Result<String> {
-        self.host.read(path)
-    }
-    fn write(&self, path: &Path, value: &str) -> std::io::Result<()> {
-        self.host.write(path, value)
-    }
-    fn create_dir(&self, path: &Path) -> std::io::Result<()> {
-        self.host.create_dir(path)
-    }
-    fn remove_dir(&self, path: &Path) -> std::io::Result<()> {
-        std::fs::remove_dir_all(self.root.resolve(path))
-    }
-    fn subdirs(&self, path: &Path) -> std::io::Result<Vec<String>> {
-        self.host.subdirs(path)
-    }
-    fn writable(&self, path: &Path) -> bool {
-        self.host.writable(path)
-    }
-    fn delegation_marked(&self, path: &Path) -> std::io::Result<bool> {
-        self.host.delegation_marked(path)
-    }
-    fn open_procs(&self, path: &Path) -> std::io::Result<std::fs::File> {
-        self.host.open_procs(path)
-    }
-}
-
-fn delegated_unit(root: &Path) -> PathBuf {
-    let unit = root.join("sys/fs/cgroup/test.slice/engenho.service");
-    std::fs::create_dir_all(&unit).unwrap();
-    std::fs::create_dir_all(root.join("proc/self")).unwrap();
-    std::fs::write(
-        root.join("proc/self/cgroup"),
-        "0::/test.slice/engenho.service\n",
-    )
-    .unwrap();
-    std::fs::write(unit.join("cgroup.controllers"), "cpu io memory pids").unwrap();
-    std::fs::write(unit.join("cgroup.subtree_control"), "").unwrap();
-    std::fs::write(unit.join("cgroup.procs"), std::process::id().to_string()).unwrap();
-    rustix::fs::setxattr(
-        unit.as_path(),
-        "user.delegate",
-        b"1",
-        rustix::fs::XattrFlags::empty(),
-    )
-    .unwrap();
-    unit
 }
 
 #[tokio::test]
