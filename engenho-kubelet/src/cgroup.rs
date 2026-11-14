@@ -1744,4 +1744,28 @@ mod tests {
             })
         ));
     }
+
+    #[test]
+    fn a_leafs_usage_is_its_cpu_time_and_its_working_set() {
+        let node = Node::delegated();
+        let (tree, _log) = node.adopt();
+        let tree = tree.expect("adopts");
+        tree.prepare("metered", &CgroupPlan::default())
+            .expect("prepares");
+        let leaf = node.path(&[UNIT, "/workloads/metered"].concat());
+        std::fs::write(
+            leaf.join("cpu.stat"),
+            "usage_usec 2500\nuser_usec 2000\nsystem_usec 500\n",
+        )
+        .unwrap();
+        std::fs::write(leaf.join("memory.current"), "10000\n").unwrap();
+        std::fs::write(leaf.join("memory.stat"), "anon 6000\ninactive_file 3000\n").unwrap();
+        assert_eq!(
+            tree.usage("metered").expect("reads"),
+            crate::usage::Cumulative {
+                cpu_ns: 2_500_000,
+                memory_working_set_bytes: 7000,
+            }
+        );
+    }
 }
