@@ -310,6 +310,20 @@ in
         applies what a pod declares and records what `enforce` would refuse.
       '';
 
+      runtimeClasses = optional (types.listOf (types.submodule {
+        options = {
+          name = mkOption { type = types.str; };
+          backend = mkOption { type = types.enum [ "podman_api" "podman" "fake" "native" ]; };
+        };
+      })) ''
+        Runtime classes this node serves beside `kubeletBackend`, each a
+        `runtimeClassName` (`name`) bound to the backend that runs the pods naming it.
+        A pod naming no class keeps running on `kubeletBackend`; a pod naming a
+        class this node does not serve is refused. `wasm` is served by the
+        kubelet itself and cannot be named. Absent or empty serves no extra
+        class.
+      '';
+
       closureSignatures = optional (types.enum [ "enforce" "audit" "off" ]) ''
         The mode of the check on the Nix closure a pod names. Absent follows
         `nativeSecurity`.
@@ -652,6 +666,7 @@ in
       advertise_address = cfg.runtime.advertiseAddress;
       remote_kubeconfig_publish_path = cfg.runtime.remoteKubeconfigPublishPath;
         kubelet_backend = cfg.runtime.kubeletBackend;
+        runtime_classes = cfg.runtime.runtimeClasses;
         native_cgroups = cfg.runtime.nativeCgroups;
         native_security = cfg.runtime.nativeSecurity;
         native_mounts = cfg.runtime.nativeMounts;

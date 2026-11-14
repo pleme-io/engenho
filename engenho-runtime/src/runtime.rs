@@ -33,7 +33,7 @@ use engenho_controllers::{
 };
 use engenho_kube_client::{emit_kubeconfig, emit_kubeconfig_with_admin};
 use engenho_kubelet::config_bridge::KubeletBackendKind;
-use engenho_kubelet::{ContainerRuntime, Kubelet, LogOptions, make_container_runtime_on_node};
+use engenho_kubelet::{ContainerRuntime, Kubelet, LogOptions};
 use engenho_scheduler::{
     ConfiguredScheduler, NodeCapabilities, Runtime as SchedRuntime, Scheduler,
 };
@@ -203,9 +203,12 @@ impl Runtime {
         let boot = BootConfig::read(&config).map_err(|e| rec.failed(e.into()))?;
         rec.enter(BootPhase::PreflightBackend)
             .map_err(|e| rec.failed(e))?;
-        let advertised = backend
-            .is_none()
-            .then(|| advertised_capabilities(boot.kubelet_backend));
+        let advertised = backend.is_none().then(|| {
+            advertised_capabilities(
+                boot.kubelet_backend,
+                boot.runtime_classes.iter().map(|b| &b.backend),
+            )
+        });
         let backend = if let Some(backend) = backend {
             backend
         } else {
@@ -2061,6 +2064,10 @@ const PODMAN_HOST_GATEWAY: &str = "host.containers.internal";
 /// `DatapathInstall::{Computed,Installed}`), so on that platform the VIP is a
 /// bookkeeping entry and the host gateway is the truth.
 fn apiserver_reachability(boot: &BootConfig) -> ApiserverReachability {
+    apiserver_reachability_of(boot.kubelet_backend, boot)
+}
+
+fn apiserver_reachability_of(kind: CfgBackendKind, boot: &BootConfig) -> ApiserverReachability {
     // The port engenho really listens on. `listen_addr` is `host:port`; a
     // shape we cannot parse is a reason to inject nothing, never to guess.
     let Some(port) = boot
@@ -2072,7 +2079,7 @@ fn apiserver_reachability(boot: &BootConfig) -> ApiserverReachability {
         return ApiserverReachability::Unknown;
     };
 
-    match boot.kubelet_backend {
+    match kind {
         // Pods run in podman. On darwin they are inside a VM and cannot reach
         // a host-loopback apiserver by any cluster address, and even on Linux
         // engenho installs no kube-proxy datapath for the VIP — so the
@@ -2121,13 +2128,24 @@ fn apiserver_reachability(boot: &BootConfig) -> ApiserverReachability {
 /// [`build_backend`] for construction, so the kind that is checked is the kind
 /// that is built. pending-I39: the two enums have identical arms and are to
 /// collapse into one.
-fn advertised_capabilities(kind: CfgBackendKind) -> NodeCapabilities {
+fn advertised_capabilities<'a>(
+    kind: CfgBackendKind,
+    classes: impl IntoIterator<Item = &'a CfgBackendKind>,
+) -> NodeCapabilities {
+    NodeCapabilities::running(
+        std::iter::once(kind)
+            .chain(classes.into_iter().copied())
+            .flat_map(|kind| runtimes_of(kind).iter().copied()),
+    )
+}
+
+const fn runtimes_of(kind: CfgBackendKind) -> &'static [SchedRuntime] {
     match kind {
-        CfgBackendKind::Native => NodeCapabilities::running([SchedRuntime::Native]),
+        CfgBackendKind::Native => &[SchedRuntime::Native],
         CfgBackendKind::Cri | CfgBackendKind::PodmanApi | CfgBackendKind::Podman => {
-            NodeCapabilities::running([SchedRuntime::Oci])
+            &[SchedRuntime::Oci]
         }
-        CfgBackendKind::Fake => NodeCapabilities::running(SchedRuntime::ALL),
+        CfgBackendKind::Fake => &SchedRuntime::ALL,
     }
 }
 
@@ -2172,14 +2190,35 @@ fn build_backend(boot: &BootConfig) -> Result<Arc<dyn ContainerRuntime>, Runtime
             );
         }
     }
-    Ok(make_container_runtime_on_node(
+    let default = engenho_kubelet::config_bridge::NodeRuntime {
         kind,
-        boot.podman_binary.as_deref(),
-        reachability.injectable(),
-        boot.native_cgroups,
-        boot.native_security,
-        boot.native_mounts,
-    )?)
+        apiserver: reachability.injectable(),
+    };
+    let classes: Vec<_> = boot
+        .runtime_classes
+        .iter()
+        .map(|binding| {
+            let apiserver = apiserver_reachability_of(binding.backend, boot).injectable();
+            info!(class = %binding.name, backend = ?binding.backend, ?apiserver, "kubelet serves a runtime class");
+            (
+                binding.name.clone(),
+                engenho_kubelet::config_bridge::NodeRuntime {
+                    kind: kubelet_backend_kind(binding.backend),
+                    apiserver,
+                },
+            )
+        })
+        .collect();
+    Ok(
+        engenho_kubelet::config_bridge::make_container_runtime_with_classes(
+            &default,
+            &classes,
+            boot.podman_binary.as_deref(),
+            boot.native_cgroups,
+            boot.native_security,
+            boot.native_mounts,
+        )?,
+    )
 }
 
 /// The directory under `data_dir` a durable node keeps its store in. The
@@ -4693,6 +4732,58 @@ mod tests {
         assert_eq!(
             port, 6443,
             "the REAL listen port, not 443 — nothing rewrites it"
+        );
+    }
+
+    #[test]
+    fn a_native_node_with_an_oci_class_is_not_podman_probed_and_advertises_both_runtimes() {
+        let mut config = super::EngenhoConfig::prescribed_default();
+        config.runtime.kubelet_backend = super::CfgBackendKind::Native;
+        config.runtime.podman_binary = Some("/nonexistent/definitely-not-podman".to_string());
+        config
+            .runtime
+            .runtime_classes
+            .push(engenho_config::RuntimeClassBinding {
+                name: "oci".to_string(),
+                backend: super::CfgBackendKind::PodmanApi,
+            });
+        let boot = read(&config);
+        super::preflight_backend(&boot).expect("a class backend never stops the node booting");
+        assert_eq!(
+            super::advertised_capabilities(
+                boot.kubelet_backend,
+                boot.runtime_classes.iter().map(|b| &b.backend)
+            )
+            .runtimes()
+            .cloned(),
+            Some([super::SchedRuntime::Native, super::SchedRuntime::Oci].into())
+        );
+        config.runtime.runtime_classes.clear();
+        let boot = read(&config);
+        assert_eq!(
+            super::advertised_capabilities(
+                boot.kubelet_backend,
+                boot.runtime_classes.iter().map(|b| &b.backend)
+            )
+            .runtimes()
+            .cloned(),
+            Some([super::SchedRuntime::Native].into())
+        );
+    }
+
+    #[test]
+    fn a_class_pod_is_told_its_own_backend_route_to_the_apiserver() {
+        let mut cfg = EngenhoConfig::default();
+        cfg.runtime.kubelet_backend = CfgBackendKind::Native;
+        cfg.runtime.listen_addr = "0.0.0.0:6443".to_string();
+        let boot = read(&cfg);
+        assert_eq!(
+            super::apiserver_reachability(&boot).injectable(),
+            Some(("127.0.0.1".to_string(), 6443))
+        );
+        assert_eq!(
+            super::apiserver_reachability_of(CfgBackendKind::PodmanApi, &boot).injectable(),
+            Some((super::PODMAN_HOST_GATEWAY.to_string(), 6443))
         );
     }
 

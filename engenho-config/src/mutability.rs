@@ -271,6 +271,7 @@ fn build() -> Vec<LeafSpec> {
         kubelet_listen_addr => listeners,
         etcd_listen_addr => listeners,
         kubelet_backend => restart,
+        runtime_classes => restart,
         native_cgroups => restart,
         native_security => restart,
         native_mounts => restart,
@@ -364,6 +365,10 @@ mod tests {
         });
         config.runtime.podman_binary = Some("/bin/podman".into());
         config.runtime.host_path_allowlist = vec!["/srv".into()];
+        config.runtime.runtime_classes = vec![crate::RuntimeClassBinding {
+            name: "oci".into(),
+            backend: crate::KubeletBackendKind::PodmanApi,
+        }];
         let tls = &mut config.runtime.tls;
         tls.ca_cert_path = Some(PathBuf::from("/ca.crt"));
         tls.ca_key_path = Some(PathBuf::from("/ca.key"));

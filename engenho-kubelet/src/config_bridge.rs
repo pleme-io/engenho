@@ -141,6 +141,60 @@ pub fn make_container_runtime_on_node(
     native_security: engenho_config::NativeSecurity,
     native_mounts: engenho_config::NativeMounts,
 ) -> Result<Arc<dyn ContainerRuntime>, BackendRefused> {
+    make_container_runtime_with_classes(
+        &NodeRuntime { kind, apiserver },
+        &[],
+        podman_binary,
+        native_cgroups,
+        native_security,
+        native_mounts,
+    )
+}
+
+#[allow(missing_docs)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeRuntime {
+    pub kind: KubeletBackendKind,
+    pub apiserver: Option<(String, u16)>,
+}
+
+#[allow(missing_docs, clippy::missing_errors_doc)]
+pub fn make_container_runtime_with_classes(
+    default: &NodeRuntime,
+    classes: &[(String, NodeRuntime)],
+    podman_binary: Option<&str>,
+    native_cgroups: NativeCgroups,
+    native_security: engenho_config::NativeSecurity,
+    native_mounts: engenho_config::NativeMounts,
+) -> Result<Arc<dyn ContainerRuntime>, BackendRefused> {
+    let build = |runtime: &NodeRuntime| {
+        make_one_runtime(
+            runtime.kind,
+            podman_binary,
+            runtime.apiserver.clone(),
+            native_cgroups,
+            native_security,
+            native_mounts,
+        )
+    };
+    let mut router = crate::runtime_class::RuntimeClassRouter::new(build(default)?).with_class(
+        crate::wasm_backend::WASM_RUNTIME_CLASS,
+        Arc::new(crate::wasm_backend::WasmBackend::new(wasm_log_dir(), false)),
+    );
+    for (class, runtime) in classes {
+        router = router.with_class(class.clone(), build(runtime)?);
+    }
+    Ok(Arc::new(router))
+}
+
+fn make_one_runtime(
+    kind: KubeletBackendKind,
+    podman_binary: Option<&str>,
+    apiserver: Option<(String, u16)>,
+    native_cgroups: NativeCgroups,
+    native_security: engenho_config::NativeSecurity,
+    native_mounts: engenho_config::NativeMounts,
+) -> Result<Arc<dyn ContainerRuntime>, BackendRefused> {
     if let Some(refused) = construction_refusal(kind) {
         return Err(refused);
     }
@@ -252,12 +306,7 @@ pub fn make_container_runtime_on_node(
         }
         KubeletBackendKind::Native | KubeletBackendKind::Fake => runtime,
     };
-    Ok(Arc::new(
-        crate::runtime_class::RuntimeClassRouter::new(runtime).with_class(
-            crate::wasm_backend::WASM_RUNTIME_CLASS,
-            Arc::new(crate::wasm_backend::WasmBackend::new(wasm_log_dir(), false)),
-        ),
-    ))
+    Ok(runtime)
 }
 
 #[cfg(test)]
@@ -315,6 +364,74 @@ mod tests {
             .expect_err("no podman here")
             .to_string();
         assert!(!shown.contains(crate::kakoi::GRANT_ANNOTATION), "{shown}");
+    }
+
+    fn in_class(class: Option<&str>) -> crate::backend::ContainerSpec {
+        crate::backend::ContainerSpec {
+            name: "default/p/c".to_string(),
+            image: "docker.io/library/busybox:1.36".to_string(),
+            runtime_class: class.map(|c| crate::backend::RuntimeClassRequest {
+                name: c.to_string(),
+                ..crate::backend::RuntimeClassRequest::default()
+            }),
+            ..crate::backend::ContainerSpec::default()
+        }
+    }
+
+    fn node(kind: KubeletBackendKind) -> NodeRuntime {
+        NodeRuntime {
+            kind,
+            apiserver: None,
+        }
+    }
+
+    fn with_oci_class(
+        kind: KubeletBackendKind,
+    ) -> Result<Arc<dyn ContainerRuntime>, BackendRefused> {
+        make_container_runtime_with_classes(
+            &node(KubeletBackendKind::Fake),
+            &[("oci".to_string(), node(kind))],
+            Some("/nonexistent/podman"),
+            NativeCgroups::default(),
+            engenho_config::NativeSecurity::Enforce,
+            engenho_config::NativeMounts::default(),
+        )
+    }
+
+    #[allow(clippy::disallowed_methods)]
+    #[tokio::test]
+    async fn a_pod_naming_a_configured_class_reaches_that_class_backend_and_no_other_pod_does() {
+        let runtime = with_oci_class(KubeletBackendKind::Podman).expect("constructs");
+        assert_eq!(runtime.name(), "fake");
+        let shown = runtime
+            .start(&in_class(Some("oci")))
+            .await
+            .expect_err("no podman here")
+            .to_string();
+        assert!(shown.contains("podman"), "{shown}");
+        runtime
+            .start(&in_class(None))
+            .await
+            .expect("a pod naming no class stays on the default backend");
+        let unknown = runtime
+            .start(&in_class(Some("gvisor")))
+            .await
+            .expect_err("an unserved class is refused")
+            .to_string();
+        assert!(!unknown.contains("podman"), "{unknown}");
+    }
+
+    #[test]
+    fn a_class_on_a_refused_backend_refuses_the_node_at_construction() {
+        expect_cri_refused(with_oci_class(KubeletBackendKind::Cri));
+    }
+
+    #[test]
+    fn the_config_reserves_exactly_the_classes_the_kubelet_serves_itself() {
+        assert_eq!(
+            engenho_config::RESERVED_RUNTIME_CLASSES,
+            [crate::wasm_backend::WASM_RUNTIME_CLASS]
+        );
     }
 
     use crate::cri_backend::CriGap;

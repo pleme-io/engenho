@@ -75,6 +75,7 @@ pub(crate) struct BootConfig {
     /// only: [`Runtime::start_with_backend`](crate::Runtime::start_with_backend)
     /// is handed the backend it drives.
     pub(crate) kubelet_backend: KubeletBackendKind,
+    pub(crate) runtime_classes: Vec<engenho_config::RuntimeClassBinding>,
     pub(crate) native_cgroups: NativeCgroups,
     pub(crate) native_security: NativeSecurity,
     pub(crate) native_mounts: NativeMounts,
@@ -190,6 +191,7 @@ impl BootConfig {
             kubelet_listen_addr,
             etcd_listen_addr,
             kubelet_backend,
+            runtime_classes,
             native_cgroups,
             native_security,
             native_mounts,
@@ -224,6 +226,7 @@ impl BootConfig {
             kubelet_listen_addr: kubelet_listen_addr.clone(),
             etcd_listen_addr: etcd_listen_addr.clone(),
             kubelet_backend: *kubelet_backend,
+            runtime_classes: runtime_classes.clone(),
             native_cgroups: *native_cgroups,
             native_security: *native_security,
             native_mounts: *native_mounts,

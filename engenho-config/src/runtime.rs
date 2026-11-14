@@ -122,6 +122,38 @@ impl KubeletBackendKind {
     }
 }
 
+#[allow(missing_docs)]
+pub const RESERVED_RUNTIME_CLASSES: &[&str] = &["wasm"];
+
+#[allow(missing_docs)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeClassBinding {
+    pub name: String,
+    pub backend: KubeletBackendKind,
+}
+
+fn runtime_class_refusal(class: &str, kind: KubeletBackendKind) -> Option<String> {
+    let label = !class.is_empty()
+        && class.len() <= 63
+        && class
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !class.starts_with('-')
+        && !class.ends_with('-');
+    if !label {
+        return Some(format!(
+            "`{class}` is not a RuntimeClass name: a DNS-1123 label (lowercase letters, digits, '-', at most 63)"
+        ));
+    }
+    if RESERVED_RUNTIME_CLASSES.contains(&class) {
+        return Some(format!(
+            "`{class}` is served by the kubelet itself and cannot be remapped"
+        ));
+    }
+    kind.selection_refusal().map(|refusal| refusal.to_string())
+}
+
 /// Why a config may not select a kubelet backend.
 ///
 /// Carried by [`ConfigError::KubeletBackendRefused`].
@@ -455,6 +487,9 @@ pub struct RuntimeConfig {
     pub kubelet_backend: KubeletBackendKind,
     #[allow(missing_docs)]
     #[serde(default)]
+    pub runtime_classes: Vec<RuntimeClassBinding>,
+    #[allow(missing_docs)]
+    #[serde(default)]
     pub native_cgroups: NativeCgroups,
     #[allow(missing_docs)]
     #[serde(default)]
@@ -549,6 +584,7 @@ impl TieredConfig for RuntimeConfig {
             kubelet_listen_addr: String::new(),
             etcd_listen_addr: String::new(),
             kubelet_backend: KubeletBackendKind::Fake,
+            runtime_classes: Vec::new(),
             native_cgroups: NativeCgroups::Off,
             native_security: NativeSecurity::Enforce,
             native_mounts: NativeMounts::Off,
@@ -622,6 +658,7 @@ impl TieredConfig for RuntimeConfig {
             // violates the fleet's NO SHELL law is a default that has to be
             // overridden on every node to be correct.
             kubelet_backend: KubeletBackendKind::PodmanApi,
+            runtime_classes: Vec::new(),
             native_cgroups: NativeCgroups::Delegated,
             native_security: NativeSecurity::Enforce,
             native_mounts: NativeMounts::Off,
@@ -693,6 +730,7 @@ impl TieredConfig for RuntimeConfig {
                 self.etcd_listen_addr
             },
             kubelet_backend: self.kubelet_backend,
+            runtime_classes: self.runtime_classes.clone(),
             native_cgroups: self.native_cgroups,
             native_security: self.native_security,
             native_mounts: self.native_mounts,
@@ -768,6 +806,22 @@ impl RuntimeConfig {
         }
         if let Some(refusal) = self.kubelet_backend.selection_refusal() {
             return Err(ConfigError::KubeletBackendRefused(refusal));
+        }
+        for (i, binding) in self.runtime_classes.iter().enumerate() {
+            let refusal = if self.runtime_classes[..i]
+                .iter()
+                .any(|earlier| earlier.name == binding.name)
+            {
+                Some(format!("`{}` is bound twice", binding.name))
+            } else {
+                runtime_class_refusal(&binding.name, binding.backend)
+            };
+            if let Some(reason) = refusal {
+                return Err(ConfigError::InvalidField {
+                    field: "runtime.runtime_classes".into(),
+                    reason,
+                });
+            }
         }
         for listener in NodeLocalListener::ALL {
             self.node_local_addr(listener)?;
@@ -996,6 +1050,7 @@ mod tests {
             kubelet_listen_addr: String::new(),
             etcd_listen_addr: String::new(),
             kubelet_backend: KubeletBackendKind::Fake,
+            runtime_classes: Vec::new(),
             native_cgroups: NativeCgroups::Off,
             native_security: NativeSecurity::Enforce,
             native_mounts: NativeMounts::Off,
@@ -1571,6 +1626,69 @@ mod closure_trust_tests {
             EngenhoConfig::from_yaml_with_defaults("runtime:\n  closure_local_builds: maybe\n")
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod runtime_classes {
+    use super::{KubeletBackendKind, RuntimeClassBinding};
+    use crate::{ConfigError, EngenhoConfig};
+
+    fn refused(yaml: &str) -> String {
+        match EngenhoConfig::from_yaml_with_defaults(yaml) {
+            Err(ConfigError::InvalidField { field, reason }) => {
+                assert_eq!(field, "runtime.runtime_classes");
+                reason
+            }
+            other => panic!("{yaml}: expected a refused runtime class, got {other:?}"),
+        }
+    }
+
+    fn one(name: &str, backend: &str) -> String {
+        format!("runtime:\n  runtime_classes:\n    - name: {name}\n      backend: {backend}\n")
+    }
+
+    #[test]
+    fn a_node_serves_no_extra_class_unless_it_names_one() {
+        let cfg = EngenhoConfig::from_yaml_with_defaults("{}").unwrap();
+        let none: Vec<RuntimeClassBinding> = Vec::new();
+        assert_eq!(cfg.runtime.runtime_classes, none);
+        assert_eq!(
+            <super::RuntimeConfig as shikumi::TieredConfig>::prescribed_default().runtime_classes,
+            none
+        );
+    }
+
+    #[test]
+    fn a_class_names_the_backend_that_runs_its_pods() {
+        let cfg = EngenhoConfig::from_yaml_with_defaults(&format!(
+            "{}  kubelet_backend: native\n",
+            one("oci", "podman_api")
+        ))
+        .unwrap();
+        assert_eq!(cfg.runtime.kubelet_backend, KubeletBackendKind::Native);
+        assert_eq!(
+            cfg.runtime.runtime_classes,
+            [RuntimeClassBinding {
+                name: "oci".into(),
+                backend: KubeletBackendKind::PodmanApi,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_class_is_refused_for_a_refused_backend_a_reserved_name_a_bad_label_or_a_second_binding() {
+        assert!(refused(&one("oci", "cri")).contains("cri"));
+        assert!(refused(&one("wasm", "podman_api")).contains("wasm"));
+        assert!(refused(&one("Oci_1", "podman_api")).contains("Oci_1"));
+        assert!(
+            refused(&format!(
+                "{}    - name: oci\n      backend: podman\n",
+                one("oci", "podman_api")
+            ))
+            .contains("twice")
+        );
+        assert!(EngenhoConfig::from_yaml_with_defaults(&one("oci", "kata")).is_err());
     }
 }
 
