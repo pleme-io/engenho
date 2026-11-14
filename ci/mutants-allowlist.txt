@@ -33,3 +33,10 @@
 # "Pre-existing" and "no time" are not reasons. The list starts empty: the 25
 # survivors measured on 2026-09-19 are test gaps, and the plan's T1/T2 items
 # add the tests that kill them.
+engenho-control-types/src/pin.rs: replace | with ^ in Spki::parse # why: equivalent; the high nibble is shifted left 4 and the low nibble is at most 15, so the two operands share no set bit and | equals ^ for every input
+engenho-control-types/src/pin.rs: replace | with ^ in Spki::mesh_node_id # why: equivalent; the left operand is masked to bits 0..51 and the right is bit 52 alone, so the operands share no set bit and | equals ^ for every input
+engenho-control-types/src/pin.rs: replace <impl ClientCertVerifier for ClientPins>::root_hint_subjects -> &[DistinguishedName] with Vec::leak(Vec::new()) # why: equivalent; leaking an empty Vec yields an empty slice, the same value as the &[] the function returns
+engenho-runtime/src/child.rs: replace Child::all::_every_shape_is_walked with () # why: equivalent; the const fn is never called, it exists only so a new Child shape fails to compile (E0004) beside the walk, and its body has no effect at run time
+engenho-controllers/src/watch_driver.rs: delete match arm FailureKind::Transient in next_wake # why: equivalent; the wildcard arm below it returns the same Some(owed), so a Transient failure is retried at the same step with or without its own arm
+engenho-kubelet/src/native_backend.rs: replace <impl ContainerRuntime for NativeBackend>::readoption -> Readoption with Default::default() # why: equivalent; Readoption's Default is Cannot, the value the function returns
+engenho-kubelet/src/native_backend.rs: delete ! in terminate # why: the negation only chooses whether a debug line is logged when SIGTERM is not delivered; the grace wait, the SIGKILL and the reap run the same either way
