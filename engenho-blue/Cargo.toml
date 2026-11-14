@@ -16,7 +16,7 @@ description = "engenho-blue — a blue program embedded in an engenho crate, loa
 workspace = true
 
 [dependencies]
-blue-lang-host = "0.0.213"
+blue-lang-host = "0.0.214"
 serde          = { workspace = true }
 serde_json     = { workspace = true }
 tokio          = { workspace = true }
