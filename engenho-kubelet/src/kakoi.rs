@@ -251,6 +251,7 @@ impl Kakoi {
             allow_escalation,
             root_grant,
             access,
+            mounts: _,
             host_pid,
             host_ipc,
             host_network,
@@ -842,25 +843,37 @@ pub struct Volume {
 /// Arrange for the child to enter its enclosure just before `exec`.
 ///
 /// `std` would change the uid before any hook runs, and mounting needs root, so
-/// an enclosed child changes identity here, in this one order: namespace, mounts,
-/// groups, gid, uid, capabilities, `no_new_privs`. Everything the hook touches
-/// is prepared before the fork.
+/// an enclosed child changes identity here, in this one order: the pod's own
+/// volume namespace ([`crate::private_mounts`]) when it has one, namespace,
+/// mounts, groups, gid, uid, capabilities, `no_new_privs`. Everything the hook
+/// touches is prepared before the fork.
 #[cfg(target_os = "linux")]
 pub fn enter_on_exec(
     cmd: &mut tokio::process::Command,
     verdict: &Verdict,
     volumes: &[Volume],
+    private: Option<crate::private_mounts::Prepared>,
 ) -> std::io::Result<()> {
     use rustix::mount::{MountFlags, MountPropagationFlags};
     use rustix::thread::UnshareFlags;
 
     let v = verdict.clone();
     if !v.enclosed && !v.no_new_privs && !v.clear_caps {
-        if let Some(uid) = v.uid {
-            cmd.uid(uid);
-        }
-        if let Some(gid) = v.gid {
-            cmd.gid(gid);
+        let Some(private) = private else {
+            if let Some(uid) = v.uid {
+                cmd.uid(uid);
+            }
+            if let Some(gid) = v.gid {
+                cmd.gid(gid);
+            }
+            return Ok(());
+        };
+        #[allow(unsafe_code)]
+        unsafe {
+            cmd.pre_exec(move || {
+                private.enter()?;
+                become_ids(v.uid, v.gid)
+            });
         }
         return Ok(());
     }
@@ -907,6 +920,9 @@ pub fn enter_on_exec(
     #[allow(unsafe_code)]
     unsafe {
         cmd.pre_exec(move || {
+            if let Some(private) = &private {
+                private.enter()?;
+            }
             if v.enclosed {
                 rustix::thread::unshare_unsafe(unshare)?;
                 rustix::mount::mount_change(
@@ -964,6 +980,24 @@ pub fn enter_on_exec(
             }
             become_declared(&v, &steps)
         });
+    }
+    Ok(())
+}
+
+/// The account change `std` makes for `Command::uid` and `Command::gid`, made in
+/// a hook instead, after a step that needs the daemon's privileges: the gid,
+/// then the supplementary groups cleared when root drops to another uid, then
+/// the uid.
+#[cfg(target_os = "linux")]
+fn become_ids(uid: Option<u32>, gid: Option<u32>) -> std::io::Result<()> {
+    if let Some(gid) = gid {
+        rustix::thread::set_thread_gid(rustix::fs::Gid::from_raw(gid))?;
+    }
+    if let Some(uid) = uid {
+        if rustix::process::getuid().is_root() {
+            rustix::thread::set_thread_groups(&[])?;
+        }
+        rustix::thread::set_thread_uid(rustix::fs::Uid::from_raw(uid))?;
     }
     Ok(())
 }
@@ -1045,17 +1079,29 @@ pub fn join_on_exec(
     cmd: &mut tokio::process::Command,
     verdict: &Verdict,
     container_pid: Option<u32>,
+    private: Option<std::fs::File>,
 ) -> std::io::Result<()> {
     use rustix::thread::{LinkNameSpaceType, move_into_link_name_space};
     use std::os::fd::AsFd;
 
     let v = verdict.clone();
     if !v.enclosed && !v.no_new_privs && !v.clear_caps {
-        if let Some(uid) = v.uid {
-            cmd.uid(uid);
-        }
-        if let Some(gid) = v.gid {
-            cmd.gid(gid);
+        let Some(private) = private else {
+            if let Some(uid) = v.uid {
+                cmd.uid(uid);
+            }
+            if let Some(gid) = v.gid {
+                cmd.gid(gid);
+            }
+            return Ok(());
+        };
+        #[allow(unsafe_code)]
+        unsafe {
+            cmd.pre_exec(move || {
+                move_into_link_name_space(private.as_fd(), Some(LinkNameSpaceType::Mount))?;
+                rustix::process::chdir(c"/")?;
+                become_ids(v.uid, v.gid)
+            });
         }
         return Ok(());
     }
@@ -1076,6 +1122,10 @@ pub fn join_on_exec(
     #[allow(unsafe_code)]
     unsafe {
         cmd.pre_exec(move || {
+            if let Some(private) = &private {
+                move_into_link_name_space(private.as_fd(), Some(LinkNameSpaceType::Mount))?;
+                rustix::process::chdir(c"/")?;
+            }
             for (namespace, kind) in &joined {
                 move_into_link_name_space(namespace.as_fd(), Some(*kind))?;
             }
@@ -1131,7 +1181,14 @@ pub fn enter_on_exec(
     cmd: &mut tokio::process::Command,
     verdict: &Verdict,
     _volumes: &[Volume],
+    private: Option<crate::private_mounts::Prepared>,
 ) -> std::io::Result<()> {
+    if private.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "a mount namespace is a Linux facility",
+        ));
+    }
     if let Some(uid) = verdict.uid {
         cmd.uid(uid);
     }
@@ -1147,8 +1204,15 @@ pub fn join_on_exec(
     cmd: &mut tokio::process::Command,
     verdict: &Verdict,
     _container_pid: Option<u32>,
+    private: Option<std::fs::File>,
 ) -> std::io::Result<()> {
-    enter_on_exec(cmd, verdict, &[])
+    if private.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "a mount namespace is a Linux facility",
+        ));
+    }
+    enter_on_exec(cmd, verdict, &[], None)
 }
 
 #[cfg(test)]

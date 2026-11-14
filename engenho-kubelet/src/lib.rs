@@ -84,6 +84,7 @@ pub mod pod_volume;
 pub mod podman_api;
 pub mod port_forward;
 pub mod port_forward_spdy;
+pub mod private_mounts;
 pub mod probe;
 pub mod pty;
 pub mod runtime_class;

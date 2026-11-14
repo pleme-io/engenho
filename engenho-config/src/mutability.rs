@@ -273,6 +273,7 @@ fn build() -> Vec<LeafSpec> {
         kubelet_backend => restart,
         native_cgroups => restart,
         native_security => restart,
+        native_mounts => restart,
         closure_signatures => restart,
         closure_trusted_keys => restart,
         closure_local_builds => restart,

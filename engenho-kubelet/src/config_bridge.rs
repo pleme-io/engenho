@@ -128,6 +128,7 @@ pub fn make_container_runtime_with_apiserver(
         apiserver,
         NativeCgroups::default(),
         engenho_config::NativeSecurity::default(),
+        engenho_config::NativeMounts::default(),
     )
 }
 
@@ -138,6 +139,7 @@ pub fn make_container_runtime_on_node(
     apiserver: Option<(String, u16)>,
     native_cgroups: NativeCgroups,
     native_security: engenho_config::NativeSecurity,
+    native_mounts: engenho_config::NativeMounts,
 ) -> Result<Arc<dyn ContainerRuntime>, BackendRefused> {
     if let Some(refused) = construction_refusal(kind) {
         return Err(refused);
@@ -237,7 +239,8 @@ pub fn make_container_runtime_on_node(
                 native_log_dir(),
                 crate::cgroup::Cgroups::select(native_cgroups),
             )
-            .with_security(native_security),
+            .with_security(native_security)
+            .with_mounts(native_mounts),
         ),
     };
     let runtime: Arc<dyn ContainerRuntime> = match kind {
@@ -282,6 +285,7 @@ mod tests {
             None,
             NativeCgroups::default(),
             engenho_config::NativeSecurity::Enforce,
+            engenho_config::NativeMounts::Off,
         )
         .expect("constructs");
         let shown = runtime
@@ -302,6 +306,7 @@ mod tests {
             None,
             NativeCgroups::default(),
             engenho_config::NativeSecurity::Off,
+            engenho_config::NativeMounts::Off,
         )
         .expect("constructs");
         let shown = runtime

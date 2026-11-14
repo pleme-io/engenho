@@ -29,30 +29,8 @@ use engenho_kubelet::pod_volume::{MountSource, ResolvedMount};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-fn closure(attr: &str) -> PathBuf {
-    let out = std::process::Command::new("nix")
-        .args(["build", "--no-link", "--print-out-paths", attr])
-        .output()
-        .unwrap_or_else(|e| panic!("could not run nix for {attr}: {e}"));
-    assert!(
-        out.status.success(),
-        "realising {attr} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    // ★ A multi-output derivation prints SEVERAL paths, and the first is not
-    // the package. postgresql_16 prints its `-man` output first; taking
-    // `.next()` yielded a store path with no bin/ and an initdb that "does not
-    // exist", which reads exactly like a broken closure. Select by what the
-    // output actually CONTAINS rather than by position.
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let path = stdout
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .find(|l| Path::new(l).join("bin").is_dir())
-        .unwrap_or_else(|| panic!("no output of {attr} contains a bin/ directory; got:\n{stdout}"));
-    PathBuf::from(path)
-}
+mod support;
+use support::closure;
 
 /// `initdb` the data directory, as an init container would.
 fn initdb(pg: &Path, data: &Path) {

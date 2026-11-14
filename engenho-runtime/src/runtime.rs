@@ -2178,6 +2178,7 @@ fn build_backend(boot: &BootConfig) -> Result<Arc<dyn ContainerRuntime>, Runtime
         reachability.injectable(),
         boot.native_cgroups,
         boot.native_security,
+        boot.native_mounts,
     )?)
 }
 

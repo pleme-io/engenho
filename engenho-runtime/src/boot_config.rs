@@ -32,8 +32,8 @@ use engenho_config::{
     ApiAudit, CertRotation, ClosureLocalBuilds, ClusterConfig, ConsistencyConfig,
     ConsistencyTierKind, ControllerEnable, ControllersConfig, DatapathMode, EngenhoConfig, Fabric,
     HealthReasons, KubeconfigVisibility, KubeletAuth, KubeletBackendKind, LegacyTeiaSection,
-    NativeCgroups, NativeSecurity, NetworkingConfig, RevoadaConfig, RuntimeConfig, SchedulerConfig,
-    SecretsAtRest, SharedCluster, TlsConfig, TopologyConfig, TopologyStrategyKind,
+    NativeCgroups, NativeMounts, NativeSecurity, NetworkingConfig, RevoadaConfig, RuntimeConfig,
+    SchedulerConfig, SecretsAtRest, SharedCluster, TlsConfig, TopologyConfig, TopologyStrategyKind,
 };
 
 use crate::health::Windows;
@@ -77,6 +77,7 @@ pub(crate) struct BootConfig {
     pub(crate) kubelet_backend: KubeletBackendKind,
     pub(crate) native_cgroups: NativeCgroups,
     pub(crate) native_security: NativeSecurity,
+    pub(crate) native_mounts: NativeMounts,
     pub(crate) closure_signatures: NativeSecurity,
     pub(crate) closure_trusted_keys: Vec<String>,
     pub(crate) closure_local_builds: ClosureLocalBuilds,
@@ -191,6 +192,7 @@ impl BootConfig {
             kubelet_backend,
             native_cgroups,
             native_security,
+            native_mounts,
             closure_signatures,
             closure_trusted_keys,
             closure_local_builds,
@@ -224,6 +226,7 @@ impl BootConfig {
             kubelet_backend: *kubelet_backend,
             native_cgroups: *native_cgroups,
             native_security: *native_security,
+            native_mounts: *native_mounts,
             closure_signatures: closure_signatures.unwrap_or(*native_security),
             closure_trusted_keys: closure_trusted_keys.clone(),
             closure_local_builds: *closure_local_builds,

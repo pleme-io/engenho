@@ -80,6 +80,10 @@ pub struct Confinement {
     /// The blue `access` value a pod carries, as its annotation states it.
     #[serde(default)]
     pub access: Option<String>,
+    /// What a native pod asks of its mounts, as its annotation
+    /// [`crate::private_mounts::MOUNTS_ANNOTATION`] states it.
+    #[serde(default)]
+    pub mounts: Option<String>,
     /// `hostPID`, from the pod.
     #[serde(default)]
     pub host_pid: bool,
@@ -127,6 +131,7 @@ impl Default for Confinement {
             allow_escalation: None,
             root_grant: None,
             access: None,
+            mounts: None,
             host_pid: false,
             host_ipc: false,
             host_network: false,
@@ -212,6 +217,7 @@ impl Confinement {
             .filter(|reason| !reason.trim().is_empty())
             .map(str::to_string);
         self.access = annotation(crate::kakoi::ACCESS_ANNOTATION).map(str::to_string);
+        self.mounts = annotation(crate::private_mounts::MOUNTS_ANNOTATION).map(str::to_string);
         let spec = pod.get("spec");
         let flag = |k: &str| {
             spec.and_then(|s| s.get(k))

@@ -34,6 +34,19 @@
 //! ran workloads unconfined while reporting success is the exact failure shape
 //! this crate keeps finding.
 //!
+//! ## Where a volume appears
+//!
+//! By default a container sees the host's paths, so a volume is honoured only
+//! when its host path IS its `mountPath` ([`NativeError::UnmappableMount`]
+//! otherwise). With `runtime.native_mounts` on ([`NativeMounts`]: `per_pod` for
+//! a pod annotated `engenho.pleme.io/mounts: private`, or `every_pod`), the
+//! container gets a mount namespace of its own and each volume is bound at its
+//! `mountPath` there, seen by no other pod and not by the host
+//! ([`crate::private_mounts`]). That is how two pods read one fixed path, such
+//! as `/etc/app/conf/app.conf`, with two configurations. It needs a root
+//! daemon on Linux; a node that cannot mount refuses the pods that ask, by
+//! name.
+//!
 //! ## ★ Why a restart cannot run a workload twice ([`Readoption::Cannot`])
 //!
 //! A workload is a child of THIS process, tracked in an in-memory table. A
@@ -86,6 +99,7 @@ use crate::error::KubeletError;
 use crate::image_source::ImageSource;
 use crate::kakoi::{Asked, DefaultLimits, Kakoi, NativeSecurity, Node, Verdict};
 use crate::pod_volume::BindSource;
+use crate::private_mounts::NativeMounts;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -130,9 +144,11 @@ pub enum NativeError {
     CommandEscapesStore { program: PathBuf },
     /// A runtime-managed named volume, which has no host path.
     NamedVolume { volume: String },
-    /// A volume whose host path and mountPath differ; a native process has no
-    /// mount namespace to reconcile them with.
+    /// A volume whose host path and mountPath differ, on a container with no
+    /// mount namespace of its own to reconcile them in.
     UnmappableMount { host: PathBuf, mount_path: String },
+    /// The container's own mount namespace was refused, for this pod alone.
+    PrivateMounts(crate::private_mounts::Refusal),
     /// A volume path that could not be created.
     VolumePath { path: PathBuf, detail: String },
     /// No such container is tracked.
@@ -225,12 +241,17 @@ impl std::fmt::Display for NativeError {
             ),
             Self::UnmappableMount { host, mount_path } => write!(
                 f,
-                "cannot mount {} at {mount_path} — a native process has no \
-                 mount namespace, so a volume is only honourable when its host \
-                 path and its mountPath are the SAME path. Declare the volume \
-                 at the path the workload already expects.",
-                host.display()
+                "cannot mount {} at {mount_path} — a native process with no \
+                 mount namespace of its own sees the host's paths, so a volume \
+                 is only honourable when its host path and its mountPath are \
+                 the SAME path. Declare the volume at the path the workload \
+                 already expects, or give the pod its own mount namespace \
+                 (runtime.native_mounts, annotation {}: {}).",
+                host.display(),
+                crate::private_mounts::MOUNTS_ANNOTATION,
+                crate::private_mounts::PRIVATE,
             ),
+            Self::PrivateMounts(e) => write!(f, "{e}"),
             Self::VolumePath { path, detail } => {
                 write!(f, "cannot create volume path {}: {detail}", path.display())
             }
@@ -332,6 +353,9 @@ struct NativeContainer {
     verdict: Verdict,
     /// Its declared environment; a command run in it gets this, not the daemon's.
     env: std::collections::BTreeMap<String, String>,
+    /// Whether it runs in a mount namespace of its own, which a command run in
+    /// it joins.
+    private_mounts: bool,
     /// Where the process is in its life, and who holds it.
     process: Process,
     leaf: Option<Leaf>,
@@ -653,6 +677,7 @@ impl NativeContainer {
 /// Runs containers as native host processes out of Nix closures.
 pub struct NativeBackend {
     security: NativeSecurity,
+    mounts: NativeMounts,
     isolation: Isolation,
     log_dir: PathBuf,
     cgroups: Cgroups,
@@ -697,6 +722,33 @@ impl NativeBackend {
     pub fn with_security(mut self, security: NativeSecurity) -> Self {
         self.security = security;
         self
+    }
+
+    /// Choose whether a container gets a mount namespace of its own. The
+    /// default is [`NativeMounts::Off`]: every container sees the host's paths.
+    #[must_use]
+    pub fn with_mounts(mut self, mounts: NativeMounts) -> Self {
+        self.mounts = mounts;
+        self
+    }
+
+    /// The container's own mount namespace, ready for its child, when the node
+    /// and its pod say it gets one; `None` keeps the host's paths.
+    fn private_mounts_for(
+        &self,
+        spec: &ContainerSpec,
+    ) -> Result<Option<crate::private_mounts::Prepared>, NativeError> {
+        use crate::private_mounts as pm;
+        if !pm::wanted(self.mounts, spec.confinement.mounts.as_deref())
+            .map_err(NativeError::PrivateMounts)?
+        {
+            return Ok(None);
+        }
+        let binds = pm::plan(&spec.mounts).map_err(NativeError::PrivateMounts)?;
+        pm::can_mount().map_err(NativeError::PrivateMounts)?;
+        pm::prepare(&binds)
+            .map(Some)
+            .map_err(NativeError::PrivateMounts)
     }
 
     fn volumes_of(spec: &ContainerSpec) -> Vec<crate::kakoi::Volume> {
@@ -767,6 +819,7 @@ impl NativeBackend {
     pub fn new(isolation: Isolation, log_dir: impl Into<PathBuf>, cgroups: Cgroups) -> Self {
         Self {
             security: NativeSecurity::default(),
+            mounts: NativeMounts::default(),
             isolation,
             log_dir: log_dir.into(),
             cgroups,
@@ -887,9 +940,10 @@ impl NativeBackend {
     }
 
     /// Check every mount can actually be honoured, and say precisely which
-    /// cannot.
+    /// cannot. Read for a container with no mount namespace of its own;
+    /// [`crate::private_mounts`] plans the binds of one that has.
     ///
-    /// ★ A native process has NO MOUNT NAMESPACE. There is no remapping
+    /// ★ Such a process sees the host's paths. There is no remapping
     /// available: whatever path the host has is the path the workload sees. So
     /// a mount is satisfiable only when the source host path IS the declared
     /// `mountPath`, and anything else is refused here rather than discovered
@@ -989,7 +1043,11 @@ impl ContainerRuntime for NativeBackend {
         let closure = Self::closure_of(spec)?;
         let argv = spec.argv();
         let program = Self::resolve_program(&closure, &argv)?;
-        Self::verify_mounts(spec)?;
+        let private = self.private_mounts_for(spec)?;
+        if private.is_none() {
+            Self::verify_mounts(spec)?;
+        }
+        let private_mounts = private.is_some();
         Self::hand_over_volumes(spec, &verdict)?;
 
         let id = Self::container_id(spec);
@@ -1057,12 +1115,12 @@ impl ContainerRuntime for NativeBackend {
             }
         };
 
-        crate::kakoi::enter_on_exec(&mut cmd, &verdict, &Self::volumes_of(spec)).map_err(|e| {
-            NativeError::Spawn {
+        crate::kakoi::enter_on_exec(&mut cmd, &verdict, &Self::volumes_of(spec), private).map_err(
+            |e| NativeError::Spawn {
                 program: program.clone(),
                 detail: e.to_string(),
-            }
-        })?;
+            },
+        )?;
         let spawned = cmd.spawn();
         drop(cmd);
         let child = match spawned {
@@ -1103,6 +1161,7 @@ impl ContainerRuntime for NativeBackend {
                 grace: spec.termination_grace.duration(),
                 verdict,
                 env: spec.env.clone(),
+                private_mounts,
                 process: Process::Live(child),
                 leaf,
                 stdio,
@@ -1316,7 +1375,7 @@ impl NativeBackend {
         argv: &[String],
     ) -> Result<(tokio::process::Command, PathBuf), NativeError> {
         let target = self.exec_target(container_id, argv)?;
-        let (verdict, pid, env) = {
+        let (verdict, pid, env, private_mounts) = {
             let guard = self.state.lock().map_err(|_| NativeError::StatePoisoned)?;
             let container =
                 guard
@@ -1328,13 +1387,26 @@ impl NativeBackend {
                 container.verdict.clone(),
                 container.process.live_pid(),
                 container.env.clone(),
+                container.private_mounts,
             )
         };
-        let mut cmd = workload_command(&target, argv.iter().skip(1), &env);
-        crate::kakoi::join_on_exec(&mut cmd, &verdict, pid).map_err(|e| NativeError::Spawn {
+        let spawn_error = |e: std::io::Error| NativeError::Spawn {
             program: target.clone(),
             detail: e.to_string(),
-        })?;
+        };
+        let private = if private_mounts {
+            let pid = pid.ok_or_else(|| {
+                spawn_error(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "the container's process is gone, so its mount namespace cannot be joined",
+                ))
+            })?;
+            Some(crate::private_mounts::namespace_of(pid).map_err(spawn_error)?)
+        } else {
+            None
+        };
+        let mut cmd = workload_command(&target, argv.iter().skip(1), &env);
+        crate::kakoi::join_on_exec(&mut cmd, &verdict, pid, private).map_err(spawn_error)?;
         Ok((cmd, target))
     }
 
@@ -1639,6 +1711,114 @@ mod tests {
             .to_string();
         assert!(msg.contains("named volume"), "{msg}");
         assert!(msg.contains("hostPath"), "the remedy must be named: {msg}");
+    }
+
+    fn mounted_at(mount_path: &str) -> ContainerSpec {
+        let mut s = spec("nix:/nix/store/a-pkg", &["app"]);
+        s.mounts = vec![crate::pod_volume::ResolvedMount {
+            source: crate::pod_volume::MountSource::UserHostPath(
+                std::env::temp_dir().join("engenho-private-mounts-src"),
+            ),
+            mount_path: mount_path.to_string(),
+            read_only: false,
+            sub_path: None,
+        }];
+        s
+    }
+
+    fn asking(mut s: ContainerSpec, value: &str) -> ContainerSpec {
+        s.confinement.mounts = Some(value.to_string());
+        s
+    }
+
+    fn on(mounts: NativeMounts) -> NativeBackend {
+        NativeBackend::new(Isolation::HostProcess, "/tmp/nb-test-logs", Cgroups::Off)
+            .with_mounts(mounts)
+    }
+
+    fn refusal(b: &NativeBackend, s: &ContainerSpec) -> crate::private_mounts::Refusal {
+        match b.private_mounts_for(s) {
+            Err(NativeError::PrivateMounts(r)) => r,
+            Err(other) => panic!("expected a private-mounts refusal, got {other}"),
+            Ok(p) => panic!("expected a refusal, got {p:?}"),
+        }
+    }
+
+    /// ★ Off is the default and changes nothing: no plan is read, so even a
+    /// mountPath a namespace would refuse goes to the host-path check as before.
+    #[test]
+    fn a_backend_built_without_a_choice_keeps_every_pod_on_the_host_paths() {
+        let b = NativeBackend::new(Isolation::HostProcess, "/tmp/nb-test-logs", Cgroups::Off);
+        assert!(
+            b.private_mounts_for(&mounted_at("relative"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            on(NativeMounts::PerPod)
+                .private_mounts_for(&mounted_at("relative"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_pod_asking_on_a_node_with_it_off_is_refused_by_name() {
+        let r = refusal(
+            &on(NativeMounts::Off),
+            &asking(mounted_at("/etc/app/conf"), crate::private_mounts::PRIVATE),
+        );
+        assert_eq!(r, crate::private_mounts::Refusal::NodeOff);
+        let shown = NativeError::PrivateMounts(r).to_string();
+        assert!(shown.contains("runtime.native_mounts: off"), "{shown}");
+    }
+
+    /// The pod's own fault is named before the node's: a bad mountPath is
+    /// refused the same way on a node that could mount and on one that could
+    /// not.
+    #[test]
+    fn a_mount_path_fault_refuses_the_pod_whatever_the_node_can_do() {
+        for (b, s) in [
+            (on(NativeMounts::EveryPod), mounted_at("etc/app")),
+            (
+                on(NativeMounts::PerPod),
+                asking(mounted_at("etc/app"), crate::private_mounts::PRIVATE),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    refusal(&b, &s),
+                    crate::private_mounts::Refusal::MountPath {
+                        fault: crate::private_mounts::MountPathFault::Relative,
+                        ..
+                    }
+                ),
+                "a relative mountPath must be refused"
+            );
+        }
+        assert!(matches!(
+            refusal(
+                &on(NativeMounts::EveryPod),
+                &mounted_at("/nix/store/x-app/etc")
+            ),
+            crate::private_mounts::Refusal::MountPath {
+                fault: crate::private_mounts::MountPathFault::InStore,
+                ..
+            }
+        ));
+    }
+
+    /// A namespace is given exactly where this process may mount, and refused
+    /// with the typed reason where it may not, never a panic.
+    #[test]
+    fn a_namespace_is_given_where_the_node_can_mount_and_refused_where_it_cannot() {
+        let dir = tempfile::tempdir().unwrap();
+        let at = dir.path().join("etc/app/conf");
+        let got = on(NativeMounts::EveryPod).private_mounts_for(&mounted_at(&at.to_string_lossy()));
+        match crate::private_mounts::can_mount() {
+            Ok(()) => assert!(got.unwrap().is_some()),
+            Err(why) => assert_eq!(got.unwrap_err(), NativeError::PrivateMounts(why)),
+        }
     }
 
     /// Logs for an unknown container are a typed error, never an empty string

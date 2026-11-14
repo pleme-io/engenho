@@ -186,6 +186,24 @@ pub enum NativeSecurity {
     Off,
 }
 
+/// Whether a native pod gets a mount namespace of its own for its volumes.
+///
+/// `Off` is the default and is today's behaviour: a native process sees the
+/// host's filesystem, so a volume is honoured only when its host path is its
+/// `mountPath`. `PerPod` gives a private namespace to a pod annotated
+/// `engenho.pleme.io/mounts: private`; `EveryPod` gives one to every native
+/// pod. In a private namespace each `volumeMount` is bind-mounted at its
+/// `mountPath`, seen by that pod alone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(missing_docs)]
+pub enum NativeMounts {
+    #[default]
+    Off,
+    PerPod,
+    EveryPod,
+}
+
 /// Whether a node renews its leaf certificates.
 ///
 /// `Renew` is the default: each leaf has a bounded span and is renewed while
@@ -441,6 +459,9 @@ pub struct RuntimeConfig {
     #[allow(missing_docs)]
     #[serde(default)]
     pub native_security: NativeSecurity,
+    #[allow(missing_docs)]
+    #[serde(default)]
+    pub native_mounts: NativeMounts,
     /// The mode of the closure check; absent follows `native_security`.
     #[serde(default)]
     pub closure_signatures: Option<NativeSecurity>,
@@ -480,10 +501,11 @@ pub struct RuntimeConfig {
     /// name any host path can name `/`; a node opts IN by naming prefixes and
     /// never inherits the permission.
     ///
-    /// Load-bearing for the `native` backend: a native process has no mount
-    /// namespace, so a volume is only honourable when its host path equals its
-    /// mountPath, and a hostPath is the only volume source that can express
-    /// that.
+    /// Load-bearing for the `native` backend with `native_mounts: off`: a
+    /// native process then sees the host's paths, so a volume is only
+    /// honourable when its host path equals its mountPath, and a hostPath is
+    /// the only volume source that can express that. With `native_mounts` on,
+    /// a pod's own mount namespace binds any volume at its mountPath.
     #[serde(default)]
     pub host_path_allowlist: Vec<String>,
     /// The directory of NODE-DECLARED manifests: every `*.yaml` / `*.yml`
@@ -529,6 +551,7 @@ impl TieredConfig for RuntimeConfig {
             kubelet_backend: KubeletBackendKind::Fake,
             native_cgroups: NativeCgroups::Off,
             native_security: NativeSecurity::Enforce,
+            native_mounts: NativeMounts::Off,
             closure_signatures: None,
             closure_trusted_keys: Vec::new(),
             closure_local_builds: ClosureLocalBuilds::Trust,
@@ -601,6 +624,7 @@ impl TieredConfig for RuntimeConfig {
             kubelet_backend: KubeletBackendKind::PodmanApi,
             native_cgroups: NativeCgroups::Delegated,
             native_security: NativeSecurity::Enforce,
+            native_mounts: NativeMounts::Off,
             closure_signatures: None,
             closure_trusted_keys: Vec::new(),
             closure_local_builds: ClosureLocalBuilds::Trust,
@@ -671,6 +695,7 @@ impl TieredConfig for RuntimeConfig {
             kubelet_backend: self.kubelet_backend,
             native_cgroups: self.native_cgroups,
             native_security: self.native_security,
+            native_mounts: self.native_mounts,
             closure_signatures: self.closure_signatures,
             closure_trusted_keys: self.closure_trusted_keys.clone(),
             closure_local_builds: self.closure_local_builds,
@@ -973,6 +998,7 @@ mod tests {
             kubelet_backend: KubeletBackendKind::Fake,
             native_cgroups: NativeCgroups::Off,
             native_security: NativeSecurity::Enforce,
+            native_mounts: NativeMounts::Off,
             closure_signatures: None,
             closure_trusted_keys: Vec::new(),
             closure_local_builds: ClosureLocalBuilds::Trust,
@@ -1479,6 +1505,42 @@ mod health_reasons_tests {
         }
         assert!(
             EngenhoConfig::from_yaml_with_defaults("runtime:\n  health_reasons: loud\n").is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod native_mounts_tests {
+    use super::NativeMounts;
+    use crate::EngenhoConfig;
+    use shikumi::TieredConfig;
+
+    #[test]
+    fn a_config_that_does_not_name_it_keeps_the_host_filesystem() {
+        let cfg = EngenhoConfig::from_yaml_with_defaults("runtime: {}\n").expect("parses");
+        assert_eq!(cfg.runtime.native_mounts, NativeMounts::Off);
+        assert_eq!(
+            super::RuntimeConfig::prescribed_default().native_mounts,
+            NativeMounts::Off
+        );
+    }
+
+    #[test]
+    fn each_wire_name_reads_back_as_its_variant() {
+        for (wire, want) in [
+            ("off", NativeMounts::Off),
+            ("per_pod", NativeMounts::PerPod),
+            ("every_pod", NativeMounts::EveryPod),
+        ] {
+            let cfg = EngenhoConfig::from_yaml_with_defaults(&format!(
+                "runtime:\n  native_mounts: {wire}\n"
+            ))
+            .unwrap_or_else(|e| panic!("`{wire}` must parse: {e}"));
+            assert_eq!(cfg.runtime.native_mounts, want);
+            assert_eq!(serde_json::to_string(&want).unwrap(), format!("\"{wire}\""));
+        }
+        assert!(
+            EngenhoConfig::from_yaml_with_defaults("runtime:\n  native_mounts: private\n").is_err()
         );
     }
 }

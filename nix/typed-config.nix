@@ -295,6 +295,14 @@ in
         `withheld`: upstream's `[-]<check> failed: reason withheld`, with
         the reason only in the daemon's log.
       '';
+      nativeMounts = optional (types.enum [ "off" "per_pod" "every_pod" ]) ''
+        Whether a native pod gets a mount namespace of its own, where each
+        `volumeMount` is bind-mounted at its `mountPath` and seen by that pod
+        alone. `off` (engenho's default): a native process sees the host's
+        filesystem, so a volume is honoured only at its own host path.
+        `per_pod`: a pod annotated `engenho.pleme.io/mounts: private` gets one.
+        `every_pod`: every native pod gets one. Needs a root daemon on Linux.
+      '';
       nativeSecurity = optional (types.enum [ "enforce" "audit" "off" ]) ''
         How this node treats a native container's security. `enforce`, engenho's
         default: a pod that says nothing runs as its namespace's account,
@@ -646,6 +654,7 @@ in
         kubelet_backend = cfg.runtime.kubeletBackend;
         native_cgroups = cfg.runtime.nativeCgroups;
         native_security = cfg.runtime.nativeSecurity;
+        native_mounts = cfg.runtime.nativeMounts;
         closure_signatures = cfg.runtime.closureSignatures;
         closure_trusted_keys = cfg.runtime.closureTrustedKeys;
         closure_local_builds = cfg.runtime.closureLocalBuilds;
