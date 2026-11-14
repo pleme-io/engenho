@@ -605,6 +605,10 @@ mod tests {
         let went = crash_gate(None, t0, t0);
         assert_eq!(went.waiting_reason(), None);
         assert_eq!(BackoffDecision::Restart.waiting_reason(), None);
+        assert_eq!(
+            BackoffDecision::Wait { remaining: S(10) }.waiting_reason(),
+            Some("CrashLoopBackOff")
+        );
     }
 
     #[test]
