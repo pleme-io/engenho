@@ -23,7 +23,7 @@
 ;;     defaults; fixing that crate would have silently dropped HTTP/2.
 ;;     The line now names them, plus rustls-tls-native-roots (the OS trust
 ;;     store native-tls read), as pleme-io/sui 66a289f did.
-;;   * That other crate is sui-store 0.1.153, reached through
+;;   * That other crate was sui-store 0.1.153, reached through
 ;;     engenho-fonte-cli -> engenho-fonte (with-sui-eval) ->
 ;;     engenho-sui-typescape -> sui-eval. It asks reqwest for its defaults.
 ;;     sui fixed its workspace line in 66a289f, and no published sui release
@@ -35,41 +35,50 @@
 ;;     engenho-mcp derivation depends on rust_openssl-sys, which is built
 ;;     against openssl-static 3.6.2. engenho-mcp does not even reach
 ;;     sui-store. A per-package `cargo tree` shows none of this.
+;;   * Resolved by the lock bump to sui-store 0.1.243 (37f9109): no reqwest
+;;     in Cargo.lock carries native-tls since, so tls:ATTRIBUTION is empty
+;;     and the native-tls family is a plain ban.
 ;;   * `cargo tree -i openssl-sys --workspace` cannot see any of this on
 ;;     darwin: native-tls uses Security.framework there, so the host-only
 ;;     query prints nothing. It needs `--target all`. Cargo.lock is resolved
 ;;     for every target at once, which is why this check reads it.
 ;;
-;; WHY, AWS-LC (tls-02). aws-lc-sys 0.41.0 is AWS-LC's C, compiled by its
-;;   build script; aws-lc-rs 1.17.0 is the binding, and rustls's DEFAULT
+;; WHY, AWS-LC (tls-02). aws-lc-sys 0.47.0 is AWS-LC's C, compiled by its
+;;   build script; aws-lc-rs 1.19.0 is the binding, and rustls's DEFAULT
 ;;   crypto provider. The workspace rustls line has asked for `ring` with
 ;;   `default-features = false` throughout, and the daemon installs ring as
 ;;   the process provider at boot — and aws-lc-sys is in Cargo.lock anyway,
 ;;   because feature unification does not care what our line says.
 ;;   Measured 2026-09-19 with
 ;;     cargo tree --workspace --all-features --target all -i aws-lc-rs -e features
-;;   and again with default features. Both give ONE root, four edges:
-;;     aws-lc-rs 1.17.0  -> aws-lc-sys, through aws-lc-rs's own `aws-lc-sys`
+;;   and again with default features, and re-read 2026-11-14 at the lock
+;;   37f9109 left. ONE active root, five edges:
+;;     aws-lc-rs 1.19.0  -> aws-lc-sys, through aws-lc-rs's own `aws-lc-sys`
 ;;                          feature, which rustls's `aws_lc_rs` turns on.
-;;     rustls 0.23.40    <- feature `aws_lc_rs` (its aliases: `aws-lc-rs`;
+;;     rustls 0.23.46    <- feature `aws_lc_rs` (its aliases: `aws-lc-rs`;
 ;;                          implied by `default`, `prefer-post-quantum`,
 ;;                          `fips`).
-;;     rustls-webpki 0.103.13 <- feature `aws-lc-rs`, which rustls's
+;;     rustls-webpki 0.103.17 <- feature `aws-lc-rs`, which rustls's
 ;;                          `aws_lc_rs` enables as `webpki/aws-lc-rs`.
-;;     quinn-proto 0.11.14 <- its optional `aws-lc-rs` dependency. NOT
+;;     quinn-proto 0.11.19 <- its optional `aws-lc-rs` dependency. NOT
 ;;                          activated in any engenho build: it appears in the
 ;;                          lock because Cargo.lock is resolved with every
 ;;                          optional dependency, and in no `cargo tree` run.
+;;     object_store 0.14.2 <- its optional `aws-lc-rs` dependency, which its
+;;                          `aws` feature turns on. NOT activated either: it
+;;                          is in the lock only as tameshi 0.1.13's optional
+;;                          `object_store` (features = [aws]), and
+;;                          `cargo tree -i object_store` matches no package.
 ;;   The one root that turns rustls's `aws_lc_rs` on:
-;;     sui-eval 0.1.153 (default)
+;;     sui-eval 0.1.243 (default)
 ;;       -> gix `blocking-http-transport-reqwest-rust-tls`
-;;       -> gix-transport 0.57.1 `http-client-reqwest-rust-tls`
-;;       -> reqwest 0.13.4 `rustls` = `__rustls-aws-lc-rs`
+;;       -> gix-transport 0.57.2 `http-client-reqwest-rust-tls`
+;;       -> reqwest 0.13.5 `rustls` = `__rustls-aws-lc-rs`
 ;;       -> rustls/aws-lc-rs + tokio-rustls/aws-lc-rs + hyper-rustls/aws-lc-rs
 ;;   Two traps in that chain. reqwest 0.13 renamed its backends: `default-tls`
 ;;   there is `["rustls"]`, and the plain `rustls` feature is the aws-lc-rs
 ;;   one, while `rustls-tls` (what the workspace line asks reqwest 0.12 for)
-;;   is the ring one. And engenho reaches this through reqwest 0.13.4, a
+;;   is the ring one. And engenho reaches this through reqwest 0.13.5, a
 ;;   SECOND reqwest in the lock, not the 0.12.28 the workspace line pins —
 ;;   so the attribution table below, which reads dependents of the reqwest
 ;;   that carries native-tls, never sees it. That is why the aws-lc family is
@@ -128,16 +137,14 @@
 ;; a lock bump makes it stale and the new version unattributed, which is the
 ;; prompt to read the new manifest.
 ;;
-;; WHEN SUI PUBLISHES A RELEASE WITH 66a289f: move the lock to it
-;; (engenho-sui-typescape's `sui-eval = "0.1.0"` admits any 0.1.x), run
-;; `gen build`, and delete the sui-store row. If the banned crates have left
-;; Cargo.lock this check then fails on the `clean` rows; delete those too,
-;; and from then on it is a plain ban.
+;; SUI'S 66a289f REACHED THE LOCK with sui-store 0.1.243 (37f9109): the
+;; native-tls family left Cargo.lock, every attribution row went stale and
+;; was deleted, and from then on it is a plain ban.
 ;;
 ;; WHEN GIX-TRANSPORT STOPS ASKING FOR reqwest's `rustls`: whether that is a
 ;; sui-eval release built on a gix that asks for `rustls-tls`, or engenho
 ;; dropping sui-eval, `cargo tree -i aws-lc-rs` goes empty and aws-lc-rs and
-;; aws-lc-sys leave Cargo.lock. Delete the three aws-lc tls:CARRIERS rows
+;; aws-lc-sys leave Cargo.lock. Delete the four aws-lc tls:CARRIERS rows
 ;; then; `direct` no longer reaches them, so nothing else has to change.
 ;;
 ;; TIER: a CI gate, not a type. It reads the TOML cargo reads: a manifest
@@ -220,29 +227,18 @@
 ;; (package version banned-crate why). See THE CARRIER TABLE above.
 (define tls:CARRIERS
   (list
-    (list "reqwest" "0.12.28" "native-tls"
-      "feature `default-tls`; which dependent asks for it is in tls:ATTRIBUTION")
-    (list "reqwest" "0.12.28" "hyper-tls"
-      "feature `default-tls`; which dependent asks for it is in tls:ATTRIBUTION")
-    (list "reqwest" "0.12.28" "tokio-native-tls"
-      "feature `default-tls`; which dependent asks for it is in tls:ATTRIBUTION")
-    (list "rustls" "0.23.40" "aws-lc-rs"
-      "feature `aws_lc_rs` (one of rustls's defaults, and implied by `prefer-post-quantum`), turned on here by reqwest 0.13.4's `__rustls-aws-lc-rs` <- gix-transport 0.57.1 `http-client-reqwest-rust-tls` <- gix <- sui-eval 0.1.153")
-    (list "rustls-webpki" "0.103.13" "aws-lc-rs"
+    (list "rustls" "0.23.46" "aws-lc-rs"
+      "feature `aws_lc_rs` (one of rustls's defaults, and implied by `prefer-post-quantum`), turned on here by reqwest 0.13.5's `__rustls-aws-lc-rs` <- gix-transport 0.57.2 `http-client-reqwest-rust-tls` <- gix <- sui-eval 0.1.243")
+    (list "rustls-webpki" "0.103.17" "aws-lc-rs"
       "feature `aws-lc-rs`, which rustls's `aws_lc_rs` enables as `webpki/aws-lc-rs`")
-    (list "quinn-proto" "0.11.14" "aws-lc-rs"
-      "its optional `aws-lc-rs` dependency, activated by no engenho build; Cargo.lock resolves every optional dependency, and `cargo tree -i aws-lc-rs` shows no quinn-proto branch")))
+    (list "quinn-proto" "0.11.19" "aws-lc-rs"
+      "its optional `aws-lc-rs` dependency, activated by no engenho build; Cargo.lock resolves every optional dependency, and `cargo tree -i aws-lc-rs` shows no quinn-proto branch")
+    (list "object_store" "0.14.2" "aws-lc-rs"
+      "its optional `aws-lc-rs` dependency, which its `aws` feature turns on; reached only through tameshi 0.1.13's optional `object_store` (features = [aws]), activated by no engenho build: `cargo tree -i object_store` matches no package")))
 
 ;; Every non-workspace reqwest dependent in Cargo.lock while a banned crate
 ;; is there, as (package version kind why). See THE ATTRIBUTION TABLE above.
-(define tls:ATTRIBUTION
-  (list
-    (list "sui-store" "0.1.153" "asks"
-      "[dependencies.reqwest] features = [rustls-tls, json, stream] with default features on; fixed in pleme-io/sui 66a289f, not in any release as of 0.1.219")
-    (list "object_store" "0.13.2" "clean"
-      "[dependencies.reqwest] default-features = false, features = [rustls-tls-native-roots, http2]")
-    (list "tameshi" "0.1.11" "clean"
-      "[dependencies.reqwest] default-features = false, features = [json, rustls-tls]")))
+(define tls:ATTRIBUTION (list))
 
 (define tls:KINDS (list "asks" "clean"))
 

@@ -172,10 +172,19 @@ dependencies = [\"reqwest\"]
 
 (define (t:members a b) (list (list "a/Cargo.toml" (t:toml a)) (list "b/Cargo.toml" (t:toml b))))
 
+(define t:CARRIERS
+  (list
+    (list "reqwest" "0.12.28" "native-tls" "feature `default-tls`")
+    (list "reqwest" "0.12.28" "hyper-tls" "feature `default-tls`")
+    (list "reqwest" "0.12.28" "tokio-native-tls" "feature `default-tls`")
+    (list "rustls" "0.23.40" "aws-lc-rs" "feature `aws_lc_rs`")))
+
+(define (t:without carriers banned-name)
+  (filter (fn (row) (not (equal? (car (cdr (cdr row))) banned-name))) carriers))
+
 ;; Every violation for the four inputs as text, the attribution rows, and the
-;; real carrier table: the fixture's reqwest is the locked 0.12.28, so its
-;; native-tls edges are read by the same rows the repository uses.
-(define (t:vs root a b lock rows) (tls:violations (t:toml root) (t:members a b) (t:toml lock) rows tls:CARRIERS))
+;; fixture's carrier table.
+(define (t:vs root a b lock rows) (tls:violations (t:toml root) (t:members a b) (t:toml lock) rows t:CARRIERS))
 
 ;; The same over a chosen carrier table, for the rows themselves.
 (define (t:carrier-vs lock carriers)
@@ -199,8 +208,7 @@ dependencies = [\"reqwest\"]
 (define (t:real-vs manifest-text) (t:real-vs-with manifest-text tls:CARRIERS))
 
 ;; The real tls:CARRIERS without the rows for `banned-name`.
-(define (t:carriers-without banned-name)
-  (filter (fn (row) (not (equal? (car (cdr (cdr row))) banned-name))) tls:CARRIERS))
+(define (t:carriers-without banned-name) (t:without tls:CARRIERS banned-name))
 
 (deftest "the real Cargo.toml, member manifests and Cargo.lock keep every rule"
   (let* ((manifest (tls:load-manifest))
@@ -354,21 +362,21 @@ dependencies = [\"reqwest\"]
     "\n[[package]]\nname = \"aws-lc-sys\"\nversion = \"0.41.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n"))
 
 (deftest "rustls on its default provider is quiet only while a carrier row reads that edge"
-  (assert (= (length (t:carrier-vs t:LOCK-AWS-LC tls:CARRIERS)) 0)
+  (assert (= (length (t:carrier-vs t:LOCK-AWS-LC t:CARRIERS)) 0)
     "rustls 0.23.40 -> aws-lc-rs is read, and aws-lc-rs -> aws-lc-sys is inside the banned family")
-  (let ((vs (t:carrier-vs t:LOCK-AWS-LC (t:carriers-without "aws-lc-rs"))))
+  (let ((vs (t:carrier-vs t:LOCK-AWS-LC (t:without t:CARRIERS "aws-lc-rs"))))
     (assert (t:has? vs "rustls 0.23.40 depends on `aws-lc-rs` directly, and no tls:CARRIERS row reads that edge")
       "the row is load-bearing: without it the edge is a new C source")
     (assert (= (length vs) 1) "and the banned-to-banned edge is not reported as a second source")))
 
 (deftest "a carrier row reads one version, so a lock bump past it is unattributed"
-  (let ((vs (t:carrier-vs (t:swap t:LOCK-AWS-LC "name = \"rustls\"\nversion = \"0.23.40\"" "name = \"rustls\"\nversion = \"0.23.41\"") tls:CARRIERS)))
+  (let ((vs (t:carrier-vs (t:swap t:LOCK-AWS-LC "name = \"rustls\"\nversion = \"0.23.40\"" "name = \"rustls\"\nversion = \"0.23.41\"") t:CARRIERS)))
     (assert (t:has? vs "rustls 0.23.41 depends on `aws-lc-rs` directly") "the bumped version has to be read")))
 
 (deftest "a crate that pulls aws-lc-rs in by itself is refused, and so is one that reaches aws-lc-sys"
-  (let ((vs (t:carrier-vs (string-append t:LOCK-AWS-LC "\n[[package]]\nname = \"up-quic\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\ndependencies = [\"aws-lc-rs\"]\n") tls:CARRIERS)))
+  (let ((vs (t:carrier-vs (string-append t:LOCK-AWS-LC "\n[[package]]\nname = \"up-quic\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\ndependencies = [\"aws-lc-rs\"]\n") t:CARRIERS)))
     (assert (t:has? vs "up-quic 0.1.0 depends on `aws-lc-rs` directly") "a dependent nobody has read is a new C source"))
-  (let ((vs (t:carrier-vs (string-append t:LOCK-AWS-LC "\n[[package]]\nname = \"up-sys\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\ndependencies = [\"aws-lc-sys\"]\n") tls:CARRIERS)))
+  (let ((vs (t:carrier-vs (string-append t:LOCK-AWS-LC "\n[[package]]\nname = \"up-sys\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\ndependencies = [\"aws-lc-sys\"]\n") t:CARRIERS)))
     (assert (t:has? vs "up-sys 0.1.0 depends on `aws-lc-sys` directly")
       "banning the binding does not leave the -sys crate reachable without a row")))
 
