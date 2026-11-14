@@ -169,6 +169,41 @@ async fn a_nix_closure_runs_as_a_native_process_and_its_output_is_readable() {
     );
 }
 
+#[tokio::test]
+async fn an_exited_containers_last_unterminated_line_is_read() {
+    let coreutils = closure("nixpkgs#coreutils");
+    let backend = NativeBackend::new(
+        Isolation::HostProcess,
+        std::env::temp_dir().join("engenho-native-e2e-partial"),
+        Cgroups::Off,
+    );
+    let started = backend
+        .start(&spec(
+            &format!("nix:{coreutils}"),
+            &["printf", "no newline at the end"],
+            &[],
+        ))
+        .await
+        .expect("start");
+    for _ in 0..100 {
+        let s = backend
+            .status(&started.container_id)
+            .await
+            .expect("status")
+            .expect("tracked");
+        if !s.is_running() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let read = backend
+        .read_log(&started.container_id, &LogOptions::default())
+        .await
+        .expect("a log read");
+    assert_eq!(read.text, "no newline at the end");
+    backend.remove(&started.container_id).await.expect("remove");
+}
+
 /// ★ T1.2, end to end through the real backend: a container ended by a
 /// signal reports the SIGNAL. The backend used to report `code()`, which is
 /// `None` for a killed process, and the kubelet read that absence as exit 0 —
