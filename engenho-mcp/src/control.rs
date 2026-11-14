@@ -197,7 +197,9 @@ fn refused(err: &ControlError) -> CallToolResult {
         ControlError::Refused(refusal) => serde_json::to_string_pretty(refusal),
         ControlError::Blind(blind) => serde_json::to_string_pretty(blind),
     };
-    CallToolResult::error(vec![ContentBlock::text(body.unwrap_or_else(|e| e.to_string()))])
+    CallToolResult::error(vec![ContentBlock::text(
+        body.unwrap_or_else(|e| e.to_string()),
+    )])
 }
 
 /// No answer from the daemon: blind, never an empty result.
