@@ -660,4 +660,43 @@ mod tests {
         assert!(handshake(&server, &client_config(&known, pin.clone()).unwrap()).is_ok());
         assert!(handshake(&server, &client_config(&stranger, pin).unwrap()).is_err());
     }
+
+    #[test]
+    fn a_client_that_presents_no_certificate_is_refused() {
+        let identity = KeyMaterial::generate().unwrap();
+        let admits: Arc<dyn PinSet> = Arc::new(Admits(Vec::new()));
+        let server = server_config(Arc::new(Presented::new(&identity).unwrap()), admits).unwrap();
+        let provider = provider();
+        let signatures = Signatures(provider.signature_verification_algorithms);
+        let anonymous = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(VERSIONS)
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(ServerPins {
+                pins: Arc::new(vec![identity.spki()]),
+                signatures,
+            }))
+            .with_no_client_auth();
+        assert!(handshake(&server, &anonymous).is_err());
+    }
+
+    #[test]
+    fn every_error_and_debug_form_says_what_it_is() {
+        assert_eq!(
+            SpkiError::NotAPin("x".into()).to_string(),
+            "\"x\" is not a pin (sha256:<64 lowercase hex>)"
+        );
+        assert_eq!(
+            SpkiError::NotACertificate("short".into()).to_string(),
+            "not a DER certificate: short"
+        );
+        assert_eq!(KeyError("no key".into()).to_string(), "no key");
+        let key = KeyMaterial::generate().unwrap();
+        let spki = key.spki();
+        assert_eq!(format!("{spki:?}"), spki.to_string());
+        assert_eq!(
+            format!("{key:?}"),
+            format!("KeyMaterial {{ spki: {spki}, .. }}")
+        );
+    }
 }
