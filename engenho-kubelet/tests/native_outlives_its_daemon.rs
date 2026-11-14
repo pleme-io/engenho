@@ -268,7 +268,8 @@ async fn a_changed_spec_replaces_the_adopted_workload_and_an_unbound_one_is_stop
 }
 
 #[tokio::test]
-async fn a_node_that_now_encloses_a_pod_differently_replaces_what_it_adopted() {
+async fn a_node_that_now_encloses_a_pod_differently_replaces_what_it_adopted_and_one_that_cannot_claims_it()
+ {
     let bash = closure("nixpkgs#bash^out");
     let node = Node::new();
     let first = node.daemon_under("outlive", NativeSecurity::Off);
@@ -279,6 +280,17 @@ async fn a_node_that_now_encloses_a_pod_differently_replaces_what_it_adopted() {
     drop(first);
 
     let second = node.daemon_under("outlive", NativeSecurity::Enforce);
+    if !engenho_kubelet::kakoi::can_enforce() {
+        let claimed = second
+            .start(&ticker)
+            .await
+            .expect("a node that cannot enforce encloses as off does, so the workload is claimed");
+        assert_eq!(claimed.state, RunState::Running);
+        assert_eq!(node.recorded_pid(&id), Some(old), "claimed, not replaced");
+        assert_eq!(status_field(old, "NoNewPrivs:"), "0");
+        second.stop(&id).await.expect("stop");
+        return;
+    }
     match second.start(&ticker).await {
         Err(KubeletError::NotReaped { .. }) => {}
         other => panic!("the same spec under a new verdict must not be claimed: {other:?}"),
