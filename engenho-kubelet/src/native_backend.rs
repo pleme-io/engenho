@@ -634,8 +634,8 @@ fn wire_stdio(
 fn wire_fifos(
     fifos: crate::native_survival::Fifos,
     declared: crate::backend::ContainerStdio,
-    log: std::fs::File,
-    log_err: std::fs::File,
+    log: crate::cri_log::FramedLog,
+    log_err: crate::cri_log::FramedLog,
 ) -> std::io::Result<Wired> {
     use crate::stream::{AttachPoint, fanout, tee};
     use tokio::net::unix::pipe::Receiver;
@@ -651,10 +651,7 @@ fn wire_fifos(
             stdin_once: declared.stdin_once,
             resize: None,
         },
-        pumps: vec![
-            tee(out, tokio::fs::File::from_std(log), out_feed),
-            tee(err, tokio::fs::File::from_std(log_err), err_feed),
-        ],
+        pumps: vec![tee(out, log, out_feed), tee(err, log_err, err_feed)],
     })
 }
 
@@ -733,22 +730,23 @@ fn detached_stdio() -> crate::stream::AttachPoint {
     }
 }
 
-type FramedLog = (
-    std::fs::File,
-    std::fs::File,
+type OpenedLog = (
+    crate::cri_log::FramedLog,
+    crate::cri_log::FramedLog,
     Vec<tokio::sync::watch::Receiver<bool>>,
 );
 
-fn append_log(path: &Path) -> std::io::Result<FramedLog> {
+fn append_log(path: &Path) -> std::io::Result<OpenedLog> {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
     let shared = Arc::new(std::sync::Mutex::new(file));
     let (log, out_written) =
-        crate::cri_log::framed_sink(Arc::clone(&shared), crate::cri_log::LogStream::Stdout)?;
+        crate::cri_log::framed_sink(Arc::clone(&shared), crate::cri_log::LogStream::Stdout);
+
     let (log_err, err_written) =
-        crate::cri_log::framed_sink(shared, crate::cri_log::LogStream::Stderr)?;
+        crate::cri_log::framed_sink(shared, crate::cri_log::LogStream::Stderr);
     Ok((log, log_err, vec![out_written, err_written]))
 }
 
