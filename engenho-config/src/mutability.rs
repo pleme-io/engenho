@@ -416,6 +416,46 @@ mod tests {
     }
 
     #[test]
+    fn only_not_overridable_refuses_and_only_respawn_and_restart_wait() {
+        let rows = [
+            (
+                Mutability::Inert {
+                    why: InertWhy::NotRun,
+                },
+                true,
+                false,
+            ),
+            (
+                Mutability::Live {
+                    effect: LiveEffect::Republish,
+                },
+                true,
+                false,
+            ),
+            (
+                Mutability::Respawn {
+                    set: RespawnSet::EnabledDrivers,
+                },
+                true,
+                true,
+            ),
+            (Mutability::NextBoot, true, false),
+            (Mutability::RestartRuntime, true, true),
+            (
+                Mutability::NotOverridable {
+                    anchor: Anchor::Identity,
+                },
+                false,
+                false,
+            ),
+        ];
+        for (class, overridable, needs_restart) in rows {
+            assert_eq!(class.overridable(), overridable, "{class:?}");
+            assert_eq!(class.needs_restart(), needs_restart, "{class:?}");
+        }
+    }
+
+    #[test]
     fn a_section_is_not_a_leaf() {
         for path in ["runtime", "runtime.tls", "controllers.enable", "nonsense"] {
             assert_eq!(classify(&LeafPath::parse(path).unwrap()), None, "{path}");
