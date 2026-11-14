@@ -906,3 +906,31 @@ fn a_restart_or_an_exit_during_a_boot_cancels_it_into_a_drain() {
         }
     );
 }
+
+#[test]
+fn only_exiting_is_terminal() {
+    let terminal: Vec<(&str, bool)> = every_state()
+        .into_iter()
+        .map(|state| {
+            let name = state.name();
+            let m = Lifecycle {
+                state,
+                ..Lifecycle::at(t(0))
+            };
+            (name, DaemonLifecycle::is_terminal(&m))
+        })
+        .collect();
+    assert_eq!(
+        terminal,
+        vec![
+            ("resolving", false),
+            ("booting", false),
+            ("running", false),
+            ("draining", false),
+            ("stopped", false),
+            ("failed", false),
+            ("wedged", false),
+            ("exiting", true),
+        ]
+    );
+}
