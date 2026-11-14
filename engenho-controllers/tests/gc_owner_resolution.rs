@@ -612,3 +612,9 @@ async fn a_cluster_scoped_or_lowercase_owner_resolves() {
     );
     assert!(store.get(&gone).await.is_none(), "positive control");
 }
+
+#[tokio::test]
+async fn the_gc_controller_is_named_gc() {
+    let store = boot_store("gc-name").await;
+    assert_eq!(GcController::new(store, None).name(), "gc");
+}
