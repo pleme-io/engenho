@@ -355,6 +355,26 @@ mod tests {
     }
 
     #[test]
+    fn a_change_with_no_next_boot_leaf_is_live_and_a_republish_makes_any_change_live() {
+        let quiet = |republished| Reconfigured::Running {
+            republished,
+            respawned: Vec::new(),
+            pending: Vec::new(),
+            restarted: false,
+        };
+        let mut live_only = base();
+        live_only.runtime.kubeconfig_publish_path = "/tmp/kc".into();
+        let live = diff(&base(), &live_only);
+        assert_eq!(effect(&live, &quiet(false)), ApplyEffect::AppliedLive);
+
+        let mut boot_only = base();
+        boot_only.runtime.leadership_timeout_seconds += 1;
+        let boot = diff(&base(), &boot_only);
+        assert_eq!(effect(&boot, &quiet(true)), ApplyEffect::AppliedLive);
+        assert_eq!(effect(&boot, &quiet(false)), ApplyEffect::NextBoot);
+    }
+
+    #[test]
     fn a_switch_taken_in_place_reports_the_children_it_moved() {
         let mut after = base();
         after.controllers.enable.gc = !after.controllers.enable.gc;
