@@ -1103,9 +1103,10 @@ impl NativeBackend {
             pumps: Vec::new(),
             recorded: Some(Arc::clone(store)),
             unclaimed: None,
+            private_mounts: false,
         };
         if !record.adoptable {
-            tracing::warn!(container = %record.id, pid = record.pid, "a native workload with a terminal or stdin outlived its daemon and cannot be served; it is stopped");
+            tracing::warn!(container = %record.id, pid = record.pid, "a native workload with a terminal, stdin or a mount namespace of its own outlived its daemon and cannot be served; it is stopped");
             return Some(stopped(handle, leaf));
         }
         let wired = store.readers(&record.id).and_then(|fifos| {
@@ -1141,6 +1142,7 @@ impl NativeBackend {
             pumps: wired.pumps,
             recorded: Some(Arc::clone(store)),
             unclaimed: Some(Box::new(record)),
+            private_mounts: false,
         })
     }
 
@@ -1153,6 +1155,7 @@ impl NativeBackend {
         log_path: &Path,
         leaf: Option<&Leaf>,
         verdict: &Verdict,
+        adoptable: bool,
     ) -> Result<(), NativeError> {
         let kept = |e: std::io::Error| NativeError::Survival {
             path: log_path.to_path_buf(),
@@ -1175,7 +1178,7 @@ impl NativeBackend {
                 grace_ms: u64::try_from(spec.termination_grace.duration().as_millis())
                     .unwrap_or(u64::MAX),
                 leaf: leaf.map(|l| l.name.clone()),
-                adoptable: !spec.stdio.tty && !spec.stdio.stdin,
+                adoptable,
             })
             .map_err(kept)?;
         Ok(())
@@ -1483,7 +1486,7 @@ impl ContainerRuntime for NativeBackend {
         let outliving = self
             .survival
             .as_ref()
-            .filter(|_| !spec.stdio.tty && !spec.stdio.stdin);
+            .filter(|_| !spec.stdio.tty && !spec.stdio.stdin && !private_mounts);
         std::fs::create_dir_all(&self.log_dir).map_err(|e| NativeError::VolumePath {
             path: self.log_dir.clone(),
             detail: e.to_string(),
@@ -1609,6 +1612,7 @@ impl ContainerRuntime for NativeBackend {
                     &log_path,
                     leaf.as_ref(),
                     &verdict,
+                    outliving.is_some(),
                 );
                 if let Err(e) = kept {
                     abandon(store, &id, child, &wired, leaf);
@@ -2426,6 +2430,7 @@ mod tests {
                 pumps: Vec::new(),
                 recorded: None,
                 unclaimed: None,
+                private_mounts: false,
             },
         );
         for bound in [

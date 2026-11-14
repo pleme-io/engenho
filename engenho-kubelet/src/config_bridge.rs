@@ -193,11 +193,11 @@ pub fn make_container_runtime_with_classes(
             lifetime,
         )
     };
-    let mut router = crate::runtime_class::RuntimeClassRouter::new(build(default, native_lifetime)?)
-        .with_class(
-        crate::wasm_backend::WASM_RUNTIME_CLASS,
-        Arc::new(crate::wasm_backend::WasmBackend::new(wasm_log_dir(), false)),
-    );
+    let mut router =
+        crate::runtime_class::RuntimeClassRouter::new(build(default, native_lifetime)?).with_class(
+            crate::wasm_backend::WASM_RUNTIME_CLASS,
+            Arc::new(crate::wasm_backend::WasmBackend::new(wasm_log_dir(), false)),
+        );
     for (class, runtime) in classes {
         router = router.with_class(
             class.clone(),
@@ -426,6 +426,7 @@ mod tests {
             NativeCgroups::default(),
             engenho_config::NativeSecurity::Enforce,
             engenho_config::NativeMounts::default(),
+            crate::native_survival::WorkloadLifetime::Bound,
         )
     }
 
