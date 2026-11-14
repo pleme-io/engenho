@@ -507,6 +507,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(FILE), "entries: [not, a, map]\n").unwrap();
         let store = OverrideStore::open(dir.path());
+        assert!(store.current().unreadable().is_some());
         let err = store.layer().unwrap_err();
         assert!(err.to_string().contains("config clear"), "{err}");
 
@@ -519,5 +520,31 @@ mod tests {
                 .unreadable()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_missing_file_is_an_empty_tier_and_any_other_read_error_is_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = OverrideStore::open(dir.path());
+        assert_eq!(fresh.current().unreadable(), None);
+        assert!(fresh.layer().unwrap().values.is_empty());
+
+        std::fs::create_dir(dir.path().join(FILE)).unwrap();
+        let blocked = OverrideStore::open(dir.path());
+        assert!(blocked.current().unreadable().is_some());
+        assert!(blocked.layer().is_err());
+    }
+
+    #[test]
+    fn a_set_is_empty_only_with_neither_a_persisted_nor_an_ephemeral_override() {
+        assert!(OverrideSet::empty().is_empty());
+        for durability in [Durability::Persisted, Durability::Ephemeral] {
+            let one = OverrideSet::empty().with(&set(
+                "scheduler.tick_interval_seconds",
+                9.into(),
+                durability,
+            ));
+            assert!(!one.is_empty(), "{durability:?}");
+        }
     }
 }
