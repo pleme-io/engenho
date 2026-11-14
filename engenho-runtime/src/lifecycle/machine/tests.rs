@@ -683,3 +683,226 @@ proptest! {
         }
     }
 }
+
+fn every_state() -> Vec<LifecycleState> {
+    let report = FailureReport {
+        phase: BootPhase::OpenStore,
+        error: "e".into(),
+        at: t(0),
+    };
+    vec![
+        LifecycleState::Resolving { since: t(0) },
+        LifecycleState::Booting {
+            attempt: one(),
+            phase: BootPhase::FIRST,
+            since: t(0),
+        },
+        LifecycleState::Running {
+            attempt: one(),
+            since: t(0),
+            apiserver_addr: "127.0.0.1:6443".into(),
+            pending: PendingApply::InSync,
+        },
+        LifecycleState::Draining {
+            attempt: one(),
+            then: AfterDrain::Stop,
+        },
+        LifecycleState::Stopped {
+            reason: StopReason::OperatorRequest,
+            epoch: 0,
+            since: t(0),
+        },
+        LifecycleState::Failed {
+            attempt: one(),
+            report,
+            retry: RetryClass::Hold,
+        },
+        LifecycleState::Wedged {
+            cause: "held".into(),
+            since: t(0),
+        },
+        LifecycleState::Exiting {
+            intent: ExitIntent::Halt,
+        },
+    ]
+}
+
+#[test]
+fn only_a_boot_a_runtime_a_drain_and_a_wedge_may_hold_the_store() {
+    let holds: Vec<(&str, bool)> = every_state()
+        .iter()
+        .map(|s| (s.name(), s.may_hold_store()))
+        .collect();
+    assert_eq!(
+        holds,
+        vec![
+            ("resolving", false),
+            ("booting", true),
+            ("running", true),
+            ("draining", true),
+            ("stopped", false),
+            ("failed", false),
+            ("wedged", true),
+            ("exiting", false),
+        ]
+    );
+}
+
+#[test]
+fn every_event_name_is_its_wire_tag() {
+    let report = FailureReport {
+        phase: BootPhase::OpenStore,
+        error: "e".into(),
+        at: t(0),
+    };
+    let events = vec![
+        LifecycleEvent::HeldAtStartup { at: t(0) },
+        LifecycleEvent::Start { at: t(0) },
+        LifecycleEvent::Retry { at: t(0) },
+        LifecycleEvent::RetryDue { at: t(0) },
+        LifecycleEvent::ConfigChanged { at: t(0) },
+        LifecycleEvent::ConfigApplied {
+            pending: PendingApply::InSync,
+        },
+        LifecycleEvent::Phase {
+            phase: BootPhase::FIRST,
+            at: t(0),
+        },
+        booted(0),
+        LifecycleEvent::BootFailed {
+            report,
+            class: FailureClass::Hold,
+            store: StoreOutcome::Released,
+        },
+        LifecycleEvent::Stop { at: t(0) },
+        LifecycleEvent::Restart { at: t(0) },
+        LifecycleEvent::Exit {
+            intent: ExitIntent::Halt,
+        },
+        LifecycleEvent::Drained {
+            at: t(0),
+            store: StoreOutcome::Released,
+        },
+    ];
+    let names: Vec<&str> = events.iter().map(LifecycleEvent::name).collect();
+    assert_eq!(
+        names,
+        vec![
+            "held_at_startup",
+            "start",
+            "retry",
+            "retry_due",
+            "config_changed",
+            "config_applied",
+            "phase",
+            "booted",
+            "boot_failed",
+            "stop",
+            "restart",
+            "exit",
+            "drained",
+        ]
+    );
+    for event in &events {
+        let wire = serde_json::to_value(event).expect("serialize");
+        assert_eq!(wire["event"].as_str(), Some(event.name()));
+    }
+}
+
+#[test]
+fn every_refusal_is_spelled_as_the_control_api_spells_it() {
+    use engenho_substrate::ErrorKind;
+    let reasons = [
+        (RefusedBecause::RuntimeRunning, "runtime_running"),
+        (RefusedBecause::RuntimeNotRunning, "runtime_not_running"),
+        (RefusedBecause::RuntimeNotFailed, "runtime_not_failed"),
+        (RefusedBecause::RuntimeNotStopped, "runtime_not_stopped"),
+        (RefusedBecause::LifecycleBusy, "lifecycle_busy"),
+        (RefusedBecause::Wedged, "wedged"),
+        (RefusedBecause::Unexpected, "unexpected"),
+    ];
+    for (reason, wire) in reasons {
+        assert_eq!(reason.as_str(), wire);
+        assert_eq!(reason.to_string(), wire);
+        assert_eq!(
+            serde_json::to_value(reason).expect("serialize"),
+            serde_json::json!(wire)
+        );
+        let refusal = Refused {
+            state: "running",
+            event: "start",
+            reason,
+        };
+        assert_eq!(refusal.kind(), wire);
+    }
+    let err = DaemonLifecycle::step(&running(), &LifecycleEvent::Start { at: t(9) })
+        .expect_err("a running runtime is not started");
+    assert_eq!(err.kind(), "runtime_running");
+    assert_eq!(
+        err.to_string(),
+        "start refused while running: runtime_running"
+    );
+}
+
+#[test]
+fn each_failure_and_each_release_advances_the_epoch_and_a_boot_that_runs_ends_the_streak() {
+    let fail = |at| {
+        failed(
+            BootPhase::BindApiserver,
+            FailureClass::Hold,
+            StoreOutcome::Released,
+            at,
+        )
+    };
+    let m = Lifecycle::at(t(0));
+    assert_eq!((m.epoch(), m.streak()), (0, 0));
+    let (m, _) = step(&m, LifecycleEvent::Start { at: t(0) });
+    let (m, _) = step(&m, fail(1));
+    assert_eq!((m.epoch(), m.streak()), (1, 1));
+    let (m, _) = step(&m, LifecycleEvent::Retry { at: t(2) });
+    let (m, _) = step(&m, fail(3));
+    assert_eq!((m.epoch(), m.streak()), (2, 2));
+    let (m, _) = step(&m, LifecycleEvent::Retry { at: t(4) });
+    let (m, _) = step(&m, booted(5));
+    assert_eq!((m.epoch(), m.streak()), (2, 0));
+    let (m, _) = step(&m, LifecycleEvent::Stop { at: t(6) });
+    let (m, _) = step(
+        &m,
+        LifecycleEvent::Drained {
+            at: t(7),
+            store: StoreOutcome::Released,
+        },
+    );
+    assert_eq!((m.epoch(), m.streak()), (3, 0));
+    assert!(matches!(m.state, LifecycleState::Stopped { epoch: 3, .. }));
+}
+
+#[test]
+fn a_restart_or_an_exit_during_a_boot_cancels_it_into_a_drain() {
+    let (booting, _) = step(&Lifecycle::at(t(0)), LifecycleEvent::Start { at: t(0) });
+    let (m, effect) = step(&booting, LifecycleEvent::Restart { at: t(1) });
+    assert_eq!(effect, LifecycleEffect::CancelBoot);
+    assert_eq!(
+        m.state,
+        LifecycleState::Draining {
+            attempt: one(),
+            then: AfterDrain::Restart,
+        }
+    );
+    let (m, effect) = step(
+        &booting,
+        LifecycleEvent::Exit {
+            intent: ExitIntent::Relaunch,
+        },
+    );
+    assert_eq!(effect, LifecycleEffect::CancelBoot);
+    assert_eq!(
+        m.state,
+        LifecycleState::Draining {
+            attempt: one(),
+            then: AfterDrain::Exit {
+                intent: ExitIntent::Relaunch,
+            },
+        }
+    );
+}
