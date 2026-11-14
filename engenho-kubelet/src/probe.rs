@@ -1595,6 +1595,65 @@ mod tests {
     }
 
     #[test]
+    fn a_trip_names_its_probe_and_its_count() {
+        let now = t0();
+        let fail = |kind, threshold| {
+            let spec = exec_spec(kind, 1, threshold);
+            let mut rt = ProbeRuntime::new(now);
+            (0..threshold)
+                .filter_map(|_| {
+                    fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now).trip
+                })
+                .last()
+                .expect("the threshold trips")
+        };
+        let liveness = fail(ProbeKind::Liveness, 3);
+        assert_eq!(liveness.kind(), TripKind::Liveness);
+        assert_eq!(liveness.kind().to_string(), "liveness");
+        assert_eq!(
+            liveness.to_string(),
+            "liveness probe failed 3 consecutive times"
+        );
+        let startup = fail(ProbeKind::Startup, 2);
+        assert_eq!(startup.kind().to_string(), "startup");
+        assert_eq!(
+            startup.to_string(),
+            "startup probe failed 2 consecutive times"
+        );
+    }
+
+    #[test]
+    fn container_probes_are_empty_only_with_no_probe_and_reset_zeroes_every_counter() {
+        let now = t0();
+        assert!(ContainerProbes::default().is_empty());
+        let spec = exec_spec(ProbeKind::Liveness, 1, 5);
+        let mut rt = ProbeRuntime::new(now);
+        fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now);
+        fold_probe_observation(&spec, &mut rt, ProbeObservation::Failure, now);
+        assert_eq!(rt.consecutive_failures, 2);
+        let ready_spec = exec_spec(ProbeKind::Readiness, 1, 5);
+        let mut ready_rt = ProbeRuntime::new(now);
+        fold_probe_observation(&ready_spec, &mut ready_rt, ProbeObservation::Success, now);
+        assert!(ready_rt.gate_satisfied);
+        let mut probes = ContainerProbes {
+            liveness: Some((spec, rt)),
+            readiness: Some((ready_spec, ready_rt)),
+            startup: None,
+        };
+        assert!(!probes.is_empty());
+        let later = now + Duration::from_secs(30);
+        probes.reset(later);
+        let (_, live) = probes.liveness.as_ref().expect("kept");
+        assert_eq!(live.consecutive_failures, 0);
+        assert_eq!(live.started_at, later);
+        assert_eq!(live.last_run, None);
+        let (_, ready) = probes.readiness.as_ref().expect("kept");
+        assert!(!ready.gate_satisfied);
+        assert_eq!(ready.consecutive_successes, 0);
+        assert_eq!(ready.started_at, later);
+    }
+
+    #[test]
     fn liveness_success_resets_failure_counter() {
         let now = t0();
         let spec = exec_spec(ProbeKind::Liveness, 1, 2);
