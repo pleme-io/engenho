@@ -1443,6 +1443,9 @@ mod tests {
         );
         assert_eq!(beat.snapshot().panics, 1);
         assert_eq!(children.running().count(), 0);
+        let handle = children.get(child).expect("kept");
+        let ended = handle.ended_at().expect("the end is recorded");
+        assert!(ended >= handle.spawned_at());
     }
 
     #[tokio::test]
@@ -1670,5 +1673,35 @@ mod tests {
             );
         }
         assert!(Child::all().all(|c| !c.rebuilt_between(&before, &before)));
+    }
+
+    #[test]
+    fn children_and_death_causes_display_their_names() {
+        assert_eq!(Child::NodeLease.to_string(), "node-lease");
+        assert_eq!(
+            Child::Listener(Listener::EtcdFacade).to_string(),
+            "etcd-facade"
+        );
+        assert_eq!(DeathCause::Panicked.to_string(), "panicked");
+        assert_eq!(DeathCause::Cancelled.to_string(), "cancelled");
+    }
+
+    #[test]
+    fn an_empty_etcd_address_disables_the_facade_and_never_the_kubelet() {
+        let mut boot = BootConfig::prescribed();
+        boot.etcd_listen_addr = "127.0.0.1:2379".into();
+        assert!(Listener::EtcdFacade.enabled(&boot));
+        boot.etcd_listen_addr = String::new();
+        assert!(!Listener::EtcdFacade.enabled(&boot));
+        assert!(Listener::KubeletHttp.enabled(&boot));
+    }
+
+    #[tokio::test]
+    async fn a_set_is_empty_until_a_child_is_spawned() {
+        let mut children = Children::default();
+        assert!(children.is_empty());
+        children.spawn(Child::NodeLease, body(std::future::pending()).1);
+        assert!(!children.is_empty());
+        assert_eq!(children.len(), 1);
     }
 }
