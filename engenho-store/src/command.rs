@@ -386,11 +386,19 @@ pub enum ApplySemantics {
     /// Under V0 and V1 a namespace delete removed it at once and left its
     /// contents stored (measured on plo 2026-11-15).
     V2,
+    /// A strategic merge (server-side apply included) matches a list element
+    /// that omits a merge key by the key's schema default, as upstream does
+    /// (`ports` is keyed by `containerPort` and `protocol`, which defaults to
+    /// `TCP`), and an apply whose config cannot be merged is refused. Under
+    /// V0 to V2 an element without `protocol` failed the merge and the apply
+    /// kept the live object, so a Deployment re-applied with a changed
+    /// template answered 200 unchanged (measured on plo 2026-11-15).
+    V3,
 }
 
 impl ApplySemantics {
     /// The rules this binary proposes under.
-    pub const CURRENT: Self = Self::V2;
+    pub const CURRENT: Self = Self::V3;
 
     /// The rules an entry written before the marker existed was applied
     /// under (the `#[serde(default)]` for [`LoggedCommand`]).
@@ -671,14 +679,14 @@ mod tests {
     }
 
     #[test]
-    fn this_binary_proposes_under_v2_and_the_marker_round_trips() {
-        assert_eq!(ApplySemantics::CURRENT, ApplySemantics::V2);
+    fn this_binary_proposes_under_v3_and_the_marker_round_trips() {
+        assert_eq!(ApplySemantics::CURRENT, ApplySemantics::V3);
         let entry = LoggedCommand::proposed(cm_put());
-        assert_eq!(entry.semantics(), ApplySemantics::V2);
+        assert_eq!(entry.semantics(), ApplySemantics::V3);
         let wire = serde_json::to_value(&entry).unwrap();
         // Flat: the marker sits beside the command's own fields.
         assert_eq!(wire["kind"], "put");
-        assert_eq!(wire["semantics"], "v2");
+        assert_eq!(wire["semantics"], "v3");
         let back: LoggedCommand = serde_json::from_value(wire).unwrap();
         assert_eq!(back, entry);
     }

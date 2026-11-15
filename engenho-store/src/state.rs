@@ -188,7 +188,7 @@ impl OnIdentical {
     const fn under(semantics: ApplySemantics) -> Self {
         match semantics {
             ApplySemantics::V0 => Self::Commit,
-            ApplySemantics::V1 | ApplySemantics::V2 => Self::Skip,
+            ApplySemantics::V1 | ApplySemantics::V2 | ApplySemantics::V3 => Self::Skip,
         }
     }
 }
@@ -211,7 +211,7 @@ impl FinalizerGate {
     const fn under(semantics: ApplySemantics) -> Self {
         match semantics {
             ApplySemantics::V0 | ApplySemantics::V1 => Self::Metadata,
-            ApplySemantics::V2 => Self::MetadataAndNamespaceSpec,
+            ApplySemantics::V2 | ApplySemantics::V3 => Self::MetadataAndNamespaceSpec,
         }
     }
 
@@ -230,11 +230,49 @@ impl FinalizerGate {
     }
 }
 
+/// How a strategic merge (server-side apply included) treats a list element
+/// that omits a merge key, and an apply config it cannot merge — the rule an
+/// [`ApplySemantics`] version selects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MergeRule {
+    /// An element without a key fails the merge, and an apply that fails
+    /// it keeps the live object ([`ApplySemantics::V0`] to `V2`).
+    Legacy,
+    /// A missing key is matched by its schema default, and an unmergeable
+    /// apply is refused ([`ApplySemantics::V3`]).
+    ListKeyDefaults,
+}
+
+impl MergeRule {
+    /// The rule `semantics` names. Exhaustive on purpose.
+    const fn under(semantics: ApplySemantics) -> Self {
+        match semantics {
+            ApplySemantics::V0 | ApplySemantics::V1 | ApplySemantics::V2 => Self::Legacy,
+            ApplySemantics::V3 => Self::ListKeyDefaults,
+        }
+    }
+
+    fn env(self, env: &dyn PatchSchemaEnv) -> patch_apply::ListKeyDefaults<'_> {
+        patch_apply::ListKeyDefaults {
+            env,
+            enabled: self == Self::ListKeyDefaults,
+        }
+    }
+
+    fn on_unmergeable(self) -> ssa::OnUnmergeable {
+        match self {
+            Self::Legacy => ssa::OnUnmergeable::KeepCurrent,
+            Self::ListKeyDefaults => ssa::OnUnmergeable::Refuse,
+        }
+    }
+}
+
 /// Every rule an [`ApplySemantics`] version selects, as one value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Rules {
     on_identical: OnIdentical,
     gate: FinalizerGate,
+    merge: MergeRule,
 }
 
 impl Rules {
@@ -242,12 +280,14 @@ impl Rules {
     const ETCD_TXN: Self = Self {
         on_identical: OnIdentical::Commit,
         gate: FinalizerGate::Metadata,
+        merge: MergeRule::Legacy,
     };
 
     const fn under(semantics: ApplySemantics) -> Self {
         Self {
             on_identical: OnIdentical::under(semantics),
             gate: FinalizerGate::under(semantics),
+            merge: MergeRule::under(semantics),
         }
     }
 
@@ -1068,8 +1108,13 @@ impl ResourceCatalog {
             Ok(b) => b,
             Err(e) => return ApplyOutcome::patch_rejected(e.to_string()),
         };
-        let merged_result =
-            patch_apply::apply(patch_type, existing_value, &body, &*self.patch_env, &gvk);
+        let merged_result = patch_apply::apply(
+            patch_type,
+            existing_value,
+            &body,
+            &rules.merge.env(&*self.patch_env),
+            &gvk,
+        );
         let mut merged = match merged_result {
             Ok(m) => m,
             Err(PatchError::Unsupported { what }) => {
@@ -1157,22 +1202,26 @@ impl ResourceCatalog {
         let gvk = Gvk::from(key);
 
         // Run the PURE SSA interpreter (reuses strategic_merge + the env).
-        let outcome = ssa::apply_ssa(
+        let outcome = ssa::apply_ssa_under(
+            rules.merge.on_unmergeable(),
             prior_value.as_ref(),
             body,
             &meta.manager,
             meta.force,
             &gvk,
-            &*self.patch_env,
+            &rules.merge.env(&*self.patch_env),
             &meta.time,
         );
         let ssa_out = match outcome {
             Ok(o) => o,
-            Err(conflicts) => {
+            Err(ssa::ApplyRefusal::Conflicts(conflicts)) => {
                 // Typed 409 — NEVER a silent overwrite. The serialized
                 // details.causes ride on patch_error.
                 let causes = conflicts.to_causes();
                 return ApplyOutcome::apply_conflict(causes.to_string());
+            }
+            Err(ssa::ApplyRefusal::Unmergeable(e)) => {
+                return ApplyOutcome::patch_rejected(e.to_string());
             }
         };
 
@@ -3594,6 +3643,56 @@ mod a_revision_means_a_change {
             ResourceOp::Deleted
         );
         assert!(v2.get(&ns).is_none());
+    }
+
+    fn web_deployment(checksum: &str) -> serde_json::Value {
+        json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "web", "namespace": "default"},
+            "spec": {
+                "selector": {"matchLabels": {"app": "web"}},
+                "template": {
+                    "metadata": {
+                        "labels": {"app": "web"},
+                        "annotations": {"checksum/config": checksum}
+                    },
+                    "spec": {"containers": [{
+                        "name": "main",
+                        "image": "nginx:1.27",
+                        "ports": [{"name": "http", "containerPort": 80}]
+                    }]}
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn an_apply_matches_a_port_by_its_default_protocol_from_v3_on() {
+        let web = ResourceKey::namespaced("apps", "v1", "Deployment", "default", "web");
+        let born = ssa(&web, web_deployment("old"), "helm", "2026-11-15T17:00:00Z");
+        let upgrade = ssa(&web, web_deployment("new"), "helm", "2026-11-15T17:00:00Z");
+        let annotation = |cat: &ResourceCatalog| {
+            cat.get(&web).unwrap()["spec"]["template"]["metadata"]["annotations"]["checksum/config"]
+                .clone()
+        };
+
+        let mut v2 = ResourceCatalog::default();
+        v2.apply_logged(&under(&born, "v2"), 1, 1);
+        assert_eq!(
+            v2.apply_logged(&under(&upgrade, "v2"), 1, 2).op,
+            ResourceOp::Unchanged
+        );
+        assert_eq!(annotation(&v2), json!("old"));
+
+        let mut v3 = ResourceCatalog::default();
+        v3.apply_logged(&LoggedCommand::proposed(born), 1, 1);
+        assert_eq!(
+            v3.apply_logged(&LoggedCommand::proposed(upgrade), 1, 2).op,
+            ResourceOp::Patched
+        );
+        assert_eq!(annotation(&v3), json!("new"));
+        assert_eq!(v3.get(&web).unwrap()["metadata"]["generation"], json!(2));
     }
 
     #[test]

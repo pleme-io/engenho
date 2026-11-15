@@ -43,7 +43,9 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
-use crate::patch_apply::{Gvk, JsonPath, ListMergeStrategy, PatchSchemaEnv, strategic_merge};
+use crate::patch_apply::{
+    Gvk, JsonPath, ListMergeStrategy, PatchError, PatchSchemaEnv, strategic_merge,
+};
 
 // ─── the internal typed ownership representation ────────────────────────────
 
@@ -441,6 +443,29 @@ impl ApplyConflicts {
     }
 }
 
+/// Why [`apply_ssa`] refused an apply. Either way nothing is written.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ApplyRefusal {
+    /// An unforced apply overlaps another manager's fields. 409.
+    #[error("apply conflicts with another field manager")]
+    Conflicts(ApplyConflicts),
+    /// The config cannot be merged into the live object. 400.
+    #[error("{0}")]
+    Unmergeable(PatchError),
+}
+
+/// What an apply does with a config the strategic-merge engine refuses
+/// to merge into the live object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OnUnmergeable {
+    /// Keep the live object as the merge result and answer success: the
+    /// rule a store log entry written before
+    /// [`crate::command::ApplySemantics::V3`] replays under.
+    KeepCurrent,
+    /// Refuse the apply with [`ApplyRefusal::Unmergeable`].
+    Refuse,
+}
+
 /// What [`apply_ssa`] produces on success — the merged object plus the new
 /// `managedFields` slice (as a wire JSON array, ready to write into
 /// `metadata.managedFields`).
@@ -512,8 +537,10 @@ impl SsaOutcome {
 ///
 /// # Errors
 ///
-/// [`ApplyConflicts`] when an unforced apply overlaps another manager's
-/// ownership with a differing value — NEVER a silent overwrite.
+/// [`ApplyRefusal::Conflicts`] when an unforced apply overlaps another
+/// manager's ownership with a differing value — NEVER a silent overwrite;
+/// [`ApplyRefusal::Unmergeable`] when the config cannot be merged into the
+/// live object — NEVER a silent keep.
 pub fn apply_ssa(
     current: Option<&Value>,
     config: &Value,
@@ -522,7 +549,36 @@ pub fn apply_ssa(
     gvk: &Gvk,
     env: &dyn PatchSchemaEnv,
     time: &str,
-) -> Result<SsaOutcome, ApplyConflicts> {
+) -> Result<SsaOutcome, ApplyRefusal> {
+    apply_ssa_under(
+        OnUnmergeable::Refuse,
+        current,
+        config,
+        manager,
+        force,
+        gvk,
+        env,
+        time,
+    )
+}
+
+/// [`apply_ssa`] with the rule for an unmergeable config named.
+///
+/// # Errors
+///
+/// As [`apply_ssa`]; [`ApplyRefusal::Unmergeable`] only under
+/// [`OnUnmergeable::Refuse`].
+#[allow(clippy::too_many_arguments)]
+pub fn apply_ssa_under(
+    on_unmergeable: OnUnmergeable,
+    current: Option<&Value>,
+    config: &Value,
+    manager: &str,
+    force: bool,
+    gvk: &Gvk,
+    env: &dyn PatchSchemaEnv,
+    time: &str,
+) -> Result<SsaOutcome, ApplyRefusal> {
     let applied_fs = fieldset_of(config, gvk, env);
 
     // ── CREATE branch ──────────────────────────────────────────────────
@@ -574,17 +630,18 @@ pub fn apply_ssa(
         // Stable order for a deterministic 409 body.
         conflicts.sort_by(|a, b| a.field.cmp(&b.field).then(a.manager.cmp(&b.manager)));
         conflicts.dedup();
-        return Err(ApplyConflicts { conflicts });
+        return Err(ApplyRefusal::Conflicts(ApplyConflicts { conflicts }));
     }
 
     // Phase 5 — MERGE (reuse the strategic-merge engine; the apply config
     // IS a strategic-merge patch over current).
-    let mut merged = strategic_merge(current, config, env, gvk, &JsonPath::root())
-        // strategic_merge only errors on a key-less merge element / bad
-        // $patch directive; an apply config carries neither. A surfaced
-        // error is conservatively treated as "no structural merge" — keep
-        // current. (Total: never a panic.)
-        .unwrap_or_else(|_| current.clone());
+    let mut merged = match strategic_merge(current, config, env, gvk, &JsonPath::root()) {
+        Ok(merged) => merged,
+        Err(e) => match on_unmergeable {
+            OnUnmergeable::Refuse => return Err(ApplyRefusal::Unmergeable(e)),
+            OnUnmergeable::KeepCurrent => current.clone(),
+        },
+    };
 
     // Phase 6 — FIELD REMOVAL: drop paths `manager` previously owned but
     // no longer applies, when no OTHER manager owns them.
@@ -1123,6 +1180,9 @@ mod tests {
             TIME,
         )
         .unwrap_err();
+        let ApplyRefusal::Conflicts(err) = err else {
+            panic!("a conflict, got {err:?}");
+        };
         assert_eq!(err.conflicts.len(), 1);
         assert_eq!(err.conflicts[0].manager, "mgr-a");
         assert_eq!(err.conflicts[0].field, ".data.a");

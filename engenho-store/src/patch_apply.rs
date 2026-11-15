@@ -236,6 +236,59 @@ pub trait PatchSchemaEnv: Send + Sync {
     /// returns [`ListMergeStrategy::Replace`] (atomic) — the conservative
     /// K8s default for a list with no merge metadata.
     fn merge_strategy(&self, gvk: &Gvk, json_path: &JsonPath) -> ListMergeStrategy;
+
+    /// The schema default of merge-key field `key` of the elements of the
+    /// list at `json_path`, the value an element that omits the key is
+    /// matched by (upstream structured-merge-diff reads a list-map key's
+    /// default the same way: `ports` is keyed by `containerPort` and
+    /// `protocol`, and `protocol` defaults to `TCP`). `None` when the key
+    /// has no default, and for an env that models no defaults.
+    fn list_key_default(&self, _gvk: &Gvk, _json_path: &JsonPath, _key: &str) -> Option<Value> {
+        None
+    }
+}
+
+/// `env`'s strategies, with its list-key defaults only when `enabled`: off
+/// is the rule a store log entry written before
+/// [`crate::command::ApplySemantics::V3`] replays under.
+pub struct ListKeyDefaults<'a> {
+    /// The env strategies and defaults are read from.
+    pub env: &'a dyn PatchSchemaEnv,
+    /// Whether `env`'s list-key defaults are read.
+    pub enabled: bool,
+}
+
+impl PatchSchemaEnv for ListKeyDefaults<'_> {
+    fn merge_strategy(&self, gvk: &Gvk, json_path: &JsonPath) -> ListMergeStrategy {
+        self.env.merge_strategy(gvk, json_path)
+    }
+
+    fn list_key_default(&self, gvk: &Gvk, json_path: &JsonPath, key: &str) -> Option<Value> {
+        self.enabled
+            .then(|| self.env.list_key_default(gvk, json_path, key))
+            .flatten()
+    }
+}
+
+/// The merge-key tuple of list element `el` under `keys`: each key's value,
+/// or the schema default when the element omits it. `None` when `el` is not
+/// an object or omits a key that has no default.
+#[must_use]
+pub fn list_element_key(
+    el: &Value,
+    keys: &[String],
+    env: &dyn PatchSchemaEnv,
+    gvk: &Gvk,
+    path: &JsonPath,
+) -> Option<Vec<Value>> {
+    let obj = el.as_object()?;
+    keys.iter()
+        .map(|k| {
+            obj.get(k)
+                .cloned()
+                .or_else(|| env.list_key_default(gvk, path, k))
+        })
+        .collect()
 }
 
 // ─── the typed patch payload ───────────────────────────────────────────────
@@ -721,10 +774,7 @@ fn merge_list_by_key(
     gvk: &Gvk,
     path: &JsonPath,
 ) -> Result<Vec<Value>, PatchError> {
-    let key_of = |el: &Value| -> Option<Vec<Value>> {
-        let obj = el.as_object()?;
-        keys.iter().map(|k| obj.get(k).cloned()).collect()
-    };
+    let key_of = |el: &Value| list_element_key(el, keys, env, gvk, path);
 
     // Seed the result with the existing elements (preserving order).
     let mut out: Vec<Value> = existing.to_vec();
@@ -744,7 +794,10 @@ fn merge_list_by_key(
             if pel.is_object() {
                 let missing = keys
                     .iter()
-                    .find(|k| pel.as_object().and_then(|o| o.get(*k)).is_none())
+                    .find(|k| {
+                        pel.as_object().and_then(|o| o.get(*k)).is_none()
+                            && env.list_key_default(gvk, path, k).is_none()
+                    })
                     .cloned()
                     .unwrap_or_default();
                 return Err(PatchError::MissingMergeKey {
@@ -798,6 +851,8 @@ fn merge_list_by_key(
 pub struct OpenApiPatchEnv {
     /// Cache of resolved strategies, keyed by `(gvk, dotted-path)`.
     cache: std::sync::Mutex<HashMap<(Gvk, String), ListMergeStrategy>>,
+    /// Cache of resolved list-key defaults, keyed by `(gvk, dotted-path, key)`.
+    key_defaults: std::sync::Mutex<HashMap<(Gvk, String, String), Option<Value>>>,
 }
 
 impl Default for OpenApiPatchEnv {
@@ -812,6 +867,7 @@ impl OpenApiPatchEnv {
     pub fn new() -> Self {
         Self {
             cache: std::sync::Mutex::new(HashMap::new()),
+            key_defaults: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -838,11 +894,47 @@ impl PatchSchemaEnv for OpenApiPatchEnv {
         }
         strat
     }
+
+    fn list_key_default(&self, gvk: &Gvk, json_path: &JsonPath, key: &str) -> Option<Value> {
+        let cache_key = (gvk.clone(), json_path.dotted(), key.to_string());
+        if let Ok(cache) = self.key_defaults.lock()
+            && let Some(hit) = cache.get(&cache_key)
+        {
+            return hit.clone();
+        }
+        let default = key_default_from_openapi(gvk, json_path, key);
+        if let Ok(mut cache) = self.key_defaults.lock() {
+            cache.insert(cache_key, default.clone());
+        }
+        default
+    }
 }
 
 /// Resolve a list strategy by walking the vendored OpenAPI v3 document for
 /// `gvk` along `json_path`. `None` when no document/schema/field is found.
 fn resolve_from_openapi(gvk: &Gvk, json_path: &JsonPath) -> Option<ListMergeStrategy> {
+    with_field_schema(gvk, json_path, |_, field| strategy_from_field(field))
+}
+
+/// The `default` the vendored schema declares for property `key` of the
+/// elements of the list field at `json_path`. `None` when there is none.
+fn key_default_from_openapi(gvk: &Gvk, json_path: &JsonPath, key: &str) -> Option<Value> {
+    with_field_schema(gvk, json_path, |schemas, field| {
+        deref(schemas, field)?
+            .get("properties")?
+            .get(key)?
+            .get("default")
+            .cloned()
+    })
+}
+
+/// Walk the vendored OpenAPI v3 document for `gvk` along `json_path` and
+/// hand `read` the schema node of the field at its final segment.
+fn with_field_schema<T>(
+    gvk: &Gvk,
+    json_path: &JsonPath,
+    read: impl FnOnce(&serde_json::Map<String, Value>, &Value) -> Option<T>,
+) -> Option<T> {
     let doc_body = engenho_types::openapi_v3::document_for(&gvk.group, &gvk.version)?;
     let doc: Value = serde_json::from_str(doc_body).ok()?;
     let schemas = doc.get("components")?.get("schemas")?.as_object()?;
@@ -858,10 +950,9 @@ fn resolve_from_openapi(gvk: &Gvk, json_path: &JsonPath) -> Option<ListMergeStra
         let props = resolved.get("properties")?.as_object()?;
         let field = props.get(seg)?;
         if i + 1 == segs.len() {
-            // Final segment — read the list extensions HERE (on the field
-            // schema, before deref, since x-kubernetes-* live on the array
-            // property node).
-            return strategy_from_field(field);
+            // Final segment — the field's own schema node, before deref,
+            // since x-kubernetes-* live on the array property node.
+            return read(schemas, field);
         }
         // Intermediate segment — descend into the field's (deref'd) schema.
         node = field;

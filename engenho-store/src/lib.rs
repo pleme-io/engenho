@@ -155,8 +155,8 @@ pub use network::{InProcessRouter, LearnerAsk, LearnerVerdict, MeshNetwork, RpcE
 pub use owned_task::{OwnedTask, TaskStop};
 pub use pagination::{ContinueInvalid, ContinueToken, ListPage, PageAtRevision};
 pub use patch_apply::{
-    Gvk, JsonPath, ListMergeStrategy, MockPatchEnv, OpenApiPatchEnv, PatchBody, PatchDirective,
-    PatchError, PatchSchemaEnv, apply as apply_patch_algorithm,
+    Gvk, JsonPath, ListKeyDefaults, ListMergeStrategy, MockPatchEnv, OpenApiPatchEnv, PatchBody,
+    PatchDirective, PatchError, PatchSchemaEnv, apply as apply_patch_algorithm, list_element_key,
 };
 #[cfg(feature = "mesh-quic")]
 pub use peer_table::{Peer, PeerTable, PeerTableError};
@@ -165,7 +165,10 @@ pub use quic_network::{MeshAddr, QuicMeshError, QuicRouter};
 pub use read::{ReadConsistency, ReadRefused};
 pub use resource::{ListScope, ResourceKey, ResourceValue};
 pub use revision::{Change, ChangeKind, CompactedTooOld, Revision, VersionMeta};
-pub use ssa::{ApplyConflicts, Conflict, FieldSet, PathElement, SsaOutcome, apply_ssa};
+pub use ssa::{
+    ApplyConflicts, ApplyRefusal, Conflict, FieldSet, OnUnmergeable, PathElement, SsaOutcome,
+    apply_ssa, apply_ssa_under,
+};
 pub use state::{ApplyOutcome, DEFAULT_HISTORY_CAPACITY, check_precondition, unchanged};
 pub use store::InMemoryStore;
 pub use type_config::{ApplyResult, RaftNodeId, TypeConfig};

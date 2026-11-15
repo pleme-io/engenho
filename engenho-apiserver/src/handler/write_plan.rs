@@ -78,8 +78,8 @@ use serde_json::Value;
 
 use engenho_controllers::admission::{AdmissionAction, AdmissionDecision};
 use engenho_store::{
-    ApplyConflicts, Gvk, OpenApiPatchEnv, PatchBody, PatchError, Revision, VersionMeta,
-    apply_patch_algorithm, apply_ssa,
+    ApplyConflicts, ApplyRefusal, Gvk, OpenApiPatchEnv, PatchBody, PatchError, Revision,
+    VersionMeta, apply_patch_algorithm, apply_ssa,
     command::{Reason, ResourceCommand, ResourceOp, TxnCompare, TxnOp},
     resource::ResourceKey,
     unchanged,
@@ -543,7 +543,10 @@ impl StoreBackedHandler {
                 &*PATCH_SCHEMA,
                 now,
             )
-            .map_err(WriteRefusal::ApplyConflict)?
+            .map_err(|refusal| match refusal {
+                ApplyRefusal::Conflicts(conflicts) => WriteRefusal::ApplyConflict(conflicts),
+                ApplyRefusal::Unmergeable(e) => WriteRefusal::PatchRejected(e),
+            })?
             .merged()
             .clone(),
         };
