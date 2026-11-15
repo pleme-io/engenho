@@ -249,12 +249,7 @@ async fn a_watch_across_a_restart_ends_and_its_resume_delivers_or_relists() {
 
     let stop_first = tokio::spawn(stop(first));
     let ended = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match held.chunk().await {
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => break,
-            }
-        }
+        while let Ok(Some(_)) = held.chunk().await {}
     })
     .await;
     assert!(ended.is_ok(), "the watch stayed open across the stop");

@@ -294,7 +294,7 @@ pub enum NativeWorkloads {
     Outlive,
 }
 
-/// Whether `batch/v1` (Job, CronJob) is served as protobuf. `Served`, the
+/// Whether `batch/v1` (`Job`, `CronJob`) is served as protobuf. `Served`, the
 /// default: client-go creates a Job as protobuf and treats a 415 as terminal.
 /// `Refused`: a protobuf body under `/apis/batch/` is 415, and a read is JSON
 /// when the client takes JSON, else 406.

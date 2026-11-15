@@ -162,7 +162,7 @@ pub struct RouterState {
     pub batch_protobuf: BatchProtobuf,
 }
 
-/// Whether `batch/v1` (Job, CronJob) is served as protobuf.
+/// Whether `batch/v1` (`Job`, `CronJob`) is served as protobuf.
 ///
 /// `Served` is the default: client-go creates a Job as protobuf and treats a
 /// 415 as terminal (it falls back to JSON only from CBOR). `Refused` answers
