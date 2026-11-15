@@ -94,6 +94,11 @@ impl ObjectBody {
                 normalize_meta_slot(container, parent)?;
             }
         }
+        for path in pod_spec_paths(group, kind) {
+            if let Some(spec) = object_at(root, path) {
+                drop_null_env_values(spec);
+            }
+        }
         Ok(Self(body))
     }
 
@@ -311,6 +316,38 @@ fn embedded_meta_parents(group: &str, kind: &str) -> &'static [&'static [&'stati
     }
 }
 
+fn pod_spec_paths(group: &str, kind: &str) -> &'static [&'static [&'static str]] {
+    match (group, kind) {
+        ("", "Pod") => &[&["spec"]],
+        ("apps", "Deployment" | "ReplicaSet" | "DaemonSet" | "StatefulSet")
+        | ("batch", "Job")
+        | ("", "ReplicationController") => &[&["spec", "template", "spec"]],
+        ("", "PodTemplate") => &[&["template", "spec"]],
+        ("batch", "CronJob") => &[&["spec", "jobTemplate", "spec", "template", "spec"]],
+        _ => &[],
+    }
+}
+
+const POD_CONTAINER_LISTS: [&str; 3] = ["containers", "initContainers", "ephemeralContainers"];
+
+fn drop_null_env_values(pod_spec: &mut Map<String, Value>) {
+    for list in POD_CONTAINER_LISTS {
+        let Some(containers) = pod_spec.get_mut(list).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for container in containers {
+            let Some(env) = container.get_mut("env").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            for entry in env.iter_mut().filter_map(Value::as_object_mut) {
+                if entry.get("value").is_some_and(Value::is_null) {
+                    entry.remove("value");
+                }
+            }
+        }
+    }
+}
+
 /// The object at `path` under `root`, when every step is an object.
 fn object_at<'v>(
     root: &'v mut Map<String, Value>,
@@ -492,6 +529,58 @@ mod tests {
             out["spec"]["jobTemplate"]["spec"]["template"]["metadata"],
             json!({})
         );
+    }
+
+    #[test]
+    fn a_null_env_value_is_dropped_in_every_pod_spec() {
+        let env = || {
+            json!([
+                {"name": "AKEYLESS_BUCKET", "value": null},
+                {"name": "NO_VALUE_KEY"},
+                {"name": "FOO", "value": "bar"}
+            ])
+        };
+        let want = json!([
+            {"name": "AKEYLESS_BUCKET"},
+            {"name": "NO_VALUE_KEY"},
+            {"name": "FOO", "value": "bar"}
+        ]);
+        let spec = || {
+            json!({
+                "containers": [{"name": "c", "image": "i", "env": env()}],
+                "initContainers": [{"name": "i", "image": "i", "env": env()}]
+            })
+        };
+        for (group, kind, body, at) in [
+            ("", "Pod", json!({"spec": spec()}), "/spec"),
+            (
+                "apps",
+                "Deployment",
+                json!({"spec": {"template": {"spec": spec()}}}),
+                "/spec/template/spec",
+            ),
+            (
+                "",
+                "PodTemplate",
+                json!({"template": {"spec": spec()}}),
+                "/template/spec",
+            ),
+            (
+                "batch",
+                "CronJob",
+                json!({"spec": {"jobTemplate": {"spec": {"template": {"spec": spec()}}}}}),
+                "/spec/jobTemplate/spec/template/spec",
+            ),
+        ] {
+            let out = normalized(group, kind, body);
+            for list in ["containers", "initContainers"] {
+                assert_eq!(
+                    out.pointer(&format!("{at}/{list}/0/env")),
+                    Some(&want),
+                    "{kind} {list}"
+                );
+            }
+        }
     }
 
     #[test]

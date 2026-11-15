@@ -1431,6 +1431,10 @@ impl Kubelet {
     /// credentials. A pod that cannot get its environment must not reach
     /// Running, because "started successfully, silently misconfigured" is
     /// the single hardest state to debug from outside.
+    fn literal_env_value(entry: &Value) -> Option<&Value> {
+        entry.get("value").filter(|v| !v.is_null())
+    }
+
     fn resolve_env_entry(
         namespace: &str,
         pod_name: &str,
@@ -1453,8 +1457,7 @@ impl Kubelet {
             .ok_or_else(|| invalid("env entry has no name".to_string()))?
             .to_string();
 
-        // A literal value wins, exactly as upstream.
-        if let Some(v) = entry.get("value") {
+        if let Some(v) = Self::literal_env_value(entry) {
             let v = v
                 .as_str()
                 .ok_or_else(|| invalid(format!("env {key}: value is not a string")))?;
@@ -1788,7 +1791,7 @@ impl Kubelet {
                         // would let a ConfigMap's contents reach into the
                         // container's environment, which is a different and
                         // much larger promise than the one Kubernetes makes.
-                        let v = if entry.get("value").is_some() {
+                        let v = if Self::literal_env_value(entry).is_some() {
                             crate::env_ref::expand_env_refs(&v, &map)
                         } else {
                             v
@@ -6567,6 +6570,29 @@ mod tests {
         assert_eq!(spec.image, "nginx:1.27");
         assert_eq!(spec.env.get("FOO").map(String::as_str), Some("bar"));
         assert!(spec.command.is_empty());
+    }
+
+    #[test]
+    fn a_null_or_absent_env_value_is_the_empty_string() {
+        let pod = json!({
+            "spec": {
+                "containers": [{
+                    "name": "main",
+                    "image": "nginx:1.27",
+                    "env": [
+                        {"name": "AKEYLESS_BUCKET", "value": null},
+                        {"name": "NO_VALUE_KEY"},
+                        {"name": "FOO", "value": "bar"}
+                    ]
+                }]
+            }
+        });
+        let specs = Kubelet::pod_to_container_specs("default", "p1", &pod, &BTreeMap::new())
+            .expect("a null or absent env value admits the pod");
+        let env = &specs[0].1.env;
+        assert_eq!(env.get("AKEYLESS_BUCKET").map(String::as_str), Some(""));
+        assert_eq!(env.get("NO_VALUE_KEY").map(String::as_str), Some(""));
+        assert_eq!(env.get("FOO").map(String::as_str), Some("bar"));
     }
 
     #[test]
