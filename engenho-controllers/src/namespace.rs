@@ -34,12 +34,20 @@
 //! finalizers, and a second delete is the store's `NoOp`. The controller
 //! re-ticks (`WatchDriver` fallback) until the namespace is actually empty.
 //!
-//! ## Scope (v1)
+//! ## Scope
 //!
-//! Cascade covers core + built-in namespaced kinds from
-//! [`RESOURCE_CATALOG`]. Dynamic CRD-served namespaced CR kinds are the
-//! next extension (fold the `CrdController`'s registered served set into the
-//! enumeration); documented as TYPED-DEFERRED, not silently dropped.
+//! Cascade covers every namespaced kind served right now: the built-in
+//! [`RESOURCE_CATALOG`] rows plus every served version of every stored
+//! `CustomResourceDefinition` ([`ServedKinds`], the garbage collector's
+//! `RESTMapper`), rebuilt each tick.
+//!
+//! ## Where the `kubernetes` finalizer lives
+//!
+//! The apiserver births a Namespace with `kubernetes` in `spec.finalizers`,
+//! as upstream does, and the store holds a deleted Namespace Terminating on
+//! that list ([`engenho_store::ApplySemantics::V2`]). A Namespace stored
+//! before then may carry it in `metadata.finalizers`; both are honoured and
+//! both are cleared.
 
 use std::sync::Arc;
 
@@ -50,14 +58,16 @@ use engenho_store::{
     resource::ResourceKey,
 };
 use engenho_types::generated_v1_34::{RESOURCE_CATALOG, ResourceDescriptor};
+use engenho_types::kind::Scope;
 use serde_json::Value;
 use tracing::{debug, info};
 
 use crate::controller::{Controller, ReconcileOutcome, ReconcileReport};
 use crate::effect::Effect;
 use crate::error::ControllerError;
+use crate::gc::{ServedKind, ServedKinds};
 use crate::meta::ObjectMeta;
-use crate::reads::{DeclaresReads, Reads, gvk};
+use crate::reads::{DeclaresReads, Reads};
 use crate::status::write_status_cas;
 
 /// The Kubernetes namespace finalizer — gates a Namespace's removal until
@@ -88,9 +98,10 @@ impl NamespaceController {
         Self { store, namespace }
     }
 
-    /// Read `metadata.finalizers` off a Namespace object.
-    fn finalizers_of(ns: &Value) -> Vec<String> {
-        ns.get("metadata")
+    /// The finalizer list at `section.finalizers` (`spec` or `metadata`)
+    /// of a Namespace object.
+    fn finalizers_at(ns: &Value, section: &str) -> Vec<String> {
+        ns.get(section)
             .and_then(|m| m.get("finalizers"))
             .and_then(Value::as_array)
             .map(|a| {
@@ -99,6 +110,41 @@ impl NamespaceController {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Whether the namespace still holds the `kubernetes` finalizer, in
+    /// `spec.finalizers` or `metadata.finalizers`.
+    fn holds_kubernetes_finalizer(ns: &Value) -> bool {
+        ["spec", "metadata"].iter().any(|section| {
+            Self::finalizers_at(ns, section)
+                .iter()
+                .any(|f| f == KUBERNETES_FINALIZER)
+        })
+    }
+
+    /// Every namespaced kind served right now, each group/version/kind
+    /// once: the catalog plus every stored CRD's served versions.
+    async fn served_namespaced(&self) -> Vec<ServedKind> {
+        let crds = self
+            .store
+            .list(
+                "apiextensions.k8s.io",
+                "v1",
+                "CustomResourceDefinition",
+                None,
+            )
+            .await;
+        let served = ServedKinds::builtin().with_crds(crds.iter().map(|(_, crd)| crd));
+        let mut kinds: Vec<ServedKind> = Vec::new();
+        for k in served.iter().filter(|k| k.scope == Scope::Namespaced) {
+            if !kinds
+                .iter()
+                .any(|s| s.group == k.group && s.version == k.version && s.kind == k.kind)
+            {
+                kinds.push(k.clone());
+            }
+        }
+        kinds
     }
 
     /// Sweep one Terminating namespace: delete every namespaced object in
@@ -129,12 +175,12 @@ impl NamespaceController {
         report.record(status.effect());
 
         // 2. Delete every namespaced object in this namespace across all
-        //    served namespaced kinds.
+        //    served namespaced kinds, CRD-served kinds included.
         let mut remaining = 0usize;
-        for d in namespaced_kinds() {
+        for d in self.served_namespaced().await {
             let objs = self
                 .store
-                .list(d.group, d.version, d.kind, Some(ns_name))
+                .list(&d.group, &d.version, &d.kind, Some(ns_name))
                 .await;
             for (key, value) in objs {
                 remaining += 1;
@@ -177,16 +223,22 @@ impl NamespaceController {
         //    the LIVE listed-this-tick `remaining` count; a non-zero count
         //    means we re-tick (WatchDriver fallback) until drained.
         if remaining == 0 {
-            let current = Self::finalizers_of(ns_obj);
-            if current.iter().any(|f| f == KUBERNETES_FINALIZER) {
-                let next: Vec<String> = current
-                    .into_iter()
-                    .filter(|f| f != KUBERNETES_FINALIZER)
-                    .collect();
-                // Typed merge patch on metadata.finalizers — empties the
-                // kubernetes finalizer on a deletionTimestamp-bearing
-                // object, which the store converts into a removal.
-                let patch = serde_json::json!({ "metadata": { "finalizers": next } });
+            if Self::holds_kubernetes_finalizer(ns_obj) {
+                let mut patch = serde_json::Map::new();
+                for section in ["spec", "metadata"] {
+                    let current = Self::finalizers_at(ns_obj, section);
+                    if current.iter().any(|f| f == KUBERNETES_FINALIZER) {
+                        let next: Vec<String> = current
+                            .into_iter()
+                            .filter(|f| f != KUBERNETES_FINALIZER)
+                            .collect();
+                        patch.insert(
+                            section.to_string(),
+                            serde_json::json!({ "finalizers": next }),
+                        );
+                    }
+                }
+                let patch = Value::Object(patch);
                 info!(
                     namespace = ns_name,
                     "namespace empty; clearing kubernetes finalizer (removal follows)"
@@ -212,14 +264,14 @@ impl NamespaceController {
     }
 }
 
-/// The Namespaces, and every namespaced kind the cascade lists in a
-/// Terminating one, from the same [`namespaced_kinds`] table the sweep
-/// walks. A child's deletion wakes it, so a namespace finishes draining when
-/// its last object goes rather than a fallback interval later.
+/// The cascade lists every served namespaced kind, CRD-served kinds it
+/// cannot name ahead of time included, so every event wakes it (as
+/// [`crate::gc::GcController`]). A child's deletion then wakes it, so a
+/// namespace finishes draining when its last object goes rather than a
+/// fallback interval later.
 impl DeclaresReads for NamespaceController {
     fn reads(&self) -> Reads {
-        Reads::of(&[gvk("", "v1", "Namespace")])
-            .and(namespaced_kinds().map(|d| gvk(d.group, d.version, d.kind)))
+        Reads::every()
     }
 }
 
@@ -239,7 +291,7 @@ impl Controller for NamespaceController {
         for (key, ns_obj) in namespaces {
             // Only act on Terminating namespaces that still hold the
             // kubernetes finalizer (the ones we own the teardown of).
-            if !ns_obj.is_terminating() || !ns_obj.has_finalizer(KUBERNETES_FINALIZER) {
+            if !ns_obj.is_terminating() || !Self::holds_kubernetes_finalizer(&ns_obj) {
                 continue;
             }
             let ns_name = &key.name;

@@ -12,8 +12,8 @@
 //! they are filtered out before `apply` is ever called for them, and
 //! a no-op outcome here leaves the revision untouched. Nor does a Put or
 //! Patch whose result equals the stored object ([`unchanged`], T3.5): it
-//! answers [`ResourceOp::Unchanged`] under [`ApplySemantics::V1`], the rules
-//! every entry this binary proposes carries.
+//! answers [`ResourceOp::Unchanged`] under [`ApplySemantics::V1`] and later,
+//! the rules every entry this binary proposes carries.
 //!
 //! Per key the catalog stores `(value, VersionMeta)` where
 //! [`VersionMeta`] carries `(create_revision, mod_revision,
@@ -178,7 +178,7 @@ enum OnIdentical {
     /// [`ApplySemantics::V0`], and etcd's rule for a `Txn` Put.
     Commit,
     /// Write nothing and answer [`ResourceOp::Unchanged`]
-    /// ([`ApplySemantics::V1`]).
+    /// ([`ApplySemantics::V1`] and later).
     Skip,
 }
 
@@ -188,7 +188,66 @@ impl OnIdentical {
     const fn under(semantics: ApplySemantics) -> Self {
         match semantics {
             ApplySemantics::V0 => Self::Commit,
-            ApplySemantics::V1 => Self::Skip,
+            ApplySemantics::V1 | ApplySemantics::V2 => Self::Skip,
+        }
+    }
+}
+
+/// Which finalizer lists hold a deleted object Terminating — the rule an
+/// [`ApplySemantics`] version selects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FinalizerGate {
+    /// `metadata.finalizers` only ([`ApplySemantics::V0`], `V1`, and a
+    /// `Txn`). A Namespace's `spec.finalizers` held nothing, so a namespace
+    /// delete removed it at once and its contents outlived it.
+    Metadata,
+    /// `metadata.finalizers`, and a core/v1 Namespace's `spec.finalizers`
+    /// ([`ApplySemantics::V2`]), as upstream's namespace storage does.
+    MetadataAndNamespaceSpec,
+}
+
+impl FinalizerGate {
+    /// The rule `semantics` names. Exhaustive on purpose.
+    const fn under(semantics: ApplySemantics) -> Self {
+        match semantics {
+            ApplySemantics::V0 | ApplySemantics::V1 => Self::Metadata,
+            ApplySemantics::V2 => Self::MetadataAndNamespaceSpec,
+        }
+    }
+
+    /// `true` while a finalizer this rule reads is still on `value`.
+    fn holds(self, key: &ResourceKey, value: &serde_json::Value) -> bool {
+        has_finalizers(value)
+            || (self == Self::MetadataAndNamespaceSpec
+                && is_namespace(key)
+                && has_namespace_spec_finalizers(value))
+    }
+
+    /// `true` when `post` is Terminating with nothing left to hold it: the
+    /// write that produced it removes the object instead of storing it.
+    fn released(self, key: &ResourceKey, post: &serde_json::Value) -> bool {
+        deletion_timestamp_of(post).is_some() && !self.holds(key, post)
+    }
+}
+
+/// Every rule an [`ApplySemantics`] version selects, as one value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Rules {
+    on_identical: OnIdentical,
+    gate: FinalizerGate,
+}
+
+impl Rules {
+    /// etcd's rules for a `Txn` op, the same under every version.
+    const ETCD_TXN: Self = Self {
+        on_identical: OnIdentical::Commit,
+        gate: FinalizerGate::Metadata,
+    };
+
+    const fn under(semantics: ApplySemantics) -> Self {
+        Self {
+            on_identical: OnIdentical::under(semantics),
+            gate: FinalizerGate::under(semantics),
         }
     }
 
@@ -198,14 +257,15 @@ impl OnIdentical {
     /// removal is a change even when the content is the same.
     fn skips(
         self,
+        key: &ResourceKey,
         prior: Option<&serde_json::Value>,
         candidate: &serde_json::Value,
         manager: Option<&str>,
     ) -> bool {
-        match self {
-            Self::Commit => false,
-            Self::Skip => prior.is_some_and(|prior| {
-                unchanged(prior, candidate, manager) && !finalizers_released(candidate)
+        match self.on_identical {
+            OnIdentical::Commit => false,
+            OnIdentical::Skip => prior.is_some_and(|prior| {
+                unchanged(prior, candidate, manager) && !self.gate.released(key, candidate)
             }),
         }
     }
@@ -706,14 +766,14 @@ impl ResourceCatalog {
         // Tentatively reserve the next revision; only committed if the
         // mutation is real (not a no-op).
         let rev = self.history.next_revision();
-        let on_identical = OnIdentical::under(semantics);
+        let rules = Rules::under(semantics);
         let outcome = match cmd {
             ResourceCommand::Put {
                 key,
                 value,
                 expected,
                 ..
-            } => self.apply_put(key, value, *expected, on_identical, rev),
+            } => self.apply_put(key, value, *expected, rules, rev),
             ResourceCommand::Patch {
                 key,
                 patch,
@@ -727,7 +787,7 @@ impl ResourceCatalog {
                 *patch_type,
                 apply.as_ref(),
                 *expected,
-                on_identical,
+                rules,
                 rev,
             ),
             ResourceCommand::Delete {
@@ -735,7 +795,13 @@ impl ResourceCatalog {
                 expected,
                 deletion_timestamp,
                 ..
-            } => self.apply_delete(key, *expected, deletion_timestamp.as_deref(), rev),
+            } => self.apply_delete(
+                key,
+                *expected,
+                deletion_timestamp.as_deref(),
+                rules.gate,
+                rev,
+            ),
             ResourceCommand::Txn {
                 compares,
                 success,
@@ -802,13 +868,17 @@ impl ResourceCatalog {
             let outcome = match op {
                 // etcd: a Put is a revision even when the value is the same,
                 // so a transaction keeps committing identical writes.
-                TxnOp::Put { key, value } => {
-                    self.apply_put(key, value, None, OnIdentical::Commit, rev)
-                }
+                TxnOp::Put { key, value } => self.apply_put(key, value, None, Rules::ETCD_TXN, rev),
                 TxnOp::Delete {
                     key,
                     deletion_timestamp,
-                } => self.apply_delete(key, None, deletion_timestamp.as_deref(), rev),
+                } => self.apply_delete(
+                    key,
+                    None,
+                    deletion_timestamp.as_deref(),
+                    Rules::ETCD_TXN.gate,
+                    rev,
+                ),
             };
             if let Some(c) = outcome.change {
                 changes.push(c);
@@ -841,7 +911,7 @@ impl ResourceCatalog {
         key: &ResourceKey,
         value: &ResourceValue,
         expected: Option<Revision>,
-        on_identical: OnIdentical,
+        rules: Rules,
         rev: Revision,
     ) -> ApplyOutcome {
         // Capture the pre-image BEFORE mutating — this is the prior
@@ -879,7 +949,7 @@ impl ResourceCatalog {
         // ★ A REVISION MEANS A CHANGE (T3.5), decided before anything is
         // stamped or committed: an identical write leaves the catalog
         // byte-identical, like a Conflict.
-        if on_identical.skips(prior_value.as_ref(), &new_value, None) {
+        if rules.skips(key, prior_value.as_ref(), &new_value, None) {
             return ApplyOutcome::no_change(ResourceOp::Unchanged);
         }
 
@@ -902,7 +972,7 @@ impl ResourceCatalog {
         // removal (emit Deleted) instead of storing the no-finalizer
         // Terminating object.
         if let Some(outcome) =
-            self.finalizer_release_removal(key, &new_value, prior_value.as_ref(), rev)
+            self.finalizer_release_removal(key, &new_value, prior_value.as_ref(), rules.gate, rev)
         {
             return outcome;
         }
@@ -936,7 +1006,7 @@ impl ResourceCatalog {
         patch_type: PatchType,
         apply: Option<&ApplyMeta>,
         expected: Option<Revision>,
-        on_identical: OnIdentical,
+        rules: Rules,
         rev: Revision,
     ) -> ApplyOutcome {
         // ── Server-side apply branch ──────────────────────────────────────
@@ -958,7 +1028,7 @@ impl ResourceCatalog {
                     "server-side apply requires a fieldManager".to_string(),
                 );
             };
-            return self.apply_ssa_command(key, patch, meta, expected, on_identical, rev);
+            return self.apply_ssa_command(key, patch, meta, expected, rules, rev);
         }
 
         let Some((existing_value, existing_meta)) = self.resources.get(key) else {
@@ -1012,7 +1082,7 @@ impl ResourceCatalog {
         // ★ A REVISION MEANS A CHANGE (T3.5): a patch whose merge leaves the
         // object as it is commits nothing. Decided on the merged object,
         // before the version is bumped or any field stamped.
-        if on_identical.skips(Some(&prior_value), &merged, None) {
+        if rules.skips(key, Some(&prior_value), &merged, None) {
             return ApplyOutcome::no_change(ResourceOp::Unchanged);
         }
         let version_meta = prior_meta.bumped_at(rev);
@@ -1031,7 +1101,8 @@ impl ResourceCatalog {
         // converts into a removal. THIS is what makes
         // `kubectl patch …finalizers:null` actually delete a Terminating
         // object.
-        if let Some(outcome) = self.finalizer_release_removal(key, &merged, Some(&prior_value), rev)
+        if let Some(outcome) =
+            self.finalizer_release_removal(key, &merged, Some(&prior_value), rules.gate, rev)
         {
             return outcome;
         }
@@ -1070,7 +1141,7 @@ impl ResourceCatalog {
         body: &ResourceValue,
         meta: &ApplyMeta,
         expected: Option<Revision>,
-        on_identical: OnIdentical,
+        rules: Rules,
         rev: Revision,
     ) -> ApplyOutcome {
         let prior_entry = self.resources.get(key).cloned();
@@ -1127,7 +1198,7 @@ impl ResourceCatalog {
         // there commits nothing. The manager's managedFields `time` is the
         // one field every apply restamps, so it is not a change by itself;
         // the stored entry keeps the time of the apply that changed it.
-        if on_identical.skips(prior_value.as_ref(), &merged, Some(&meta.manager)) {
+        if rules.skips(key, prior_value.as_ref(), &merged, Some(&meta.manager)) {
             return ApplyOutcome::no_change(ResourceOp::Unchanged);
         }
 
@@ -1139,7 +1210,7 @@ impl ResourceCatalog {
         // removal. Only meaningful for an UPDATE (prior present).
         if prior_value.is_some()
             && let Some(out) =
-                self.finalizer_release_removal(key, &merged, prior_value.as_ref(), rev)
+                self.finalizer_release_removal(key, &merged, prior_value.as_ref(), rules.gate, rev)
         {
             return out;
         }
@@ -1183,9 +1254,10 @@ impl ResourceCatalog {
         key: &ResourceKey,
         post: &ResourceValue,
         prior: Option<&ResourceValue>,
+        gate: FinalizerGate,
         rev: Revision,
     ) -> Option<ApplyOutcome> {
-        if prior.is_none() || !finalizers_released(post) {
+        if prior.is_none() || !gate.released(key, post) {
             return None;
         }
         // Terminating + finalizers cleared ⇒ remove now. The version_meta
@@ -1239,6 +1311,7 @@ impl ResourceCatalog {
         key: &ResourceKey,
         expected: Option<Revision>,
         deletion_timestamp: Option<&str>,
+        gate: FinalizerGate,
         rev: Revision,
     ) -> ApplyOutcome {
         // Precondition (CAS) BEFORE any mutation. A `Some(_)` precondition
@@ -1258,7 +1331,7 @@ impl ResourceCatalog {
         };
 
         // ── BEHAVIOR-PRESERVATION: no finalizers ⇒ remove immediately. ──
-        if !has_finalizers(&live_value) {
+        if !gate.holds(key, &live_value) {
             let (removed_value, removed_meta) = self
                 .resources
                 .remove(key)
@@ -1875,12 +1948,18 @@ fn deletion_timestamp_of(value: &serde_json::Value) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
-/// `true` when `post` is Terminating (`metadata.deletionTimestamp`) with no
-/// finalizers left — the state in which the write that produced it removes
-/// the object instead of storing it (see
-/// [`ResourceCatalog::finalizer_release_removal`]).
-fn finalizers_released(post: &serde_json::Value) -> bool {
-    deletion_timestamp_of(post).is_some() && !has_finalizers(post)
+/// `true` iff `key` names a core/v1 Namespace.
+fn is_namespace(key: &ResourceKey) -> bool {
+    key.group.is_empty() && key.version == "v1" && key.kind == "Namespace"
+}
+
+/// `true` iff the object carries a NON-EMPTY `spec.finalizers` array, the
+/// list a Namespace keeps its `kubernetes` finalizer in.
+fn has_namespace_spec_finalizers(value: &serde_json::Value) -> bool {
+    spec_of(value)
+        .and_then(|s| s.get("finalizers"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|a| !a.is_empty())
 }
 
 /// The `metadata` object of `value`, created empty when absent. `None` when
@@ -3460,6 +3539,82 @@ mod a_revision_means_a_change {
             ]
         );
         assert_eq!(new.revision(), Revision(2));
+    }
+
+    fn namespace_key(name: &str) -> ResourceKey {
+        ResourceKey::cluster_scoped("", "v1", "Namespace", name)
+    }
+
+    fn under(cmd: &ResourceCommand, semantics: &str) -> LoggedCommand {
+        let mut wire = serde_json::to_value(cmd).unwrap();
+        wire["semantics"] = json!(semantics);
+        serde_json::from_value(wire).unwrap()
+    }
+
+    #[test]
+    fn a_namespace_spec_finalizer_holds_its_delete_from_v2_on() {
+        let ns = namespace_key("env-core1");
+        let born = put(
+            &ns,
+            json!({"metadata": {"name": "env-core1"}, "spec": {"finalizers": ["kubernetes"]}}),
+        );
+        let delete = ResourceCommand::delete_at(
+            ns.clone(),
+            None,
+            Reason::Operator,
+            Some("2026-11-15T17:00:00Z".into()),
+        );
+
+        let mut v1 = ResourceCatalog::default();
+        v1.apply_logged(&under(&born, "v1"), 1, 1);
+        assert_eq!(
+            v1.apply_logged(&under(&delete, "v1"), 1, 2).op,
+            ResourceOp::Deleted
+        );
+        assert!(v1.get(&ns).is_none());
+
+        let mut v2 = ResourceCatalog::default();
+        v2.apply_logged(&LoggedCommand::proposed(born), 1, 1);
+        assert_eq!(
+            v2.apply_logged(&LoggedCommand::proposed(delete), 1, 2).op,
+            ResourceOp::DeletionPending
+        );
+        let status = merge(&ns, json!({"status": {"phase": "Terminating"}}));
+        assert_eq!(
+            v2.apply_logged(&LoggedCommand::proposed(status), 1, 3).op,
+            ResourceOp::Patched
+        );
+        assert_eq!(
+            v2.get(&ns).unwrap()["metadata"]["deletionTimestamp"],
+            json!("2026-11-15T17:00:00Z")
+        );
+        let finalize = merge(&ns, json!({"spec": {"finalizers": []}}));
+        assert_eq!(
+            v2.apply_logged(&LoggedCommand::proposed(finalize), 1, 4).op,
+            ResourceOp::Deleted
+        );
+        assert!(v2.get(&ns).is_none());
+    }
+
+    #[test]
+    fn spec_finalizers_hold_only_a_namespace() {
+        let cm_key = cm("spec-finalizers");
+        let mut cat = ResourceCatalog::default();
+        cat.apply_logged(
+            &LoggedCommand::proposed(put(&cm_key, json!({"spec": {"finalizers": ["x"]}}))),
+            1,
+            1,
+        );
+        let delete = ResourceCommand::delete_at(
+            cm_key.clone(),
+            None,
+            Reason::Operator,
+            Some("2026-11-15T17:00:00Z".into()),
+        );
+        assert_eq!(
+            cat.apply_logged(&LoggedCommand::proposed(delete), 1, 2).op,
+            ResourceOp::Deleted
+        );
     }
 }
 

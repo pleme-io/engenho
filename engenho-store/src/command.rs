@@ -369,8 +369,8 @@ impl ResourceCommand {
 /// every entry as V0, which is why a rollback across a version starts only
 /// from a clean stop (nothing left to replay).
 ///
-/// Only `Put` and `Patch` (server-side apply included) read it; `Delete`
-/// and `Txn` apply the same way under every version.
+/// `Put`, `Patch` (server-side apply included) and `Delete` read it; `Txn`
+/// applies the same way under every version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApplySemantics {
@@ -381,11 +381,16 @@ pub enum ApplySemantics {
     /// equals the stored object (see [`crate::state::unchanged`]) returns
     /// [`ResourceOp::Unchanged`]: no revision, no history, no watch event.
     V1,
+    /// A core/v1 Namespace's `spec.finalizers` holds it Terminating on
+    /// delete, as `metadata.finalizers` does, until a write empties both.
+    /// Under V0 and V1 a namespace delete removed it at once and left its
+    /// contents stored (measured on plo 2026-11-15).
+    V2,
 }
 
 impl ApplySemantics {
     /// The rules this binary proposes under.
-    pub const CURRENT: Self = Self::V1;
+    pub const CURRENT: Self = Self::V2;
 
     /// The rules an entry written before the marker existed was applied
     /// under (the `#[serde(default)]` for [`LoggedCommand`]).
@@ -518,7 +523,7 @@ pub enum ResourceOp {
     ///
     /// A response, never a log entry: `ResourceOp` is what `apply` returns,
     /// so adding it changes no replayed bytes. Only entries under
-    /// [`ApplySemantics::V1`] can produce it.
+    /// [`ApplySemantics::V1`] or later can produce it.
     Unchanged,
     /// Idempotent no-op (delete-not-found, etc.).
     #[default]
@@ -666,14 +671,14 @@ mod tests {
     }
 
     #[test]
-    fn this_binary_proposes_under_v1_and_the_marker_round_trips() {
-        assert_eq!(ApplySemantics::CURRENT, ApplySemantics::V1);
+    fn this_binary_proposes_under_v2_and_the_marker_round_trips() {
+        assert_eq!(ApplySemantics::CURRENT, ApplySemantics::V2);
         let entry = LoggedCommand::proposed(cm_put());
-        assert_eq!(entry.semantics(), ApplySemantics::V1);
+        assert_eq!(entry.semantics(), ApplySemantics::V2);
         let wire = serde_json::to_value(&entry).unwrap();
         // Flat: the marker sits beside the command's own fields.
         assert_eq!(wire["kind"], "put");
-        assert_eq!(wire["semantics"], "v1");
+        assert_eq!(wire["semantics"], "v2");
         let back: LoggedCommand = serde_json::from_value(wire).unwrap();
         assert_eq!(back, entry);
     }

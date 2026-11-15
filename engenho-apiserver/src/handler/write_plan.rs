@@ -368,6 +368,10 @@ pub(super) enum WriteRefusal {
     /// 404, naming the namespace, as upstream does.
     #[error("namespaces \"{0}\" not found")]
     NamespaceMissing(String),
+    /// A create into a namespace that is being deleted
+    /// (`NamespaceLifecycle`). 403, upstream's message.
+    #[error("unable to create new content in namespace {0} because it is being terminated")]
+    NamespaceTerminating(String),
     /// The object names itself differently from the URL (upstream
     /// `checkName`). 400.
     #[error("the name of the object ({body}) does not match the name on the URL ({url})")]
@@ -401,6 +405,7 @@ impl From<WriteRefusal> for ApiError {
             }
             WriteRefusal::NotFound(object) => Self::NotFound(object.to_string()),
             WriteRefusal::NamespaceMissing(_) => Self::NotFound(refusal.to_string()),
+            WriteRefusal::NamespaceTerminating(_) => Self::Forbidden(refusal.to_string()),
             WriteRefusal::ApplyConflict(conflicts) => Self::ApplyConflict(conflicts.to_causes()),
             WriteRefusal::Invalid(_) => Self::Invalid(refusal.to_string()),
             WriteRefusal::NameMismatch { .. }
@@ -641,8 +646,12 @@ impl StoreBackedHandler {
             && let Some(ns) = namespace
         {
             let ns_key = ResourceKey::cluster_scoped("", "v1", "Namespace", ns.to_string());
-            if self.store.get(&ns_key).await.is_none() {
-                return Err(WriteRefusal::NamespaceMissing(ns.to_string()).into());
+            match self.store.get(&ns_key).await {
+                None => return Err(WriteRefusal::NamespaceMissing(ns.to_string()).into()),
+                Some(live) if is_terminating(&live) => {
+                    return Err(WriteRefusal::NamespaceTerminating(ns.to_string()).into());
+                }
+                Some(_) => {}
             }
         }
         Ok(())
