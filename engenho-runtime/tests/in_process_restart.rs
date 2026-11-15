@@ -121,6 +121,96 @@ async fn a_stopped_runtime_boots_again_in_process_on_the_same_durable_store() {
     stop(second).await;
 }
 
+/// The CRD the restart test serves: `widgets.example.com/v1`, namespaced.
+fn widget_crd() -> serde_json::Value {
+    json!({
+        "apiVersion": "apiextensions.k8s.io/v1",
+        "kind": "CustomResourceDefinition",
+        "metadata": {"name": "widgets.example.com"},
+        "spec": {
+            "group": "example.com",
+            "scope": "Namespaced",
+            "names": {"plural": "widgets", "singular": "widget", "kind": "Widget", "listKind": "WidgetList"},
+            "versions": [{
+                "name": "v1", "served": true, "storage": true,
+                "schema": {"openAPIV3Schema": {"type": "object", "x-kubernetes-preserve-unknown-fields": true}}
+            }]
+        }
+    })
+}
+
+async fn send(
+    rt: &Runtime,
+    data_dir: &std::path::Path,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> (reqwest::StatusCode, serde_json::Value) {
+    let mut req = reqwest::Client::new()
+        .request(method, format!("http://{}{path}", rt.local_addr()))
+        .bearer_auth(admin_token(data_dir));
+    if let Some(body) = body {
+        req = req.json(&body);
+    }
+    let resp = req.send().await.expect("request");
+    let status = resp.status();
+    (status, resp.json().await.unwrap_or(serde_json::Value::Null))
+}
+
+const WIDGETS: &str = "/apis/example.com/v1/namespaces/default/widgets";
+
+/// After a daemon restart clients got `the server doesn't have a resource
+/// type "helmreleases"` for seconds to minutes although `kubectl get crd`
+/// listed it, and an informer started in that window made no progress for
+/// about 40 minutes (measured on plo 2026-11-15, engenho 7279198). Every
+/// stored CRD is served before the apiserver accepts its first request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stored_crd_is_served_on_the_first_request_after_a_restart() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let first = Runtime::boot(durable(tmp.path()))
+        .await
+        .expect("first boot");
+    let (status, body) = send(
+        &first,
+        tmp.path(),
+        reqwest::Method::POST,
+        "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+        Some(widget_crd()),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
+    let mut created = false;
+    for _ in 0..100 {
+        let (status, _) = send(
+            &first,
+            tmp.path(),
+            reqwest::Method::POST,
+            WIDGETS,
+            Some(json!({"apiVersion": "example.com/v1", "kind": "Widget", "metadata": {"name": "w1"}})),
+        )
+        .await;
+        if status == reqwest::StatusCode::CREATED {
+            created = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(created, "the CRD was never served on the first boot");
+    stop(first).await;
+
+    let second = Runtime::boot(durable(tmp.path()))
+        .await
+        .expect("second boot");
+    let (status, body) = send(&second, tmp.path(), reqwest::Method::GET, WIDGETS, None).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "the first request after the restart: {body}"
+    );
+    assert_eq!(body["items"][0]["metadata"]["name"], "w1", "{body}");
+    stop(second).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_boot_that_fails_after_opening_the_store_releases_it_for_the_retry() {
     let tmp = tempfile::tempdir().expect("tempdir");

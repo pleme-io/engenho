@@ -124,7 +124,7 @@ pub use controller::{
 };
 pub use crd::{
     CrdController, CrdEntry, CrdError, CrdHandlerSpec, CrdNames, CrdScope, CrdSpec, CrdVersion,
-    DynamicHandlerSink,
+    DynamicHandlerSink, serve_stored_crds,
 };
 pub use crd_validator::{CrdValidationWebhook, ValidationRegistry, crd_validation_webhook};
 pub use create_stamp::{

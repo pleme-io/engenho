@@ -294,6 +294,12 @@ in
         (engenho's default): client-go creates a Job as protobuf. `refused`: a
         protobuf body is 415 and a read falls back to JSON.
       '';
+      storedCrds = optional (types.enum [ "before_bind" "by_controller" ]) ''
+        When a booting node serves the CRDs already in its store.
+        `before_bind` (engenho's default): before the apiserver accepts its
+        first request. `by_controller`: on the CRD controller's first tick, so a
+        request in between is answered `unknown kind`.
+      '';
       healthReasons = optional (types.enum [ "named" "withheld" ]) ''
         What a failing `/livez`, `/healthz` or `/readyz` check says in the
         body. `named` (engenho's default): `[-]<check> failed: <reason>`.
@@ -710,6 +716,7 @@ in
         cert_rotation = cfg.runtime.certRotation;
         native_workloads = cfg.runtime.nativeWorkloads;
         health_reasons = cfg.runtime.healthReasons;
+        stored_crds = cfg.runtime.storedCrds;
         batch_protobuf = cfg.runtime.batchProtobuf;
         host_path_allowlist = cfg.runtime.hostPathAllowlist;
         node_manifests_dir = cfg.runtime.nodeManifestsDir;

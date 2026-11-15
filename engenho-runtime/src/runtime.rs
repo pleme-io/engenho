@@ -520,6 +520,13 @@ impl Runtime {
         let router_state_for_logs = router_state.clone();
 
         rec.enter(BootPhase::BindApiserver)?;
+        if boot.stored_crds == engenho_config::StoredCrds::BeforeBind {
+            let served = engenho_controllers::serve_stored_crds(store, handler_sink.as_ref()).await;
+            info!(
+                versions = served,
+                "stored CRDs served before the apiserver binds"
+            );
+        }
         let apiserver = ApiServer::start_with_state(listen_addr, router_state, tls).await?;
         let bound_addr = apiserver.local_addr();
         info!(addr = %bound_addr, tls = boot.tls.is_enabled(), "apiserver bound");

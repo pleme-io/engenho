@@ -423,6 +423,35 @@ impl CrdController {
     }
 }
 
+/// Register every served version of every CRD in `store` into `sink`, and
+/// return how many were registered.
+///
+/// The boot calls this before the apiserver binds, so a restarted daemon
+/// serves its stored CRDs on its first request instead of answering
+/// `unknown kind` until the [`CrdController`]'s first tick (measured on plo
+/// 2026-11-15: seconds to minutes, and an informer that started in that
+/// window made no progress for about 40 minutes). The controller's first tick
+/// registers the same entries again, an overwrite of the same handler.
+pub async fn serve_stored_crds(store: &StoreMesh, sink: &dyn DynamicHandlerSink) -> usize {
+    let crds = store
+        .list(
+            "apiextensions.k8s.io",
+            "v1",
+            "CustomResourceDefinition",
+            None,
+        )
+        .await;
+    let mut registered = 0;
+    for entry in crds
+        .iter()
+        .flat_map(|(_, crd)| CrdController::extract_entries(crd))
+    {
+        sink.register_crd(CrdHandlerSpec::from(&entry));
+        registered += 1;
+    }
+    registered
+}
+
 /// The CRDs whose served versions it registers handlers for.
 impl DeclaresReads for CrdController {
     fn reads(&self) -> Reads {

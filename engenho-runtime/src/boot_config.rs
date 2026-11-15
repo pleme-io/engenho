@@ -34,7 +34,7 @@ use engenho_config::{
     HealthReasons, JobSelector, KubeconfigVisibility, KubeletAuth, KubeletBackendKind,
     LegacyTeiaSection, NativeCgroups, NativeMounts, NativeSecurity, NativeWorkloads,
     NetworkingConfig, RevoadaConfig, RuntimeConfig, SchedulerConfig, SecretsAtRest, SharedCluster,
-    TlsConfig, TopologyConfig, TopologyStrategyKind,
+    StoredCrds, TlsConfig, TopologyConfig, TopologyStrategyKind,
 };
 
 use crate::health::Windows;
@@ -89,6 +89,7 @@ pub(crate) struct BootConfig {
     pub(crate) cert_rotation: CertRotation,
     pub(crate) native_workloads: NativeWorkloads,
     pub(crate) health_reasons: HealthReasons,
+    pub(crate) stored_crds: StoredCrds,
     pub(crate) batch_protobuf: BatchProtobuf,
     /// `runtime.podman_binary`, read with `kubelet_backend`.
     pub(crate) podman_binary: Option<String>,
@@ -210,6 +211,7 @@ impl BootConfig {
             cert_rotation,
             native_workloads,
             health_reasons,
+            stored_crds,
             batch_protobuf,
             podman_binary,
             host_path_allowlist,
@@ -247,6 +249,7 @@ impl BootConfig {
             cert_rotation: *cert_rotation,
             native_workloads: *native_workloads,
             health_reasons: *health_reasons,
+            stored_crds: *stored_crds,
             batch_protobuf: *batch_protobuf,
             podman_binary: podman_binary.clone(),
             host_path_allowlist: host_path_allowlist.clone(),

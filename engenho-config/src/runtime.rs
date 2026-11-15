@@ -307,6 +307,19 @@ pub enum BatchProtobuf {
     Refused,
 }
 
+/// When a booting node serves the CRDs already in its store. `BeforeBind`,
+/// the default: every served version is registered before the apiserver
+/// accepts its first request. `ByController`: the CRD controller registers
+/// them on its first tick, and until then a request for one is `unknown kind`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(missing_docs)]
+pub enum StoredCrds {
+    #[default]
+    BeforeBind,
+    ByController,
+}
+
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -558,6 +571,9 @@ pub struct RuntimeConfig {
     pub health_reasons: HealthReasons,
     #[allow(missing_docs)]
     #[serde(default)]
+    pub stored_crds: StoredCrds,
+    #[allow(missing_docs)]
+    #[serde(default)]
     pub batch_protobuf: BatchProtobuf,
     /// Optional explicit podman binary path.
     ///
@@ -634,6 +650,7 @@ impl TieredConfig for RuntimeConfig {
             cert_rotation: CertRotation::Renew,
             native_workloads: NativeWorkloads::Bound,
             health_reasons: HealthReasons::Withheld,
+            stored_crds: StoredCrds::BeforeBind,
             batch_protobuf: BatchProtobuf::Served,
             podman_binary: None,
             host_path_allowlist: Vec::new(),
@@ -710,6 +727,7 @@ impl TieredConfig for RuntimeConfig {
             cert_rotation: CertRotation::Renew,
             native_workloads: NativeWorkloads::Bound,
             health_reasons: HealthReasons::Named,
+            stored_crds: StoredCrds::BeforeBind,
             batch_protobuf: BatchProtobuf::Served,
             podman_binary: None,
             host_path_allowlist: Vec::new(),
@@ -784,6 +802,7 @@ impl TieredConfig for RuntimeConfig {
             cert_rotation: self.cert_rotation,
             native_workloads: self.native_workloads,
             health_reasons: self.health_reasons,
+            stored_crds: self.stored_crds,
             batch_protobuf: self.batch_protobuf,
             // No "unset" sentinel on an enum whose safe arm is also a
             // meaningful value, so the overlay's value wins — same rule as
@@ -1106,6 +1125,7 @@ mod tests {
             cert_rotation: CertRotation::Renew,
             native_workloads: NativeWorkloads::Bound,
             health_reasons: HealthReasons::Withheld,
+            stored_crds: StoredCrds::BeforeBind,
             batch_protobuf: BatchProtobuf::Served,
             podman_binary: None,
             host_path_allowlist: Vec::new(),
@@ -1831,6 +1851,44 @@ mod batch_protobuf_tests {
         }
         assert!(
             EngenhoConfig::from_yaml_with_defaults("runtime:\n  batch_protobuf: maybe\n").is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod stored_crds_tests {
+    use super::StoredCrds;
+    use crate::EngenhoConfig;
+    use shikumi::TieredConfig;
+
+    #[test]
+    fn a_config_that_does_not_name_it_is_beforebind() {
+        let cfg = EngenhoConfig::from_yaml_with_defaults("runtime: {}\n").expect("parses");
+        assert_eq!(cfg.runtime.stored_crds, StoredCrds::BeforeBind);
+        assert_eq!(
+            super::RuntimeConfig::prescribed_default().stored_crds,
+            StoredCrds::BeforeBind
+        );
+        assert_eq!(
+            super::RuntimeConfig::bare().stored_crds,
+            StoredCrds::BeforeBind
+        );
+    }
+
+    #[test]
+    fn each_wire_name_reads_back_as_its_variant() {
+        for (wire, want) in [
+            ("before_bind", StoredCrds::BeforeBind),
+            ("by_controller", StoredCrds::ByController),
+        ] {
+            let cfg = EngenhoConfig::from_yaml_with_defaults(&format!(
+                "runtime:\n  stored_crds: {wire}\n"
+            ))
+            .unwrap_or_else(|e| panic!("`{wire}` must parse: {e}"));
+            assert_eq!(cfg.runtime.stored_crds, want);
+        }
+        assert!(
+            EngenhoConfig::from_yaml_with_defaults("runtime:\n  stored_crds: maybe\n").is_err()
         );
     }
 }
