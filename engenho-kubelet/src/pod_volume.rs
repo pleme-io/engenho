@@ -174,6 +174,8 @@ pub enum VolumeTeardown {
     RemoveEmptyDir {
         /// The pod's logical volume name (`spec.volumes[i].name`).
         volume: String,
+        /// The `metadata.uid` of the pod incarnation that ensured it.
+        pod_uid: String,
     },
     /// Release whatever was published for the claim mounted as `volume`
     /// ([`VolumeMaterializer::unpublish_csi`]). A node-local PV was never
@@ -182,6 +184,8 @@ pub enum VolumeTeardown {
     ReleaseClaim {
         /// The pod's logical volume name (`spec.volumes[i].name`).
         volume: String,
+        /// The `metadata.uid` of the pod incarnation that published it.
+        pod_uid: String,
     },
 }
 
@@ -192,17 +196,23 @@ pub enum VolumeTeardown {
 /// means. `None` is a decision, not a default: a `hostPath` belongs to the
 /// user.
 #[must_use]
-pub fn teardown_obligation(volume: &str, source: &MountSource) -> Option<VolumeTeardown> {
+pub fn teardown_obligation(
+    pod_uid: &str,
+    volume: &str,
+    source: &MountSource,
+) -> Option<VolumeTeardown> {
     match source {
         MountSource::UserHostPath(_) => None,
         MountSource::Materialized(dir) => Some(VolumeTeardown::RemoveMaterialized(dir.clone())),
         MountSource::EmptyDirHostDir(_) | MountSource::NamedVolume(_) => {
             Some(VolumeTeardown::RemoveEmptyDir {
                 volume: volume.to_string(),
+                pod_uid: pod_uid.to_string(),
             })
         }
         MountSource::PvcHostDir { .. } => Some(VolumeTeardown::ReleaseClaim {
             volume: volume.to_string(),
+            pod_uid: pod_uid.to_string(),
         }),
     }
 }
@@ -210,11 +220,12 @@ pub fn teardown_obligation(volume: &str, source: &MountSource) -> Option<VolumeT
 /// Every teardown a resolved `volName → MountSource` map owes.
 #[must_use]
 pub fn teardowns_of(
+    pod_uid: &str,
     resolved: &BTreeMap<String, MountSource>,
 ) -> std::collections::BTreeSet<VolumeTeardown> {
     resolved
         .iter()
-        .filter_map(|(volume, source)| teardown_obligation(volume, source))
+        .filter_map(|(volume, source)| teardown_obligation(pod_uid, volume, source))
         .collect()
 }
 
@@ -661,6 +672,7 @@ pub trait VolumeMaterializer: Send + Sync {
         &self,
         namespace: &str,
         pod: &str,
+        pod_uid: &str,
         volume: &str,
         files: &BTreeMap<String, Vec<u8>>,
     ) -> Result<MountSource, VolumeResolveError>;
@@ -676,6 +688,7 @@ pub trait VolumeMaterializer: Send + Sync {
         &self,
         namespace: &str,
         pod: &str,
+        pod_uid: &str,
         volume: &str,
     ) -> Result<MountSource, VolumeResolveError>;
 
@@ -698,6 +711,7 @@ pub trait VolumeMaterializer: Send + Sync {
         &self,
         _namespace: &str,
         _pod: &str,
+        _pod_uid: &str,
         volume: &str,
         req: &CsiPublishRequest,
     ) -> Result<MountSource, VolumeResolveError> {
@@ -722,6 +736,7 @@ pub trait VolumeMaterializer: Send + Sync {
         &self,
         _namespace: &str,
         _pod: &str,
+        _pod_uid: &str,
         _volume: &str,
     ) -> Result<(), VolumeResolveError> {
         Ok(())
@@ -742,6 +757,7 @@ pub trait VolumeMaterializer: Send + Sync {
         &self,
         namespace: &str,
         pod: &str,
+        pod_uid: &str,
         volume: &str,
     ) -> Result<(), VolumeResolveError>;
 
@@ -1062,6 +1078,10 @@ where
     F: Fn(&str, &str) -> Option<Value>,
 {
     let volumes = pod_volumes(pod)?;
+    let pod_uid = pod
+        .pointer("/metadata/uid")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let mut out: BTreeMap<String, MountSource> = BTreeMap::new();
 
     for vol in &volumes {
@@ -1086,7 +1106,7 @@ where
                     }
                 };
                 materializer
-                    .materialize_files(namespace, pod_name, &vol.name, &files)
+                    .materialize_files(namespace, pod_name, pod_uid, &vol.name, &files)
                     .await?
             }
             PodVolumeSource::Secret {
@@ -1108,7 +1128,7 @@ where
                     }
                 };
                 materializer
-                    .materialize_files(namespace, pod_name, &vol.name, &files)
+                    .materialize_files(namespace, pod_name, pod_uid, &vol.name, &files)
                     .await?
             }
             PodVolumeSource::EmptyDir { medium } => {
@@ -1122,7 +1142,7 @@ where
                     );
                 }
                 materializer
-                    .ensure_empty_dir(namespace, pod_name, &vol.name)
+                    .ensure_empty_dir(namespace, pod_name, pod_uid, &vol.name)
                     .await?
             }
             PodVolumeSource::DownwardApi => {
@@ -1155,7 +1175,7 @@ where
                     }
                 }
                 materializer
-                    .materialize_files(namespace, pod_name, &vol.name, &merged)
+                    .materialize_files(namespace, pod_name, pod_uid, &vol.name, &merged)
                     .await?
             }
             PodVolumeSource::Pvc {
@@ -1167,7 +1187,7 @@ where
                 // materializations, not inside the pure resolver.
                 PvcBacking::Csi(req) => {
                     materializer
-                        .publish_csi(namespace, pod_name, &vol.name, &req)
+                        .publish_csi(namespace, pod_name, pod_uid, &vol.name, &req)
                         .await?
                 }
             },
@@ -1620,7 +1640,7 @@ pub enum EmptyDirBacking {
     /// A podman named volume, resolved to its mountpoint.
     #[default]
     PodmanVolume,
-    /// A host directory `<data_root>/<ns>_<pod>/empty-<volume>`, for a native
+    /// A host directory `<data_root>/<ns>_<pod>_<uid>/empty-<volume>`, for a native
     /// node, which has no podman to create a volume with.
     HostDir,
 }
@@ -1797,17 +1817,30 @@ impl PodmanVolumeMaterializer {
         self
     }
 
-    /// The host dir backing an `emptyDir` when [`EmptyDirBacking::HostDir`].
-    fn empty_dir_host_dir(&self, namespace: &str, pod: &str, volume: &str) -> PathBuf {
+    /// The host dir backing an `emptyDir` when [`EmptyDirBacking::HostDir`]:
+    /// `<data_root>/<ns>_<pod>_<uid>/empty-<volume>`.
+    fn empty_dir_host_dir(
+        &self,
+        namespace: &str,
+        pod: &str,
+        pod_uid: &str,
+        volume: &str,
+    ) -> PathBuf {
+        self.data_root
+            .join(pod_dir_name(namespace, pod, pod_uid))
+            .join(format!("empty-{volume}"))
+    }
+
+    fn legacy_empty_dir_host_dir(&self, namespace: &str, pod: &str, volume: &str) -> PathBuf {
         self.data_root
             .join(format!("{namespace}_{pod}"))
             .join(format!("empty-{volume}"))
     }
 
-    /// The per-pod-per-volume host dir: `<data_root>/<ns>_<pod>/<volume>`.
-    fn volume_dir(&self, namespace: &str, pod: &str, volume: &str) -> PathBuf {
+    /// The per-pod-per-volume host dir: `<data_root>/<ns>_<pod>_<uid>/<volume>`.
+    fn volume_dir(&self, namespace: &str, pod: &str, pod_uid: &str, volume: &str) -> PathBuf {
         self.data_root
-            .join(format!("{namespace}_{pod}"))
+            .join(pod_dir_name(namespace, pod, pod_uid))
             .join(volume)
     }
 
@@ -1894,10 +1927,49 @@ impl PodmanVolumeMaterializer {
     }
 
     /// The deterministic emptyDir named-volume name:
-    /// `engenho-empty-<ns>_<pod>_<volume>`.
+    /// `engenho-empty-<ns>_<pod>_<uid>_<volume>`.
     #[must_use]
-    pub fn empty_dir_volume_name(namespace: &str, pod: &str, volume: &str) -> String {
+    pub fn empty_dir_volume_name(
+        namespace: &str,
+        pod: &str,
+        pod_uid: &str,
+        volume: &str,
+    ) -> String {
+        format!(
+            "engenho-empty-{}_{volume}",
+            pod_dir_name(namespace, pod, pod_uid)
+        )
+    }
+
+    fn legacy_empty_dir_volume_name(namespace: &str, pod: &str, volume: &str) -> String {
         format!("engenho-empty-{namespace}_{pod}_{volume}")
+    }
+
+    async fn volume_exists(&self, name: &str) -> bool {
+        tokio::process::Command::new(&self.binary)
+            .args(["volume", "exists", name])
+            .output()
+            .await
+            .is_ok_and(|out| out.status.success())
+    }
+
+    async fn volume_rm(&self, name: &str) -> Result<bool, VolumeResolveError> {
+        let argv = Self::volume_rm_argv(name);
+        let out = tokio::process::Command::new(&self.binary)
+            .args(&argv)
+            .output()
+            .await
+            .map_err(|e| VolumeResolveError::Materialize(format!("podman volume rm spawn: {e}")))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if !stderr.contains("no such volume") && !stderr.contains("not found") {
+                return Err(VolumeResolveError::Materialize(format!(
+                    "podman volume rm {name}: {stderr}"
+                )));
+            }
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     /// Widen an emptyDir's host directory to `0777`.
@@ -1960,10 +2032,11 @@ impl VolumeMaterializer for PodmanVolumeMaterializer {
         &self,
         namespace: &str,
         pod: &str,
+        pod_uid: &str,
         volume: &str,
         files: &BTreeMap<String, Vec<u8>>,
     ) -> Result<MountSource, VolumeResolveError> {
-        let dir = self.volume_dir(namespace, pod, volume);
+        let dir = self.volume_dir(namespace, pod, pod_uid, volume);
         // Each file is written atomically (reuses the substrate's
         // write_atomic — the load-bearing fix, not a hand-rolled write).
         // write_atomic mkdir's the parent, so the dir is created implicitly;
@@ -1985,17 +2058,26 @@ impl VolumeMaterializer for PodmanVolumeMaterializer {
         &self,
         namespace: &str,
         pod: &str,
+        pod_uid: &str,
         volume: &str,
     ) -> Result<MountSource, VolumeResolveError> {
         if self.empty_dirs == EmptyDirBacking::HostDir {
-            let dir = self.empty_dir_host_dir(namespace, pod, volume);
+            let dir = self.empty_dir_host_dir(namespace, pod, pod_uid, volume);
+            adopt_legacy_dir(
+                &self.legacy_empty_dir_host_dir(namespace, pod, volume),
+                &dir,
+            )?;
             std::fs::create_dir_all(&dir).map_err(|e| {
                 VolumeResolveError::Materialize(format!("mkdir {}: {e}", dir.display()))
             })?;
             Self::open_empty_dir_to_every_uid(&HostPath::new(dir.clone()))?;
             return Ok(MountSource::EmptyDirHostDir(dir));
         }
-        let vol_name = Self::empty_dir_volume_name(namespace, pod, volume);
+        let mut vol_name = Self::empty_dir_volume_name(namespace, pod, pod_uid, volume);
+        let legacy = Self::legacy_empty_dir_volume_name(namespace, pod, volume);
+        if !self.volume_exists(&vol_name).await && self.volume_exists(&legacy).await {
+            vol_name = legacy;
+        }
         // `podman volume create` is idempotent in effect: creating an
         // existing volume returns its name with exit 0. We tolerate a
         // benign "already exists" stderr the same way ensure_network does.
@@ -2066,42 +2148,34 @@ impl VolumeMaterializer for PodmanVolumeMaterializer {
         &self,
         namespace: &str,
         pod: &str,
+        pod_uid: &str,
         volume: &str,
     ) -> Result<(), VolumeResolveError> {
         if self.empty_dirs == EmptyDirBacking::HostDir {
-            let dir = self.empty_dir_host_dir(namespace, pod, volume);
+            let dir = self.empty_dir_host_dir(namespace, pod, pod_uid, volume);
             remove_materialized_dir(&dir)?;
             if let Some(pod_dir) = dir.parent() {
                 remove_if_empty(pod_dir)?;
             }
             return Ok(());
         }
-        let vol_name = Self::empty_dir_volume_name(namespace, pod, volume);
-        // `podman volume rm` of an absent volume exits non-zero with a "no
-        // such volume" stderr — idempotent SUCCESS for the delete path (a
-        // re-run after a partial cleanup, or a volume that never got created
-        // because the pod failed to start, must NOT wedge cleanup).
-        let argv = Self::volume_rm_argv(&vol_name);
-        let out = tokio::process::Command::new(&self.binary)
-            .args(&argv)
-            .output()
-            .await
-            .map_err(|e| VolumeResolveError::Materialize(format!("podman volume rm spawn: {e}")))?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if !stderr.contains("no such volume") && !stderr.contains("not found") {
-                return Err(VolumeResolveError::Materialize(format!(
-                    "podman volume rm {vol_name}: {stderr}"
-                )));
-            }
+        if self
+            .volume_rm(&Self::empty_dir_volume_name(
+                namespace, pod, pod_uid, volume,
+            ))
+            .await?
+        {
+            return Ok(());
         }
-        Ok(())
+        self.volume_rm(&Self::legacy_empty_dir_volume_name(namespace, pod, volume))
+            .await
+            .map(|_| ())
     }
 
     async fn remove_materialized(&self, dir: &MaterializedDir) -> Result<(), VolumeResolveError> {
         remove_materialized_dir(dir.path())?;
-        // `<data_root>/<ns>_<pod>/<volume>`: once the pod's last volume is
-        // gone its `<ns>_<pod>` directory is empty, and leaving it would
+        // `<data_root>/<ns>_<pod>_<uid>/<volume>`: once the pod's last volume is
+        // gone its `<ns>_<pod>_<uid>` directory is empty, and leaving it would
         // leave one empty directory per pod this node ever ran. Removed only
         // when empty and only inside the data root — never a directory this
         // materializer did not lay out.
@@ -2112,6 +2186,36 @@ impl VolumeMaterializer for PodmanVolumeMaterializer {
         }
         Ok(())
     }
+}
+
+/// The per-pod-incarnation directory name every materializer lays a pod's
+/// host state under: `<ns>_<pod>_<uid>`. The uid is what separates two pods
+/// that share a name across a delete and recreate.
+#[must_use]
+pub fn pod_dir_name(namespace: &str, pod: &str, pod_uid: &str) -> String {
+    format!("{namespace}_{pod}_{pod_uid}")
+}
+
+fn adopt_legacy_dir(legacy: &Path, dir: &Path) -> Result<(), VolumeResolveError> {
+    if dir.exists() || !legacy.is_dir() {
+        return Ok(());
+    }
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            VolumeResolveError::Materialize(format!("mkdir {}: {e}", parent.display()))
+        })?;
+    }
+    std::fs::rename(legacy, dir).map_err(|e| {
+        VolumeResolveError::Materialize(format!(
+            "adopt {} as {}: {e}",
+            legacy.display(),
+            dir.display()
+        ))
+    })?;
+    if let Some(legacy_pod_dir) = legacy.parent() {
+        remove_if_empty(legacy_pod_dir)?;
+    }
+    Ok(())
 }
 
 /// Remove a materialized directory; already gone is success.
@@ -2216,6 +2320,7 @@ impl VolumeMaterializer for FakeVolumeMaterializer {
         &self,
         _namespace: &str,
         _pod: &str,
+        _pod_uid: &str,
         volume: &str,
         files: &BTreeMap<String, Vec<u8>>,
     ) -> Result<MountSource, VolumeResolveError> {
@@ -2233,6 +2338,7 @@ impl VolumeMaterializer for FakeVolumeMaterializer {
         &self,
         _namespace: &str,
         _pod: &str,
+        _pod_uid: &str,
         volume: &str,
     ) -> Result<MountSource, VolumeResolveError> {
         self.inner.lock().await.empty_dirs.push(volume.to_string());
@@ -2243,6 +2349,7 @@ impl VolumeMaterializer for FakeVolumeMaterializer {
         &self,
         _namespace: &str,
         _pod: &str,
+        _pod_uid: &str,
         volume: &str,
     ) -> Result<(), VolumeResolveError> {
         self.inner
@@ -2430,19 +2537,19 @@ mod tests {
     #[test]
     fn empty_dir_volume_name_is_deterministic() {
         assert_eq!(
-            PodmanVolumeMaterializer::empty_dir_volume_name("default", "p1", "scratch"),
-            "engenho-empty-default_p1_scratch"
+            PodmanVolumeMaterializer::empty_dir_volume_name("default", "p1", "u1", "scratch"),
+            "engenho-empty-default_p1_u1_scratch"
         );
     }
 
     #[tokio::test]
     async fn fake_records_remove_empty_dir_calls() {
         let mat = FakeVolumeMaterializer::new();
-        mat.ensure_empty_dir("default", "p1", "scratch")
+        mat.ensure_empty_dir("default", "p1", "u1", "scratch")
             .await
             .unwrap();
         assert!(mat.removed_empty_dirs().await.is_empty());
-        mat.remove_empty_dir("default", "p1", "scratch")
+        mat.remove_empty_dir("default", "p1", "u1", "scratch")
             .await
             .unwrap();
         assert_eq!(mat.removed_empty_dirs().await, vec!["scratch".to_string()]);
@@ -2456,7 +2563,7 @@ mod tests {
             .with_data_root(&root)
             .with_empty_dirs(EmptyDirBacking::HostDir);
         let src = m
-            .ensure_empty_dir("ns", "pod", "data")
+            .ensure_empty_dir("ns", "pod", "u1", "data")
             .await
             .expect("host dir");
         let MountSource::EmptyDirHostDir(dir) = src else {
@@ -2478,7 +2585,7 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o777, "an emptyDir must be writable by any uid");
         }
-        m.remove_empty_dir("ns", "pod", "data")
+        m.remove_empty_dir("ns", "pod", "u1", "data")
             .await
             .expect("removed");
         assert!(!dir.exists(), "{} survived removal", dir.display());
@@ -2493,7 +2600,7 @@ mod tests {
     async fn a_podman_node_still_asks_podman_for_an_empty_dir() {
         let m = PodmanVolumeMaterializer::with_binary("/nonexistent/podman");
         let err = m
-            .ensure_empty_dir("ns", "pod", "data")
+            .ensure_empty_dir("ns", "pod", "u1", "data")
             .await
             .expect_err("no podman");
         assert!(err.to_string().contains("podman volume create"), "{err}");
@@ -3282,13 +3389,13 @@ mod teardown_tests {
     #[test]
     fn each_source_owes_its_own_teardown_and_a_host_path_owes_none() {
         assert_eq!(
-            teardown_obligation("data", &MountSource::UserHostPath("/srv/data".into())),
+            teardown_obligation("u1", "data", &MountSource::UserHostPath("/srv/data".into())),
             None,
             "a hostPath is the user's directory and is never removed"
         );
         let dir = MaterializedDir::written_at(PathBuf::from("/root/ns_p/cfg"));
         assert_eq!(
-            teardown_obligation("cfg", &MountSource::Materialized(dir.clone())),
+            teardown_obligation("u1", "cfg", &MountSource::Materialized(dir.clone())),
             Some(VolumeTeardown::RemoveMaterialized(dir))
         );
         for source in [
@@ -3296,14 +3403,16 @@ mod teardown_tests {
             MountSource::EmptyDirHostDir("/var/lib/x/_data".into()),
         ] {
             assert_eq!(
-                teardown_obligation("scratch", &source),
+                teardown_obligation("u1", "scratch", &source),
                 Some(VolumeTeardown::RemoveEmptyDir {
-                    volume: "scratch".into()
+                    volume: "scratch".into(),
+                    pod_uid: "u1".into()
                 })
             );
         }
         assert_eq!(
             teardown_obligation(
+                "u1",
                 "pv",
                 &MountSource::PvcHostDir {
                     path: "/mnt/pv".into(),
@@ -3311,7 +3420,8 @@ mod teardown_tests {
                 }
             ),
             Some(VolumeTeardown::ReleaseClaim {
-                volume: "pv".into()
+                volume: "pv".into(),
+                pod_uid: "u1".into()
             })
         );
     }
@@ -3374,20 +3484,20 @@ mod teardown_tests {
             .collect();
 
         let MountSource::Materialized(secret) = m
-            .materialize_files("ns", "p", "secret-vol", &files)
+            .materialize_files("ns", "p", "u1", "secret-vol", &files)
             .await
             .expect("materialize")
         else {
             panic!("materialize_files must produce a Materialized source");
         };
         let MountSource::Materialized(cfg) = m
-            .materialize_files("ns", "p", "cfg-vol", &files)
+            .materialize_files("ns", "p", "u1", "cfg-vol", &files)
             .await
             .expect("materialize")
         else {
             panic!("materialize_files must produce a Materialized source");
         };
-        let pod_dir = root.path().join("ns_p");
+        let pod_dir = root.path().join("ns_p_u1");
         assert!(secret.path().join("token").exists(), "control: written");
 
         m.remove_materialized(&secret).await.expect("remove");
@@ -3405,5 +3515,61 @@ mod teardown_tests {
         m.remove_materialized(&cfg)
             .await
             .expect("removing what is already gone is success");
+    }
+
+    #[tokio::test]
+    async fn a_recreated_pod_with_the_same_name_keeps_its_volumes_when_the_old_one_is_torn_down() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let m = PodmanVolumeMaterializer::with_binary("/nonexistent/podman")
+            .with_data_root(root.path())
+            .with_empty_dirs(EmptyDirBacking::HostDir);
+        let files: BTreeMap<String, Vec<u8>> =
+            [("conf".to_string(), b"a".to_vec())].into_iter().collect();
+
+        let MountSource::EmptyDirHostDir(old_data) = m
+            .ensure_empty_dir("ns", "p", "uid-a", "data")
+            .await
+            .expect("ensure a")
+        else {
+            panic!("not a host dir");
+        };
+        let MountSource::Materialized(old_cfg) = m
+            .materialize_files("ns", "p", "uid-a", "cfg", &files)
+            .await
+            .expect("materialize a")
+        else {
+            panic!("not materialized");
+        };
+        std::fs::write(old_data.join("bucket"), b"a").expect("write a");
+
+        let MountSource::EmptyDirHostDir(new_data) = m
+            .ensure_empty_dir("ns", "p", "uid-b", "data")
+            .await
+            .expect("ensure b")
+        else {
+            panic!("not a host dir");
+        };
+        let MountSource::Materialized(new_cfg) = m
+            .materialize_files("ns", "p", "uid-b", "cfg", &files)
+            .await
+            .expect("materialize b")
+        else {
+            panic!("not materialized");
+        };
+        std::fs::write(new_data.join("bucket"), b"b").expect("write b");
+
+        m.remove_empty_dir("ns", "p", "uid-a", "data")
+            .await
+            .expect("remove a");
+        m.remove_materialized(&old_cfg).await.expect("remove a cfg");
+
+        assert_eq!(
+            std::fs::read(new_data.join("bucket")).expect("uid b's emptyDir survives"),
+            b"b"
+        );
+        assert_eq!(
+            std::fs::read(new_cfg.path().join("conf")).expect("uid b's configMap survives"),
+            b"a"
+        );
     }
 }

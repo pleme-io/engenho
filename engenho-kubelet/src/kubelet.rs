@@ -1073,7 +1073,7 @@ impl Kubelet {
     ///
     /// ── ★ WHY REWRITING IN PLACE IS SOUND, AND NOT A RESTART ─────────────
     /// `materialize_files` derives a STABLE directory from
-    /// `(namespace, pod, volume)` and that directory is bind-mounted into the
+    /// `(namespace, pod, uid, volume)` and that directory is bind-mounted into the
     /// container, so a rewrite on the host is visible inside the container
     /// immediately — no restart, no remount, no container churn. And it
     /// writes through `write_atomic`, so a client reading the token
@@ -3301,14 +3301,14 @@ impl Kubelet {
             VolumeTeardown::RemoveMaterialized(dir) => {
                 self.volume_materializer.remove_materialized(dir).await
             }
-            VolumeTeardown::RemoveEmptyDir { volume } => {
+            VolumeTeardown::RemoveEmptyDir { volume, pod_uid } => {
                 self.volume_materializer
-                    .remove_empty_dir(namespace, pod, volume)
+                    .remove_empty_dir(namespace, pod, pod_uid, volume)
                     .await
             }
-            VolumeTeardown::ReleaseClaim { volume } => {
+            VolumeTeardown::ReleaseClaim { volume, pod_uid } => {
                 self.volume_materializer
-                    .unpublish_csi(namespace, pod, volume)
+                    .unpublish_csi(namespace, pod, pod_uid, volume)
                     .await
             }
         }
@@ -3660,7 +3660,7 @@ impl Kubelet {
         };
         let source = self
             .volume_materializer
-            .materialize_files(namespace, pod, SA_PROJECTION_VOLUME, &files)
+            .materialize_files(namespace, pod, pod_uid, SA_PROJECTION_VOLUME, &files)
             .await
             .map_err(|cause| SaProjectionFailed::Write {
                 service_account: service_account.to_string(),
@@ -3967,11 +3967,11 @@ impl Kubelet {
         };
         // What removing these volumes will owe — the resolved ones and the
         // ServiceAccount projection, which is materialized outside `resolved`.
-        let mut teardowns = teardowns_of(&resolved);
+        let mut teardowns = teardowns_of(pod_uid, &resolved);
         teardowns.extend(
             sa_mount
                 .as_ref()
-                .and_then(|m| teardown_obligation(SA_PROJECTION_VOLUME, &m.source)),
+                .and_then(|m| teardown_obligation(pod_uid, SA_PROJECTION_VOLUME, &m.source)),
         );
 
         // Ensure a fresh local record exists, then start each container not
@@ -5204,7 +5204,9 @@ impl Kubelet {
         let entry = local.entry(key.clone()).or_default();
         // The pod's volumes were materialized for this container too; a pod
         // deleted mid-init owes their removal as much as a running one.
-        entry.volume_teardowns.extend(teardowns_of(resolved));
+        entry
+            .volume_teardowns
+            .extend(teardowns_of(&spec.pod.uid, resolved));
         entry.init_containers.insert(
             cname.to_string(),
             ContainerRecord {

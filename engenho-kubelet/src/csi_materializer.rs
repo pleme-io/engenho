@@ -128,9 +128,15 @@ pub fn staging_path(root: &Path, driver: &str, volume_handle: &str) -> PathBuf {
 /// Upstream's layout, including the `kubernetes.io~csi` segment and the
 /// trailing `mount`. Drivers and e2e suites both look at this shape.
 #[must_use]
-pub fn target_path(root: &Path, namespace: &str, pod: &str, volume: &str) -> PathBuf {
+pub fn target_path(
+    root: &Path,
+    namespace: &str,
+    pod: &str,
+    pod_uid: &str,
+    volume: &str,
+) -> PathBuf {
     root.join("pods")
-        .join(format!("{namespace}_{pod}"))
+        .join(crate::pod_volume::pod_dir_name(namespace, pod, pod_uid))
         .join("volumes")
         .join("kubernetes.io~csi")
         .join(volume)
@@ -190,8 +196,8 @@ impl CsiVolumeMaterializer {
         self.drivers.clone()
     }
 
-    fn book_key(namespace: &str, pod: &str, volume: &str) -> String {
-        format!("{namespace}/{pod}/{volume}")
+    fn book_key(namespace: &str, pod: &str, pod_uid: &str, volume: &str) -> String {
+        format!("{namespace}/{pod}/{pod_uid}/{volume}")
     }
 
     /// The volume capability engenho asks for.
@@ -230,11 +236,12 @@ impl VolumeMaterializer for CsiVolumeMaterializer {
         &self,
         namespace: &str,
         pod: &str,
+        pod_uid: &str,
         volume: &str,
         files: &BTreeMap<String, Vec<u8>>,
     ) -> Result<MountSource, VolumeResolveError> {
         self.base
-            .materialize_files(namespace, pod, volume, files)
+            .materialize_files(namespace, pod, pod_uid, volume, files)
             .await
     }
 
@@ -242,18 +249,24 @@ impl VolumeMaterializer for CsiVolumeMaterializer {
         &self,
         namespace: &str,
         pod: &str,
+        pod_uid: &str,
         volume: &str,
     ) -> Result<MountSource, VolumeResolveError> {
-        self.base.ensure_empty_dir(namespace, pod, volume).await
+        self.base
+            .ensure_empty_dir(namespace, pod, pod_uid, volume)
+            .await
     }
 
     async fn remove_empty_dir(
         &self,
         namespace: &str,
         pod: &str,
+        pod_uid: &str,
         volume: &str,
     ) -> Result<(), VolumeResolveError> {
-        self.base.remove_empty_dir(namespace, pod, volume).await
+        self.base
+            .remove_empty_dir(namespace, pod, pod_uid, volume)
+            .await
     }
 
     async fn remove_materialized(&self, dir: &MaterializedDir) -> Result<(), VolumeResolveError> {
@@ -266,6 +279,7 @@ impl VolumeMaterializer for CsiVolumeMaterializer {
         &self,
         namespace: &str,
         pod: &str,
+        pod_uid: &str,
         volume: &str,
         req: &CsiPublishRequest,
     ) -> Result<MountSource, VolumeResolveError> {
@@ -279,7 +293,7 @@ impl VolumeMaterializer for CsiVolumeMaterializer {
             });
         };
 
-        let target = target_path(&self.root, namespace, pod, volume);
+        let target = target_path(&self.root, namespace, pod, pod_uid, volume);
         // The driver mounts AT this path and does not create it; upstream's
         // kubelet is the one that mkdirs. A driver handed a nonexistent
         // target fails with an errno that reads as a driver bug.
@@ -342,7 +356,7 @@ impl VolumeMaterializer for CsiVolumeMaterializer {
             .map_err(|e| driver_err(volume, &e))?;
 
         self.published.lock().await.insert(
-            Self::book_key(namespace, pod, volume),
+            Self::book_key(namespace, pod, pod_uid, volume),
             Published {
                 driver: req.driver.clone(),
                 volume_handle: req.volume_handle.clone(),
@@ -365,9 +379,10 @@ impl VolumeMaterializer for CsiVolumeMaterializer {
         &self,
         namespace: &str,
         pod: &str,
+        pod_uid: &str,
         volume: &str,
     ) -> Result<(), VolumeResolveError> {
-        let key = Self::book_key(namespace, pod, volume);
+        let key = Self::book_key(namespace, pod, pod_uid, volume);
         // Never published, or already torn down: SUCCESS. Teardown runs on
         // a path that may already be half-complete.
         let Some(record) = self.published.lock().await.remove(&key) else {
@@ -425,10 +440,10 @@ mod path_tests {
     fn the_target_path_is_upstreams_layout_exactly() {
         // Not cosmetic: drivers write bookkeeping beside this path and the
         // CSI e2e suites assert on its shape.
-        let p = target_path(Path::new("/var/lib/kubelet"), "ns", "pod1", "data");
+        let p = target_path(Path::new("/var/lib/kubelet"), "ns", "pod1", "u1", "data");
         assert_eq!(
             p,
-            PathBuf::from("/var/lib/kubelet/pods/ns_pod1/volumes/kubernetes.io~csi/data/mount")
+            PathBuf::from("/var/lib/kubelet/pods/ns_pod1_u1/volumes/kubernetes.io~csi/data/mount")
         );
     }
 
@@ -455,6 +470,7 @@ mod path_tests {
             .publish_csi(
                 "ns",
                 "pod1",
+                "u1",
                 "data",
                 &CsiPublishRequest {
                     driver: "absent.csi.io".into(),
@@ -479,7 +495,7 @@ mod path_tests {
             DriverTable::new(),
             "/tmp/engenho-csi-test",
         );
-        assert!(m.unpublish_csi("ns", "pod1", "data").await.is_ok());
+        assert!(m.unpublish_csi("ns", "pod1", "u1", "data").await.is_ok());
     }
 }
 

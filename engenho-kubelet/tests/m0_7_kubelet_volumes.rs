@@ -661,7 +661,7 @@ async fn deleting_a_pod_removes_its_materialized_secret_and_never_its_host_path(
         pod_key("db"),
         json!({
             "kind": "Pod", "apiVersion": "v1",
-            "metadata": { "name": "db", "namespace": "default" },
+            "metadata": { "name": "db", "namespace": "default", "uid": "db-uid" },
             "spec": {
                 "nodeName": "node-A",
                 "volumes": [
@@ -682,7 +682,7 @@ async fn deleting_a_pod_removes_its_materialized_secret_and_never_its_host_path(
 
     kubelet.tick().await.unwrap();
     assert_eq!(count_starts(&backend.events().await), 1, "control: started");
-    let secret_dir = data_root.path().join("default_db").join("creds");
+    let secret_dir = data_root.path().join("default_db_db-uid").join("creds");
     assert_eq!(
         std::fs::read(secret_dir.join("password")).unwrap(),
         b"hunter2",
@@ -697,7 +697,7 @@ async fn deleting_a_pod_removes_its_materialized_secret_and_never_its_host_path(
         "the materialized secret must not outlive its pod"
     );
     assert!(
-        !data_root.path().join("default_db").exists(),
+        !data_root.path().join("default_db_db-uid").exists(),
         "nor the pod's now-empty directory"
     );
     assert!(

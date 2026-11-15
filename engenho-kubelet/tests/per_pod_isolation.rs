@@ -102,6 +102,7 @@ impl VolumeMaterializer for Materializer {
         &self,
         namespace: &str,
         pod: &str,
+        pod_uid: &str,
         volume: &str,
         files: &BTreeMap<String, Vec<u8>>,
     ) -> Result<MountSource, VolumeResolveError> {
@@ -111,7 +112,7 @@ impl VolumeMaterializer for Materializer {
             ));
         }
         self.inner
-            .materialize_files(namespace, pod, volume, files)
+            .materialize_files(namespace, pod, pod_uid, volume, files)
             .await
     }
 
@@ -119,18 +120,24 @@ impl VolumeMaterializer for Materializer {
         &self,
         namespace: &str,
         pod: &str,
+        pod_uid: &str,
         volume: &str,
     ) -> Result<MountSource, VolumeResolveError> {
-        self.inner.ensure_empty_dir(namespace, pod, volume).await
+        self.inner
+            .ensure_empty_dir(namespace, pod, pod_uid, volume)
+            .await
     }
 
     async fn remove_empty_dir(
         &self,
         namespace: &str,
         pod: &str,
+        pod_uid: &str,
         volume: &str,
     ) -> Result<(), VolumeResolveError> {
-        self.inner.remove_empty_dir(namespace, pod, volume).await
+        self.inner
+            .remove_empty_dir(namespace, pod, pod_uid, volume)
+            .await
     }
 
     async fn remove_materialized(&self, dir: &MaterializedDir) -> Result<(), VolumeResolveError> {

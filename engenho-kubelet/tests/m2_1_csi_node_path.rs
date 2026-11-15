@@ -28,6 +28,7 @@ const DRIVER: &str = "test.csi.engenho.io";
 
 fn pod_with_pvc(read_only: bool) -> Value {
     json!({
+        "metadata": { "uid": "u1" },
         "spec": { "volumes": [{
             "name": "data",
             "persistentVolumeClaim": { "claimName": "c", "readOnly": read_only }
@@ -238,7 +239,7 @@ async fn teardown_unpublishes_and_unstages() {
     )
     .await
     .unwrap();
-    m.unpublish_csi("ns", "pod1", "data").await.unwrap();
+    m.unpublish_csi("ns", "pod1", "u1", "data").await.unwrap();
 
     let calls = d.calls();
     assert_eq!(
@@ -254,7 +255,7 @@ async fn teardown_unpublishes_and_unstages() {
 
     // Idempotent: a second teardown is a no-op, not an error, because
     // deletion may retry after a partial failure.
-    m.unpublish_csi("ns", "pod1", "data").await.unwrap();
+    m.unpublish_csi("ns", "pod1", "u1", "data").await.unwrap();
     assert_eq!(d.calls().len(), 4, "no duplicate teardown");
 
     d.stop().await;
@@ -312,6 +313,7 @@ async fn volume_attributes_are_carried_to_the_driver_unchanged() {
             _: &str,
             _: &str,
             _: &str,
+            _: &str,
             _: &BTreeMap<String, Vec<u8>>,
         ) -> Result<MountSource, engenho_kubelet::pod_volume::VolumeResolveError> {
             unreachable!()
@@ -321,11 +323,13 @@ async fn volume_attributes_are_carried_to_the_driver_unchanged() {
             _: &str,
             _: &str,
             _: &str,
+            _: &str,
         ) -> Result<MountSource, engenho_kubelet::pod_volume::VolumeResolveError> {
             unreachable!()
         }
         async fn remove_empty_dir(
             &self,
+            _: &str,
             _: &str,
             _: &str,
             _: &str,
@@ -340,6 +344,7 @@ async fn volume_attributes_are_carried_to_the_driver_unchanged() {
         }
         async fn publish_csi(
             &self,
+            _: &str,
             _: &str,
             _: &str,
             _: &str,

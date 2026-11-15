@@ -2847,7 +2847,7 @@ mod tests {
         let files = std::collections::BTreeMap::from([("k".to_string(), b"v".to_vec())]);
         let materialized = crate::pod_volume::PodmanVolumeMaterializer::new()
             .with_data_root(root.path().join("volumes"))
-            .materialize_files("ns", "pod", "cfg", &files)
+            .materialize_files("ns", "pod", "u1", "cfg", &files)
             .await
             .expect("materializes");
         let MountSource::Materialized(dir) = &materialized else {
