@@ -487,6 +487,11 @@ async fn a_workload_with_stdin_or_a_terminal_is_recorded_unadoptable_and_ends_wi
         let node = Node::new();
         let daemon = node.daemon("outlive");
         let mut s = spec(&bash, "uid-1", &[]);
+        s.command = vec![
+            "bash".to_string(),
+            "-c".to_string(),
+            "while sleep 0.1; do :; done".to_string(),
+        ];
         s.stdio.stdin = stdin;
         s.stdio.tty = tty;
         let id = daemon.start(&s).await.expect("start").container_id;
