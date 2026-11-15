@@ -46,6 +46,7 @@ pub mod list_floor;
 pub mod metrics;
 pub mod object_body;
 pub mod openapi;
+pub mod openapi_v2;
 pub mod params;
 pub mod pki;
 pub mod pki_files;

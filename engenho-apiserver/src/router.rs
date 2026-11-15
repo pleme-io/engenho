@@ -580,6 +580,7 @@ fn route_table() -> Vec<(&'static str, axum::routing::MethodRouter<RouterState>)
         // `explain` consume — a typed index + per-group vendored schemas,
         // scoped to exactly the cataloged groups.
         ("/openapi.json", get(openapi_spec)),
+        ("/openapi/v2", get(openapi_v2_document)),
         ("/openapi/v3", get(openapi_v3_index)),
         ("/openapi/v3/api/v1", get(openapi_v3_core)),
         ("/openapi/v3/apis/:group/:version", get(openapi_v3_group)),
@@ -849,6 +850,52 @@ async fn self_subject_review(user_info: ExtractUserInfo) -> Result<Response, Api
         },
     };
     Ok((StatusCode::CREATED, Json(review)).into_response())
+}
+
+async fn openapi_v2_document(
+    State(state): State<RouterState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, ApiError> {
+    let accept = headers.get(ACCEPT).and_then(|v| v.to_str().ok());
+    let Some(encoding) = crate::openapi_v2::negotiate(accept) else {
+        return Err(ApiError::NotAcceptable(
+            "the OpenAPI v2 document is served as application/json or \
+             application/com.github.proto-openapi.spec.v2.v1.0+protobuf"
+                .to_owned(),
+        ));
+    };
+    let handlers = state.handler_set();
+    let custom: Vec<crate::openapi_v2::CustomResource<'_>> = handlers
+        .iter()
+        .filter_map(|h| {
+            h.openapi_v3_schema()
+                .map(|schema| crate::openapi_v2::CustomResource {
+                    group: h.group(),
+                    version: h.version(),
+                    kind: h.kind(),
+                    schema,
+                })
+        })
+        .collect();
+    let git_version = state.api_face.version().git_version();
+    let body = match encoding {
+        crate::openapi_v2::Encoding::Json => {
+            serde_json::to_vec(&crate::openapi_v2::json_document(git_version, &custom))
+                .map_err(|e| ApiError::Internal(e.to_string()))?
+        }
+        crate::openapi_v2::Encoding::Protobuf => {
+            crate::openapi_v2::protobuf_document(git_version, &custom)
+        }
+    };
+    Ok((
+        StatusCode::OK,
+        [
+            (CONTENT_TYPE, encoding.content_type()),
+            (axum::http::header::VARY, "Accept"),
+        ],
+        body,
+    )
+        .into_response())
 }
 
 // ── K8s OpenAPI-v3 discovery surface (/openapi/v3) ─────────────────────

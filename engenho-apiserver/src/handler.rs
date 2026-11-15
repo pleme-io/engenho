@@ -98,6 +98,10 @@ pub trait ResourceHandler: Send + Sync + 'static {
         false
     }
 
+    fn openapi_v3_schema(&self) -> Option<&Value> {
+        None
+    }
+
     /// GET the parent object's `/status` view. Default: a typed `NotFound`
     /// (this kind does not serve `/status`) — never a panic. `StoreBackedHandler`
     /// overrides for status-bearing kinds: it reads the live object (the
@@ -834,6 +838,9 @@ impl ResourceHandler for StoreBackedHandler {
     }
     fn categories(&self) -> &[&str] {
         self.categories
+    }
+    fn openapi_v3_schema(&self) -> Option<&Value> {
+        self.crd_schema.as_deref()
     }
 
     fn subresources(&self) -> &[Subresource] {
