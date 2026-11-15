@@ -502,7 +502,10 @@ async fn reconcile_parent<T: OwnedChildrenReconciler + ?Sized>(
     // What this parent's writes did, read off each op the store returned:
     // a child delete the store answered NoOp (already gone) is no change.
     let mut effect = Effect::Unchanged;
+    let mut parent_written = false;
     for mut command in delta.commands {
+        parent_written |=
+            matches!(&command, ResourceCommand::Patch { key, .. } if key == parent_key);
         let live = match child_write_target(&command) {
             Some(key) => store.get(key).await,
             None => None,
@@ -531,6 +534,20 @@ async fn reconcile_parent<T: OwnedChildrenReconciler + ?Sized>(
     // tick's own creates/deletes. Then write the CAS status (the same
     // `write_status_cas` primitive the hand-written ticks used).
     let owned_after = gather_owned(store, child_kinds, uid, ns).await;
+    // A delta that wrote the parent itself (a Job's generated selector)
+    // moved its resourceVersion; the status CAS is taken against that write,
+    // not against the copy listed before it.
+    let rewritten = if parent_written {
+        store.get(parent_key).await
+    } else {
+        None
+    };
+    let parent_value = rewritten.as_ref().unwrap_or(parent_value);
+    let generation = if parent_written {
+        generation_of(parent_value)?
+    } else {
+        generation
+    };
     if let Some(desired_status) = this.compute_status(parent_value, &owned_after, generation) {
         let status = write_status_cas(store, parent_key, parent_value, &desired_status).await?;
         effect = effect.and(status.effect());

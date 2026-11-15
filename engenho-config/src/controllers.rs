@@ -18,6 +18,29 @@ pub struct ControllersConfig {
     pub fallback_interval_seconds: u32,
     /// `WatchDriver` event-coalescing window (milliseconds).
     pub debounce_milliseconds: u32,
+    /// Whether the Job controller gives a Job upstream's generated selector
+    /// and its pods upstream's job labels. `#[serde(default)]` so operator
+    /// YAML written before this key existed still parses (generated).
+    #[serde(default)]
+    pub job_selector: JobSelector,
+}
+
+/// Whether a Job without `spec.manualSelector: true` gets upstream's
+/// generated selector (`batch.kubernetes.io/controller-uid: <uid>`) and its
+/// pod template, so every pod it creates, upstream's four labels:
+/// `batch.kubernetes.io/controller-uid`, `batch.kubernetes.io/job-name`,
+/// `controller-uid` and `job-name`.
+///
+/// `Generated` is the default and is upstream's behaviour: `kubectl logs
+/// job/x` and a `job-name=<job>` list find that Job's pods. `Off` leaves the
+/// Job and its pods with only the labels its template declares.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(missing_docs)]
+pub enum JobSelector {
+    #[default]
+    Generated,
+    Off,
 }
 
 /// Per-controller enable flags.
@@ -129,6 +152,7 @@ impl TieredConfig for ControllersConfig {
             namespace: String::new(),
             fallback_interval_seconds: 0,
             debounce_milliseconds: 0,
+            job_selector: JobSelector::Generated,
         }
     }
 
@@ -153,6 +177,7 @@ impl TieredConfig for ControllersConfig {
             namespace: String::new(),
             fallback_interval_seconds: 30,
             debounce_milliseconds: 50,
+            job_selector: JobSelector::Generated,
         }
     }
 
@@ -174,6 +199,7 @@ impl TieredConfig for ControllersConfig {
             } else {
                 self.debounce_milliseconds
             },
+            job_selector: self.job_selector,
         }
     }
 }
@@ -214,6 +240,20 @@ mod tests {
         assert!(cfg.enable.namespace);
         assert!(cfg.enable.pv_binder);
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn the_job_selector_is_generated_unless_turned_off() {
+        assert_eq!(
+            ControllersConfig::prescribed_default().job_selector,
+            JobSelector::Generated
+        );
+        let base = "enable: {replicaset: true, deployment: true, endpoints: true, gc: true}\nnamespace: ''\nfallback_interval_seconds: 30\ndebounce_milliseconds: 50\n";
+        let absent: ControllersConfig = serde_yaml::from_str(base).unwrap();
+        assert_eq!(absent.job_selector, JobSelector::Generated);
+        let off: ControllersConfig =
+            serde_yaml::from_str(&format!("{base}job_selector: off\n")).unwrap();
+        assert_eq!(off.job_selector, JobSelector::Off);
     }
 
     #[test]

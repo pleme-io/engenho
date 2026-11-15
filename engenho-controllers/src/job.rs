@@ -66,7 +66,17 @@ use crate::owned_children::{
 use crate::owner::{OwnerReference, owner_ref_for, set_owner_reference};
 use crate::reads::{DeclaresReads, Reads, gvk};
 use crate::sweep::{ObjectOutcome, Sweep, impl_sweep_event_sink};
+use engenho_config::JobSelector;
 use engenho_types::kind::GroupVersionKind;
+
+/// Upstream's `batch.kubernetes.io/controller-uid` pod label and selector key.
+pub const JOB_CONTROLLER_UID_LABEL: &str = "batch.kubernetes.io/controller-uid";
+/// Upstream's `batch.kubernetes.io/job-name` pod label.
+pub const JOB_NAME_LABEL: &str = "batch.kubernetes.io/job-name";
+/// Upstream's legacy `controller-uid` pod label, still set beside the prefixed one.
+pub const LEGACY_CONTROLLER_UID_LABEL: &str = "controller-uid";
+/// Upstream's legacy `job-name` pod label, still set beside the prefixed one.
+pub const LEGACY_JOB_NAME_LABEL: &str = "job-name";
 
 /// Where a `CronJob`'s job labels are declared.
 const JOB_TEMPLATE_LABELS: &[&str] = &["spec", "jobTemplate", "metadata", "labels"];
@@ -118,6 +128,8 @@ pub fn fixed_clock(unix_secs: u64) -> std::sync::Arc<FrozenClock> {
 pub struct JobController {
     store: Arc<StoreMesh>,
     namespace: Option<String>,
+    /// `controllers.job_selector`: upstream's generated selector and labels.
+    selector: JobSelector,
     /// Per-Job isolation (`FailedCreate` on a malformed template).
     sweep: Sweep,
 }
@@ -131,8 +143,16 @@ impl JobController {
         Self {
             store,
             namespace,
+            selector: JobSelector::Generated,
             sweep: Sweep::new("job-controller", EventReason::FailedCreate),
         }
+    }
+
+    /// Whether this controller generates upstream's Job selector and labels.
+    #[must_use]
+    pub fn with_selector(mut self, selector: JobSelector) -> Self {
+        self.selector = selector;
+        self
     }
 
     fn pod_phase_is(pod: &Value, phase: &str) -> bool {
@@ -140,6 +160,64 @@ impl JobController {
             .and_then(|s| s.get("phase"))
             .and_then(|p| p.as_str())
             == Some(phase)
+    }
+
+    /// Upstream's `generateSelector`: unless `spec.manualSelector` is true,
+    /// the Job's pod template carries `controller-uid`, `job-name` and their
+    /// `batch.kubernetes.io/` forms, and `spec.selector` matches the uid.
+    /// `Some((merge patch, the Job with it applied))` when a label or the
+    /// selector is missing; `None` when nothing is, or under
+    /// [`JobSelector::Off`].
+    ///
+    /// # Errors
+    ///
+    /// [`ShapeError`] when the template's `metadata.labels` is not an object.
+    fn generated_selector(&self, job: &Value) -> Result<Option<(Value, Value)>, ShapeError> {
+        if self.selector == JobSelector::Off
+            || job.pointer("/spec/manualSelector") == Some(&Value::Bool(true))
+        {
+            return Ok(None);
+        }
+        let (Some(uid), Some(name)) = (job.uid(), job.name()) else {
+            return Ok(None);
+        };
+        let want = [
+            (JOB_CONTROLLER_UID_LABEL, uid),
+            (JOB_NAME_LABEL, name),
+            (LEGACY_CONTROLLER_UID_LABEL, uid),
+            (LEGACY_JOB_NAME_LABEL, name),
+        ];
+        let mut selected = job.clone();
+        let labels =
+            template_object_mut(&mut selected, &["spec", "template", "metadata", "labels"])?;
+        let mut missing = serde_json::Map::new();
+        for (key, value) in want {
+            if !labels.contains_key(key) {
+                labels.insert(key.into(), Value::from(value));
+                missing.insert(key.into(), Value::from(value));
+            }
+        }
+        let mut patch = json!({"spec": {}});
+        if !missing.is_empty() {
+            patch["spec"]["template"] = json!({"metadata": {"labels": missing}});
+        }
+        if job.pointer("/spec/selector").is_none_or(Value::is_null) {
+            let selector = json!({"matchLabels": {JOB_CONTROLLER_UID_LABEL: uid}});
+            patch["spec"]["selector"] = selector.clone();
+            selected["spec"]["selector"] = selector;
+        }
+        if patch["spec"]
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty)
+        {
+            return Ok(None);
+        }
+        Ok(Some((patch, selected)))
+    }
+
+    fn job_key(job: &Value, namespace: &str) -> Option<ResourceKey> {
+        job.name()
+            .map(|name| ResourceKey::namespaced("batch", "v1", "Job", namespace, name))
     }
 
     /// Build a Pod from the Job template + index, owned by `owner`.
@@ -218,6 +296,18 @@ impl OwnedChildrenReconciler for JobController {
         };
         let pod_ns = crate::owned_children::child_namespace(job_value, self.namespace.as_deref());
 
+        let mut commands = Vec::new();
+        let selected = match self.generated_selector(job_value)? {
+            Some((patch, selected)) => {
+                if let Some(key) = Self::job_key(job_value, &pod_ns) {
+                    commands.push(ResourceCommand::patch(key, patch, Reason::Controller));
+                }
+                Some(selected)
+            }
+            None => None,
+        };
+        let job_value = selected.as_ref().unwrap_or(job_value);
+
         let succeeded = owned
             .iter()
             .filter(|(_, p)| Self::pod_phase_is(p, "Succeeded"))
@@ -231,7 +321,7 @@ impl OwnedChildrenReconciler for JobController {
 
         // Already complete → no pods to create.
         if succeeded >= completions {
-            return Ok(ReconcileDelta::none());
+            return Ok(ReconcileDelta::from_commands(commands));
         }
 
         let failed = owned
@@ -239,7 +329,7 @@ impl OwnedChildrenReconciler for JobController {
             .filter(|(_, p)| Self::pod_phase_is(p, "Failed"))
             .count();
         if failed > backoff_limit {
-            return Ok(ReconcileDelta::none());
+            return Ok(ReconcileDelta::from_commands(commands));
         }
 
         // Create up to `parallelism - active` more pods toward completions.
@@ -248,7 +338,7 @@ impl OwnedChildrenReconciler for JobController {
             .min(parallelism)
             .saturating_sub(active);
         if needed == 0 {
-            return Ok(ReconcileDelta::none());
+            return Ok(ReconcileDelta::from_commands(commands));
         }
 
         let existing_indices: std::collections::BTreeSet<usize> = owned
@@ -260,7 +350,6 @@ impl OwnedChildrenReconciler for JobController {
             })
             .collect();
 
-        let mut commands = Vec::new();
         let mut to_create = needed;
         let mut idx = 0usize;
         while to_create > 0 {
@@ -1492,7 +1581,7 @@ mod tests {
     #[tokio::test]
     async fn a_pod_that_always_fails_stops_at_backoff_limit_plus_one() {
         let store = test_store("job-backoff").await;
-        let c = JobController::new(store, None);
+        let c = JobController::new(store, None).with_selector(JobSelector::Off);
         let job = job_with_backoff(Some(3));
 
         let retry = c
@@ -1525,7 +1614,7 @@ mod tests {
     #[tokio::test]
     async fn an_absent_backoff_limit_stops_after_seven_failures() {
         let store = test_store("job-backoff-default").await;
-        let c = JobController::new(store, None);
+        let c = JobController::new(store, None).with_selector(JobSelector::Off);
         let job = job_with_backoff(None);
         assert_eq!(
             c.reconcile_one(&job, &pods_in_phase("Failed", 6))
@@ -1547,7 +1636,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_pod_under_the_limit_leaves_status_without_a_condition() {
         let store = test_store("job-backoff-under").await;
-        let c = JobController::new(store, None);
+        let c = JobController::new(store, None).with_selector(JobSelector::Off);
         let job = job_with_backoff(Some(3));
         let status = c
             .compute_status(&job, &pods_in_phase("Failed", 2), 1)
@@ -1681,5 +1770,79 @@ mod tests {
         let out = c.tick().await.unwrap();
         assert_eq!(out.objects_changed, 1);
         assert_eq!(job_names(&store).await, ["every-bad-2"]);
+    }
+
+    fn probe_job() -> Value {
+        json!({
+            "kind": "Job", "apiVersion": "batch/v1",
+            "metadata": {"name": "probe", "namespace": "default", "uid": "probe-uid"},
+            "spec": {"template": {"spec": {"containers": [{"image": "alpine"}]}}}
+        })
+    }
+
+    async fn job_pods(store: &StoreMesh) -> Vec<(ResourceKey, Value)> {
+        store.list("", "v1", "Pod", Some("default")).await
+    }
+
+    #[tokio::test]
+    async fn a_job_pod_carries_upstreams_job_labels_and_the_job_selects_it() {
+        let store = test_store("job-labels").await;
+        let job_key = ResourceKey::namespaced("batch", "v1", "Job", "default", "probe");
+        put(&store, job_key.clone(), probe_job()).await;
+        put(
+            &store,
+            ResourceKey::namespaced("", "v1", "Pod", "default", "other"),
+            json!({"kind": "Pod", "apiVersion": "v1", "metadata": {"name": "other", "namespace": "default"}}),
+        )
+        .await;
+        let c = JobController::new(store.clone(), None);
+        c.tick().await.unwrap();
+        c.tick().await.unwrap();
+
+        let job = store.get(&job_key).await.unwrap();
+        let want = json!({
+            "batch.kubernetes.io/controller-uid": "probe-uid",
+            "batch.kubernetes.io/job-name": "probe",
+            "controller-uid": "probe-uid",
+            "job-name": "probe",
+        });
+        assert_eq!(
+            job["spec"]["selector"],
+            json!({"matchLabels": {"batch.kubernetes.io/controller-uid": "probe-uid"}}),
+            "{job}"
+        );
+        assert_eq!(job["spec"]["template"]["metadata"]["labels"], want, "{job}");
+        let pods = job_pods(&store).await;
+        let selected: Vec<&str> = pods
+            .iter()
+            .filter(|(_, p)| {
+                crate::selector::selector_match_labels(&job)
+                    .is_some_and(|want| crate::selector::matches_labels(p, want))
+            })
+            .map(|(k, _)| k.name.as_str())
+            .collect();
+        assert_eq!(selected, ["probe-0"], "{pods:?}");
+        let pod = &pods.iter().find(|(k, _)| k.name == "probe-0").unwrap().1;
+        assert_eq!(pod["metadata"]["labels"], want, "{pod}");
+    }
+
+    #[tokio::test]
+    async fn a_manual_selector_job_and_the_off_switch_leave_the_job_unlabelled() {
+        for (manual, selector) in [(true, JobSelector::Generated), (false, JobSelector::Off)] {
+            let store = test_store("job-labels-off").await;
+            let job_key = ResourceKey::namespaced("batch", "v1", "Job", "default", "probe");
+            let mut job = probe_job();
+            if manual {
+                job["spec"]["manualSelector"] = json!(true);
+            }
+            put(&store, job_key.clone(), job).await;
+            let c = JobController::new(store.clone(), None).with_selector(selector);
+            c.tick().await.unwrap();
+            let job = store.get(&job_key).await.unwrap();
+            assert!(job["spec"].get("selector").is_none(), "{job}");
+            let pods = job_pods(&store).await;
+            assert_eq!(pods.len(), 1);
+            assert!(pods[0].1["metadata"].get("labels").is_none(), "{pods:?}");
+        }
     }
 }

@@ -497,6 +497,12 @@ in
         "Resync period when no watch event arrives.";
       debounceMilliseconds = optional types.ints.unsigned
         "Watch-event debounce window.";
+      jobSelector = optional (types.enum [ "generated" "off" ]) ''
+        Whether a Job without `manualSelector: true` gets upstream's generated
+        selector and its pods upstream's `job-name`, `controller-uid` and
+        `batch.kubernetes.io/` labels. `generated` (engenho's default) is
+        upstream's behaviour; `off` leaves them with their template's labels.
+      '';
     };
 
     consistency.defaultTier = optional
@@ -742,6 +748,7 @@ in
         namespace = cfg.controllers.namespace;
         fallback_interval_seconds = cfg.controllers.fallbackIntervalSeconds;
         debounce_milliseconds = cfg.controllers.debounceMilliseconds;
+        job_selector = cfg.controllers.jobSelector;
       };
       consistency.default_tier = cfg.consistency.defaultTier;
       networking = {

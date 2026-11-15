@@ -31,10 +31,10 @@ use std::time::Duration;
 use engenho_config::{
     ApiAudit, CertRotation, ClosureLocalBuilds, ClusterConfig, ConsistencyConfig,
     ConsistencyTierKind, ControllerEnable, ControllersConfig, DatapathMode, EngenhoConfig, Fabric,
-    HealthReasons, KubeconfigVisibility, KubeletAuth, KubeletBackendKind, LegacyTeiaSection,
-    NativeCgroups, NativeMounts, NativeSecurity, NativeWorkloads, NetworkingConfig, RevoadaConfig,
-    RuntimeConfig, SchedulerConfig, SecretsAtRest, SharedCluster, TlsConfig, TopologyConfig,
-    TopologyStrategyKind,
+    HealthReasons, JobSelector, KubeconfigVisibility, KubeletAuth, KubeletBackendKind,
+    LegacyTeiaSection, NativeCgroups, NativeMounts, NativeSecurity, NativeWorkloads,
+    NetworkingConfig, RevoadaConfig, RuntimeConfig, SchedulerConfig, SecretsAtRest, SharedCluster,
+    TlsConfig, TopologyConfig, TopologyStrategyKind,
 };
 
 use crate::health::Windows;
@@ -109,6 +109,8 @@ pub(crate) struct BootConfig {
     fallback: Duration,
     /// `controllers.debounce_milliseconds`.
     debounce: Duration,
+    /// `controllers.job_selector`.
+    pub(crate) job_selector: JobSelector,
     /// `networking.service_cidr`.
     pub(crate) service_cidr: String,
     /// `networking.datapath_mode`.
@@ -173,6 +175,7 @@ impl BootConfig {
             namespace,
             fallback_interval_seconds,
             debounce_milliseconds,
+            job_selector,
         } = controllers;
 
         let NetworkingConfig {
@@ -252,6 +255,7 @@ impl BootConfig {
             controllers_namespace: Some(namespace).filter(|n| !n.is_empty()).cloned(),
             fallback: Duration::from_secs(u64::from(*fallback_interval_seconds)),
             debounce: Duration::from_millis(u64::from(*debounce_milliseconds)),
+            job_selector: *job_selector,
             service_cidr: service_cidr.clone(),
             datapath_mode: *datapath_mode,
             not_run,

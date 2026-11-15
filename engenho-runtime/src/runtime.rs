@@ -4012,7 +4012,9 @@ impl Parts {
             ),
             Driver::Job => self.watch(
                 driver,
-                JobController::new(store.clone(), ns()).with_event_sink(events()),
+                JobController::new(store.clone(), ns())
+                    .with_selector(self.boot.job_selector)
+                    .with_event_sink(events()),
             ),
             // CronJob: parses spec.schedule (5-field cron) against the
             // WallClock and creates a batch/v1 Job from the jobTemplate on

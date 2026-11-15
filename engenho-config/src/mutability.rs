@@ -232,6 +232,7 @@ fn build() -> Vec<LeafSpec> {
         namespace => restart,
         fallback_interval_seconds => restart,
         debounce_milliseconds => restart,
+        job_selector => restart,
     });
     section!(rows, "controllers.enable", ControllerEnable {
         replicaset => drivers,

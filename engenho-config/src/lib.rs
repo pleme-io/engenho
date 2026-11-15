@@ -132,7 +132,7 @@ pub use control::{
     RemoteControlConfig, RemoteTier, SOCKET_PATH_MAX, SYSTEM_SOCKET_PATH, SocketAccess,
     SocketDefaults, check_socket_path_len,
 };
-pub use controllers::{ControllerEnable, ControllersConfig};
+pub use controllers::{ControllerEnable, ControllersConfig, JobSelector};
 pub use discovery::{HostnameLayer, NODE_NAME_FALLBACK};
 pub use error::ConfigError;
 pub use fabric::{ConfigDeprecation, Fabric, LegacyTeiaSection};

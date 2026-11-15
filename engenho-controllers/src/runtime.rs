@@ -47,6 +47,7 @@ impl From<&engenho_config::ControllersConfig> for RuntimeConfig {
             enable: _,
             namespace: _,
             debounce_milliseconds: _,
+            job_selector: _,
             fallback_interval_seconds,
         } = top;
         Self {
@@ -258,6 +259,7 @@ mod tests {
             namespace: String::new(),
             fallback_interval_seconds: 45,
             debounce_milliseconds: 100,
+            job_selector: engenho_config::JobSelector::Generated,
         };
         let runtime: RuntimeConfig = (&top).into();
         assert_eq!(runtime.default_interval, Duration::from_secs(45));
