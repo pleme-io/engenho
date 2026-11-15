@@ -140,6 +140,7 @@ pub fn make_container_runtime_with_apiserver(
         NativeCgroups::default(),
         engenho_config::NativeSecurity::default(),
         engenho_config::NativeMounts::default(),
+        engenho_config::NativeFsGroup::default(),
         crate::native_survival::WorkloadLifetime::Bound,
     )
 }
@@ -152,6 +153,7 @@ pub fn make_container_runtime_on_node(
     native_cgroups: NativeCgroups,
     native_security: engenho_config::NativeSecurity,
     native_mounts: engenho_config::NativeMounts,
+    native_fs_group: engenho_config::NativeFsGroup,
     native_lifetime: crate::native_survival::WorkloadLifetime,
 ) -> Result<Arc<dyn ContainerRuntime>, BackendRefused> {
     make_container_runtime_with_classes(
@@ -161,6 +163,7 @@ pub fn make_container_runtime_on_node(
         native_cgroups,
         native_security,
         native_mounts,
+        native_fs_group,
         native_lifetime,
     )
 }
@@ -180,6 +183,7 @@ pub fn make_container_runtime_with_classes(
     native_cgroups: NativeCgroups,
     native_security: engenho_config::NativeSecurity,
     native_mounts: engenho_config::NativeMounts,
+    native_fs_group: engenho_config::NativeFsGroup,
     native_lifetime: crate::native_survival::WorkloadLifetime,
 ) -> Result<Arc<dyn ContainerRuntime>, BackendRefused> {
     let build = |runtime: &NodeRuntime, lifetime| {
@@ -190,6 +194,7 @@ pub fn make_container_runtime_with_classes(
             native_cgroups,
             native_security,
             native_mounts,
+            native_fs_group,
             lifetime,
         )
     };
@@ -214,6 +219,7 @@ fn make_one_runtime(
     native_cgroups: NativeCgroups,
     native_security: engenho_config::NativeSecurity,
     native_mounts: engenho_config::NativeMounts,
+    native_fs_group: engenho_config::NativeFsGroup,
     native_lifetime: crate::native_survival::WorkloadLifetime,
 ) -> Result<Arc<dyn ContainerRuntime>, BackendRefused> {
     if let Some(refused) = construction_refusal(kind) {
@@ -322,6 +328,7 @@ fn make_one_runtime(
             )
             .with_security(native_security)
             .with_mounts(native_mounts)
+            .with_fs_group(native_fs_group)
             .with_lifetime(native_lifetime)
             .map_err(|e| BackendRefused::NativeSurvival(e.to_string()))?,
         ),
@@ -364,6 +371,7 @@ mod tests {
             NativeCgroups::default(),
             engenho_config::NativeSecurity::Enforce,
             engenho_config::NativeMounts::Off,
+            engenho_config::NativeFsGroup::Applied,
             crate::native_survival::WorkloadLifetime::Bound,
         )
         .expect("constructs");
@@ -386,6 +394,7 @@ mod tests {
             NativeCgroups::default(),
             engenho_config::NativeSecurity::Off,
             engenho_config::NativeMounts::Off,
+            engenho_config::NativeFsGroup::Applied,
             crate::native_survival::WorkloadLifetime::Bound,
         )
         .expect("constructs");
@@ -426,6 +435,7 @@ mod tests {
             NativeCgroups::default(),
             engenho_config::NativeSecurity::Enforce,
             engenho_config::NativeMounts::default(),
+            engenho_config::NativeFsGroup::default(),
             crate::native_survival::WorkloadLifetime::Bound,
         )
     }

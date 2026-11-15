@@ -111,6 +111,7 @@ use crate::kakoi::{Asked, DefaultLimits, Kakoi, NativeSecurity, Node, Verdict};
 use crate::native_survival::{Handle, Projection, Record, Store, WorkloadLifetime};
 use crate::pod_volume::BindSource;
 use crate::private_mounts::NativeMounts;
+use engenho_config::NativeFsGroup;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -431,6 +432,38 @@ fn chown_tree(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn give_to_group(path: &Path, gid: u32, read_only: bool) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() {
+        return Ok(());
+    }
+    rustix::fs::chown(path, None, Some(rustix::fs::Gid::from_raw(gid)))?;
+    let mut mask = if read_only { 0o440 } else { 0o660 };
+    if meta.is_dir() {
+        mask |= 0o2110;
+    }
+    let mode = meta.permissions().mode() & 0o7777;
+    if mode & mask != mask {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode | mask))?;
+    }
+    if meta.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            give_to_group(&entry?.path(), gid, read_only)?;
+        }
+    }
+    Ok(())
+}
+
+fn group_matches(path: &Path, gid: u32, read_only: bool) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    let mask = if read_only { 0o2550 } else { 0o2770 };
+    meta.is_dir() && meta.gid() == gid && meta.mode() & mask == mask
 }
 
 fn join_on_exec(cmd: &mut tokio::process::Command, procs: std::fs::File) {
@@ -858,6 +891,7 @@ impl NativeContainer {
 pub struct NativeBackend {
     security: NativeSecurity,
     mounts: NativeMounts,
+    fs_group: NativeFsGroup,
     isolation: Isolation,
     log_dir: PathBuf,
     cgroups: Cgroups,
@@ -929,6 +963,35 @@ impl NativeBackend {
         self
     }
 
+    /// Choose whether a pod's `fsGroup` is applied. The default is
+    /// [`NativeFsGroup::Applied`].
+    #[must_use]
+    pub fn with_fs_group(mut self, fs_group: NativeFsGroup) -> Self {
+        self.fs_group = fs_group;
+        self
+    }
+
+    fn confinement_of<'a>(&self, spec: &'a ContainerSpec) -> std::borrow::Cow<'a, Confinement> {
+        let c = &spec.confinement;
+        match (self.fs_group, c.fs_group) {
+            (_, None) => std::borrow::Cow::Borrowed(c),
+            (NativeFsGroup::Off, Some(_)) => std::borrow::Cow::Owned(Confinement {
+                fs_group: None,
+                fs_group_change_policy: None,
+                ..c.clone()
+            }),
+            (NativeFsGroup::Applied, Some(_)) => std::borrow::Cow::Owned(Confinement {
+                not_applied: c
+                    .not_applied
+                    .iter()
+                    .filter(|field| *field != "fsGroup")
+                    .cloned()
+                    .collect(),
+                ..c.clone()
+            }),
+        }
+    }
+
     /// The container's own mount namespace, ready for its child, when the node
     /// and its pod say it gets one; `None` keeps the host's paths.
     fn private_mounts_for(
@@ -964,6 +1027,7 @@ impl NativeBackend {
             .get_or_init(Kakoi::start)
             .clone()
             .map_err(NativeError::Kakoi)?;
+        let confinement = self.confinement_of(spec);
         let all = Self::volumes_of(spec);
         let volumes: Vec<String> = all.iter().map(|v| v.path.clone()).collect();
         let read_only: Vec<String> = all
@@ -974,7 +1038,7 @@ impl NativeBackend {
         kakoi
             .enclose(
                 Asked {
-                    confinement: &spec.confinement,
+                    confinement: &confinement,
                     namespace: &spec.pod.namespace,
                     volumes: &volumes,
                     read_only_volumes: &read_only,
@@ -987,25 +1051,41 @@ impl NativeBackend {
     }
 
     /// Give a container the storage made for it, so an account that is not the
-    /// daemon's can read and write it. A host path is left alone: it belongs to
+    /// daemon's can read and write it, and give its pod's `fsGroup` each of its
+    /// volumes upstream's kubelet gives it: emptyDir, the materialized ones and
+    /// a persistentVolumeClaim's. A host path is left alone: it belongs to
     /// whoever declared it.
-    fn hand_over_volumes(spec: &ContainerSpec, verdict: &Verdict) -> Result<(), NativeError> {
-        let Some(uid) = verdict.uid else {
-            return Ok(());
+    fn hand_over_volumes(
+        &self,
+        spec: &ContainerSpec,
+        verdict: &Verdict,
+    ) -> Result<(), NativeError> {
+        use crate::pod_volume::MountSource;
+        let failed = |path: &Path| {
+            let path = path.to_path_buf();
+            move |e: std::io::Error| NativeError::VolumePath {
+                path,
+                detail: e.to_string(),
+            }
         };
+        let confinement = self.confinement_of(spec);
+        let fs_group = confinement.fs_group.and_then(|gid| u32::try_from(gid).ok());
+        let on_mismatch = confinement.fs_group_change_policy.as_deref() == Some("OnRootMismatch");
         for m in &spec.mounts {
-            let owned = match &m.source {
-                crate::pod_volume::MountSource::EmptyDirHostDir(p) => Some(p.as_path()),
-                crate::pod_volume::MountSource::Materialized(dir) => Some(dir.path()),
-                _ => None,
+            let (path, made, forced_read_only) = match &m.source {
+                MountSource::EmptyDirHostDir(p) => (p.as_path(), true, false),
+                MountSource::Materialized(dir) => (dir.path(), true, false),
+                MountSource::PvcHostDir { path, read_only } => (path.as_path(), false, *read_only),
+                _ => continue,
             };
-            if let Some(path) = owned {
-                chown_tree(path, uid, verdict.gid.unwrap_or(uid)).map_err(|e| {
-                    NativeError::VolumePath {
-                        path: path.to_path_buf(),
-                        detail: e.to_string(),
-                    }
-                })?;
+            if made && let Some(uid) = verdict.uid {
+                chown_tree(path, uid, verdict.gid.unwrap_or(uid)).map_err(failed(path))?;
+            }
+            if let Some(gid) = fs_group {
+                let read_only = m.read_only || forced_read_only;
+                if !(on_mismatch && group_matches(path, gid, read_only)) {
+                    give_to_group(path, gid, read_only).map_err(failed(path))?;
+                }
             }
         }
         Ok(())
@@ -1017,6 +1097,7 @@ impl NativeBackend {
         Self {
             security: NativeSecurity::default(),
             mounts: NativeMounts::default(),
+            fs_group: NativeFsGroup::default(),
             isolation,
             log_dir: log_dir.into(),
             cgroups,
@@ -1470,7 +1551,7 @@ impl ContainerRuntime for NativeBackend {
             Self::verify_mounts(spec)?;
         }
         let private_mounts = private.is_some();
-        Self::hand_over_volumes(spec, &verdict)?;
+        self.hand_over_volumes(spec, &verdict)?;
 
         let id = Self::container_id(spec);
         // ── ★ ONE PROCESS PER ID ───────────────────────────────────────────
@@ -2894,14 +2975,15 @@ mod tests {
             gid: Some(target),
             ..Verdict::default()
         };
-        NativeBackend::hand_over_volumes(&s, &verdict).expect("hands over");
+        let b = NativeBackend::new(Isolation::HostProcess, "/tmp/nb-test-logs", Cgroups::Off);
+        b.hand_over_volumes(&s, &verdict).expect("hands over");
         assert_eq!(gid_of(&empty_dir), target);
         assert_eq!(gid_of(&config), target);
         assert_eq!(gid_of(&config.join("k")), target);
         assert_eq!(gid_of(&host), host_gid, "a host path is left alone");
 
         std::fs::remove_dir_all(&empty_dir).unwrap();
-        let err = NativeBackend::hand_over_volumes(&s, &verdict).expect_err("gone");
+        let err = b.hand_over_volumes(&s, &verdict).expect_err("gone");
         assert!(err.to_string().contains("empty"), "{err}");
     }
 
@@ -2918,5 +3000,134 @@ mod tests {
         assert_eq!(warnings, said);
         assert!(!warnings.is_empty());
         assert!(warnings.iter().all(|w| w.len() > 10), "{warnings:?}");
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::symlink_metadata(path)
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    fn fs_group_pvc(fs_group: Option<u32>) -> (tempfile::TempDir, ContainerSpec, Verdict) {
+        use crate::pod_volume::{MountSource, ResolvedMount};
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let pv = root.path().join("pvc");
+        std::fs::create_dir_all(pv.join("nested")).unwrap();
+        std::fs::write(pv.join("nested/file"), "x").unwrap();
+        for (path, mode) in [(pv.clone(), 0o755), (pv.join("nested"), 0o755)] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        std::fs::set_permissions(
+            pv.join("nested/file"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let mut s = spec("nix:/nix/store/aaa-pkg", &[]);
+        s.confinement.fs_group = fs_group.map(i64::from);
+        s.mounts = vec![ResolvedMount {
+            source: MountSource::PvcHostDir {
+                path: pv,
+                read_only: false,
+            },
+            mount_path: "/data".to_string(),
+            read_only: false,
+            sub_path: None,
+        }];
+        let verdict = Verdict {
+            uid: Some(rustix::process::getuid().as_raw()),
+            gid: Some(rustix::process::getgid().as_raw()),
+            ..Verdict::default()
+        };
+        (root, s, verdict)
+    }
+
+    #[test]
+    fn a_pvc_volume_is_handed_to_the_pods_fs_group_and_untouched_without_one() {
+        let (root, s, verdict) = fs_group_pvc(None);
+        let pv = root.path().join("pvc");
+        let gid = gid_of(&pv);
+        let fs_group = another_group_than(gid);
+        let b = NativeBackend::new(Isolation::HostProcess, "/tmp/nb-test-logs", Cgroups::Off);
+        b.hand_over_volumes(&s, &verdict).expect("hands over");
+        for path in [pv.clone(), pv.join("nested"), pv.join("nested/file")] {
+            assert_eq!(gid_of(&path), gid, "{}", path.display());
+        }
+        assert_eq!(mode_of(&pv), 0o755);
+        assert_eq!(mode_of(&pv.join("nested/file")), 0o644);
+
+        let (root, s, verdict) = fs_group_pvc(Some(fs_group));
+        let pv = root.path().join("pvc");
+        b.hand_over_volumes(&s, &verdict).expect("hands over");
+        for path in [pv.clone(), pv.join("nested"), pv.join("nested/file")] {
+            assert_eq!(gid_of(&path), fs_group, "{}", path.display());
+        }
+        assert_eq!(mode_of(&pv), 0o2775);
+        assert_eq!(mode_of(&pv.join("nested")), 0o2775);
+        assert_eq!(mode_of(&pv.join("nested/file")), 0o664);
+    }
+
+    #[test]
+    fn the_off_switch_and_a_host_path_keep_their_group_and_on_root_mismatch_skips_a_matching_root()
+    {
+        use crate::pod_volume::{MountSource, ResolvedMount};
+        let (root, mut s, verdict) = fs_group_pvc(None);
+        let pv = root.path().join("pvc");
+        let gid = gid_of(&pv);
+        let fs_group = another_group_than(gid);
+        s.confinement.fs_group = Some(i64::from(fs_group));
+        let host = root.path().join("host");
+        std::fs::create_dir_all(&host).unwrap();
+        s.mounts.push(ResolvedMount {
+            source: MountSource::UserHostPath(host.clone()),
+            mount_path: "/host".to_string(),
+            read_only: false,
+            sub_path: None,
+        });
+        let off = NativeBackend::new(Isolation::HostProcess, "/tmp/nb-test-logs", Cgroups::Off)
+            .with_fs_group(NativeFsGroup::Off);
+        off.hand_over_volumes(&s, &verdict).expect("hands over");
+        assert_eq!(gid_of(&pv), gid, "the off switch leaves a pvc alone");
+        assert_eq!(mode_of(&pv), 0o755);
+
+        let on = NativeBackend::new(Isolation::HostProcess, "/tmp/nb-test-logs", Cgroups::Off);
+        on.hand_over_volumes(&s, &verdict).expect("hands over");
+        assert_eq!(gid_of(&pv), fs_group);
+        assert_eq!(
+            gid_of(&host),
+            gid_of(root.path()),
+            "a host path is left alone"
+        );
+
+        let later = pv.join("later");
+        std::fs::write(&later, "x").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&later, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        s.confinement.fs_group_change_policy = Some("OnRootMismatch".to_string());
+        on.hand_over_volumes(&s, &verdict).expect("hands over");
+        assert_eq!(mode_of(&later), 0o644, "a matching root is skipped");
+        s.confinement.fs_group_change_policy = Some("Always".to_string());
+        on.hand_over_volumes(&s, &verdict).expect("hands over");
+        assert_eq!(mode_of(&later), 0o664);
+    }
+
+    #[test]
+    fn the_off_switch_reads_fs_group_as_not_applied_and_applied_drops_the_warning() {
+        let mut s = spec("nix:/nix/store/aaa-pkg", &[]);
+        s.confinement.fs_group = Some(65532);
+        s.confinement.not_applied = vec!["fsGroup".into(), "procMount".into()];
+        let on = NativeBackend::new(Isolation::HostProcess, "/tmp/nb-test-logs", Cgroups::Off);
+        let applied = on.confinement_of(&s);
+        assert_eq!(applied.fs_group, Some(65532));
+        assert_eq!(applied.not_applied, vec!["procMount".to_string()]);
+        let off = on.with_fs_group(NativeFsGroup::Off);
+        let refused = off.confinement_of(&s);
+        assert_eq!(refused.fs_group, None);
+        assert_eq!(refused.not_applied, s.confinement.not_applied);
     }
 }

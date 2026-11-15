@@ -314,6 +314,15 @@ in
         `per_pod`: a pod annotated `engenho.pleme.io/mounts: private` gets one.
         `every_pod`: every native pod gets one. Needs a root daemon on Linux.
       '';
+      nativeFsGroup = optional (types.enum [ "applied" "off" ]) ''
+        Whether a native pod's `securityContext.fsGroup` is applied as
+        upstream's kubelet applies it: the container joins the group, and its
+        emptyDir, configMap, secret, projected and persistentVolumeClaim
+        volumes are given to the group (group read-write, setgid on
+        directories). `applied` (engenho's default) is upstream's behaviour; a
+        hostPath volume is never changed and a pod without `fsGroup` sees no
+        change. `off` warns that `fsGroup` is not applied.
+      '';
       nativeSecurity = optional (types.enum [ "enforce" "audit" "off" ]) ''
         How this node treats a native container's security. `enforce`, engenho's
         default: a pod that says nothing runs as its namespace's account,
@@ -707,6 +716,7 @@ in
         native_cgroups = cfg.runtime.nativeCgroups;
         native_security = cfg.runtime.nativeSecurity;
         native_mounts = cfg.runtime.nativeMounts;
+        native_fs_group = cfg.runtime.nativeFsGroup;
         closure_signatures = cfg.runtime.closureSignatures;
         closure_trusted_keys = cfg.runtime.closureTrustedKeys;
         closure_local_builds = cfg.runtime.closureLocalBuilds;

@@ -43,6 +43,7 @@ struct Declared<'a> {
     devices: &'a [String],
     volume_devices: &'a [String],
     not_applied: &'a [String],
+    fs_group: Option<i64>,
     memory_limit: Option<i64>,
     memory_request: Option<i64>,
 }
@@ -169,6 +170,10 @@ pub struct Verdict {
     pub uid: Option<u32>,
     /// The gid to run as; `None` keeps the daemon's.
     pub gid: Option<u32>,
+    /// The pod's `fsGroup`, the child's one supplementary group; `None` leaves
+    /// it none when it changes identity.
+    #[serde(default)]
+    pub fs_group: Option<u32>,
     /// Set `no_new_privs` on the child.
     pub no_new_privs: bool,
     /// Clear the child's capability sets, but for [`Self::keep`].
@@ -275,6 +280,8 @@ impl Kakoi {
             devices,
             volume_devices,
             not_applied,
+            fs_group,
+            fs_group_change_policy: _,
         } = confinement;
         let parsed = access
             .as_deref()
@@ -312,6 +319,7 @@ impl Kakoi {
                 devices,
                 volume_devices,
                 not_applied,
+                fs_group: *fs_group,
                 memory_limit: resources.memory_limit_bytes.value(),
                 memory_request: resources.memory_request_bytes.value(),
             },
@@ -875,11 +883,18 @@ pub fn enter_on_exec(
     let v = verdict.clone();
     if !v.enclosed && !v.no_new_privs && !v.clear_caps {
         let Some(private) = private else {
-            if let Some(uid) = v.uid {
-                cmd.uid(uid);
+            if v.fs_group.is_none() {
+                if let Some(uid) = v.uid {
+                    cmd.uid(uid);
+                }
+                if let Some(gid) = v.gid {
+                    cmd.gid(gid);
+                }
+                return Ok(());
             }
-            if let Some(gid) = v.gid {
-                cmd.gid(gid);
+            #[allow(unsafe_code)]
+            unsafe {
+                cmd.pre_exec(move || become_ids(v.uid, v.gid, v.fs_group));
             }
             return Ok(());
         };
@@ -887,7 +902,7 @@ pub fn enter_on_exec(
         unsafe {
             cmd.pre_exec(move || {
                 private.enter()?;
-                become_ids(v.uid, v.gid)
+                become_ids(v.uid, v.gid, v.fs_group)
             });
         }
         return Ok(());
@@ -1001,20 +1016,28 @@ pub fn enter_on_exec(
 
 /// The account change `std` makes for `Command::uid` and `Command::gid`, made in
 /// a hook instead, after a step that needs the daemon's privileges: the gid,
-/// then the supplementary groups cleared when root drops to another uid, then
-/// the uid.
+/// then the supplementary groups set to the pod's `fsGroup` alone when root
+/// drops to another uid or the pod has one, then the uid.
 #[cfg(target_os = "linux")]
-fn become_ids(uid: Option<u32>, gid: Option<u32>) -> std::io::Result<()> {
+fn become_ids(uid: Option<u32>, gid: Option<u32>, fs_group: Option<u32>) -> std::io::Result<()> {
     if let Some(gid) = gid {
         rustix::thread::set_thread_gid(rustix::fs::Gid::from_raw(gid))?;
     }
+    if rustix::process::getuid().is_root() && (uid.is_some() || fs_group.is_some()) {
+        rustix::thread::set_thread_groups(&supplementary(fs_group))?;
+    }
     if let Some(uid) = uid {
-        if rustix::process::getuid().is_root() {
-            rustix::thread::set_thread_groups(&[])?;
-        }
         rustix::thread::set_thread_uid(rustix::fs::Uid::from_raw(uid))?;
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn supplementary(fs_group: Option<u32>) -> Vec<rustix::fs::Gid> {
+    fs_group
+        .into_iter()
+        .map(rustix::fs::Gid::from_raw)
+        .collect()
 }
 
 /// The child's last steps before `exec`, in this one order: the Landlock ruleset,
@@ -1033,8 +1056,10 @@ fn become_declared(v: &Verdict, steps: &Steps) -> std::io::Result<()> {
     if !steps.kept.is_empty() {
         rustix::thread::set_keep_capabilities(true)?;
     }
+    if v.gid.is_some() || v.fs_group.is_some() {
+        rustix::thread::set_thread_groups(&supplementary(v.fs_group))?;
+    }
     if let Some(gid) = v.gid {
-        rustix::thread::set_thread_groups(&[])?;
         rustix::thread::set_thread_gid(rustix::fs::Gid::from_raw(gid))?;
     }
     if let Some(uid) = v.uid {
@@ -1102,11 +1127,18 @@ pub fn join_on_exec(
     let v = verdict.clone();
     if !v.enclosed && !v.no_new_privs && !v.clear_caps {
         let Some(private) = private else {
-            if let Some(uid) = v.uid {
-                cmd.uid(uid);
+            if v.fs_group.is_none() {
+                if let Some(uid) = v.uid {
+                    cmd.uid(uid);
+                }
+                if let Some(gid) = v.gid {
+                    cmd.gid(gid);
+                }
+                return Ok(());
             }
-            if let Some(gid) = v.gid {
-                cmd.gid(gid);
+            #[allow(unsafe_code)]
+            unsafe {
+                cmd.pre_exec(move || become_ids(v.uid, v.gid, v.fs_group));
             }
             return Ok(());
         };
@@ -1115,7 +1147,7 @@ pub fn join_on_exec(
             cmd.pre_exec(move || {
                 move_into_link_name_space(private.as_fd(), Some(LinkNameSpaceType::Mount))?;
                 rustix::process::chdir(c"/")?;
-                become_ids(v.uid, v.gid)
+                become_ids(v.uid, v.gid, v.fs_group)
             });
         }
         return Ok(());
@@ -1264,6 +1296,40 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_pods_fs_group_is_the_verdicts_supplementary_group_where_identity_changes() {
+        let c = Confinement {
+            run_as_user: Some(65532),
+            run_as_group: Some(65532),
+            fs_group: Some(65532),
+            ..Confinement::default()
+        };
+        let enforcing = verdict_of(&c, &[], &node(NativeSecurity::Enforce, true)).await;
+        assert_eq!(enforcing.refused, None);
+        assert_eq!(enforcing.fs_group, Some(65532));
+        let unable = verdict_of(&c, &[], &node(NativeSecurity::Enforce, false)).await;
+        assert_eq!(unable.fs_group, None);
+        let none = Confinement {
+            fs_group: None,
+            ..c
+        };
+        let without = verdict_of(&none, &[], &node(NativeSecurity::Enforce, true)).await;
+        assert_eq!(without.fs_group, None);
+        let foreign = Confinement {
+            fs_group: Some(165_535),
+            ..Confinement::default()
+        };
+        let refused = verdict_of(&foreign, &[], &node(NativeSecurity::Enforce, true)).await;
+        assert!(
+            refused
+                .refused
+                .as_deref()
+                .is_some_and(|why| why.contains("fsGroup 165535")),
+            "{refused:?}"
+        );
+        assert_eq!(refused.fs_group, None);
     }
 
     async fn enclosed_default() -> Verdict {

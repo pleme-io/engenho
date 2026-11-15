@@ -2228,6 +2228,7 @@ fn build_backend(boot: &BootConfig) -> Result<Arc<dyn ContainerRuntime>, Runtime
             boot.native_cgroups,
             boot.native_security,
             boot.native_mounts,
+            boot.native_fs_group,
             match boot.native_workloads {
                 engenho_config::NativeWorkloads::Bound => {
                     engenho_kubelet::native_survival::WorkloadLifetime::Bound

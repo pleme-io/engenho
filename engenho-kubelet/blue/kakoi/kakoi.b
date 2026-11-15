@@ -883,15 +883,19 @@ outside_range: The reason an id cannot exist on a host, or nil.
 
     outside_range({"run_as_user" => -1}) #=> "runAsUser -1 is outside the host's range"
     outside_range({"run_as_group" => 4294967296}) #=> "runAsGroup 4294967296 is outside the host's range"
+    outside_range({"fs_group" => -2}) #=> "fsGroup -2 is outside the host's range"
     outside_range({"run_as_user" => 0}) #=> nil
 """
 def outside_range(declared)
   uid = declared["run_as_user"]
   gid = declared["run_as_group"]
+  fs = declared["fs_group"]
   if uid != nil and (uid < 0 or uid > 4_294_967_295)
     "runAsUser #{to_s(uid)} is outside the host's range"
   elsif gid != nil and (gid < 0 or gid > 4_294_967_295)
     "runAsGroup #{to_s(gid)} is outside the host's range"
+  elsif fs != nil and (fs < 0 or fs > 4_294_967_295)
+    "fsGroup #{to_s(fs)} is outside the host's range"
   end
 end
 
@@ -949,6 +953,7 @@ foreign_account: Why a declared id is another namespace's, or nil. The ids from 
 
     foreign_account({"namespace" => "a", "declared" => {"run_as_user" => 100001}}) #=> "runAsUser 100001 is in the range kept for namespace accounts, so it may be another namespace's identity"
     foreign_account({"namespace" => "a", "declared" => {"run_as_group" => 165535}}) #=> "runAsGroup 165535 is in the range kept for namespace accounts, so it may be another namespace's identity"
+    foreign_account({"namespace" => "a", "declared" => {"fs_group" => 165535}}) #=> "fsGroup 165535 is in the range kept for namespace accounts, so it may be another namespace's identity"
     foreign_account({"namespace" => "a", "declared" => {"run_as_user" => namespace_uid("a")}}) #=> nil
     foreign_account({"declared" => {"run_as_user" => 65534}}) #=> nil
     foreign_account({"declared" => {"run_as_user" => 165536}}) #=> nil
@@ -969,6 +974,8 @@ def foreign_account(facts)
     "runAsUser #{to_s(declared["run_as_user"])} is in the range kept for namespace accounts, so it may be another namespace's identity"
   elsif foreign?(declared["run_as_group"])
     "runAsGroup #{to_s(declared["run_as_group"])} is in the range kept for namespace accounts, so it may be another namespace's identity"
+  elsif foreign?(declared["fs_group"])
+    "fsGroup #{to_s(declared["fs_group"])} is in the range kept for namespace accounts, so it may be another namespace's identity"
   end
 end
 
@@ -1077,6 +1084,20 @@ def declared_only(facts)
   [declared["run_as_user"], declared["run_as_group"]]
 end
 
+@doc """
+joined_group: The pod's fsGroup, which its container joins as its one supplementary group, as upstream's kubelet adds it: where this node changes identity and nothing is refused.
+
+    joined_group(nil, {"can_enforce" => true, "declared" => {"fs_group" => 2000}}) #=> 2000
+    joined_group(nil, {"can_enforce" => false, "declared" => {"fs_group" => 2000}}) #=> nil
+    joined_group("no", {"can_enforce" => true, "declared" => {"fs_group" => 2000}}) #=> nil
+    joined_group(nil, {"can_enforce" => true, "declared" => {}}) #=> nil
+"""
+def joined_group(refused, facts)
+  if refused.nil? and field(facts, "can_enforce", false)
+    field(field(facts, "declared", {}), "fs_group", nil)
+  end
+end
+
 def verdict_text(refused, ids, confine, warnings, facts?)
   own = field(facts, "volumes", [])
   arch = field(facts, "arch", "x86_64")
@@ -1086,6 +1107,7 @@ def verdict_text(refused, ids, confine, warnings, facts?)
       "refused" => refused,
       "uid" => ids[0],
       "gid" => ids[1],
+      "fs_group" => joined_group(refused, facts),
       "no_new_privs" => confine,
       "clear_caps" => confine,
       "limits" => if confine
@@ -1263,7 +1285,7 @@ def enclose(facts_text)
   if outside != nil
     verdict_text(outside, [nil, nil], false, [])
   elsif mode == "off"
-    verdict_text(nil, declared_only(facts), false, [])
+    verdict_text(nil, declared_only(facts), false, [], facts)
   elsif not field(facts, "can_enforce", false)
     if field(facts, "kernel_decides", false)
       verdict_text(
@@ -1289,7 +1311,8 @@ def enclose(facts_text)
         []
       else
         ["would refuse under enforce: #{why}"]
-      end
+      end,
+      facts
     )
   elsif why != nil
     verdict_text(why, [nil, nil], false, [])
@@ -1536,6 +1559,18 @@ test "audit names what enforce would refuse among the new fields"
   )
   assert v.refused.nil?
   assert contains?(retsu::first(v.warnings), "hostPID")
+end
+
+test "a pod's fsGroup is its container's supplementary group, and a pod without one joins none"
+  v = answer(
+    enforced({"declared" => {"run_as_user" => 65532, "fs_group" => 65532}})
+  )
+  assert v.refused.nil?
+  assert v.fs_group == 65532
+  assert answer(
+    enforced({"declared" => {"run_as_user" => 65532}})
+  ).fs_group.nil?
+  assert answer(enforced({"declared" => {"fs_group" => -1}})).fs_group.nil?
 end
 
 test "a field the node reads and does not apply reaches a reader, enclosed or granted"

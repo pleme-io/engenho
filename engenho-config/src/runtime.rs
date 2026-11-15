@@ -236,6 +236,25 @@ pub enum NativeMounts {
     EveryPod,
 }
 
+/// Whether a native pod's `securityContext.fsGroup` is applied, as upstream's
+/// kubelet applies it: the container joins the group, and each of its
+/// emptyDir, configMap, secret, projected and persistentVolumeClaim volumes is
+/// given to the group (group-owned, group read-write, setgid on directories;
+/// `fsGroupChangePolicy: OnRootMismatch` skips a volume whose root already
+/// matches). A `hostPath` volume is never changed, and a pod without `fsGroup`
+/// sees no change.
+///
+/// `Applied` is the default and is upstream's behaviour. `Off` reads
+/// `fsGroup` as a field this node does not apply, with a warning.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(missing_docs)]
+pub enum NativeFsGroup {
+    #[default]
+    Applied,
+    Off,
+}
+
 /// Whether a node renews its leaf certificates.
 ///
 /// `Renew` is the default: each leaf has a bounded span and is renewed while
@@ -541,6 +560,9 @@ pub struct RuntimeConfig {
     #[allow(missing_docs)]
     #[serde(default)]
     pub native_mounts: NativeMounts,
+    #[allow(missing_docs)]
+    #[serde(default)]
+    pub native_fs_group: NativeFsGroup,
     /// The mode of the closure check; absent follows `native_security`.
     #[serde(default)]
     pub closure_signatures: Option<NativeSecurity>,
@@ -641,6 +663,7 @@ impl TieredConfig for RuntimeConfig {
             native_cgroups: NativeCgroups::Off,
             native_security: NativeSecurity::Enforce,
             native_mounts: NativeMounts::Off,
+            native_fs_group: NativeFsGroup::Applied,
             closure_signatures: None,
             closure_trusted_keys: Vec::new(),
             closure_local_builds: ClosureLocalBuilds::Trust,
@@ -718,6 +741,7 @@ impl TieredConfig for RuntimeConfig {
             native_cgroups: NativeCgroups::Delegated,
             native_security: NativeSecurity::Enforce,
             native_mounts: NativeMounts::Off,
+            native_fs_group: NativeFsGroup::Applied,
             closure_signatures: None,
             closure_trusted_keys: Vec::new(),
             closure_local_builds: ClosureLocalBuilds::Trust,
@@ -793,6 +817,7 @@ impl TieredConfig for RuntimeConfig {
             native_cgroups: self.native_cgroups,
             native_security: self.native_security,
             native_mounts: self.native_mounts,
+            native_fs_group: self.native_fs_group,
             closure_signatures: self.closure_signatures,
             closure_trusted_keys: self.closure_trusted_keys.clone(),
             closure_local_builds: self.closure_local_builds,
@@ -1116,6 +1141,7 @@ mod tests {
             native_cgroups: NativeCgroups::Off,
             native_security: NativeSecurity::Enforce,
             native_mounts: NativeMounts::Off,
+            native_fs_group: NativeFsGroup::Applied,
             closure_signatures: None,
             closure_trusted_keys: Vec::new(),
             closure_local_builds: ClosureLocalBuilds::Trust,
@@ -1814,6 +1840,44 @@ mod cert_rotation_tests {
             EngenhoConfig::from_yaml_with_defaults("runtime:\n  cert_rotation: off\n").unwrap();
         assert_eq!(cfg.runtime.cert_rotation, CertRotation::Off);
         assert!(EngenhoConfig::from_yaml_with_defaults("runtime:\n  cert_rotation: x\n").is_err());
+    }
+}
+
+#[cfg(test)]
+mod native_fs_group_tests {
+    use super::NativeFsGroup;
+    use crate::EngenhoConfig;
+    use shikumi::TieredConfig;
+
+    #[test]
+    fn a_config_that_does_not_name_it_applies_fs_group() {
+        let cfg = EngenhoConfig::from_yaml_with_defaults("runtime: {}\n").expect("parses");
+        assert_eq!(cfg.runtime.native_fs_group, NativeFsGroup::Applied);
+        assert_eq!(
+            super::RuntimeConfig::prescribed_default().native_fs_group,
+            NativeFsGroup::Applied
+        );
+        assert_eq!(
+            super::RuntimeConfig::bare().native_fs_group,
+            NativeFsGroup::Applied
+        );
+    }
+
+    #[test]
+    fn each_wire_name_reads_back_as_its_variant() {
+        for (wire, want) in [
+            ("applied", NativeFsGroup::Applied),
+            ("off", NativeFsGroup::Off),
+        ] {
+            let cfg = EngenhoConfig::from_yaml_with_defaults(&format!(
+                "runtime:\n  native_fs_group: {wire}\n"
+            ))
+            .unwrap_or_else(|e| panic!("`{wire}` must parse: {e}"));
+            assert_eq!(cfg.runtime.native_fs_group, want);
+        }
+        assert!(
+            EngenhoConfig::from_yaml_with_defaults("runtime:\n  native_fs_group: chown\n").is_err()
+        );
     }
 }
 

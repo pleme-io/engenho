@@ -108,6 +108,12 @@ pub struct Confinement {
     /// What the pod sets that this node reads and does not apply, by field name.
     #[serde(default)]
     pub not_applied: Vec<String>,
+    /// The pod's `securityContext.fsGroup`.
+    #[serde(default)]
+    pub fs_group: Option<i64>,
+    /// The pod's `securityContext.fsGroupChangePolicy`.
+    #[serde(default)]
+    pub fs_group_change_policy: Option<String>,
 }
 
 impl Default for Confinement {
@@ -140,6 +146,8 @@ impl Default for Confinement {
             devices: Vec::new(),
             volume_devices: Vec::new(),
             not_applied: Vec::new(),
+            fs_group: None,
+            fs_group_change_policy: None,
         }
     }
 }
@@ -233,6 +241,11 @@ impl Confinement {
                 .map(str::to_string)
         });
         self.sysctls = strings_at(sc.and_then(|s| s.get("sysctls")), "name");
+        self.fs_group = int("fsGroup");
+        self.fs_group_change_policy = sc
+            .and_then(|s| s.get("fsGroupChangePolicy"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
         self.devices = host_path_devices(spec.and_then(|s| s.get("volumes")));
         let set = |k: &str| {
             sc.and_then(|s| s.get(k))
