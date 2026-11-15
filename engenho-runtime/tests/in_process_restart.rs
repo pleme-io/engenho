@@ -211,6 +211,82 @@ async fn a_stored_crd_is_served_on_the_first_request_after_a_restart() {
     stop(second).await;
 }
 
+/// After a daemon restart, Flux source-controller and helm-controller made
+/// no progress and logged nothing for 10+ minutes until their pods were
+/// deleted (measured on plo 2026-11-15, engenho 7279198). A watch held across
+/// a restart ends at the stop, never stays open silent, and a re-watch from
+/// the last resourceVersion it saw either delivers the next write or is
+/// refused in-band with 410, which makes client-go relist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_watch_across_a_restart_ends_and_its_resume_delivers_or_relists() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let first = Runtime::boot(durable(tmp.path()))
+        .await
+        .expect("first boot");
+    create_configmap(&first, tmp.path(), "before").await;
+    let (_, list) = send(
+        &first,
+        tmp.path(),
+        reqwest::Method::GET,
+        "/api/v1/namespaces/default/configmaps",
+        None,
+    )
+    .await;
+    let rv = list["metadata"]["resourceVersion"]
+        .as_str()
+        .expect("list resourceVersion")
+        .to_string();
+    let watch_path = format!("/api/v1/namespaces/default/configmaps?watch=1&resourceVersion={rv}");
+    let open = |rt: &Runtime| {
+        reqwest::Client::new()
+            .get(format!("http://{}{watch_path}", rt.local_addr()))
+            .bearer_auth(admin_token(tmp.path()))
+            .send()
+    };
+    let mut held = open(&first).await.expect("watch opens");
+    assert_eq!(held.status(), reqwest::StatusCode::OK);
+    let _ = tokio::time::timeout(Duration::from_millis(300), held.chunk()).await;
+
+    let stop_first = tokio::spawn(stop(first));
+    let ended = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match held.chunk().await {
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+    })
+    .await;
+    assert!(ended.is_ok(), "the watch stayed open across the stop");
+    stop_first.await.expect("stop task");
+
+    let second = Runtime::boot(durable(tmp.path()))
+        .await
+        .expect("second boot");
+    let mut resumed = open(&second).await.expect("re-watch opens");
+    assert_eq!(resumed.status(), reqwest::StatusCode::OK);
+    create_configmap(&second, tmp.path(), "after").await;
+    let mut seen = String::new();
+    let answered = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Ok(Some(chunk)) = resumed.chunk().await {
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+            if seen.contains("\"name\":\"after\"") || seen.contains("\"code\":410") {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        answered.is_ok() || seen.contains("\"code\":410"),
+        "the resumed watch neither delivered the write nor asked for a relist: {seen}"
+    );
+    assert!(
+        seen.contains("\"name\":\"after\"") || seen.contains("\"code\":410"),
+        "the resumed watch ended without the write or a 410: {seen}"
+    );
+    stop(second).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_boot_that_fails_after_opening_the_store_releases_it_for_the_retry() {
     let tmp = tempfile::tempdir().expect("tempdir");
