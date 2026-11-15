@@ -1653,6 +1653,18 @@ struct WatchStreamState {
     partial: bool,
 }
 
+impl WatchStreamState {
+    fn line_gvk<'a>(&'a self, api_version: &'a str) -> WatchGvk<'a> {
+        watch_gvk(
+            WatchGvk {
+                api_version,
+                kind: self.handler.kind(),
+            },
+            self.partial,
+        )
+    }
+}
+
 /// The object a watch line carries: the stored object, or just its metadata
 /// when the client negotiated PartialObjectMetadata.
 fn project_watch_object(object: &serde_json::Value, partial: bool) -> serde_json::Value {
@@ -1746,7 +1758,7 @@ async fn watch_response(
         // its initializing state forever even though every object above was
         // delivered. A client that did not ask gets none, as upstream.
         if end_bookmark {
-            prelude.push(bookmark_line(rv, gvk, true));
+            prelude.push(bookmark_line(rv, watch_gvk(gvk, partial), true));
         }
         from = ResumePoint::At(rv);
     }
@@ -1809,26 +1821,18 @@ async fn watch_response(
                         continue;
                     }
                     let api_version = st.handler.api_version();
-                    let gvk = watch_gvk(
-                        WatchGvk {
-                            api_version: &api_version,
-                            kind: st.handler.kind(),
-                        },
-                        st.partial,
+                    let line = event_line(
+                        ev.kind,
+                        &project_watch_object(&ev.object, st.partial),
+                        st.line_gvk(&api_version),
                     );
-                    let line =
-                        event_line(ev.kind, &project_watch_object(&ev.object, st.partial), gvk);
                     st.progress.delivered(Revision(ev.resource_version));
                     return Some((Ok::<Bytes, Infallible>(line), st));
                 }
                 Some(Ok(WatchSignal::Bookmark(rev))) => {
                     if st.progress.forwards_bookmark(rev) {
                         let api_version = st.handler.api_version();
-                        let gvk = WatchGvk {
-                            api_version: &api_version,
-                            kind: st.handler.kind(),
-                        };
-                        let line = bookmark_line(rev, gvk, false);
+                        let line = bookmark_line(rev, st.line_gvk(&api_version), false);
                         st.progress.delivered(rev);
                         return Some((Ok(line), st));
                     }
@@ -1884,11 +1888,7 @@ async fn watch_response(
                         }
                     };
                     let api_version = st.handler.api_version();
-                    let gvk = WatchGvk {
-                        api_version: &api_version,
-                        kind: st.handler.kind(),
-                    };
-                    let line = end.final_line(gvk)?;
+                    let line = end.final_line(st.line_gvk(&api_version))?;
                     return Some((Ok(line), st));
                 }
                 None => return None, // store dropped / clean close → end.
@@ -3312,12 +3312,21 @@ mod tests {
         from: u64,
         bookmarks: bool,
     ) -> Vec<serde_json::Value> {
+        watch_lines_as(h, from, bookmarks, ResponseCodec::Json).await
+    }
+
+    async fn watch_lines_as(
+        h: Arc<FakeHandler>,
+        from: u64,
+        bookmarks: bool,
+        codec: ResponseCodec,
+    ) -> Vec<serde_json::Value> {
         let p = ListWatchParams {
             resource_version: Some(from.to_string()),
             allow_watch_bookmarks: bookmarks,
             ..ListWatchParams::default()
         };
-        let resp = watch_response(h, None, p, Selectors::default(), ResponseCodec::Json)
+        let resp = watch_response(h, None, p, Selectors::default(), codec)
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "every watch end is in-band");
@@ -3332,6 +3341,126 @@ mod tests {
             .filter(|line| !line.is_empty())
             .map(|line| serde_json::from_slice(line).unwrap())
             .collect()
+    }
+
+    const METADATA_ACCEPT: &str = "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1";
+    const METADATA_LIST_ACCEPT: &str =
+        "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1";
+
+    fn metadata_codec(accept: &str) -> ResponseCodec {
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, accept.parse().unwrap());
+        let codec = ResponseCodec::from_headers(&headers).unwrap();
+        assert!(matches!(codec, ResponseCodec::PartialMetadata), "{accept}");
+        codec
+    }
+
+    fn config_map_change(name: &str, rev: u64) -> engenho_store::Change {
+        engenho_store::Change {
+            revision: Revision(rev),
+            key: engenho_store::ResourceKey::namespaced("", "v1", "ConfigMap", "default", name),
+            kind: engenho_store::ChangeKind::Put,
+            value: serde_json::json!({
+                "kind": "ConfigMap",
+                "apiVersion": "v1",
+                "metadata": {"name": name, "namespace": "default", "resourceVersion": rev.to_string()},
+                "data": {"secret": "body"},
+                "spec": {"x": 1}
+            }),
+            prior: None,
+            version_meta: engenho_store::VersionMeta::created_at(Revision(rev)),
+        }
+    }
+
+    fn assert_metadata_only(object: &serde_json::Value, context: &str) {
+        assert_eq!(
+            object["kind"], "PartialObjectMetadata",
+            "{context}: {object}"
+        );
+        assert_eq!(
+            object["apiVersion"], "meta.k8s.io/v1",
+            "{context}: {object}"
+        );
+        let mut keys: Vec<&str> = object
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["apiVersion", "kind", "metadata"],
+            "{context}: {object}"
+        );
+        assert!(
+            object["metadata"]["resourceVersion"].is_string(),
+            "{context}: {object}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_metadata_watch_and_list_carry_only_partial_object_metadata() {
+        let list = render_list(
+            metadata_codec(METADATA_LIST_ACCEPT),
+            &Gvk::new("v1", "ConfigMap"),
+            &crate::printer::Printer::for_kind("", "ConfigMap"),
+            serde_json::json!({
+                "kind": "ConfigMapList",
+                "apiVersion": "v1",
+                "metadata": {"resourceVersion": "12"},
+                "items": [config_map_change("a", 11).value, config_map_change("b", 12).value]
+            }),
+        )
+        .unwrap();
+        let list: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(list.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(list["kind"], "PartialObjectMetadataList", "{list}");
+        assert_eq!(list["apiVersion"], "meta.k8s.io/v1", "{list}");
+        assert_eq!(list["metadata"]["resourceVersion"], "12", "{list}");
+        let items = list["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2, "{list}");
+        for item in items {
+            assert_metadata_only(item, "list item");
+        }
+
+        let mut registry = engenho_store::watch_backend::WatcherRegistry::new();
+        let live = registry.register_captured(
+            vec![config_map_change("a", 11), config_map_change("b", 12)],
+            Revision(12),
+            &engenho_store::WatchOpts {
+                from: Revision(10),
+                buffer: 16,
+                bookmark_every: std::time::Duration::from_nanos(1),
+            },
+        );
+        registry.tick_bookmarks(
+            Revision(20),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        );
+        drop(registry);
+        let overflowed = overflowing(vec![
+            config_map_change("a", 11),
+            config_map_change("b", 12),
+            config_map_change("c", 13),
+        ]);
+
+        for (scenario, stream) in [("live bookmark", live), ("overflow end", overflowed)] {
+            let h = FakeHandler::watching("ConfigMap", "configmaps", FakeWatch::Once(Some(stream)));
+            let lines = watch_lines_as(h, 10, true, metadata_codec(METADATA_ACCEPT)).await;
+            assert_eq!(
+                line_types(&lines),
+                ["ADDED", "ADDED", "BOOKMARK"],
+                "{scenario}: {lines:?}"
+            );
+            for line in &lines {
+                assert_metadata_only(&line["object"], scenario);
+            }
+        }
     }
 
     fn line_types(lines: &[serde_json::Value]) -> Vec<&str> {
