@@ -294,6 +294,19 @@ pub enum NativeWorkloads {
     Outlive,
 }
 
+/// Whether `batch/v1` (Job, CronJob) is served as protobuf. `Served`, the
+/// default: client-go creates a Job as protobuf and treats a 415 as terminal.
+/// `Refused`: a protobuf body under `/apis/batch/` is 415, and a read is JSON
+/// when the client takes JSON, else 406.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(missing_docs)]
+pub enum BatchProtobuf {
+    #[default]
+    Served,
+    Refused,
+}
+
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -543,6 +556,9 @@ pub struct RuntimeConfig {
     #[allow(missing_docs)]
     #[serde(default)]
     pub health_reasons: HealthReasons,
+    #[allow(missing_docs)]
+    #[serde(default)]
+    pub batch_protobuf: BatchProtobuf,
     /// Optional explicit podman binary path.
     ///
     /// Used by the shell-out backend, and by the `PodmanApi` backend ONLY on
@@ -618,6 +634,7 @@ impl TieredConfig for RuntimeConfig {
             cert_rotation: CertRotation::Renew,
             native_workloads: NativeWorkloads::Bound,
             health_reasons: HealthReasons::Withheld,
+            batch_protobuf: BatchProtobuf::Served,
             podman_binary: None,
             host_path_allowlist: Vec::new(),
             node_manifests_dir: PathBuf::new(),
@@ -693,6 +710,7 @@ impl TieredConfig for RuntimeConfig {
             cert_rotation: CertRotation::Renew,
             native_workloads: NativeWorkloads::Bound,
             health_reasons: HealthReasons::Named,
+            batch_protobuf: BatchProtobuf::Served,
             podman_binary: None,
             host_path_allowlist: Vec::new(),
             node_manifests_dir: PathBuf::from(DEFAULT_NODE_MANIFESTS_DIR),
@@ -766,6 +784,7 @@ impl TieredConfig for RuntimeConfig {
             cert_rotation: self.cert_rotation,
             native_workloads: self.native_workloads,
             health_reasons: self.health_reasons,
+            batch_protobuf: self.batch_protobuf,
             // No "unset" sentinel on an enum whose safe arm is also a
             // meaningful value, so the overlay's value wins — same rule as
             // `durable` and `kubelet_backend` above. A node asking for
@@ -1087,6 +1106,7 @@ mod tests {
             cert_rotation: CertRotation::Renew,
             native_workloads: NativeWorkloads::Bound,
             health_reasons: HealthReasons::Withheld,
+            batch_protobuf: BatchProtobuf::Served,
             podman_binary: None,
             host_path_allowlist: Vec::new(),
             node_manifests_dir: PathBuf::new(),
@@ -1774,5 +1794,43 @@ mod cert_rotation_tests {
             EngenhoConfig::from_yaml_with_defaults("runtime:\n  cert_rotation: off\n").unwrap();
         assert_eq!(cfg.runtime.cert_rotation, CertRotation::Off);
         assert!(EngenhoConfig::from_yaml_with_defaults("runtime:\n  cert_rotation: x\n").is_err());
+    }
+}
+
+#[cfg(test)]
+mod batch_protobuf_tests {
+    use super::BatchProtobuf;
+    use crate::EngenhoConfig;
+    use shikumi::TieredConfig;
+
+    #[test]
+    fn a_config_that_does_not_name_it_is_served() {
+        let cfg = EngenhoConfig::from_yaml_with_defaults("runtime: {}\n").expect("parses");
+        assert_eq!(cfg.runtime.batch_protobuf, BatchProtobuf::Served);
+        assert_eq!(
+            super::RuntimeConfig::prescribed_default().batch_protobuf,
+            BatchProtobuf::Served
+        );
+        assert_eq!(
+            super::RuntimeConfig::bare().batch_protobuf,
+            BatchProtobuf::Served
+        );
+    }
+
+    #[test]
+    fn each_wire_name_reads_back_as_its_variant() {
+        for (wire, want) in [
+            ("served", BatchProtobuf::Served),
+            ("refused", BatchProtobuf::Refused),
+        ] {
+            let cfg = EngenhoConfig::from_yaml_with_defaults(&format!(
+                "runtime:\n  batch_protobuf: {wire}\n"
+            ))
+            .unwrap_or_else(|e| panic!("`{wire}` must parse: {e}"));
+            assert_eq!(cfg.runtime.batch_protobuf, want);
+        }
+        assert!(
+            EngenhoConfig::from_yaml_with_defaults("runtime:\n  batch_protobuf: maybe\n").is_err()
+        );
     }
 }

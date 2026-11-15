@@ -289,6 +289,11 @@ in
         entirely client-side. Switching between them does not migrate, restart
         or orphan anything.
       '';
+      batchProtobuf = optional (types.enum [ "served" "refused" ]) ''
+        Whether `batch/v1` (Job, CronJob) is served as protobuf. `served`
+        (engenho's default): client-go creates a Job as protobuf. `refused`: a
+        protobuf body is 415 and a read falls back to JSON.
+      '';
       healthReasons = optional (types.enum [ "named" "withheld" ]) ''
         What a failing `/livez`, `/healthz` or `/readyz` check says in the
         body. `named` (engenho's default): `[-]<check> failed: <reason>`.
@@ -705,6 +710,7 @@ in
         cert_rotation = cfg.runtime.certRotation;
         native_workloads = cfg.runtime.nativeWorkloads;
         health_reasons = cfg.runtime.healthReasons;
+        batch_protobuf = cfg.runtime.batchProtobuf;
         host_path_allowlist = cfg.runtime.hostPathAllowlist;
         node_manifests_dir = cfg.runtime.nodeManifestsDir;
         # DERIVED, never a second hand-list: an explicit `podmanBinary` wins,

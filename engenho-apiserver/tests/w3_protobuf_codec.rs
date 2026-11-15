@@ -11,7 +11,7 @@
 //! .configMapKeyRef` came back as `{"localObjectReference": {"name": …}}`;
 //! and a protobuf READ of any Deployment that declares resources failed,
 //! because `"500m"` is not a `Quantity` message. A protobuf read of a kind
-//! with no vendored message (batch, networking, discovery, storage, …) was a
+//! with no vendored message (networking, discovery, storage, …) was a
 //! 400 even though every client-go client also accepts JSON.
 //!
 //! ## The oracle
@@ -1273,7 +1273,7 @@ fn every_covered_kind_round_trips_exactly_as_object_and_list() {
     );
     assert_eq!(
         cells,
-        29 + 25,
+        31 + 27,
         "every covered kind, and every list upstream defines"
     );
 }
@@ -1322,8 +1322,8 @@ fn every_payload_row_names_a_covered_kind() {
     }
 }
 
-/// The coverage census, pinned: 29 served kinds have a vendored message and
-/// 23 do not. The 22 are answered in JSON when the client takes JSON (every
+/// The coverage census, pinned: 31 served kinds have a vendored message and
+/// 21 do not. The 21 are answered in JSON when the client takes JSON (every
 /// client-go client does) and refused with 415 as a protobuf request body.
 /// Vendoring a group into engenho-kube-proto moves kinds from the second
 /// list to the first, and this test is where that is recorded.
@@ -1335,7 +1335,7 @@ fn the_protobuf_coverage_census() {
         .map(|d| [d.api_version, "/", d.kind].concat())
         .collect();
     uncovered.sort();
-    assert_eq!(covered_kinds().len(), 29);
+    assert_eq!(covered_kinds().len(), 31);
     assert_eq!(
         uncovered,
         [
@@ -1345,8 +1345,6 @@ fn the_protobuf_coverage_census() {
             "apiregistration.k8s.io/v1/APIService",
             "authorization.k8s.io/v1/LocalSubjectAccessReview",
             "autoscaling/v2/HorizontalPodAutoscaler",
-            "batch/v1/CronJob",
-            "batch/v1/Job",
             "certificates.k8s.io/v1/CertificateSigningRequest",
             "discovery.k8s.io/v1/EndpointSlice",
             "flowcontrol.apiserver.k8s.io/v1/FlowSchema",
@@ -1513,6 +1511,10 @@ fn every_inline_embed_is_a_message_field_in_the_pool() {
 // ── over HTTP ───────────────────────────────────────────────────────────────
 
 async fn boot() -> (Arc<StoreMesh>, ApiServer) {
+    boot_with(engenho_apiserver::BatchProtobuf::Served).await
+}
+
+async fn boot_with(batch: engenho_apiserver::BatchProtobuf) -> (Arc<StoreMesh>, ApiServer) {
     let router = InProcessRouter::new();
     let cfg = default_config("apiserver-w3-proto").unwrap();
     let store = Arc::new(
@@ -1523,7 +1525,8 @@ async fn boot() -> (Arc<StoreMesh>, ApiServer) {
     store.initialize_singleton().await.unwrap();
     assert!(store.wait_for_leadership(Duration::from_secs(3)).await);
     let handlers = handlers_from_catalog(store.clone());
-    let server = ApiServer::start("127.0.0.1:0".parse().unwrap(), handlers, None)
+    let state = engenho_apiserver::RouterState::new(handlers).with_batch_protobuf(batch);
+    let server = ApiServer::start_with_state("127.0.0.1:0".parse().unwrap(), state, None)
         .await
         .unwrap();
     (store, server)
@@ -1667,6 +1670,86 @@ async fn a_protobuf_lease_keeps_its_micro_time() {
     let stored = protobuf_read_equals_json_read(&client, &url).await;
     assert_eq!(stored["spec"]["renewTime"], "2024-09-10T20:26:55.123456Z");
     assert_eq!(stored["spec"]["acquireTime"], "2024-09-10T20:26:40.000000Z");
+}
+
+/// client-go 0.35 creates a `batch/v1` Job over protobuf and never retries a
+/// 415 in JSON; the create was refused with `no protobuf serialization for
+/// apiVersion="batch/v1" kind="Job"` (measured on plo 2026-11-15, engenho
+/// 7279198). The Job is stored as upstream JSON and reads back over protobuf.
+#[tokio::test]
+async fn a_protobuf_job_create_is_stored_and_reads_back() {
+    let (_store, server) = boot().await;
+    let base = format!("http://{}", server.local_addr());
+    let client = reqwest::Client::new();
+    let container = wire::msg(2, &[wire::string(1, "probe"), wire::string(2, "alpine")]);
+    let pod_spec = wire::msg(2, &[container, wire::string(3, "Never")]);
+    let job = [
+        wire::msg(1, &[wire::string(1, "probe"), wire::string(3, "default")]),
+        wire::msg(2, &[wire::int(7, 2), wire::msg(6, &[pod_spec])]),
+    ];
+
+    let resp = client
+        .post(format!("{base}/apis/batch/v1/namespaces/default/jobs"))
+        .header("Content-Type", CONTENT_TYPE_PROTOBUF)
+        .header("Accept", PROTOBUF_OR_JSON)
+        .body(wire::go_frame("batch/v1", "Job", &job))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CREATED,
+        "{:?}",
+        resp.text().await
+    );
+
+    let url = format!("{base}/apis/batch/v1/namespaces/default/jobs/probe");
+    let stored = protobuf_read_equals_json_read(&client, &url).await;
+    assert_eq!(stored["spec"]["backoffLimit"], 2);
+    assert_eq!(
+        stored["spec"]["template"]["spec"]["containers"][0],
+        json!({"name": "probe", "image": "alpine"})
+    );
+    assert_eq!(stored["spec"]["template"]["spec"]["restartPolicy"], "Never");
+}
+
+/// `runtime.batch_protobuf: refused` answers `batch` as a kind with no
+/// vendored message: a protobuf body is 415, and a read is JSON when the
+/// client also takes JSON.
+#[tokio::test]
+async fn refused_batch_protobuf_is_answered_as_an_uncovered_kind() {
+    let (_store, server) = boot_with(engenho_apiserver::BatchProtobuf::Refused).await;
+    let base = format!("http://{}", server.local_addr());
+    let client = reqwest::Client::new();
+    let job = [wire::msg(
+        1,
+        &[wire::string(1, "probe"), wire::string(3, "default")],
+    )];
+    let resp = client
+        .post(format!("{base}/apis/batch/v1/namespaces/default/jobs"))
+        .header("Content-Type", CONTENT_TYPE_PROTOBUF)
+        .header("Accept", PROTOBUF_OR_JSON)
+        .body(wire::go_frame("batch/v1", "Job", &job))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+    let resp = client
+        .get(format!("{base}/apis/batch/v1/namespaces/default/jobs"))
+        .header("Accept", PROTOBUF_OR_JSON)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert!(content_type(&resp).starts_with("application/json"));
+    let resp = client
+        .get(format!("{base}/apis/batch/v1/namespaces/default/jobs"))
+        .header("Accept", CONTENT_TYPE_PROTOBUF)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_ACCEPTABLE);
 }
 
 /// A kind with no vendored message is answered in JSON when the client takes

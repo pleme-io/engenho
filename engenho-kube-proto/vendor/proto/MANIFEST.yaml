@@ -97,3 +97,9 @@ files:
     description: "authorization v1 — SubjectAccessReview family (kubectl auth can-i)"
     blake3: "8e1f71c58a2c94e9ecc67e30ec663050c7b5c62bd58c9439fa57e09512da386b"
     bytes: 11656
+  - path: k8s.io/api/batch/v1/generated.proto
+    group: batch
+    version: v1
+    description: "batch v1 — Job, CronJob (client-go 0.35 creates a Job as protobuf and never retries a 415 in JSON)"
+    blake3: "3616ff518b86fb74036c8c89a4cba68daaa7ad64a5a662592253a90a6e203471"
+    bytes: 29060

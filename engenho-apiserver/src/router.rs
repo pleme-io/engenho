@@ -156,6 +156,72 @@ pub struct RouterState {
     /// What became of leaf certificate renewals, when this node renews.
     pub cert_renewals: Option<Arc<crate::pki_rotation::RenewalCounts>>,
     pub api_face: engenho_types::ApiFace,
+    /// Whether `batch/v1` is served as protobuf. [`BatchProtobuf::Refused`]
+    /// answers a protobuf body 415 and a protobuf-only `Accept` 406, as for
+    /// a kind with no vendored message.
+    pub batch_protobuf: BatchProtobuf,
+}
+
+/// Whether `batch/v1` (Job, CronJob) is served as protobuf.
+///
+/// `Served` is the default: client-go creates a Job as protobuf and treats a
+/// 415 as terminal (it falls back to JSON only from CBOR). `Refused` answers
+/// `batch` as a kind with no vendored message: a protobuf body is 415, and a
+/// response is JSON when the client takes JSON, else 406.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BatchProtobuf {
+    #[default]
+    Served,
+    Refused,
+}
+
+/// The path prefix of the `batch` group.
+const BATCH_PREFIX: &str = "/apis/batch/";
+
+/// [`BatchProtobuf::Refused`]: a protobuf body under `/apis/batch/` is 415;
+/// an `Accept` loses its protobuf ranges, and one with nothing left is 406.
+async fn refuse_batch_protobuf(
+    mut req: axum::http::Request<Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    if !req.uri().path().starts_with(BATCH_PREFIX) {
+        return next.run(req).await;
+    }
+    let refused = |what: &str| {
+        format!(
+            "no protobuf serialization for the batch group ({what}): runtime.batch_protobuf is refused"
+        )
+    };
+    if req
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(is_protobuf_content_type)
+    {
+        return ApiError::UnsupportedMediaType(refused("request body")).into_response();
+    }
+    if let Some(accept) = req
+        .headers()
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .filter(|a| a.contains(CONTENT_TYPE_PROTOBUF))
+    {
+        let rest: Vec<&str> = accept
+            .split(',')
+            .map(str::trim)
+            .filter(|r| !is_protobuf_content_type(r))
+            .collect();
+        if rest.is_empty() {
+            return ApiError::NotAcceptable(refused("response")).into_response();
+        }
+        match axum::http::HeaderValue::from_str(&rest.join(",")) {
+            Ok(v) => {
+                req.headers_mut().insert(axum::http::header::ACCEPT, v);
+            }
+            Err(_) => return ApiError::NotAcceptable(refused("response")).into_response(),
+        }
+    }
+    next.run(req).await
 }
 
 impl RouterState {
@@ -190,7 +256,14 @@ impl RouterState {
             audit_log: None,
             cert_renewals: None,
             api_face: engenho_types::ApiFace::VENDORED,
+            batch_protobuf: BatchProtobuf::Served,
         }
+    }
+
+    #[must_use]
+    pub fn with_batch_protobuf(mut self, batch: BatchProtobuf) -> Self {
+        self.batch_protobuf = batch;
+        self
     }
 
     #[must_use]
@@ -418,7 +491,12 @@ pub fn build(state: RouterState) -> Router {
     let authenticator = state.authenticator.clone();
     let authorizer = state.authorizer.clone();
     let audit_log = state.audit_log.clone();
+    let batch_protobuf = state.batch_protobuf;
     let router = build_routes(state);
+    let router = match batch_protobuf {
+        BatchProtobuf::Served => router,
+        BatchProtobuf::Refused => router.layer(axum::middleware::from_fn(refuse_batch_protobuf)),
+    };
     // Layer order (axum: the LAST `.layer()` is OUTERMOST), outside in:
     //
     //   1. request-info — classifies the request ONCE (method + decoded path +

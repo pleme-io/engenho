@@ -113,7 +113,7 @@ pub use pod_stream::{
     PodStreamKind, PodStreamProxy, PodStreamTarget, PodStreamUpstream, dial_kubelet,
     dial_kubelet_with, kubelet_authority_of_node,
 };
-pub use router::{RouterState, build};
+pub use router::{BatchProtobuf, RouterState, build};
 pub use scale::{
     Scale, ScaleMeta, ScaleSpec, ScaleStatus, UnprojectableScale, label_selector_to_string,
     project_scale,

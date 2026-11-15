@@ -72,6 +72,9 @@ fn main() {
         // application/vnd.kubernetes.protobuf, so every controller-runtime
         // manager needs this descriptor before it can become leader.
         "k8s.io/api/coordination/v1/generated.proto",
+        // Job and CronJob — client-go creates a Job as protobuf and treats a
+        // 415 as terminal, so a controller that runs Jobs needs it.
+        "k8s.io/api/batch/v1/generated.proto",
         "k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto",
         "k8s.io/apimachinery/pkg/runtime/generated.proto",
         "k8s.io/apimachinery/pkg/runtime/schema/generated.proto",

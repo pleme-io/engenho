@@ -478,6 +478,10 @@ impl Runtime {
             engenho_config::HealthReasons::Withheld => {
                 engenho_apiserver::health::FailureReasons::Withheld
             }
+        })
+        .with_batch_protobuf(match boot.batch_protobuf {
+            engenho_config::BatchProtobuf::Served => engenho_apiserver::BatchProtobuf::Served,
+            engenho_config::BatchProtobuf::Refused => engenho_apiserver::BatchProtobuf::Refused,
         });
         let router_state = match boot.api_audit {
             engenho_config::ApiAudit::Record => {

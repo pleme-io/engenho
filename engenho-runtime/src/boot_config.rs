@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use engenho_config::{
-    ApiAudit, CertRotation, ClosureLocalBuilds, ClusterConfig, ConsistencyConfig,
+    ApiAudit, BatchProtobuf, CertRotation, ClosureLocalBuilds, ClusterConfig, ConsistencyConfig,
     ConsistencyTierKind, ControllerEnable, ControllersConfig, DatapathMode, EngenhoConfig, Fabric,
     HealthReasons, JobSelector, KubeconfigVisibility, KubeletAuth, KubeletBackendKind,
     LegacyTeiaSection, NativeCgroups, NativeMounts, NativeSecurity, NativeWorkloads,
@@ -89,6 +89,7 @@ pub(crate) struct BootConfig {
     pub(crate) cert_rotation: CertRotation,
     pub(crate) native_workloads: NativeWorkloads,
     pub(crate) health_reasons: HealthReasons,
+    pub(crate) batch_protobuf: BatchProtobuf,
     /// `runtime.podman_binary`, read with `kubelet_backend`.
     pub(crate) podman_binary: Option<String>,
     /// `runtime.host_path_allowlist`.
@@ -209,6 +210,7 @@ impl BootConfig {
             cert_rotation,
             native_workloads,
             health_reasons,
+            batch_protobuf,
             podman_binary,
             host_path_allowlist,
             node_manifests_dir,
@@ -245,6 +247,7 @@ impl BootConfig {
             cert_rotation: *cert_rotation,
             native_workloads: *native_workloads,
             health_reasons: *health_reasons,
+            batch_protobuf: *batch_protobuf,
             podman_binary: podman_binary.clone(),
             host_path_allowlist: host_path_allowlist.clone(),
             node_manifests_dir: node_manifests_dir.clone(),

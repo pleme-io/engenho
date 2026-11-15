@@ -177,6 +177,11 @@ fn package_for_api_version(api_version: &str) -> Option<&'static str> {
         // with an empty status, and the pods reported Running the whole time —
         // a workload that holds no lease looks perfectly healthy from outside.
         "coordination.k8s.io/v1" => Some("k8s.io.api.coordination.v1"),
+        // Job, CronJob — client-go 0.35 creates a Job as protobuf, and a 415
+        // is terminal for a protobuf request (it falls back only from CBOR):
+        // `no protobuf serialization for apiVersion="batch/v1" kind="Job"`
+        // (measured on plo 2026-11-15).
+        "batch/v1" => Some("k8s.io.api.batch.v1"),
         _ => None,
     }
 }

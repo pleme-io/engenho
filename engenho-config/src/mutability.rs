@@ -285,6 +285,7 @@ fn build() -> Vec<LeafSpec> {
         cert_rotation => restart,
         native_workloads => restart,
         health_reasons => restart,
+        batch_protobuf => restart,
         podman_binary => restart,
         host_path_allowlist => restart,
         node_manifests_dir => restart,
