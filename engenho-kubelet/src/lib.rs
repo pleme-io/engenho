@@ -119,9 +119,9 @@ pub use lifecycle::{
     RunningAction, down_action, reconcile_pod_phase, running_action, starts_fresh,
 };
 pub use pod_volume::{
-    BindSource, FakeVolumeMaterializer, MaterializedDir, MountSource, NoServiceAccountProjection,
-    PodVolumeSource, PodmanVolumeMaterializer, ResolvedMount, SA_MOUNT_PATH,
-    ServiceAccountProjector, VolumeMaterializer, VolumeResolveError, VolumeTeardown,
+    BindSource, EmptyDirBacking, FakeVolumeMaterializer, MaterializedDir, MountSource,
+    NoServiceAccountProjection, PodVolumeSource, PodmanVolumeMaterializer, ResolvedMount,
+    SA_MOUNT_PATH, ServiceAccountProjector, VolumeMaterializer, VolumeResolveError, VolumeTeardown,
     resolve_pod_volumes, teardown_obligation,
 };
 pub use probe::{

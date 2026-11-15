@@ -1609,6 +1609,20 @@ pub struct PodmanVolumeMaterializer {
     /// per materializer, because it decides [`Mountpoint`] classification and
     /// cannot change under a running podman connection.
     service_is_remote: tokio::sync::OnceCell<bool>,
+    /// What backs an `emptyDir`: a podman volume, or a host directory under
+    /// [`data_root`](Self::data_root) for a node with no container runtime.
+    empty_dirs: EmptyDirBacking,
+}
+
+/// What backs an `emptyDir` volume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EmptyDirBacking {
+    /// A podman named volume, resolved to its mountpoint.
+    #[default]
+    PodmanVolume,
+    /// A host directory `<data_root>/<ns>_<pod>/empty-<volume>`, for a native
+    /// node, which has no podman to create a volume with.
+    HostDir,
 }
 
 impl Default for PodmanVolumeMaterializer {
@@ -1617,6 +1631,7 @@ impl Default for PodmanVolumeMaterializer {
             binary: "podman".to_string(),
             data_root: default_data_root(),
             service_is_remote: tokio::sync::OnceCell::new(),
+            empty_dirs: EmptyDirBacking::PodmanVolume,
         }
     }
 }
@@ -1772,6 +1787,21 @@ impl PodmanVolumeMaterializer {
     pub fn with_data_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.data_root = root.into();
         self
+    }
+
+    /// Builder: back every `emptyDir` with a host directory instead of a
+    /// podman volume.
+    #[must_use]
+    pub fn with_empty_dirs(mut self, backing: EmptyDirBacking) -> Self {
+        self.empty_dirs = backing;
+        self
+    }
+
+    /// The host dir backing an `emptyDir` when [`EmptyDirBacking::HostDir`].
+    fn empty_dir_host_dir(&self, namespace: &str, pod: &str, volume: &str) -> PathBuf {
+        self.data_root
+            .join(format!("{namespace}_{pod}"))
+            .join(format!("empty-{volume}"))
     }
 
     /// The per-pod-per-volume host dir: `<data_root>/<ns>_<pod>/<volume>`.
@@ -1957,6 +1987,14 @@ impl VolumeMaterializer for PodmanVolumeMaterializer {
         pod: &str,
         volume: &str,
     ) -> Result<MountSource, VolumeResolveError> {
+        if self.empty_dirs == EmptyDirBacking::HostDir {
+            let dir = self.empty_dir_host_dir(namespace, pod, volume);
+            std::fs::create_dir_all(&dir).map_err(|e| {
+                VolumeResolveError::Materialize(format!("mkdir {}: {e}", dir.display()))
+            })?;
+            Self::open_empty_dir_to_every_uid(&HostPath::new(dir.clone()))?;
+            return Ok(MountSource::EmptyDirHostDir(dir));
+        }
         let vol_name = Self::empty_dir_volume_name(namespace, pod, volume);
         // `podman volume create` is idempotent in effect: creating an
         // existing volume returns its name with exit 0. We tolerate a
@@ -2030,6 +2068,14 @@ impl VolumeMaterializer for PodmanVolumeMaterializer {
         pod: &str,
         volume: &str,
     ) -> Result<(), VolumeResolveError> {
+        if self.empty_dirs == EmptyDirBacking::HostDir {
+            let dir = self.empty_dir_host_dir(namespace, pod, volume);
+            remove_materialized_dir(&dir)?;
+            if let Some(pod_dir) = dir.parent() {
+                remove_if_empty(pod_dir)?;
+            }
+            return Ok(());
+        }
         let vol_name = Self::empty_dir_volume_name(namespace, pod, volume);
         // `podman volume rm` of an absent volume exits non-zero with a "no
         // such volume" stderr — idempotent SUCCESS for the delete path (a
@@ -2400,6 +2446,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mat.removed_empty_dirs().await, vec!["scratch".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_native_node_backs_an_empty_dir_with_a_host_dir_and_no_podman() {
+        let root =
+            std::env::temp_dir().join(format!("engenho-native-empty-{}", std::process::id()));
+        let m = PodmanVolumeMaterializer::with_binary("/nonexistent/podman")
+            .with_data_root(&root)
+            .with_empty_dirs(EmptyDirBacking::HostDir);
+        let src = m
+            .ensure_empty_dir("ns", "pod", "data")
+            .await
+            .expect("host dir");
+        let MountSource::EmptyDirHostDir(dir) = src else {
+            panic!("not a host dir: {src:?}");
+        };
+        assert!(
+            dir.starts_with(&root),
+            "{} outside {}",
+            dir.display(),
+            root.display()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dir)
+                .expect("exists")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o777, "an emptyDir must be writable by any uid");
+        }
+        m.remove_empty_dir("ns", "pod", "data")
+            .await
+            .expect("removed");
+        assert!(!dir.exists(), "{} survived removal", dir.display());
+        assert!(
+            !dir.parent().expect("pod dir").exists(),
+            "the empty pod dir survived"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_podman_node_still_asks_podman_for_an_empty_dir() {
+        let m = PodmanVolumeMaterializer::with_binary("/nonexistent/podman");
+        let err = m
+            .ensure_empty_dir("ns", "pod", "data")
+            .await
+            .expect_err("no podman");
+        assert!(err.to_string().contains("podman volume create"), "{err}");
     }
 
     #[tokio::test]

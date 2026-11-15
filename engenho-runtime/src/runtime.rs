@@ -4376,7 +4376,11 @@ fn build_kubelet(
             // the same one the CSI layer is being handed.
             Arc::new(
                 engenho_kubelet::PodmanVolumeMaterializer::new()
-                    .with_data_root(Area::Volumes.path(&boot.data_dir)),
+                    .with_data_root(Area::Volumes.path(&boot.data_dir))
+                    .with_empty_dirs(match boot.kubelet_backend {
+                        CfgBackendKind::Native => engenho_kubelet::EmptyDirBacking::HostDir,
+                        _ => engenho_kubelet::EmptyDirBacking::PodmanVolume,
+                    }),
             ),
             csi_drivers.clone(),
             boot.data_dir.clone(),
