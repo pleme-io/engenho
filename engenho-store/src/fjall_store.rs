@@ -944,6 +944,26 @@ impl FjallStore {
             .map_err(|e| map(&e))
     }
 
+    fn purge_span(
+        &self,
+        last_purged: Option<LogId<RNodeId>>,
+        upto: u64,
+    ) -> Result<std::ops::RangeInclusive<u64>, StorageError<RNodeId>> {
+        let first = match last_purged {
+            Some(purged) => purged.index.saturating_add(1),
+            None => match self
+                .inner
+                .log
+                .first_key_value()
+                .map_err(|e| read_logs_err(&e))?
+            {
+                Some((key, _)) => be_bytes_to_u64(&key),
+                None => upto.saturating_add(1),
+            },
+        };
+        Ok(first..=upto)
+    }
+
     /// Durably write a batch of log entries: serialize each, insert
     /// under its big-endian index key, then fsync ONCE. Shared by the
     /// openraft `append` trait method (which acks the flush callback
@@ -1241,7 +1261,7 @@ impl RaftLogStorage<TypeConfig> for FjallStore {
     async fn truncate(&mut self, log_id: LogId<RNodeId>) -> Result<(), StorageError<RNodeId>> {
         // Remove all entries with idx >= log_id.index.
         let from = log_id.index.to_be_bytes();
-        let keys: Vec<Vec<u8>> = collect_keys_in_range(&self.inner.log, from.., None)?;
+        let keys: Vec<Vec<u8>> = collect_keys_in_range(&self.inner.log, from..)?;
         for k in keys {
             self.inner.log.remove(k).map_err(|e| write_logs_err(&e))?;
         }
@@ -1249,15 +1269,22 @@ impl RaftLogStorage<TypeConfig> for FjallStore {
     }
 
     async fn purge(&mut self, log_id: LogId<RNodeId>) -> Result<(), StorageError<RNodeId>> {
-        // Remove all entries with idx <= log_id.index.
-        let keys: Vec<Vec<u8>> = collect_keys_in_range(&self.inner.log, .., Some(log_id.index))?;
-        for k in keys {
-            self.inner.log.remove(k).map_err(|e| write_logs_err(&e))?;
+        let last_purged = self.inner.state.lock().await.last_purged;
+        let span = self.purge_span(last_purged, log_id.index)?;
+        let mut batch = self
+            .inner
+            .keyspace
+            .batch()
+            .durability(Some(fjall::PersistMode::SyncAll));
+        for index in span {
+            batch.remove(&self.inner.log, index.to_be_bytes());
         }
-        meta_put_json(&self.inner.meta, META_LAST_PURGED, &Some(log_id), |e| {
-            write_logs_err(&io_to_anyerror_dyn(e))
-        })?;
-        self.persist(write_logs_err)?;
+        batch.insert(
+            &self.inner.meta,
+            META_LAST_PURGED,
+            serde_json::to_vec(&Some(log_id)).map_err(|e| write_logs_err(&e))?,
+        );
+        batch.commit().map_err(|e| write_logs_err(&e))?;
         self.inner.state.lock().await.last_purged = Some(log_id);
         Ok(())
     }
@@ -1283,31 +1310,14 @@ fn u64_range_to_be_bytes<RB: RangeBounds<u64>>(
     (lo, hi)
 }
 
-/// Collect the keys of every log entry in `[from..]` (when
-/// `up_to_inclusive` is `None`) or with `index <= up_to_inclusive`
-/// (when `Some`). Used by truncate/purge which then issue removes.
 fn collect_keys_in_range(
     log: &fjall::PartitionHandle,
     from: impl RangeBounds<[u8; 8]>,
-    up_to_inclusive: Option<u64>,
 ) -> Result<Vec<Vec<u8>>, StorageError<RNodeId>> {
     let mut keys = Vec::new();
-    match up_to_inclusive {
-        None => {
-            for kv in log.range(from) {
-                let (k, _) = kv.map_err(|e| write_logs_err(&e))?;
-                keys.push(k.to_vec());
-            }
-        }
-        Some(limit) => {
-            for kv in log.iter() {
-                let (k, _) = kv.map_err(|e| write_logs_err(&e))?;
-                let idx = be_bytes_to_u64(&k);
-                if idx <= limit {
-                    keys.push(k.to_vec());
-                }
-            }
-        }
+    for kv in log.range(from) {
+        let (k, _) = kv.map_err(|e| write_logs_err(&e))?;
+        keys.push(k.to_vec());
     }
     Ok(keys)
 }
@@ -1708,6 +1718,67 @@ mod tests {
         let state = s2.get_log_state().await.unwrap();
         assert_eq!(state.last_log_id.map(|l| l.index), Some(3));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn append_span(s: &FjallStore, span: std::ops::RangeInclusive<u64>) {
+        let indices: Vec<u64> = span.collect();
+        for chunk in indices.chunks(10_000) {
+            s.append_entries_durable(chunk.iter().map(|&i| put_entry(i, "p")))
+                .unwrap();
+        }
+    }
+
+    async fn timed_purge(s: &mut FjallStore, upto: u64) -> std::time::Duration {
+        let started = std::time::Instant::now();
+        s.purge(LogId {
+            leader_id: CommittedLeaderId::new(1, 0),
+            index: upto,
+        })
+        .await
+        .unwrap();
+        started.elapsed()
+    }
+
+    #[tokio::test]
+    async fn a_purge_costs_its_own_span_not_the_history_purged_before_it() {
+        const HISTORY: u64 = 400_000;
+        const SPAN: u64 = 1_000;
+        let shallow_dir = temp_dir("purge-shallow");
+        let deep_dir = temp_dir("purge-deep");
+        let _ = std::fs::remove_dir_all(&shallow_dir);
+        let _ = std::fs::remove_dir_all(&deep_dir);
+
+        let mut shallow = FjallStore::open(&shallow_dir).unwrap();
+        append_span(&shallow, 1..=4 * SPAN);
+        timed_purge(&mut shallow, SPAN).await;
+        let shallow_cost = timed_purge(&mut shallow, 2 * SPAN).await;
+
+        let mut deep = FjallStore::open(&deep_dir).unwrap();
+        append_span(&deep, 1..=HISTORY + 2 * SPAN);
+        timed_purge(&mut deep, HISTORY).await;
+        let deep_cost = timed_purge(&mut deep, HISTORY + SPAN).await;
+
+        let read = deep.try_get_log_entries(..).await.unwrap();
+        assert_eq!(
+            read.first().map(|e| e.log_id.index),
+            Some(HISTORY + SPAN + 1)
+        );
+        assert_eq!(read.len() as u64, SPAN);
+        let state = deep.get_log_state().await.unwrap();
+        assert_eq!(
+            state.last_purged_log_id.map(|l| l.index),
+            Some(HISTORY + SPAN)
+        );
+
+        assert!(
+            deep_cost <= shallow_cost * 5 + std::time::Duration::from_millis(100),
+            "purging {SPAN} entries took {deep_cost:?} behind {HISTORY} purged ones and {shallow_cost:?} behind {SPAN}: \
+             purge runs inside openraft's core, so its cost is how long every read index and write waits"
+        );
+        drop(shallow);
+        drop(deep);
+        let _ = std::fs::remove_dir_all(&shallow_dir);
+        let _ = std::fs::remove_dir_all(&deep_dir);
     }
 
     #[tokio::test]
