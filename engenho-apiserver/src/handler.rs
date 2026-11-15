@@ -112,9 +112,9 @@ pub trait ResourceHandler: Send + Sync + 'static {
     }
 
     /// PUT (full-object replace) the parent's `/status`. Default typed 404.
-    /// `StoreBackedHandler` writes ONLY `.status` from the incoming object
-    /// (spec/metadata preserved by the RFC7396 merge + generation preserved
-    /// by `compute_generation_on_put` on a status-only write).
+    /// `StoreBackedHandler` replaces `.status` with the incoming object's
+    /// `.status` exactly (RFC 6902 add/remove on `/status`; spec and metadata
+    /// untouched, generation preserved on a status-only write).
     async fn put_status(
         &self,
         _namespace: Option<&str>,
@@ -861,9 +861,9 @@ impl ResourceHandler for StoreBackedHandler {
     //
     // Each method reads the LIVE object via `store.get`, builds a SCOPED
     // patch, and proposes a `ResourceCommand::Patch` — no new store command.
-    // The scoping is what gives spec/status isolation: a /status write
-    // carries only `{"status": …}` so `apply_patch`'s RFC7396 merge preserves
-    // spec+metadata and `compute_generation_on_put` preserves generation; a
+    // The scoping is what gives spec/status isolation: a /status PUT carries
+    // only an add/remove of `/status`, so spec+metadata are untouched and
+    // `compute_generation_on_put` preserves generation; a
     // /scale write carries only `{"spec":{"replicas":N}}`. CAS threads
     // `expected` from the incoming object's metadata.resourceVersion (same
     // `body_precondition` the main path uses) so concurrent writes conflict
@@ -893,14 +893,23 @@ impl ResourceHandler for StoreBackedHandler {
         // rv); absent → fall back to the live rv so a no-rv PUT still
         // conflicts on a concurrent change rather than blindly clobbering.
         let expected = body_precondition(&incoming)?.or_else(|| revision_of(&live));
-        // Take ONLY the incoming object's `.status` — a /status PUT may not
-        // touch spec/metadata (K8s drops them on the /status endpoint). The
-        // scoped `{"status": …}` merge patch leaves spec+metadata intact and
-        // preserves generation (status-only writes don't bump it).
-        let incoming_status = incoming.get("status").cloned().unwrap_or(Value::Null);
-        let scoped = serde_json::json!({ "status": incoming_status });
-        self.propose_scoped_patch(&key, name, scoped, expected)
-            .await
+        let ops = match incoming.get("status").filter(|s| !s.is_null()) {
+            Some(status) => {
+                serde_json::json!([{ "op": "add", "path": "/status", "value": status }])
+            }
+            None if live.get("status").is_some() => {
+                serde_json::json!([{ "op": "remove", "path": "/status" }])
+            }
+            None => serde_json::json!([]),
+        };
+        self.propose_scoped_patch_typed(
+            &key,
+            name,
+            ops,
+            engenho_types::patch::PatchType::Json,
+            expected,
+        )
+        .await
     }
 
     async fn patch_status(
