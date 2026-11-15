@@ -321,6 +321,13 @@ impl std::fmt::Display for ImageUnavailable<'_> {
 /// cap their predecessors' thousands of failures had earned. Upstream keys
 /// container backoff by pod UID. A pod with no uid (only in tests) falls
 /// back to its name.
+fn pod_uid(value: &Value) -> &str {
+    value
+        .pointer("/metadata/uid")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+}
+
 fn pod_instance(key: &ResourceKey, value: &Value) -> String {
     let label = key.label();
     match value.pointer("/metadata/uid").and_then(Value::as_str) {
@@ -619,6 +626,7 @@ pub struct SaRefreshReport {
 
 #[derive(Clone, Debug, Default)]
 struct LocalPod {
+    uid: String,
     /// Per-container records keyed by the container's logical name. These are
     /// the APP containers (`spec.containers[i]`); they are started only AFTER
     /// every init container has Succeeded (`init_complete == true`).
@@ -653,6 +661,18 @@ struct LocalPod {
 }
 
 impl LocalPod {
+    fn of(uid: &str) -> Self {
+        Self {
+            uid: uid.to_owned(),
+            ..Self::default()
+        }
+    }
+
+    fn belongs_to(&self, value: &Value) -> bool {
+        let live = pod_uid(value);
+        self.uid.is_empty() || live.is_empty() || self.uid == live
+    }
+
     /// The app-container records.
     fn apps(&mut self) -> &mut BTreeMap<String, ContainerRecord> {
         &mut self.containers
@@ -2919,6 +2939,13 @@ impl Kubelet {
         // short lock to avoid holding it across the backend await.
         let local_entry = self.local.lock().await.get(key).cloned();
 
+        if local_entry.as_ref().is_some_and(|lp| !lp.belongs_to(value)) {
+            debug!(pod = %key.label(), "a deleted pod under this name is still stopping; the new pod waits");
+            report.objects_skipped += 1;
+            Self::accumulate_requeue(soonest_requeue, MIN_PROBE_REQUEUE);
+            return Ok(());
+        }
+
         match local_entry {
             None => {
                 // (B) Not started locally. Skip if already terminal
@@ -3156,10 +3183,9 @@ impl Kubelet {
     ) {
         let orphaned: Vec<(ResourceKey, LocalPod)> = {
             let local = self.local.lock().await;
-            let live: BTreeSet<&ResourceKey> = bound.keys().collect();
             local
                 .iter()
-                .filter(|(key, _)| !live.contains(key))
+                .filter(|(key, lp)| bound.get(*key).is_none_or(|live| !lp.belongs_to(live)))
                 .map(|(key, lp)| (key.clone(), lp.clone()))
                 .collect()
         };
@@ -4055,7 +4081,9 @@ impl Kubelet {
                             .readoption_of(spec.runtime_class.as_ref().map(|r| r.name.as_str())),
                     );
                     let mut local = self.local.lock().await;
-                    let entry = local.entry(key.clone()).or_default();
+                    let entry = local
+                        .entry(key.clone())
+                        .or_insert_with(|| LocalPod::of(&spec.pod.uid));
                     // A started container mounts these, so the pod now owes
                     // their removal. A set: a later start re-resolving the
                     // same volumes owes nothing twice.
@@ -5201,7 +5229,9 @@ impl Kubelet {
     ) -> Result<crate::backend::ContainerStatus, LaunchFailed> {
         let status = self.launch(permit, spec).await?;
         let mut local = self.local.lock().await;
-        let entry = local.entry(key.clone()).or_default();
+        let entry = local
+            .entry(key.clone())
+            .or_insert_with(|| LocalPod::of(&spec.pod.uid));
         // The pod's volumes were materialized for this container too; a pod
         // deleted mid-init owes their removal as much as a running one.
         entry
@@ -5497,7 +5527,7 @@ impl Kubelet {
             .lock()
             .await
             .entry(key.clone())
-            .or_default()
+            .or_insert_with(|| LocalPod::of(pod_uid(value)))
             .init_complete = true;
         report.objects_changed += 1;
         debug!(
