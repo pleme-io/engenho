@@ -289,6 +289,7 @@ pub struct StoreMesh {
     /// Feeds peer RPCs from the router into `raft`, holding a `Raft` clone.
     /// Owned so [`Self::quiesce`] can abort AND await it.
     rpc_pump: OwnedTask,
+    deletion_generation: crate::command::DeletionGeneration,
 }
 
 impl StoreMesh {
@@ -458,7 +459,18 @@ impl StoreMesh {
             listen_addr,
             router: Box::new(router),
             rpc_pump,
+            deletion_generation: crate::command::DeletionGeneration::Bumped,
         })
+    }
+
+    /// What this node's deletes do to the generation of an object they
+    /// leave Terminating ([`crate::command::DeletionGeneration::Bumped`]
+    /// unless set). Carried in each proposed entry, so replicas replay it
+    /// whatever their own setting.
+    #[must_use]
+    pub fn with_deletion_generation(mut self, rule: crate::command::DeletionGeneration) -> Self {
+        self.deletion_generation = rule;
+        self
     }
 
     /// `true` if the underlying store already holds Raft state (a
@@ -524,7 +536,8 @@ impl StoreMesh {
             return Err(StoreError::SecretUnreadable { subject, fault });
         }
         self.stamp_births(&mut cmd).await;
-        let command = LoggedCommand::proposed(cmd);
+        let command =
+            LoggedCommand::proposed(cmd).with_deletion_generation(self.deletion_generation);
         if self.leader_known().0 != Some(self.node_id) {
             return self.forward(command).await;
         }
@@ -1269,6 +1282,7 @@ impl StoreMesh {
             // A registry of senders, not a task; `terminate` deregisters.
             router: _,
             rpc_pump,
+            deletion_generation: _,
         } = self;
         let rpc_pump = rpc_pump.stop().await;
         let bookmark_ticker = store.quiesce_bookmarks().await;

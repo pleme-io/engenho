@@ -30,11 +30,12 @@ use std::time::Duration;
 
 use engenho_config::{
     ApiAudit, BatchProtobuf, CertRotation, ClosureLocalBuilds, ClusterConfig, ConsistencyConfig,
-    ConsistencyTierKind, ControllerEnable, ControllersConfig, DatapathMode, EngenhoConfig, Fabric,
-    HealthReasons, JobSelector, KubeconfigVisibility, KubeletAuth, KubeletBackendKind,
-    LegacyTeiaSection, NativeCgroups, NativeFsGroup, NativeMounts, NativeSecurity, NativeWorkloads,
-    NetworkingConfig, RevoadaConfig, RuntimeConfig, SchedulerConfig, SecretsAtRest, SharedCluster,
-    StoredCrds, TlsConfig, TopologyConfig, TopologyStrategyKind,
+    ConsistencyTierKind, ControllerEnable, ControllersConfig, DatapathMode, DeletionGeneration,
+    EngenhoConfig, Fabric, HealthReasons, JobSelector, KubeconfigVisibility, KubeletAuth,
+    KubeletBackendKind, LegacyTeiaSection, NativeCgroups, NativeFsGroup, NativeMounts,
+    NativeSecurity, NativeWorkloads, NetworkingConfig, RevoadaConfig, RuntimeConfig,
+    SchedulerConfig, SecretsAtRest, SharedCluster, StoredCrds, TlsConfig, TopologyConfig,
+    TopologyStrategyKind,
 };
 
 use crate::health::Windows;
@@ -92,6 +93,7 @@ pub(crate) struct BootConfig {
     pub(crate) health_reasons: HealthReasons,
     pub(crate) stored_crds: StoredCrds,
     pub(crate) batch_protobuf: BatchProtobuf,
+    pub(crate) deletion_generation: DeletionGeneration,
     /// `runtime.podman_binary`, read with `kubelet_backend`.
     pub(crate) podman_binary: Option<String>,
     /// `runtime.host_path_allowlist`.
@@ -215,6 +217,7 @@ impl BootConfig {
             health_reasons,
             stored_crds,
             batch_protobuf,
+            deletion_generation,
             podman_binary,
             host_path_allowlist,
             node_manifests_dir,
@@ -254,6 +257,7 @@ impl BootConfig {
             health_reasons: *health_reasons,
             stored_crds: *stored_crds,
             batch_protobuf: *batch_protobuf,
+            deletion_generation: *deletion_generation,
             podman_binary: podman_binary.clone(),
             host_path_allowlist: host_path_allowlist.clone(),
             node_manifests_dir: node_manifests_dir.clone(),

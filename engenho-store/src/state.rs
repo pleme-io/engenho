@@ -41,7 +41,8 @@ use engenho_types::patch::PatchType;
 
 use crate::at_rest::{SealFault, SecretSealer, is_envelope, is_sealed_kind};
 use crate::command::{
-    ApplyMeta, ApplySemantics, LoggedCommand, ResourceCommand, ResourceOp, TxnCompare, TxnOp,
+    ApplyMeta, ApplySemantics, DeletionGeneration, LoggedCommand, ResourceCommand, ResourceOp,
+    TxnCompare, TxnOp,
 };
 use crate::pagination::{ListPage, PageAtRevision};
 use crate::patch_apply::{self, Gvk, OpenApiPatchEnv, PatchBody, PatchError, PatchSchemaEnv};
@@ -766,14 +767,26 @@ impl ResourceCatalog {
         )
     )]
     pub fn apply(&mut self, cmd: &ResourceCommand, term: u64, index: u64) -> ApplyOutcome {
-        self.apply_under(cmd, ApplySemantics::CURRENT, term, index)
+        self.apply_under(
+            cmd,
+            ApplySemantics::CURRENT,
+            DeletionGeneration::Bumped,
+            term,
+            index,
+        )
     }
 
     /// Apply one committed Raft log entry, under the [`ApplySemantics`] it
     /// carries — an entry written before the marker replays under V0, so
     /// replaying an old log reproduces its revisions exactly.
     pub fn apply_logged(&mut self, entry: &LoggedCommand, term: u64, index: u64) -> ApplyOutcome {
-        self.apply_under(entry.command(), entry.semantics(), term, index)
+        self.apply_under(
+            entry.command(),
+            entry.semantics(),
+            entry.deletion_generation(),
+            term,
+            index,
+        )
     }
 
     /// Apply a single committed command. Pure function. Returns the
@@ -795,6 +808,7 @@ impl ResourceCatalog {
         &mut self,
         cmd: &ResourceCommand,
         semantics: ApplySemantics,
+        deletion_generation: DeletionGeneration,
         term: u64,
         index: u64,
     ) -> ApplyOutcome {
@@ -840,6 +854,7 @@ impl ResourceCatalog {
                 *expected,
                 deletion_timestamp.as_deref(),
                 rules.gate,
+                deletion_generation,
                 rev,
             ),
             ResourceCommand::Txn {
@@ -917,6 +932,7 @@ impl ResourceCatalog {
                     None,
                     deletion_timestamp.as_deref(),
                     Rules::ETCD_TXN.gate,
+                    DeletionGeneration::Kept,
                     rev,
                 ),
             };
@@ -1344,8 +1360,9 @@ impl ResourceCatalog {
     ///    on a no-finalizer object is untouched).
     /// 3. **Finalizers present + `deletionTimestamp` NOT yet set** ⇒ do NOT
     ///    remove. Stamp `metadata.deletionTimestamp` from the REPLICATED
-    ///    `deletion_timestamp` scalar (never a per-node clock), bump the
-    ///    per-key version + global revision, and emit a `ChangeKind::Put`
+    ///    `deletion_timestamp` scalar (never a per-node clock), raise a
+    ///    generation above zero by one under [`DeletionGeneration::Bumped`],
+    ///    bump the per-key version + global revision, and emit a `ChangeKind::Put`
     ///    (Modified) event carrying the now-Terminating object. Returns
     ///    [`ResourceOp::DeletionPending`].
     /// 4. **Finalizers present + `deletionTimestamp` ALREADY set** ⇒
@@ -1361,6 +1378,7 @@ impl ResourceCatalog {
         expected: Option<Revision>,
         deletion_timestamp: Option<&str>,
         gate: FinalizerGate,
+        deletion_generation: DeletionGeneration,
         rev: Revision,
     ) -> ApplyOutcome {
         // Precondition (CAS) BEFORE any mutation. A `Some(_)` precondition
@@ -1422,9 +1440,7 @@ impl ResourceCatalog {
         let prior = live_value.clone();
         let mut terminating = live_value;
         stamp_deletion_timestamp(&mut terminating, ts);
-        // resourceVersion follows the bump (so a watcher's CAS sees the new
-        // rev); generation is spec-intent and unchanged by a metadata-only
-        // deletionTimestamp stamp, so it is preserved verbatim.
+        stamp_terminating_generation(&mut terminating, deletion_generation);
         stamp_resource_version(&mut terminating, rev);
 
         self.resources
@@ -2102,6 +2118,22 @@ fn stamp_deletion_timestamp(value: &mut serde_json::Value, ts: &str) {
                 serde_json::Value::String(ts.to_string()),
             );
         }
+    }
+}
+
+/// Raise `metadata.generation` by one on an object going Terminating, under
+/// [`DeletionGeneration::Bumped`] and only when it is above zero, as
+/// upstream's `markAsDeleting` does.
+fn stamp_terminating_generation(value: &mut serde_json::Value, rule: DeletionGeneration) {
+    let generation = generation_of(value);
+    if rule == DeletionGeneration::Kept || generation <= 0 {
+        return;
+    }
+    if let Some(meta_obj) = metadata_mut(value) {
+        meta_obj.insert(
+            "generation".to_string(),
+            serde_json::Value::Number((generation + 1).into()),
+        );
     }
 }
 
@@ -3643,6 +3675,50 @@ mod a_revision_means_a_change {
             ResourceOp::Deleted
         );
         assert!(v2.get(&ns).is_none());
+    }
+
+    #[test]
+    fn a_delete_logged_without_the_generation_marker_replays_without_a_bump() {
+        let cm = ResourceKey::namespaced("", "v1", "ConfigMap", "default", "held");
+        let born = put(
+            &cm,
+            json!({"metadata": {"finalizers": ["example.com/hold"]}, "data": {"k": "v"}}),
+        );
+        let delete = ResourceCommand::delete_at(
+            cm.clone(),
+            None,
+            Reason::Operator,
+            Some("2026-11-15T17:00:00Z".into()),
+        );
+
+        let legacy = under(&delete, "v3");
+        assert_eq!(legacy.deletion_generation(), DeletionGeneration::Kept);
+        let mut old = ResourceCatalog::default();
+        old.apply_logged(&under(&born, "v3"), 1, 1);
+        assert_eq!(
+            old.apply_logged(&legacy, 1, 2).op,
+            ResourceOp::DeletionPending
+        );
+        assert_eq!(old.get(&cm).unwrap()["metadata"]["generation"], json!(1));
+
+        let proposed = LoggedCommand::proposed(delete);
+        assert_eq!(proposed.deletion_generation(), DeletionGeneration::Bumped);
+        let wire = serde_json::to_value(&proposed).unwrap();
+        assert_eq!(wire["deletion_generation"], json!("bumped"));
+        let mut new = ResourceCatalog::default();
+        new.apply_logged(&LoggedCommand::proposed(born.clone()), 1, 1);
+        assert_eq!(
+            new.apply_logged(&serde_json::from_value(wire).unwrap(), 1, 2)
+                .op,
+            ResourceOp::DeletionPending
+        );
+        assert_eq!(new.get(&cm).unwrap()["metadata"]["generation"], json!(2));
+        assert!(
+            serde_json::to_value(LoggedCommand::proposed(born))
+                .unwrap()
+                .get("deletion_generation")
+                .is_none()
+        );
     }
 
     fn web_deployment(checksum: &str) -> serde_json::Value {

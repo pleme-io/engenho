@@ -294,6 +294,12 @@ in
         (engenho's default): client-go creates a Job as protobuf. `refused`: a
         protobuf body is 415 and a read falls back to JSON.
       '';
+      deletionGeneration = optional (types.enum [ "bumped" "kept" ]) ''
+        What a delete that leaves an object Terminating does to its
+        `metadata.generation`. `bumped` (engenho's default): a generation above
+        zero is raised by one, as upstream does, so a controller filtering on a
+        generation change sees the delete. `kept`: it is left as it was.
+      '';
       storedCrds = optional (types.enum [ "before_bind" "by_controller" ]) ''
         When a booting node serves the CRDs already in its store.
         `before_bind` (engenho's default): before the apiserver accepts its
@@ -728,6 +734,7 @@ in
         health_reasons = cfg.runtime.healthReasons;
         stored_crds = cfg.runtime.storedCrds;
         batch_protobuf = cfg.runtime.batchProtobuf;
+        deletion_generation = cfg.runtime.deletionGeneration;
         host_path_allowlist = cfg.runtime.hostPathAllowlist;
         node_manifests_dir = cfg.runtime.nodeManifestsDir;
         # DERIVED, never a second hand-list: an explicit `podmanBinary` wins,

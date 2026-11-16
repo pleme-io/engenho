@@ -143,9 +143,10 @@ pub use node_local::{ListenerAddrRejection, LoopbackAddr, NodeLocalListener};
 pub use revoada::{RevoadaConfig, TopologyConfig, TopologyStrategyKind};
 pub use runtime::{
     ApiAudit, BatchProtobuf, CertRotation, ClosureLocalBuilds, DEFAULT_NODE_MANIFESTS_DIR,
-    HealthReasons, KubeconfigVisibility, KubeletAuth, KubeletBackendKind, KubeletBackendRefusal,
-    NativeCgroups, NativeFsGroup, NativeMounts, NativeSecurity, NativeWorkloads,
-    RESERVED_RUNTIME_CLASSES, RuntimeClassBinding, RuntimeConfig, SecretsAtRest, StoredCrds,
+    DeletionGeneration, HealthReasons, KubeconfigVisibility, KubeletAuth, KubeletBackendKind,
+    KubeletBackendRefusal, NativeCgroups, NativeFsGroup, NativeMounts, NativeSecurity,
+    NativeWorkloads, RESERVED_RUNTIME_CLASSES, RuntimeClassBinding, RuntimeConfig, SecretsAtRest,
+    StoredCrds,
 };
 pub use scheduler::{SchedulerConfig, SchedulerStrategyKind};
 pub use teia::TeiaConfig;

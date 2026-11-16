@@ -407,6 +407,34 @@ impl ApplySemantics {
     }
 }
 
+/// What a `Delete` that leaves an object Terminating does to its
+/// `metadata.generation`. Upstream's `markAsDeleting` and `BeforeDelete` add
+/// one when they first set `deletionTimestamp` on an object whose generation
+/// is above zero, so a controller filtering on a generation change sees the
+/// delete.
+///
+/// A per-entry marker beside [`ApplySemantics`], not a version of it: the
+/// proposing node's `runtime.deletion_generation` decides it, so it must be
+/// expressible in either direction under the current rules. Absence means
+/// [`Self::Kept`], so every entry written before the marker replays as it
+/// did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeletionGeneration {
+    /// Generation is left as it was.
+    #[default]
+    Kept,
+    /// Generation is raised by one when it is above zero.
+    Bumped,
+}
+
+impl DeletionGeneration {
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    fn is_kept(&self) -> bool {
+        *self == Self::Kept
+    }
+}
+
 /// A [`ResourceCommand`] as the Raft log carries it: the command plus the
 /// [`ApplySemantics`] it was proposed under.
 ///
@@ -424,6 +452,8 @@ pub struct LoggedCommand {
     command: ResourceCommand,
     #[serde(default = "ApplySemantics::unmarked")]
     semantics: ApplySemantics,
+    #[serde(default, skip_serializing_if = "DeletionGeneration::is_kept")]
+    deletion_generation: DeletionGeneration,
 }
 
 impl LoggedCommand {
@@ -434,7 +464,26 @@ impl LoggedCommand {
         Self {
             command,
             semantics: ApplySemantics::CURRENT,
+            deletion_generation: DeletionGeneration::Kept,
         }
+        .with_deletion_generation(DeletionGeneration::Bumped)
+    }
+
+    /// Mark what this entry's `Delete` does to the generation of an object
+    /// it leaves Terminating. Every other command keeps no marker.
+    #[must_use]
+    pub fn with_deletion_generation(mut self, rule: DeletionGeneration) -> Self {
+        self.deletion_generation = match self.command {
+            ResourceCommand::Delete { .. } => rule,
+            _ => DeletionGeneration::Kept,
+        };
+        self
+    }
+
+    /// The generation rule this entry's `Delete` replays under.
+    #[must_use]
+    pub fn deletion_generation(&self) -> DeletionGeneration {
+        self.deletion_generation
     }
 
     /// The rules this entry replays under.

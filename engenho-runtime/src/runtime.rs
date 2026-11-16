@@ -2292,14 +2292,19 @@ async fn open_store(
 ) -> Result<(StoreMesh, BootKind), RuntimeError> {
     let cfg = default_config(&boot.cluster_name)?;
     let forms = !boot.membership.joins();
+    let deletion_generation = match boot.deletion_generation {
+        engenho_config::DeletionGeneration::Bumped => engenho_store::DeletionGeneration::Bumped,
+        engenho_config::DeletionGeneration::Kept => engenho_store::DeletionGeneration::Kept,
+    };
     if boot.durable {
         let store_path = boot.data_dir.join(STORE_DIR);
         let writes = match boot.secrets_at_rest {
             engenho_config::SecretsAtRest::Encrypt => engenho_store::SealWrites::Seal,
             engenho_config::SecretsAtRest::Off => engenho_store::SealWrites::Plain,
         };
-        let mesh =
-            StoreMesh::start_durable_with(node_id, listen, router, cfg, store_path, writes).await?;
+        let mesh = StoreMesh::start_durable_with(node_id, listen, router, cfg, store_path, writes)
+            .await?
+            .with_deletion_generation(deletion_generation);
         let fresh = !mesh.is_initialized().await;
         if fresh && forms {
             mesh.initialize_singleton().await?;
@@ -2316,7 +2321,9 @@ async fn open_store(
         info!(?kind, node_id, forms, "durable store opened");
         Ok((mesh, kind))
     } else {
-        let mesh = StoreMesh::start(node_id, listen, router, cfg).await?;
+        let mesh = StoreMesh::start(node_id, listen, router, cfg)
+            .await?
+            .with_deletion_generation(deletion_generation);
         if forms {
             mesh.initialize_singleton().await?;
         }

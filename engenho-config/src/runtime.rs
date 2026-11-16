@@ -326,6 +326,20 @@ pub enum BatchProtobuf {
     Refused,
 }
 
+/// What a delete that leaves an object Terminating does to its
+/// `metadata.generation`. `Bumped`, the default: a generation above zero is
+/// raised by one, as upstream's `markAsDeleting` does, so a controller that
+/// filters on a generation change sees the delete. `Kept`: the generation is
+/// left as it was. A node writes its choice into each delete it proposes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(missing_docs)]
+pub enum DeletionGeneration {
+    #[default]
+    Bumped,
+    Kept,
+}
+
 /// When a booting node serves the CRDs already in its store. `BeforeBind`,
 /// the default: every served version is registered before the apiserver
 /// accepts its first request. `ByController`: the CRD controller registers
@@ -597,6 +611,9 @@ pub struct RuntimeConfig {
     #[allow(missing_docs)]
     #[serde(default)]
     pub batch_protobuf: BatchProtobuf,
+    #[allow(missing_docs)]
+    #[serde(default)]
+    pub deletion_generation: DeletionGeneration,
     /// Optional explicit podman binary path.
     ///
     /// Used by the shell-out backend, and by the `PodmanApi` backend ONLY on
@@ -675,6 +692,7 @@ impl TieredConfig for RuntimeConfig {
             health_reasons: HealthReasons::Withheld,
             stored_crds: StoredCrds::BeforeBind,
             batch_protobuf: BatchProtobuf::Served,
+            deletion_generation: DeletionGeneration::Bumped,
             podman_binary: None,
             host_path_allowlist: Vec::new(),
             node_manifests_dir: PathBuf::new(),
@@ -753,6 +771,7 @@ impl TieredConfig for RuntimeConfig {
             health_reasons: HealthReasons::Named,
             stored_crds: StoredCrds::BeforeBind,
             batch_protobuf: BatchProtobuf::Served,
+            deletion_generation: DeletionGeneration::Bumped,
             podman_binary: None,
             host_path_allowlist: Vec::new(),
             node_manifests_dir: PathBuf::from(DEFAULT_NODE_MANIFESTS_DIR),
@@ -829,6 +848,7 @@ impl TieredConfig for RuntimeConfig {
             health_reasons: self.health_reasons,
             stored_crds: self.stored_crds,
             batch_protobuf: self.batch_protobuf,
+            deletion_generation: self.deletion_generation,
             // No "unset" sentinel on an enum whose safe arm is also a
             // meaningful value, so the overlay's value wins — same rule as
             // `durable` and `kubelet_backend` above. A node asking for
@@ -1153,6 +1173,7 @@ mod tests {
             health_reasons: HealthReasons::Withheld,
             stored_crds: StoredCrds::BeforeBind,
             batch_protobuf: BatchProtobuf::Served,
+            deletion_generation: DeletionGeneration::Bumped,
             podman_binary: None,
             host_path_allowlist: Vec::new(),
             node_manifests_dir: PathBuf::new(),
@@ -1953,6 +1974,45 @@ mod stored_crds_tests {
         }
         assert!(
             EngenhoConfig::from_yaml_with_defaults("runtime:\n  stored_crds: maybe\n").is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod deletion_generation_tests {
+    use super::DeletionGeneration;
+    use crate::EngenhoConfig;
+    use shikumi::TieredConfig;
+
+    #[test]
+    fn a_config_that_does_not_name_it_is_bumped() {
+        let cfg = EngenhoConfig::from_yaml_with_defaults("runtime: {}\n").expect("parses");
+        assert_eq!(cfg.runtime.deletion_generation, DeletionGeneration::Bumped);
+        assert_eq!(
+            super::RuntimeConfig::prescribed_default().deletion_generation,
+            DeletionGeneration::Bumped
+        );
+        assert_eq!(
+            super::RuntimeConfig::bare().deletion_generation,
+            DeletionGeneration::Bumped
+        );
+    }
+
+    #[test]
+    fn each_wire_name_reads_back_as_its_variant() {
+        for (wire, want) in [
+            ("bumped", DeletionGeneration::Bumped),
+            ("kept", DeletionGeneration::Kept),
+        ] {
+            let cfg = EngenhoConfig::from_yaml_with_defaults(&format!(
+                "runtime:\n  deletion_generation: {wire}\n"
+            ))
+            .unwrap_or_else(|e| panic!("`{wire}` must parse: {e}"));
+            assert_eq!(cfg.runtime.deletion_generation, want);
+        }
+        assert!(
+            EngenhoConfig::from_yaml_with_defaults("runtime:\n  deletion_generation: maybe\n")
+                .is_err()
         );
     }
 }

@@ -138,7 +138,9 @@ mod watch_history;
 mod catalog_tests;
 
 pub use at_rest::{KEY_FILE, KEYS_DIR_SUFFIX, KeyId, SealFault, SealWrites, keys_dir_for};
-pub use command::{ApplySemantics, LoggedCommand, Reason, ResourceCommand, ResourceOp};
+pub use command::{
+    ApplySemantics, DeletionGeneration, LoggedCommand, Reason, ResourceCommand, ResourceOp,
+};
 pub use drv_committal::{
     DRV_GROUP, DRV_KIND, DRV_VERSION, delete_drv_command, drv_resource_key, put_drv_command,
     render_drv_resource,
