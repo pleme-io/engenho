@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "29b3099d3542253dec591d1c9fea07dd16b158efdec724574c3e9c55d30edf8b",
+  "cargo_lock_sha256": "1740928575876b494d882cc3a896839f4bf709e29286739c4c87acda8e67e75c",
   "manifest_sha256": {
     "Cargo.toml": "e3ded593538cf33124e1e0400d3e942c72ddf1ecf90fcf9dff2cbe8cda9889eb",
     "engenho-apiserver/Cargo.toml": "9067f6fa2bc2ae377fa39f17105775d0a8026c554d3fca62b7a1ceb850381307",
@@ -17,7 +17,7 @@
     "engenho-diff/Cargo.toml": "b58a040e9e4ade051db52e99e78ad8c20b3c48581751017f66b040081a64d311",
     "engenho-etcd/Cargo.toml": "e6b4272524396e9053cefa45975dd859304c62f4d5992133819fbb932e426884",
     "engenho-fonte-cli/Cargo.toml": "370c6b06297206379f4ad84b91baa3c51796f1a5b8563d7ce127752cc59f1612",
-    "engenho-fonte/Cargo.toml": "04343a7d710c292cfed4e39283052957f4fcf50d1d504752943db96b341f0f8d",
+    "engenho-fonte/Cargo.toml": "0661ddb1706112195dc06efbbd0998b211e8db536a4760057f67913d3de9eac1",
     "engenho-kube-client/Cargo.toml": "13c087c13387687e3eef012b93241130f91e18d2e1bc6a154aebdba25d401d71",
     "engenho-kube-codegen/Cargo.toml": "7ab3d1dc28ff9350251c270452fa2d9d0bac586ab1457d21df2f88654f02e55f",
     "engenho-kube-proto/Cargo.toml": "ceee7a3b75abb4c1dec379a1d8c8bbb2cc1f6b613afd186f4c8eb17bb844493f",
