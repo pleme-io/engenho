@@ -418,7 +418,7 @@ mod tests {
         ] {
             assert!(bad.validate().is_err(), "{bad:?}");
         }
-        let parsed: ControlConfig = serde_yaml::from_str(
+        let parsed: ControlConfig = serde_norway::from_str(
             "remote:\n  enable: true\n  authorized_clients:\n    - {name: ryn, spki_sha256: sha256:0000000000000000000000000000000000000000000000000000000000000000, tier: destructive}\n",
         )
         .expect("parse");
@@ -432,10 +432,10 @@ mod tests {
     #[test]
     fn the_section_parses_and_rejects_unknown_fields() {
         let cfg: ControlConfig =
-            serde_yaml::from_str("socket:\n  access: group\n  group_tier: mutate\n")
+            serde_norway::from_str("socket:\n  access: group\n  group_tier: mutate\n")
                 .expect("parse");
         assert_eq!(cfg.socket.access, SocketAccess::Group);
         assert_eq!(cfg.socket.group_tier, GroupTier::Mutate);
-        assert!(serde_yaml::from_str::<ControlConfig>("socket:\n  nope: 1\n").is_err());
+        assert!(serde_norway::from_str::<ControlConfig>("socket:\n  nope: 1\n").is_err());
     }
 }

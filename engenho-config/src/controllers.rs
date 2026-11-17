@@ -249,10 +249,10 @@ mod tests {
             JobSelector::Generated
         );
         let base = "enable: {replicaset: true, deployment: true, endpoints: true, gc: true}\nnamespace: ''\nfallback_interval_seconds: 30\ndebounce_milliseconds: 50\n";
-        let absent: ControllersConfig = serde_yaml::from_str(base).unwrap();
+        let absent: ControllersConfig = serde_norway::from_str(base).unwrap();
         assert_eq!(absent.job_selector, JobSelector::Generated);
         let off: ControllersConfig =
-            serde_yaml::from_str(&format!("{base}job_selector: off\n")).unwrap();
+            serde_norway::from_str(&format!("{base}job_selector: off\n")).unwrap();
         assert_eq!(off.job_selector, JobSelector::Off);
     }
 
@@ -260,12 +260,12 @@ mod tests {
     fn the_hpa_is_off_unless_declared() {
         assert!(!ControllersConfig::prescribed_default().enable.hpa);
         assert!(!ControllersConfig::bare().enable.hpa);
-        let on: ControllersConfig = serde_yaml::from_str(
+        let on: ControllersConfig = serde_norway::from_str(
             "enable: {replicaset: true, deployment: true, endpoints: true, gc: true, hpa: true}\nnamespace: ''\nfallback_interval_seconds: 30\ndebounce_milliseconds: 50\n",
         )
         .unwrap();
         assert!(on.enable.hpa);
-        let absent: ControllersConfig = serde_yaml::from_str(
+        let absent: ControllersConfig = serde_norway::from_str(
             "enable: {replicaset: true, deployment: true, endpoints: true, gc: true}\nnamespace: ''\nfallback_interval_seconds: 30\ndebounce_milliseconds: 50\n",
         )
         .unwrap();
@@ -290,7 +290,7 @@ namespace: ""
 fallback_interval_seconds: 30
 debounce_milliseconds: 50
 "#;
-        let cfg: ControllersConfig = serde_yaml::from_str(yaml).unwrap();
+        let cfg: ControllersConfig = serde_norway::from_str(yaml).unwrap();
         assert!(cfg.enable.namespace, "missing flag defaults to true");
         // The same default-true contract covers the later service_routing
         // flag — pre-existing YAML lacking it still enables it.

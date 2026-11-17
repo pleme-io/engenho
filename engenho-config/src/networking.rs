@@ -284,14 +284,14 @@ mod tests {
         // `datapath_mode` existed (deny_unknown_fields struct) still
         // deserializes, defaulting to Auto.
         let yaml = "service_cidr: \"10.96.0.0/12\"\n";
-        let cfg: NetworkingConfig = serde_yaml::from_str(yaml).unwrap();
+        let cfg: NetworkingConfig = serde_norway::from_str(yaml).unwrap();
         assert_eq!(cfg.datapath_mode, DatapathMode::Auto);
     }
 
     #[test]
     fn datapath_mode_serde_snake_case() {
         let yaml = "service_cidr: \"10.96.0.0/12\"\ndatapath_mode: compute_only\n";
-        let cfg: NetworkingConfig = serde_yaml::from_str(yaml).unwrap();
+        let cfg: NetworkingConfig = serde_norway::from_str(yaml).unwrap();
         assert_eq!(cfg.datapath_mode, DatapathMode::ComputeOnly);
     }
 

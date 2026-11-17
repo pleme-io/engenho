@@ -36,7 +36,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
     let spec: Value =
-        serde_yaml::from_str(SPEC_TEXT).unwrap_or_else(|e| panic!("parse {SPEC}: {e}"));
+        serde_norway::from_str(SPEC_TEXT).unwrap_or_else(|e| panic!("parse {SPEC}: {e}"));
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
 
     write(&out.join("types.rs"), &types(&spec));

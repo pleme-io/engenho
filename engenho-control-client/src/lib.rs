@@ -311,7 +311,8 @@ pub fn resolve_socket(explicit: Option<PathBuf>) -> SocketResolution {
 /// config the daemon cannot boot on still names its socket.
 fn declared_socket_path() -> Option<PathBuf> {
     let file = EngenhoConfig::discover_path()?;
-    let doc: serde_yaml::Value = serde_yaml::from_str(&std::fs::read_to_string(file).ok()?).ok()?;
+    let doc: serde_norway::Value =
+        serde_norway::from_str(&std::fs::read_to_string(file).ok()?).ok()?;
     doc.get("control")?
         .get("socket")?
         .get("path")?

@@ -45,7 +45,7 @@ fn vendor_path(name: &str) -> PathBuf {
 
 fn load_manifest() -> Manifest {
     let raw = fs::read_to_string(manifest_path()).expect("read MANIFEST.yaml");
-    serde_yaml::from_str(&raw).expect("parse MANIFEST.yaml")
+    serde_norway::from_str(&raw).expect("parse MANIFEST.yaml")
 }
 
 #[test]

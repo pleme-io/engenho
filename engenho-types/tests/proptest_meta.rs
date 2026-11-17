@@ -102,8 +102,8 @@ proptest! {
 
     #[test]
     fn object_meta_yaml_round_trips(m in arb_object_meta()) {
-        let s   = serde_yaml::to_string(&m).unwrap();
-        let back: ObjectMeta = serde_yaml::from_str(&s).unwrap();
+        let s   = serde_norway::to_string(&m).unwrap();
+        let back: ObjectMeta = serde_norway::from_str(&s).unwrap();
         prop_assert_eq!(m, back);
     }
 }

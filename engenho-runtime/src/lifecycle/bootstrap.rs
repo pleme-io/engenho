@@ -78,7 +78,7 @@ impl ControlBootstrap {
                 let control = doc
                     .as_ref()
                     .and_then(|d| d.get("control"))
-                    .and_then(|c| serde_yaml::from_value(c.clone()).ok())
+                    .and_then(|c| serde_norway::from_value(c.clone()).ok())
                     .unwrap_or_default();
                 match doc.as_ref().and_then(lenient_data_dir) {
                     Some(data_dir) => (
@@ -105,12 +105,12 @@ impl ControlBootstrap {
     }
 }
 
-fn read_yaml(path: &Path) -> Option<serde_yaml::Value> {
-    serde_yaml::from_str(&std::fs::read_to_string(path).ok()?).ok()
+fn read_yaml(path: &Path) -> Option<serde_norway::Value> {
+    serde_norway::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
 
 /// `runtime.data_dir` from a YAML document, and nothing else from it.
-fn lenient_data_dir(doc: &serde_yaml::Value) -> Option<PathBuf> {
+fn lenient_data_dir(doc: &serde_norway::Value) -> Option<PathBuf> {
     doc.get("runtime")?
         .get("data_dir")?
         .as_str()

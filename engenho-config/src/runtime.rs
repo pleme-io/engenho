@@ -1411,7 +1411,7 @@ mod node_local_listener_tests {
     fn the_refusal_names_a_field_the_operator_can_actually_set() {
         // The error tells the operator which key to fix. If a field is renamed
         // and `NodeLocalListener::field` is not, the message points at nothing.
-        let serialized = serde_yaml::to_value(RuntimeConfig::prescribed_default()).unwrap();
+        let serialized = serde_norway::to_value(RuntimeConfig::prescribed_default()).unwrap();
         for listener in NodeLocalListener::ALL {
             let key = listener
                 .field()
@@ -1477,12 +1477,12 @@ mod visibility_tests {
     fn visibility_round_trips_through_serde_as_snake_case() {
         // nix renders this config to YAML, so the wire spelling is load-bearing:
         // a rename would silently fall back to the default rather than error.
-        let y = serde_yaml::to_string(&KubeconfigVisibility::Group).expect("serializes");
+        let y = serde_norway::to_string(&KubeconfigVisibility::Group).expect("serializes");
         assert!(
             y.contains("group"),
             "expected snake_case `group`, got {y:?}"
         );
-        let back: KubeconfigVisibility = serde_yaml::from_str("private").expect("parses");
+        let back: KubeconfigVisibility = serde_norway::from_str("private").expect("parses");
         assert_eq!(back, KubeconfigVisibility::Private);
     }
 
@@ -1490,8 +1490,8 @@ mod visibility_tests {
     fn an_unknown_visibility_is_refused_not_defaulted() {
         // A typo must not be indistinguishable from silence — the same rule
         // engenho's `Dialect` records about not copying `spec.executor`.
-        assert!(serde_yaml::from_str::<KubeconfigVisibility>("groups").is_err());
-        assert!(serde_yaml::from_str::<KubeconfigVisibility>("Group").is_err());
+        assert!(serde_norway::from_str::<KubeconfigVisibility>("groups").is_err());
+        assert!(serde_norway::from_str::<KubeconfigVisibility>("Group").is_err());
     }
 }
 

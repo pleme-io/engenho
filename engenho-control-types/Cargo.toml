@@ -40,12 +40,12 @@ proc-macro2  = "1"
 quote        = "1"
 schemars     = "0.8"
 serde_json   = { workspace = true }
-serde_yaml   = { workspace = true }
+serde_norway   = { workspace = true }
 syn          = { version = "2", features = ["full"] }
 typify       = "0.8"
 
 [dev-dependencies]
-serde_yaml = { workspace = true }
+serde_norway = { workspace = true }
 
 [lints]
 workspace = true

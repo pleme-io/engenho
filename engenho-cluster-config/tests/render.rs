@@ -599,7 +599,7 @@ fn yaml_round_trip_preserves_full_config() {
         version: "v2.3.0".into(),
     };
     c.validate().unwrap();
-    let yaml = serde_yaml::to_string(&c).unwrap();
+    let yaml = serde_norway::to_string(&c).unwrap();
     let back = ClusterConfig::from_yaml_str(&yaml).unwrap();
     assert_eq!(c, back);
 }

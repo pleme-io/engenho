@@ -32,7 +32,7 @@ prost-types   = "0.14"
 
 [dev-dependencies]
 serde      = { workspace = true }
-serde_yaml = { workspace = true }
+serde_norway = { workspace = true }
 blake3     = "1"
 
 [lints]

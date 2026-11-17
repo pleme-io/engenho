@@ -50,7 +50,7 @@ serde               = { workspace = true }
 serde_json          = { workspace = true }
 # The lenient `runtime.data_dir` read the supervisor falls back on when the
 # declared config does not resolve (lifecycle/bootstrap.rs).
-serde_yaml          = { workspace = true }
+serde_norway          = { workspace = true }
 # Timestamp arithmetic for the lifecycle (a failed boot's next retry). Already
 # in the graph through engenho-types, same features.
 chrono              = { version = "0.4", features = ["serde"] }

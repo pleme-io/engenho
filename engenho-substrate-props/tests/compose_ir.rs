@@ -85,7 +85,7 @@ proptest! {
         prop_assert_eq!(back, ir);
     }
 
-    /// to_yaml() produces valid YAML that re-parses through serde_yaml
+    /// to_yaml() produces valid YAML that re-parses through serde_norway
     /// to a structure containing the expected `services:` key.
     #[test]
     fn to_yaml_emits_services_block(ir in compose_ir_strategy(4)) {

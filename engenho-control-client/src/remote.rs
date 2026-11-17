@@ -132,7 +132,7 @@ impl RemotesConfig {
     pub fn load(dir: &Path) -> Result<Self, RemoteError> {
         let path = dir.join(REMOTES_FILE);
         match std::fs::read_to_string(&path) {
-            Ok(text) => serde_yaml::from_str(&text).map_err(|e| RemoteError::Invalid {
+            Ok(text) => serde_norway::from_str(&text).map_err(|e| RemoteError::Invalid {
                 path,
                 why: e.to_string(),
             }),

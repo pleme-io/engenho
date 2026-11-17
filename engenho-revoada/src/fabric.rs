@@ -444,8 +444,8 @@ mod tests {
     #[test]
     fn strategy_round_trips_through_serde() {
         let s = FabricStrategy::prescribed_homelab();
-        let yaml = serde_yaml::to_string(&s).unwrap();
-        let back: FabricStrategy = serde_yaml::from_str(&yaml).unwrap();
+        let yaml = serde_norway::to_string(&s).unwrap();
+        let back: FabricStrategy = serde_norway::from_str(&yaml).unwrap();
         assert_eq!(s, back);
     }
 
@@ -493,8 +493,8 @@ mod tests {
     #[test]
     fn face_round_trips_through_serde() {
         let f = FabricFace::prescribed_kubernetes_v1_34();
-        let yaml = serde_yaml::to_string(&f).unwrap();
-        let back: FabricFace = serde_yaml::from_str(&yaml).unwrap();
+        let yaml = serde_norway::to_string(&f).unwrap();
+        let back: FabricFace = serde_norway::from_str(&yaml).unwrap();
         assert_eq!(f, back);
     }
 
@@ -517,8 +517,8 @@ mod tests {
                 name: "x".into(),
                 kind: k.clone(),
             };
-            let yaml = serde_yaml::to_string(&f).unwrap();
-            let back: FabricFace = serde_yaml::from_str(&yaml).unwrap();
+            let yaml = serde_norway::to_string(&f).unwrap();
+            let back: FabricFace = serde_norway::from_str(&yaml).unwrap();
             assert_eq!(f, back, "round-trip failed for {k:?}");
         }
     }

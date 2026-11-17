@@ -46,8 +46,8 @@ fn node(data_dir: &Path, shared: Option<&SharedCa>) -> EngenhoConfig {
     cfg
 }
 
-fn kubeconfig(data_dir: &Path) -> serde_yaml::Value {
-    serde_yaml::from_str(&std::fs::read_to_string(data_dir.join("kubeconfig")).unwrap()).unwrap()
+fn kubeconfig(data_dir: &Path) -> serde_norway::Value {
+    serde_norway::from_str(&std::fs::read_to_string(data_dir.join("kubeconfig")).unwrap()).unwrap()
 }
 
 fn ca_data(data_dir: &Path) -> String {

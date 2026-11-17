@@ -297,7 +297,7 @@ Then T3.2a, then the one-line T3.3, in that order. The honest 410 after a restar
 
 | ID | Change | Tier | Size |
 |---|---|---|---|
-| T5.1 | **Closure gate.** A test parses the workspace manifests and computes the normal-dependency closure, with default features, of engenho, engenho-mcp and engenho-cluster-config-render. It asserts that the eight unshipped crates are absent and that substrate core pulls in no tokio or serde_yaml. Positive control: the closure contains engenho-controllers. Any per-module table is advisory and labelled as compile-reach. (substrate-2, reduced) | ci-gate | S |
+| T5.1 | **Closure gate.** A test parses the workspace manifests and computes the normal-dependency closure, with default features, of engenho, engenho-mcp and engenho-cluster-config-render. It asserts that the eight unshipped crates are absent and that substrate core pulls in no tokio or serde_norway. Positive control: the closure contains engenho-controllers. Any per-module table is advisory and labelled as compile-reach. (substrate-2, reduced) | ci-gate | S |
 | T5.2 | Put the NATS fabric behind a feature that is off by default (decision in §5.1). | parse-boundary | M |
 | T5.3 | Delete engenho-machines (decision in §5.2). STATE-MACHINES.md's SM3 and SM6 rows name the code that actually implements them. In wave 3, `QuorumTracker` becomes the only quorum fold: a sealed `QuorumVerdict`, a `NonZeroUsize` threshold, and the MemoryLedger and StoreLedger mirrors deleted. | delete | S |
 | T5.4 | revoada is a typed draft (§5.3). Correct these claims now: DISTRIBUTED.md:194; params.rs:64-66 and CONSISTENCY-FABRIC.md:114-118; engenho-etcd lib.rs:37; runtime.rs:410-412. Delete `RoutingPolicy::RoundRobin`, which always returns member 0. | — | S |

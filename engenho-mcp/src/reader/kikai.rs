@@ -96,7 +96,7 @@ impl KikaiClusterReader {
             source,
         })?;
         let all: BTreeMap<String, ClusterYamlEntry> =
-            serde_yaml::from_str(&contents).map_err(|source| ReaderError::Parse {
+            serde_norway::from_str(&contents).map_err(|source| ReaderError::Parse {
                 what: path.display().to_string(),
                 source,
             })?;
@@ -156,7 +156,7 @@ impl KikaiClusterReader {
                 });
             }
         };
-        serde_yaml::from_str(&contents).map_err(|source| ReaderError::Parse {
+        serde_norway::from_str(&contents).map_err(|source| ReaderError::Parse {
             what: path.display().to_string(),
             source,
         })

@@ -44,7 +44,7 @@ with-tatara-lisp = ["dep:tatara-lisp"]
 # caixa renderer integration — CaixaAppReconciler wraps
 # caixa-helm's chart renderer. Cross-workspace path deps to
 # pleme-io/caixa.
-with-caixa = ["dep:caixa-core", "dep:caixa-helm", "dep:serde_yaml", "dep:tempfile"]
+with-caixa = ["dep:caixa-core", "dep:caixa-helm", "dep:serde_norway", "dep:tempfile"]
 # shigoto DAG integration — ShigotoProvisioningController uses
 # shigoto-dag for typed topological ordering + parallel waves.
 with-shigoto = ["dep:shigoto-dag", "dep:shigoto-types", "dep:shigoto-retry", "dep:shigoto-budget"]
@@ -81,7 +81,7 @@ tatara-lisp            = { version = "0.3.3", optional = true }
 # to pleme-io/caixa for typed Servico chart rendering.
 caixa-core             = { version = "0.1.0", optional = true }
 caixa-helm             = { version = "0.1.0", optional = true }
-serde_yaml             = { workspace = true, optional = true }
+serde_norway             = { workspace = true, optional = true }
 # Optional — enabled by `with-caixa` for the helm installer's
 # tempdir scratch space.
 tempfile               = { version = "3", optional = true }

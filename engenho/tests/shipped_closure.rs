@@ -24,7 +24,7 @@
 //! The walk keeps the crates.io dependencies a workspace crate declares, so
 //! two named crates can be held out of the shipped binaries: `async-nats`
 //! (T5.2 — engenho's fabric is `in_binary`, so the NATS client stays behind
-//! `teia-nats`) and, from engenho-substrate-core, `tokio` and `serde_yaml`
+//! `teia-nats`) and, from engenho-substrate-core, `tokio` and `serde_norway`
 //! (T5.6 — the core is the tokio-free half of the substrate carve).
 //!
 //! ## Tier, stated plainly
@@ -388,9 +388,9 @@ const NATS_FEATURE: &str = "teia-nats";
 
 /// What engenho-substrate-core must not carry, and why. `tokio`: the core's
 /// whole promise is that no async runtime is reachable from it (T5.6).
-/// `serde_yaml`: parsing a config format is engenho-config's job, and the
+/// `serde_norway`: parsing a config format is engenho-config's job, and the
 /// core sits below it.
-const CORE_MUST_NOT_CARRY: [&str; 2] = ["tokio", "serde_yaml"];
+const CORE_MUST_NOT_CARRY: [&str; 2] = ["tokio", "serde_norway"];
 
 /// T5.2's integration half: no shipped binary links the NATS client.
 ///

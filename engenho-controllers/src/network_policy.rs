@@ -272,7 +272,7 @@ impl CiliumNetworkPolicyAdapter {
     /// Render the `CiliumNetworkPolicy` CRD YAML for one rule. Pure.
     ///
     /// Builds a typed [`engenho_types::egress::CiliumNetworkPolicy`]
-    /// + renders it through `serde_yaml` (per the ★★ TYPED EMISSION
+    /// + renders it through `serde_norway` (per the ★★ TYPED EMISSION
     /// rule — no `format!()` of YAML syntax).
     #[must_use]
     pub fn render_crd(rule: &NetworkPolicyRule) -> String {

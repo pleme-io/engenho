@@ -15,7 +15,7 @@ description = "engenho-config — the top-level shikumi-back typed configuration
 [dependencies]
 serde              = { workspace = true }
 serde_json         = { workspace = true }
-serde_yaml         = { workspace = true }
+serde_norway         = { workspace = true }
 thiserror          = { workspace = true }
 shikumi            = "0.1.0"
 # The `discovered()` tier is wired through shikumi's `DiscoveryLayer` seam,

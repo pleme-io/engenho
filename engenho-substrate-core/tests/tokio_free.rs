@@ -18,7 +18,7 @@ const MANIFEST: &str = include_str!("../Cargo.toml");
 
 /// What the core must not link, and why. The runtime crates are T5.6's
 /// carve: this half of the substrate is the one no executor reaches.
-/// `serde_yaml` is the same line drawn at config — parsing a config format
+/// `serde_norway` is the same line drawn at config — parsing a config format
 /// is engenho-config's job, and the core sits below it.
 const FORBIDDEN: [(&str, &str); 7] = [
     ("tokio", "an async runtime"),
@@ -28,7 +28,7 @@ const FORBIDDEN: [(&str, &str); 7] = [
     ("smol", "an async runtime"),
     ("tokio-util", "exists to drive an async runtime"),
     (
-        "serde_yaml",
+        "serde_norway",
         "a config format; that is engenho-config's layer",
     ),
 ];

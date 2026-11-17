@@ -6,7 +6,7 @@
 //! INI / iptables / nginx / argv syntax is banned. The three allowed
 //! egress surfaces are:
 //!
-//! 1. **serde structs + `serde_yaml`** for the Kubernetes-style CRDs
+//! 1. **serde structs + `serde_norway`** for the Kubernetes-style CRDs
 //!    ([`CiliumNetworkPolicy`], [`TraefikIngressRoute`]). The struct
 //!    *is* the typed render surface; `to_yaml()` is the deterministic
 //!    serializer.
@@ -18,7 +18,7 @@
 //!    `Vec<String>` from typed fields — never a `format!()` command
 //!    string that a shell would have to re-tokenize.
 //!
-//! Output is byte-equivalent (modulo `serde_yaml`'s canonical list
+//! Output is byte-equivalent (modulo `serde_norway`'s canonical list
 //! indentation, which parses identically) to the hand-rolled
 //! `format!()` renderers these types replace; round-trip / snapshot
 //! tests pin the shape.
@@ -29,7 +29,7 @@ use std::fmt::{self, Display, Write as _};
 use serde::Serialize;
 
 // =================================================================
-// CiliumNetworkPolicy — cilium.io/v2 CRD (serde + serde_yaml)
+// CiliumNetworkPolicy — cilium.io/v2 CRD (serde + serde_norway)
 // =================================================================
 
 /// Traffic direction for a [`CiliumNetworkPolicy`] rule block.
@@ -126,15 +126,15 @@ impl CiliumNetworkPolicy {
     /// # Panics
     ///
     /// Never — the fixed struct shape always serializes; `expect` only
-    /// guards an unreachable `serde_yaml` failure.
+    /// guards an unreachable `serde_norway` failure.
     #[must_use]
     pub fn to_yaml(&self) -> String {
-        serde_yaml::to_string(self).expect("CiliumNetworkPolicy serializes")
+        serde_norway::to_string(self).expect("CiliumNetworkPolicy serializes")
     }
 }
 
 // =================================================================
-// TraefikIngressRoute — traefik.io/v1alpha1 CRD (serde + serde_yaml)
+// TraefikIngressRoute — traefik.io/v1alpha1 CRD (serde + serde_norway)
 // =================================================================
 
 /// A `traefik.io/v1alpha1` `IngressRoute` resource.
@@ -244,7 +244,7 @@ impl TraefikIngressRoute {
     /// Never — the fixed struct shape always serializes.
     #[must_use]
     pub fn to_yaml(&self) -> String {
-        serde_yaml::to_string(self).expect("TraefikIngressRoute serializes")
+        serde_norway::to_string(self).expect("TraefikIngressRoute serializes")
     }
 }
 
@@ -778,7 +778,7 @@ mod tests {
     }
 
     #[test]
-    fn cilium_yaml_round_trips_through_serde_yaml() {
+    fn cilium_yaml_round_trips_through_serde_norway() {
         let policy = CiliumNetworkPolicy::new(
             "default-allow-frontend",
             cilium_selector(),
@@ -787,12 +787,12 @@ mod tests {
         let yaml = policy.to_yaml();
         // The emitted document parses back into a generic YAML value
         // with the documented structure.
-        let v: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(v["apiVersion"], serde_yaml::Value::from("cilium.io/v2"));
-        assert_eq!(v["kind"], serde_yaml::Value::from("CiliumNetworkPolicy"));
+        let v: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
+        assert_eq!(v["apiVersion"], serde_norway::Value::from("cilium.io/v2"));
+        assert_eq!(v["kind"], serde_norway::Value::from("CiliumNetworkPolicy"));
         assert_eq!(
             v["spec"]["endpointSelector"]["matchLabels"]["app"],
-            serde_yaml::Value::from("podinfo")
+            serde_norway::Value::from("podinfo")
         );
         assert!(v["spec"]["ingress"].is_sequence());
     }
@@ -843,14 +843,14 @@ mod tests {
             None,
         );
         let yaml = route.to_yaml();
-        let v: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let v: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
         assert_eq!(
             v["spec"]["routes"][0]["services"][0]["port"],
-            serde_yaml::Value::from(80)
+            serde_norway::Value::from(80)
         );
         assert_eq!(
             v["spec"]["routes"][0]["kind"],
-            serde_yaml::Value::from("Rule")
+            serde_norway::Value::from("Rule")
         );
     }
 

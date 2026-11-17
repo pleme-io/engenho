@@ -103,7 +103,7 @@ impl ClusterConfig {
     /// Returns [`ConfigError::Parse`] for malformed YAML or
     /// [`ConfigError::Invalid`] for any cross-field violation.
     pub fn from_yaml_str(s: &str) -> Result<Self, ConfigError> {
-        let cfg: Self = serde_yaml::from_str(s).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        let cfg: Self = serde_norway::from_str(s).map_err(|e| ConfigError::Parse(e.to_string()))?;
         cfg.validate()?;
         Ok(cfg)
     }

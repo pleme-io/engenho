@@ -52,13 +52,13 @@ rand               = "0.8"
 
 # Face-level resource verbs: NativeEnvelope CBOR for PureRaftFace's
 # apply/get/list/delete byte protocol. Other faces use their own
-# native format (yaml/json/hcl via serde_yaml / serde_json already
+# native format (yaml/json/hcl via serde_norway / serde_json already
 # in workspace).
 ciborium           = "0.2"
 # FormatAdapter — YAML/JSON parsing for K8s-style manifests on the
 # operator-facing verb surface (extracts metadata.name/namespace
 # to build typed ResourceRef before storing).
-serde_yaml         = { workspace = true }
+serde_norway         = { workspace = true }
 # HclAdapter — Nomad HCL parsing.
 hcl-rs             = "0.18"
 

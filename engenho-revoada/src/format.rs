@@ -387,11 +387,11 @@ impl FormatAdapter for K8sYamlAdapter {
         if format != ResourceFormat::Yaml {
             return Err(AdapterError::UnsupportedFormat { format });
         }
-        // serde_yaml → serde_json::Value via the YAML's own Value;
+        // serde_norway → serde_json::Value via the YAML's own Value;
         // we reuse the JSON walker so K8s YAML and K8s JSON share
         // the same metadata-extraction logic.
-        let yaml_value: serde_yaml::Value =
-            serde_yaml::from_slice(body).map_err(|e| AdapterError::Parse {
+        let yaml_value: serde_norway::Value =
+            serde_norway::from_slice(body).map_err(|e| AdapterError::Parse {
                 format,
                 reason: e.to_string(),
             })?;

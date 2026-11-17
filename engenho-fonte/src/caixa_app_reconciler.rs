@@ -71,8 +71,8 @@ impl CaixaAppReconciler {
 
     /// Minimal placeholder ComputeUnit YAML — real wiring sources
     /// the actual ComputeUnit from the operator's repo.
-    fn default_computeunit(&self, app: &AppRef) -> serde_yaml::Value {
-        serde_yaml::from_str(&format!(
+    fn default_computeunit(&self, app: &AppRef) -> serde_norway::Value {
+        serde_norway::from_str(&format!(
             "apiVersion: wasm-operator.pleme.io/v1\nkind: ComputeUnit\nmetadata:\n  name: {}-cu\nspec:\n  image: {}:latest\n",
             app.name, app.name
         ))

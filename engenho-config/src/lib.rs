@@ -402,21 +402,21 @@ impl EngenhoConfig {
     /// [`ConfigError::Incoherent`] on cross-section invariant
     /// violation.
     pub fn from_yaml_with_defaults(yaml: &str) -> Result<Self, ConfigError> {
-        let overlay: serde_yaml::Value = serde_yaml::from_str(yaml)
+        let overlay: serde_norway::Value = serde_norway::from_str(yaml)
             .map_err(|e| ConfigError::Parse(format!("operator YAML: {e}")))?;
         Self::from_yaml_value_with_defaults(overlay)
     }
 
     /// [`Self::from_yaml_with_defaults`] over an already-parsed overlay.
-    fn from_yaml_value_with_defaults(overlay: serde_yaml::Value) -> Result<Self, ConfigError> {
+    fn from_yaml_value_with_defaults(overlay: serde_norway::Value) -> Result<Self, ConfigError> {
         // The operator YAML is parsed into a full struct (serde
         // requires all fields). We accept partial YAML via merging
-        // serde_yaml::Value onto the default's Value, then
+        // serde_norway::Value onto the default's Value, then
         // re-deserializing.
-        let default_v: serde_yaml::Value = serde_yaml::to_value(Self::prescribed_default())
+        let default_v: serde_norway::Value = serde_norway::to_value(Self::prescribed_default())
             .map_err(|e| ConfigError::Parse(format!("serialize default: {e}")))?;
         let merged = merge_yaml(default_v, overlay);
-        let cfg: Self = serde_yaml::from_value(merged)
+        let cfg: Self = serde_norway::from_value(merged)
             .map_err(|e| ConfigError::Parse(format!("merge round-trip: {e}")))?;
         cfg.validate()?;
         Ok(cfg)
@@ -497,9 +497,9 @@ impl EngenhoConfig {
     ) -> Result<ProgressiveResolution<Self>, ConfigError> {
         let overrides = overrides.filter(|o| !o.values.is_empty());
         let declared_value = match declared {
-            Some((_, yaml)) if !yaml.trim().is_empty() => serde_yaml::from_str(yaml)
+            Some((_, yaml)) if !yaml.trim().is_empty() => serde_norway::from_str(yaml)
                 .map_err(|e| ConfigError::Parse(format!("operator YAML: {e}")))?,
-            _ => serde_yaml::Value::Null,
+            _ => serde_norway::Value::Null,
         };
 
         // The strict gate: deny_unknown_fields and every validator, over
@@ -512,7 +512,7 @@ impl EngenhoConfig {
             if let Some((path, yaml)) = declared {
                 overlays.push(ProgressiveLayer::file(path, yaml_to_dict(yaml)?));
             }
-            let text = serde_yaml::to_string(&override_value)
+            let text = serde_norway::to_string(&override_value)
                 .map_err(|e| ConfigError::Parse(format!("serialize the override tier: {e}")))?;
             overlays.push(ProgressiveLayer::file(
                 &overrides.path,
@@ -548,7 +548,7 @@ impl EngenhoConfig {
     /// Returns [`ConfigError::Parse`] if serialization fails (a struct-shaped
     /// config never does in practice).
     pub fn to_yaml(&self) -> Result<String, ConfigError> {
-        serde_yaml::to_string(self)
+        serde_norway::to_string(self)
             .map_err(|e| ConfigError::Parse(format!("serialize config: {e}")))
     }
 }
@@ -567,8 +567,8 @@ pub struct OverrideLayer {
 }
 
 impl OverrideLayer {
-    fn to_yaml_value(&self) -> Result<serde_yaml::Value, ConfigError> {
-        serde_yaml::to_value(leaf::nest(&self.values))
+    fn to_yaml_value(&self) -> Result<serde_norway::Value, ConfigError> {
+        serde_norway::to_value(leaf::nest(&self.values))
             .map_err(|e| ConfigError::Parse(format!("serialize the override tier: {e}")))
     }
 
@@ -631,18 +631,18 @@ pub fn render_provenance(prov: &ProvenanceMap) -> String {
 /// values are overwritten by overlay. Arrays are replaced (not
 /// concatenated) — operator intent is to specify a full list, not
 /// extend defaults.
-fn merge_yaml(base: serde_yaml::Value, overlay: serde_yaml::Value) -> serde_yaml::Value {
+fn merge_yaml(base: serde_norway::Value, overlay: serde_norway::Value) -> serde_norway::Value {
     match (base, overlay) {
         // Null overlay = "no override" — keep base. Empty operator
         // YAML parses to Null at the root, and unset keys parse to
         // Null inside Mappings; both cases should leave base intact.
-        (base, serde_yaml::Value::Null) => base,
-        (serde_yaml::Value::Mapping(mut b), serde_yaml::Value::Mapping(o)) => {
+        (base, serde_norway::Value::Null) => base,
+        (serde_norway::Value::Mapping(mut b), serde_norway::Value::Mapping(o)) => {
             for (k, v) in o {
-                let entry = b.remove(&k).unwrap_or(serde_yaml::Value::Null);
+                let entry = b.remove(&k).unwrap_or(serde_norway::Value::Null);
                 b.insert(k, merge_yaml(entry, v));
             }
-            serde_yaml::Value::Mapping(b)
+            serde_norway::Value::Mapping(b)
         }
         (_, overlay) => overlay,
     }
@@ -750,8 +750,8 @@ runtime:
     #[test]
     fn round_trip_through_yaml() {
         let original = EngenhoConfig::prescribed_default();
-        let yaml = serde_yaml::to_string(&original).unwrap();
-        let parsed: EngenhoConfig = serde_yaml::from_str(&yaml).unwrap();
+        let yaml = serde_norway::to_string(&original).unwrap();
+        let parsed: EngenhoConfig = serde_norway::from_str(&yaml).unwrap();
         assert_eq!(parsed, original);
     }
 
@@ -773,22 +773,22 @@ runtime:
     /// Mappings recurse; arrays + scalars are wholesale leaves (matching the
     /// shikumi fold's per-leaf attribution); `null` (a `None` option) is
     /// skipped (it carries no effective value and no provenance entry).
-    fn non_null_leaf_paths(v: &serde_yaml::Value, prefix: &[String], out: &mut Vec<Vec<String>>) {
+    fn non_null_leaf_paths(v: &serde_norway::Value, prefix: &[String], out: &mut Vec<Vec<String>>) {
         match v {
-            serde_yaml::Value::Mapping(m) => {
+            serde_norway::Value::Mapping(m) => {
                 for (k, val) in m {
                     let mut p = prefix.to_vec();
                     p.push(k.as_str().unwrap_or_default().to_string());
                     non_null_leaf_paths(val, &p, out);
                 }
             }
-            serde_yaml::Value::Null => {}
+            serde_norway::Value::Null => {}
             _ => out.push(prefix.to_vec()),
         }
     }
 
     fn leaf_paths_of(cfg: &EngenhoConfig) -> Vec<Vec<String>> {
-        let value = serde_yaml::to_value(cfg).unwrap();
+        let value = serde_norway::to_value(cfg).unwrap();
         let mut out = Vec::new();
         non_null_leaf_paths(&value, &[], &mut out);
         out
@@ -1005,8 +1005,8 @@ runtime:
     fn the_fabric_is_in_binary_and_spelled_in_binary_on_the_wire() {
         let d = EngenhoConfig::prescribed_default();
         assert_eq!(d.fabric, Fabric::InBinary);
-        let v: serde_yaml::Value = serde_yaml::from_str(&d.to_yaml().unwrap()).unwrap();
-        assert_eq!(v["fabric"], serde_yaml::Value::from("in_binary"));
+        let v: serde_norway::Value = serde_norway::from_str(&d.to_yaml().unwrap()).unwrap();
+        assert_eq!(v["fabric"], serde_norway::Value::from("in_binary"));
         let explicit = EngenhoConfig::from_yaml_with_defaults("fabric: in_binary\n").unwrap();
         assert_eq!(explicit, d);
     }
@@ -1026,7 +1026,7 @@ runtime:
     #[test]
     fn the_default_config_carries_no_teia_section_and_no_deprecation() {
         let d = EngenhoConfig::prescribed_default();
-        let v: serde_yaml::Value = serde_yaml::from_str(&d.to_yaml().unwrap()).unwrap();
+        let v: serde_norway::Value = serde_norway::from_str(&d.to_yaml().unwrap()).unwrap();
         assert!(
             v.get("teia").is_none(),
             "the default config renders a teia section again:\n{}",
@@ -1091,14 +1091,14 @@ runtime:
     /// `fabric:` key) still parses strictly, with no defaults merged in.
     #[test]
     fn a_full_pre_fabric_dump_still_parses() {
-        let mut v = serde_yaml::to_value(EngenhoConfig::prescribed_default()).unwrap();
+        let mut v = serde_norway::to_value(EngenhoConfig::prescribed_default()).unwrap();
         let map = v.as_mapping_mut().unwrap();
         map.remove("fabric");
         map.insert(
             "teia".into(),
-            serde_yaml::from_str("{servers: [\"nats://127.0.0.1:4222\"], cluster: rio}").unwrap(),
+            serde_norway::from_str("{servers: [\"nats://127.0.0.1:4222\"], cluster: rio}").unwrap(),
         );
-        let cfg: EngenhoConfig = serde_yaml::from_value(v).unwrap();
+        let cfg: EngenhoConfig = serde_norway::from_value(v).unwrap();
         assert_eq!(cfg.fabric, Fabric::InBinary);
         assert_eq!(cfg.deprecations(), vec![ConfigDeprecation::TeiaSection]);
     }
@@ -1140,7 +1140,7 @@ runtime:
         // same config.
         let cfg = EngenhoConfig::prescribed_default();
         let yaml = cfg.to_yaml().unwrap();
-        let back: EngenhoConfig = serde_yaml::from_str(&yaml).unwrap();
+        let back: EngenhoConfig = serde_norway::from_str(&yaml).unwrap();
         assert_eq!(cfg, back);
     }
 

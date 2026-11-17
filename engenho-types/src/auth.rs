@@ -273,9 +273,9 @@ mod tests {
     #[test]
     fn anonymous_is_yaml_safe() {
         let v = KubeAuth::Anonymous;
-        let s = serde_yaml::to_string(&v).unwrap();
+        let s = serde_norway::to_string(&v).unwrap();
         assert!(s.contains("kind: anonymous"));
-        let back: KubeAuth = serde_yaml::from_str(&s).unwrap();
+        let back: KubeAuth = serde_norway::from_str(&s).unwrap();
         assert_eq!(v, back);
     }
 
@@ -284,8 +284,8 @@ mod tests {
         let v = KubeAuth::BearerToken(TokenSource::Inline {
             token: "abc".into(),
         });
-        let s = serde_yaml::to_string(&v).unwrap();
-        let back: KubeAuth = serde_yaml::from_str(&s).unwrap();
+        let s = serde_norway::to_string(&v).unwrap();
+        let back: KubeAuth = serde_norway::from_str(&s).unwrap();
         assert_eq!(v, back);
     }
 
@@ -294,8 +294,8 @@ mod tests {
         let v = KubeAuth::BearerToken(TokenSource::File {
             path: "/var/run/sa-token".into(),
         });
-        let s = serde_yaml::to_string(&v).unwrap();
-        let back: KubeAuth = serde_yaml::from_str(&s).unwrap();
+        let s = serde_norway::to_string(&v).unwrap();
+        let back: KubeAuth = serde_norway::from_str(&s).unwrap();
         assert_eq!(v, back);
     }
 
@@ -309,8 +309,8 @@ mod tests {
                 data: "PEM-KEY".into(),
             },
         };
-        let s = serde_yaml::to_string(&v).unwrap();
-        let back: KubeAuth = serde_yaml::from_str(&s).unwrap();
+        let s = serde_norway::to_string(&v).unwrap();
+        let back: KubeAuth = serde_norway::from_str(&s).unwrap();
         assert_eq!(v, back);
     }
 
@@ -325,8 +325,8 @@ mod tests {
             }],
             api_version: "client.authentication.k8s.io/v1".into(),
         };
-        let s = serde_yaml::to_string(&v).unwrap();
-        let back: KubeAuth = serde_yaml::from_str(&s).unwrap();
+        let s = serde_norway::to_string(&v).unwrap();
+        let back: KubeAuth = serde_norway::from_str(&s).unwrap();
         assert_eq!(v, back);
     }
 }

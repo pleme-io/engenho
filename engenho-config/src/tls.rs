@@ -276,7 +276,7 @@ mod tests {
         // compatibility that matters is this one: every engenho.yaml already
         // deployed omits `extra_sans` entirely.
         let yaml = "enabled: true\nauto_generate: true\n";
-        let parsed: TlsConfig = serde_yaml::from_str(yaml).expect("legacy config must parse");
+        let parsed: TlsConfig = serde_norway::from_str(yaml).expect("legacy config must parse");
         assert!(parsed.extra_sans.is_empty());
     }
 }

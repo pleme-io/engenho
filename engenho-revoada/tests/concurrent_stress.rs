@@ -94,7 +94,7 @@ fn concurrent_apply_same_ref_last_writer_wins_no_data_corruption() {
     let r = ResourceRef::namespaced("Pod", "hot", "default");
     // Body is valid YAML (parses correctly).
     let body = face.get_resource(&r, ResourceFormat::Yaml).unwrap();
-    let parsed: serde_yaml::Value = serde_yaml::from_slice(&body).unwrap();
+    let parsed: serde_norway::Value = serde_norway::from_slice(&body).unwrap();
     assert!(parsed.get("kind").is_some(), "body should be valid YAML");
 }
 

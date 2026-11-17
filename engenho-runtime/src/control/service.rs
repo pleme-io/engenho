@@ -833,7 +833,7 @@ impl EngenhoControl for DaemonControl {
         let effective = self.effective()?;
         let overrides = self.override_set()?;
         Ok(types::ConfigView {
-            effective_yaml: serde_yaml::to_string(&effective.config).map_err(internal)?,
+            effective_yaml: serde_norway::to_string(&effective.config).map_err(internal)?,
             declared: self.declared_source()?,
             generation: overrides.generation(),
             override_count: u32::try_from(overrides.len()).unwrap_or(u32::MAX),

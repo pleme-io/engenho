@@ -2,7 +2,7 @@
 //!
 //! Closes the remaining 22 `formatdoc!` sites in `render.rs` (TYPED-EMISSION).
 //! Every emitted byte flows
-//! through `serde_yaml::to_string` on a typed struct.
+//! through `serde_norway::to_string` on a typed struct.
 
 use std::collections::BTreeMap;
 
@@ -61,7 +61,7 @@ pub struct HelmChartSpec {
     pub values_content: Option<String>,
     /// Forward-compat for future spec fields. Survives round-trip.
     #[serde(flatten)]
-    pub extra: BTreeMap<String, serde_yaml::Value>,
+    pub extra: BTreeMap<String, serde_norway::Value>,
 }
 
 impl HelmChart {
@@ -89,7 +89,7 @@ impl HelmChart {
     /// Never in practice: every field serializes to YAML.
     #[must_use]
     pub fn to_yaml(&self) -> String {
-        serde_yaml::to_string(self).expect("HelmChart serializes")
+        serde_norway::to_string(self).expect("HelmChart serializes")
     }
 
     /// Parse a `HelmChart` manifest. Tolerant of extra spec fields
@@ -98,8 +98,8 @@ impl HelmChart {
     /// # Errors
     ///
     /// Returns `Err` on malformed YAML.
-    pub fn from_yaml(s: &str) -> Result<Self, serde_yaml::Error> {
-        serde_yaml::from_str(s)
+    pub fn from_yaml(s: &str) -> Result<Self, serde_norway::Error> {
+        serde_norway::from_str(s)
     }
 }
 

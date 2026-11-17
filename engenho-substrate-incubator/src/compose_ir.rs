@@ -144,7 +144,7 @@ impl ComposeIr {
     #[must_use]
     pub fn to_yaml(&self) -> String {
         // Build the YAML by typed shape — no direct string templating
-        // for the data; serde_yaml writes the canonical bytes.
+        // for the data; serde_norway writes the canonical bytes.
         let mut root = serde_json::Map::new();
         root.insert("version".into(), serde_json::Value::String("3.9".into()));
         // services
@@ -164,8 +164,8 @@ impl ComposeIr {
             );
         }
         let value = serde_json::Value::Object(root);
-        // serde_json -> serde_yaml round-trip; safe + canonical.
-        serde_yaml::to_string(&value).unwrap_or_else(|_| "{}".into())
+        // serde_json -> serde_norway round-trip; safe + canonical.
+        serde_norway::to_string(&value).unwrap_or_else(|_| "{}".into())
     }
 }
 

@@ -14,7 +14,7 @@ description = "Typed schema for engenho/k3s cluster configuration: every network
 
 [dependencies]
 serde       = { workspace = true }
-serde_yaml  = { workspace = true }
+serde_norway  = { workspace = true }
 serde_json  = { workspace = true }
 thiserror   = { workspace = true }
 indoc       = { workspace = true }

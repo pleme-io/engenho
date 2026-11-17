@@ -60,7 +60,7 @@ pub enum ReaderError {
     Parse {
         what: String,
         #[source]
-        source: serde_yaml::Error,
+        source: serde_norway::Error,
     },
 
     #[error("invalid cluster state: {0}")]

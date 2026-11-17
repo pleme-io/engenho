@@ -749,7 +749,7 @@ fn print_reply(id: OperationId, reply: &Reply, json: bool) {
     let rendered = if json {
         serde_json::to_string_pretty(&value).unwrap_or_else(|_| text.into_owned())
     } else {
-        serde_yaml::to_string(&value).unwrap_or_else(|_| text.into_owned())
+        serde_norway::to_string(&value).unwrap_or_else(|_| text.into_owned())
     };
     println!("{}", rendered.trim_end());
 }

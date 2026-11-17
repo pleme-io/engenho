@@ -142,7 +142,7 @@ pub struct NamedContext {
 /// Emit a kubeconfig YAML for an engenho-served cluster.
 ///
 /// Builds the typed [`Kubeconfig`] value and serializes it with
-/// `serde_yaml` — a typed AST render, never a hand-rolled YAML string
+/// `serde_norway` — a typed AST render, never a hand-rolled YAML string
 /// (per the ★★ TYPED EMISSION rule). Because the emitter and the parser
 /// ([`Kubeconfig::from_yaml`]) share ONE type, emit∘parse round-trips for
 /// free.
@@ -166,7 +166,7 @@ pub struct NamedContext {
 ///
 /// # Errors
 ///
-/// [`KubeError::Encode`] if `serde_yaml` can't serialize the value (does not
+/// [`KubeError::Encode`] if `serde_norway` can't serialize the value (does not
 /// happen for the fixed shape built here, but the typed surface keeps the
 /// fallible contract).
 /// Placeholder bearer token emitted into the kubeconfig so real `kubectl`
@@ -221,7 +221,7 @@ pub fn emit_kubeconfig(
         }],
     };
 
-    serde_yaml::to_string(&config).map_err(|e| KubeError::Encode(format!("kubeconfig emit: {e}")))
+    serde_norway::to_string(&config).map_err(|e| KubeError::Encode(format!("kubeconfig emit: {e}")))
 }
 
 /// User name + context name for the admin-client-cert kubeconfig.
@@ -246,7 +246,7 @@ const ADMIN_USER: &str = "engenho-admin";
 ///
 /// # Errors
 ///
-/// [`KubeError::Encode`] if `serde_yaml` can't serialize the value.
+/// [`KubeError::Encode`] if `serde_norway` can't serialize the value.
 pub fn emit_kubeconfig_with_admin(
     cluster_name: &str,
     server_url: &str,
@@ -292,7 +292,7 @@ pub fn emit_kubeconfig_with_admin(
         }],
     };
 
-    serde_yaml::to_string(&config).map_err(|e| KubeError::Encode(format!("kubeconfig emit: {e}")))
+    serde_norway::to_string(&config).map_err(|e| KubeError::Encode(format!("kubeconfig emit: {e}")))
 }
 
 impl Kubeconfig {
@@ -302,7 +302,7 @@ impl Kubeconfig {
     ///
     /// Returns [`KubeError::Decode`] if the YAML is malformed.
     pub fn from_yaml(s: &str) -> Result<Self, KubeError> {
-        serde_yaml::from_str(s).map_err(|e| KubeError::Decode(format!("kubeconfig parse: {e}")))
+        serde_norway::from_str(s).map_err(|e| KubeError::Decode(format!("kubeconfig parse: {e}")))
     }
 
     /// Read + parse from disk.
@@ -657,9 +657,9 @@ contexts: []
 
     #[test]
     fn emitted_kubeconfig_is_valid_yaml() {
-        // serde_yaml round-trips the emitted document (no structural junk).
+        // serde_norway round-trips the emitted document (no structural junk).
         let yaml = emit_kubeconfig("c", "https://127.0.0.1:6443", SAMPLE_CA_PEM).expect("emit");
-        let _v: serde_yaml::Value =
-            serde_yaml::from_str(&yaml).expect("emitted kubeconfig is valid YAML");
+        let _v: serde_norway::Value =
+            serde_norway::from_str(&yaml).expect("emitted kubeconfig is valid YAML");
     }
 }

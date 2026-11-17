@@ -259,13 +259,13 @@ fn split_api_version(api_version: &str) -> (&str, &str) {
 /// The first document that is not YAML or not an object shape.
 pub fn parse_file(file: &str, text: &str) -> Result<Vec<RawObject>, NodeManifestError> {
     let mut objects = Vec::new();
-    for (document, de) in serde_yaml::Deserializer::from_str(text).enumerate() {
+    for (document, de) in serde_norway::Deserializer::from_str(text).enumerate() {
         let parse = |detail: String| NodeManifestError::Parse {
             file: file.to_owned(),
             document,
             detail,
         };
-        let yaml = <serde_yaml::Value as serde::Deserialize>::deserialize(de)
+        let yaml = <serde_norway::Value as serde::Deserialize>::deserialize(de)
             .map_err(|e| parse(e.to_string()))?;
         if yaml.is_null() {
             continue;

@@ -231,7 +231,7 @@ impl TraefikIngressBackend {
     /// The Traefik match expression is domain logic (path-type →
     /// `Path`/`PathPrefix`); the YAML document itself is built as a
     /// typed [`engenho_types::egress::TraefikIngressRoute`] + rendered
-    /// through `serde_yaml` (★★ TYPED EMISSION — no `format!()` of
+    /// through `serde_norway` (★★ TYPED EMISSION — no `format!()` of
     /// YAML syntax).
     #[must_use]
     pub fn render_crd(route: &IngressRoute) -> String {

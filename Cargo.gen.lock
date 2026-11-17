@@ -1,43 +1,43 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "f24920b2b4c5baf5cdcdb6db4950a572b93f83090a6cb7e97828ead22b3b6221",
+  "cargo_lock_sha256": "29b3099d3542253dec591d1c9fea07dd16b158efdec724574c3e9c55d30edf8b",
   "manifest_sha256": {
-    "Cargo.toml": "2537fade567ca28f94d3f32d52f365424f265137d0b16ac4342d71fc64973fe6",
+    "Cargo.toml": "e3ded593538cf33124e1e0400d3e942c72ddf1ecf90fcf9dff2cbe8cda9889eb",
     "engenho-apiserver/Cargo.toml": "9067f6fa2bc2ae377fa39f17105775d0a8026c554d3fca62b7a1ceb850381307",
     "engenho-blue/Cargo.toml": "95d5812ff18bcbd975b8620b6ef05783dd781e937cabd4bb6a20eef929537ba3",
-    "engenho-cluster-config-render/Cargo.toml": "5f5f6d40c2b9a572f18418d12e568412517972684259f34a9aa3d34de0a5dc8c",
-    "engenho-cluster-config/Cargo.toml": "49d8ea7131956ec2d6323ae41968f624fab66bbbbca1afbb0537b2327a683391",
+    "engenho-cluster-config-render/Cargo.toml": "bc169ce048b7e7a8cf50095ce64c234d529b0edfdde5df3bcf796262ac4b21f6",
+    "engenho-cluster-config/Cargo.toml": "67d1b32c1e60959ca0c4bf33608cce6ad041f7af875ddf541ce45afdf4c02d3b",
     "engenho-cni/Cargo.toml": "f885e491a2490e5d1503fafe0f625ada2c38ade0ccac21ee27a6ab595f368945",
-    "engenho-config/Cargo.toml": "24ed939d431673000e27510329a39b705b37ea5bf60c392ff6a93dbdfb20ed39",
-    "engenho-control-client/Cargo.toml": "e90cb5d2e9e5c53d1e59b43b6f99fe2d5edf7ec1c21923edede71172d1c0de91",
+    "engenho-config/Cargo.toml": "4bc39936444416b1b5b414002746eaef4cb25ea50829c1b98948496ba1c452ac",
+    "engenho-control-client/Cargo.toml": "2bc4ee44336fcaead277a5f6a93440b3076f5a988450cd9afdfb9fcb58963de8",
     "engenho-control-server/Cargo.toml": "04f883c3bdc3cddb47558bdfaf37b00c3418e3c036ca405b400a9f4948f2b7e6",
-    "engenho-control-types/Cargo.toml": "6f31045cccf72f10354b019946ca1c373c5ce9158b244f7f986a7292d24ba1b5",
+    "engenho-control-types/Cargo.toml": "7c829b3b1bf788421930d9ca76ead15aadac4c7b36cadac51ba13c4dfdf458f4",
     "engenho-controllers/Cargo.toml": "954ef744c98e1c84b6e8f86d1fdf781a7c9845a4a754803805cc097453fa9ef4",
     "engenho-csi/Cargo.toml": "3c39cb1483e2bcb62a63b87a826fb365c2b971852859e9008352768538a919d3",
     "engenho-diff/Cargo.toml": "b58a040e9e4ade051db52e99e78ad8c20b3c48581751017f66b040081a64d311",
     "engenho-etcd/Cargo.toml": "e6b4272524396e9053cefa45975dd859304c62f4d5992133819fbb932e426884",
     "engenho-fonte-cli/Cargo.toml": "370c6b06297206379f4ad84b91baa3c51796f1a5b8563d7ce127752cc59f1612",
-    "engenho-fonte/Cargo.toml": "a074bc92449afc5b002c35965f1c0e8f86754064d7bf7e6d86cb7c496c5bfd1e",
-    "engenho-kube-client/Cargo.toml": "91708a8a8ec2457678a3dcb977c6145d09b82a0930e609381cce93af4a1c7b3e",
-    "engenho-kube-codegen/Cargo.toml": "7c7002a740b63972a9c02397068472bb1096363deef6f1e32ca3169df577c204",
-    "engenho-kube-proto/Cargo.toml": "9e8634861b58e3c953099309b71d4cbd22f3eabf495dab9da1d054f0dbe1a6bb",
+    "engenho-fonte/Cargo.toml": "04343a7d710c292cfed4e39283052957f4fcf50d1d504752943db96b341f0f8d",
+    "engenho-kube-client/Cargo.toml": "13c087c13387687e3eef012b93241130f91e18d2e1bc6a154aebdba25d401d71",
+    "engenho-kube-codegen/Cargo.toml": "7ab3d1dc28ff9350251c270452fa2d9d0bac586ab1457d21df2f88654f02e55f",
+    "engenho-kube-proto/Cargo.toml": "ceee7a3b75abb4c1dec379a1d8c8bbb2cc1f6b613afd186f4c8eb17bb844493f",
     "engenho-kubelet/Cargo.toml": "b6874cbf22ca77eb852c69b286a831b97f772dfea629a583d5784572f235826d",
-    "engenho-mcp/Cargo.toml": "a73d0471a92fe4eeb98d75f5ca945aeafcf56c6034e36f47d06bbf980ed9e369",
+    "engenho-mcp/Cargo.toml": "2d34bdb27493966f1ca44828393bae7c7b3efd4585e568e9a6e8f8a0b7919910",
     "engenho-oracle/Cargo.toml": "9b0da2a6c1d469c28eb0617b8d71df0b0bf6db7751596956e0bb74a6ac979984",
-    "engenho-revoada/Cargo.toml": "08cfd6e45e8acfb75f3073e3a70a9a11a9c33575c43509d0199b1e73bb8012f9",
-    "engenho-runtime/Cargo.toml": "9fd0d0e0d4e7845a2a472147b4f7376d9e2747016ff4917dfc3aef21deec5c82",
+    "engenho-revoada/Cargo.toml": "ddc1cee69537a0bc6cbc42d785c59dbbdabdd3ec2c803248f16dfc44afdc1013",
+    "engenho-runtime/Cargo.toml": "7d9686ec87f06e1faa2d406464d373e0a1f7c71d524bfbf3c03a8f0375c74c6a",
     "engenho-scheduler/Cargo.toml": "b8e178bbb3012942524cd91c4f5e3c1160e11d2ec81eb81ce5f18bd1504426d1",
     "engenho-serve/Cargo.toml": "e91e4b03ebb3c2537969e30bce65f374c368c8e5a668006970524d2687023cd6",
     "engenho-store/Cargo.toml": "273289f403e635a092fbdc62b93cc16fb34424552154017d435e2d4da1c912d4",
     "engenho-substrate-core/Cargo.toml": "3bc0b7054258b721c4ac21dc36f7bf1b949352bb0d345171db6f812461d5bf8b",
-    "engenho-substrate-incubator/Cargo.toml": "b50e274b639f6bc7cee77c27de9e3c01e2f250505707ca33ab1997bd68b54bd4",
+    "engenho-substrate-incubator/Cargo.toml": "3b5f25d85008a0ae19c65ce9628ddbb8e11b5aafa63f9b6681d5d4e97dda8855",
     "engenho-substrate-props/Cargo.toml": "d5a75c33f45b46eddd6d7d4a7166e002f10b0787e57dc35bbbdd1521e126bec6",
     "engenho-substrate/Cargo.toml": "1a10dc9c0d10746216a4b6b6f9ada55b826ef57b5e0e7354ea9bdc636b920a0f",
     "engenho-sui-typescape/Cargo.toml": "30fde1a3a1db010241fa2d2c10c14a4953dcbb9979d760cf0843622f3b694207",
     "engenho-teia/Cargo.toml": "c0b840a05f7e1a944503ea3701d4f1f2a4e3656b3c334d9029e8ceb6ee8cbbcc",
-    "engenho-types/Cargo.toml": "ed835cbe693033a0b05c49550da9b34545d51a477a28a053bd0a86878bc917c3",
+    "engenho-types/Cargo.toml": "db73ac6ee09d29dd3e33af9245a0b26fde27cfe78c2ea17c5f6483fc411e564d",
     "engenho-unit/Cargo.toml": "c50c84e16c1c00b4114eb42306bd59b21ce535cb6d4c67237ba9ddb2c68be3e3",
-    "engenho/Cargo.toml": "41b636d176cd33e1d574d054f4f821b578b0610cd189e3d67c95b72b5c249802"
+    "engenho/Cargo.toml": "3994bf5af14bb68aefc41c912d2cf1bb47de5cd43a8474abd0ad53f99a616a3f"
   },
   "target_resolves": {
     "base": {
@@ -5014,8 +5014,8 @@
             "tree": "target"
           },
           {
-            "name": "serde_yaml",
-            "package_key": "serde_yaml-0.9.34+deprecated",
+            "name": "serde_norway",
+            "package_key": "serde_norway-0.9.42",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5568,8 +5568,8 @@
             "tree": "target"
           },
           {
-            "name": "serde_yaml",
-            "package_key": "serde_yaml-0.9.34+deprecated",
+            "name": "serde_norway",
+            "package_key": "serde_norway-0.9.42",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5648,8 +5648,8 @@
             "tree": "target"
           },
           {
-            "name": "serde_yaml",
-            "package_key": "serde_yaml-0.9.34+deprecated",
+            "name": "serde_norway",
+            "package_key": "serde_norway-0.9.42",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5800,8 +5800,8 @@
             "tree": "target"
           },
           {
-            "name": "serde_yaml",
-            "package_key": "serde_yaml-0.9.34+deprecated",
+            "name": "serde_norway",
+            "package_key": "serde_norway-0.9.42",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -5921,8 +5921,8 @@
             "tree": "target"
           },
           {
-            "name": "serde_yaml",
-            "package_key": "serde_yaml-0.9.34+deprecated",
+            "name": "serde_norway",
+            "package_key": "serde_norway-0.9.42",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -6330,8 +6330,8 @@
             "tree": "host"
           },
           {
-            "name": "serde_yaml",
-            "package_key": "serde_yaml-0.9.34+deprecated",
+            "name": "serde_norway",
+            "package_key": "serde_norway-0.9.42",
             "kind": "build",
             "features": [],
             "uses_default_features": true,
@@ -7397,8 +7397,8 @@
             "tree": "target"
           },
           {
-            "name": "serde_yaml",
-            "package_key": "serde_yaml-0.9.34+deprecated",
+            "name": "serde_norway",
+            "package_key": "serde_norway-0.9.42",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -7523,8 +7523,8 @@
             "tree": "target"
           },
           {
-            "name": "serde_yaml",
-            "package_key": "serde_yaml-0.9.34+deprecated",
+            "name": "serde_norway",
+            "package_key": "serde_norway-0.9.42",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -8145,8 +8145,8 @@
             "tree": "target"
           },
           {
-            "name": "serde_yaml",
-            "package_key": "serde_yaml-0.9.34+deprecated",
+            "name": "serde_norway",
+            "package_key": "serde_norway-0.9.42",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -8401,8 +8401,8 @@
             "tree": "target"
           },
           {
-            "name": "serde_yaml",
-            "package_key": "serde_yaml-0.9.34+deprecated",
+            "name": "serde_norway",
+            "package_key": "serde_norway-0.9.42",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -8698,8 +8698,8 @@
             "tree": "target"
           },
           {
-            "name": "serde_yaml",
-            "package_key": "serde_yaml-0.9.34+deprecated",
+            "name": "serde_norway",
+            "package_key": "serde_norway-0.9.42",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -9420,8 +9420,8 @@
             "tree": "target"
           },
           {
-            "name": "serde_yaml",
-            "package_key": "serde_yaml-0.9.34+deprecated",
+            "name": "serde_norway",
+            "package_key": "serde_norway-0.9.42",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -9728,8 +9728,8 @@
             "tree": "target"
           },
           {
-            "name": "serde_yaml",
-            "package_key": "serde_yaml-0.9.34+deprecated",
+            "name": "serde_norway",
+            "package_key": "serde_norway-0.9.42",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,

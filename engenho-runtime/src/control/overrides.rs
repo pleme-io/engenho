@@ -261,7 +261,7 @@ impl OverrideSet {
 pub enum OverrideWriteError {
     /// Serializing it failed.
     #[error("serialize {FILE}: {0}")]
-    Serialize(#[from] serde_yaml::Error),
+    Serialize(#[from] serde_norway::Error),
     /// Writing it failed.
     #[error("write {FILE}: {0}")]
     Write(#[from] AtomicWriteError),
@@ -293,7 +293,7 @@ impl OverrideStore {
                 unreadable: Some(err.to_string()),
                 ..OverrideSet::empty()
             },
-            Ok(bytes) => match serde_yaml::from_slice::<OverrideFile>(&bytes) {
+            Ok(bytes) => match serde_norway::from_slice::<OverrideFile>(&bytes) {
                 Ok(file) => OverrideSet {
                     generation: file.generation,
                     persisted: file.entries,
@@ -351,7 +351,7 @@ impl OverrideStore {
                 current: set.generation,
             });
         }
-        let bytes = serde_yaml::to_string(&next.to_file())?;
+        let bytes = serde_norway::to_string(&next.to_file())?;
         write_atomic_mode(&self.path, bytes.as_bytes(), 0o600)?;
         let generation = next.generation;
         *set = next;

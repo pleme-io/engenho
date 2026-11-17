@@ -13,7 +13,7 @@ use engenho_control_types::wire::{HttpParts, HttpRequest, OperationRequest};
 use engenho_control_types::{
     AuthorityTier, CATALOG, ConfirmGate, HttpMethod, OperationId, SPEC_YAML, ops, types,
 };
-use serde_yaml::Value;
+use serde_norway::Value;
 
 struct RawOp {
     method: String,
@@ -23,7 +23,7 @@ struct RawOp {
 }
 
 fn spec() -> Value {
-    serde_yaml::from_str(SPEC_YAML).expect("the spec parses")
+    serde_norway::from_str(SPEC_YAML).expect("the spec parses")
 }
 
 fn raw_ops(spec: &Value) -> Vec<RawOp> {

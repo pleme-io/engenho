@@ -6,5 +6,5 @@
 # `clippy.toml` walking up from this crate's manifest; this file REPLACES the
 # non-banning workspace-root ../clippy.toml for this crate only.
 disallowed-macros = [
-  { path = "std::format", reason = "TYPED EMISSION: emit through typed serde / Display write!() / serde_yaml / the codec, not format!() of wire" },
+  { path = "std::format", reason = "TYPED EMISSION: emit through typed serde / Display write!() / serde_norway / the codec, not format!() of wire" },
 ]
