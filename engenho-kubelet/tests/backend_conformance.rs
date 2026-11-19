@@ -281,6 +281,9 @@ enum Unavailable {
         image: String,
         detail: String,
     },
+    RootlessNetns {
+        detail: String,
+    },
     NoPodmanSocket {
         tried: Vec<PathBuf>,
         /// What the constructor built instead — a fallback worth recording.
@@ -295,6 +298,10 @@ impl fmt::Display for Unavailable {
                 write!(f, "nix could not realise {attr}: {detail}")
             }
             Self::PodmanUnreachable { detail } => write!(f, "podman is not reachable: {detail}"),
+            Self::RootlessNetns { detail } => write!(
+                f,
+                "rootless podman cannot tear down a container's network namespace on this host: {detail}"
+            ),
             Self::ImageUnobtainable { image, detail } => write!(
                 f,
                 "the conformance image {image} is not in the local store and could not be \
@@ -706,11 +713,47 @@ async fn evaluate_contract(kind: KubeletBackendKind, contract: Contract) -> Verd
     run.clean_up().await;
     match outcome {
         Ok(()) => Verdict::Conforms(run.held),
-        Err(broke) => Verdict::Violates {
-            held: run.held,
-            broke,
+        Err(broke) => match host_restriction(&broke) {
+            Some(why) => Verdict::Unavailable(why),
+            None => Verdict::Violates {
+                held: run.held,
+                broke,
+            },
         },
     }
+}
+
+fn host_restriction(broke: &Violation) -> Option<Unavailable> {
+    let observed = &broke.observed;
+    (observed.contains("rootless netns") && observed.contains("permission denied")).then(|| {
+        Unavailable::RootlessNetns {
+            detail: observed
+                .lines()
+                .find(|l| l.contains("rootless netns"))
+                .unwrap_or(observed)
+                .trim()
+                .to_owned(),
+        }
+    })
+}
+
+#[test]
+fn a_rootless_netns_refusal_is_the_host_not_the_backend() {
+    let netns = Violation::new(
+        Clause::Stop,
+        "podman stop failed\nError: removing container x network: 1 error occurred:\n\t* rootless netns: kill network process: permission denied",
+    );
+    assert_eq!(
+        host_restriction(&netns),
+        Some(Unavailable::RootlessNetns {
+            detail: "* rootless netns: kill network process: permission denied".to_owned()
+        })
+    );
+    assert_eq!(
+        host_restriction(&Violation::new(Clause::Stop, "exit 125")),
+        None
+    );
+    assert_eq!(host_restriction(&Violation::new(Clause::Stop, "")), None);
 }
 
 /// Build through both constructors and check each built the row's runtime.
