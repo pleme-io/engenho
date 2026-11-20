@@ -446,7 +446,7 @@ fn give_to_group(path: &Path, gid: u32, read_only: bool) -> std::io::Result<()> 
         mask |= 0o2110;
     }
     let mode = meta.permissions().mode() & 0o7777;
-    if mode & mask != mask {
+    if lacks_bits(mode, mask) {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode | mask))?;
     }
     if meta.is_dir() {
@@ -455,6 +455,10 @@ fn give_to_group(path: &Path, gid: u32, read_only: bool) -> std::io::Result<()> 
         }
     }
     Ok(())
+}
+
+fn lacks_bits(mode: u32, mask: u32) -> bool {
+    mode & mask != mask
 }
 
 fn group_matches(path: &Path, gid: u32, read_only: bool) -> bool {
@@ -2051,6 +2055,17 @@ unsafe extern "C" {
     reason = "tests of the runtime itself call its start directly"
 )]
 mod tests {
+
+    #[test]
+    fn a_mode_lacks_bits_only_when_some_mask_bit_is_unset() {
+        assert!(!super::lacks_bits(0o660, 0o440));
+        assert!(!super::lacks_bits(0o2770, 0o2110));
+        assert!(super::lacks_bits(0o600, 0o660));
+        assert!(super::lacks_bits(0o000, 0o440));
+        assert!(!super::lacks_bits(0o7777, 0o2770));
+        assert!(super::lacks_bits(0o0770, 0o2770));
+    }
+
     use super::*;
     use crate::backend::PodIdentity;
 
