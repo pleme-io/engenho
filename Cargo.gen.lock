@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "32d4717c406d2f216f9db0c3e5ac882c458fad3372d071a5f89468e9b9d11085",
+  "cargo_lock_sha256": "196a372a4dd2075514f37d2638b582140c83e911b0181f6887c665bfdff4b060",
   "manifest_sha256": {
     "Cargo.toml": "3cad6ac5182eef3e7bc478696da65a162d1b4a557107207cbb4b9da1cfa8b797",
     "engenho-apiserver/Cargo.toml": "9067f6fa2bc2ae377fa39f17105775d0a8026c554d3fca62b7a1ceb850381307",
@@ -3290,12 +3290,12 @@
           "std"
         ]
       },
-      "cranelift-assembler-x64-0.135.8": {
+      "cranelift-assembler-x64-0.135.10": {
         "runtime_dependencies": [],
         "build_dependencies": [
           {
             "name": "cranelift_assembler_x64_meta",
-            "package_key": "cranelift-assembler-x64-meta-0.135.8",
+            "package_key": "cranelift-assembler-x64-meta-0.135.10",
             "kind": "build",
             "features": [],
             "uses_default_features": true,
@@ -3306,11 +3306,11 @@
         ],
         "features": []
       },
-      "cranelift-assembler-x64-meta-0.135.8": {
+      "cranelift-assembler-x64-meta-0.135.10": {
         "runtime_dependencies": [
           {
             "name": "cranelift_srcgen",
-            "package_key": "cranelift-srcgen-0.135.8",
+            "package_key": "cranelift-srcgen-0.135.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -3322,11 +3322,11 @@
         "build_dependencies": [],
         "features": []
       },
-      "cranelift-bforest-0.135.8": {
+      "cranelift-bforest-0.135.10": {
         "runtime_dependencies": [
           {
             "name": "cranelift_entity",
-            "package_key": "cranelift-entity-0.135.8",
+            "package_key": "cranelift-entity-0.135.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -3336,7 +3336,7 @@
           },
           {
             "name": "wasmtime_core",
-            "package_key": "wasmtime-internal-core-48.0.8",
+            "package_key": "wasmtime-internal-core-48.0.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -3348,7 +3348,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "cranelift-bitset-0.135.8": {
+      "cranelift-bitset-0.135.10": {
         "runtime_dependencies": [
           {
             "name": "serde",
@@ -3374,7 +3374,7 @@
           },
           {
             "name": "wasmtime_core",
-            "package_key": "wasmtime-internal-core-48.0.8",
+            "package_key": "wasmtime-internal-core-48.0.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -3388,7 +3388,7 @@
           "enable-serde"
         ]
       },
-      "cranelift-codegen-0.135.8": {
+      "cranelift-codegen-0.135.10": {
         "runtime_dependencies": [
           {
             "name": "bumpalo",
@@ -3402,7 +3402,7 @@
           },
           {
             "name": "cranelift_assembler_x64",
-            "package_key": "cranelift-assembler-x64-0.135.8",
+            "package_key": "cranelift-assembler-x64-0.135.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -3412,7 +3412,7 @@
           },
           {
             "name": "cranelift_bforest",
-            "package_key": "cranelift-bforest-0.135.8",
+            "package_key": "cranelift-bforest-0.135.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -3422,7 +3422,7 @@
           },
           {
             "name": "cranelift_bitset",
-            "package_key": "cranelift-bitset-0.135.8",
+            "package_key": "cranelift-bitset-0.135.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -3432,7 +3432,7 @@
           },
           {
             "name": "cranelift_codegen_shared",
-            "package_key": "cranelift-codegen-shared-0.135.8",
+            "package_key": "cranelift-codegen-shared-0.135.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -3442,7 +3442,7 @@
           },
           {
             "name": "cranelift_control",
-            "package_key": "cranelift-control-0.135.8",
+            "package_key": "cranelift-control-0.135.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": false,
@@ -3452,7 +3452,7 @@
           },
           {
             "name": "cranelift_entity",
-            "package_key": "cranelift-entity-0.135.8",
+            "package_key": "cranelift-entity-0.135.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -3519,7 +3519,7 @@
           },
           {
             "name": "pulley_interpreter",
-            "package_key": "pulley-interpreter-48.0.8",
+            "package_key": "pulley-interpreter-48.0.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -3605,7 +3605,7 @@
           },
           {
             "name": "wasmtime_core",
-            "package_key": "wasmtime-internal-core-48.0.8",
+            "package_key": "wasmtime-internal-core-48.0.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -3617,7 +3617,7 @@
         "build_dependencies": [
           {
             "name": "cranelift_codegen_meta",
-            "package_key": "cranelift-codegen-meta-0.135.8",
+            "package_key": "cranelift-codegen-meta-0.135.10",
             "kind": "build",
             "features": [],
             "uses_default_features": true,
@@ -3627,7 +3627,7 @@
           },
           {
             "name": "cranelift_isle",
-            "package_key": "cranelift-isle-0.135.8",
+            "package_key": "cranelift-isle-0.135.10",
             "kind": "build",
             "features": [],
             "uses_default_features": true,
@@ -3651,11 +3651,11 @@
           "unwind"
         ]
       },
-      "cranelift-codegen-meta-0.135.8": {
+      "cranelift-codegen-meta-0.135.10": {
         "runtime_dependencies": [
           {
             "name": "cranelift_assembler_x64_meta",
-            "package_key": "cranelift-assembler-x64-meta-0.135.8",
+            "package_key": "cranelift-assembler-x64-meta-0.135.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -3665,7 +3665,7 @@
           },
           {
             "name": "cranelift_codegen_shared",
-            "package_key": "cranelift-codegen-shared-0.135.8",
+            "package_key": "cranelift-codegen-shared-0.135.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -3675,7 +3675,7 @@
           },
           {
             "name": "cranelift_srcgen",
-            "package_key": "cranelift-srcgen-0.135.8",
+            "package_key": "cranelift-srcgen-0.135.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -3695,7 +3695,7 @@
           },
           {
             "name": "pulley_interpreter",
-            "package_key": "pulley-interpreter-48.0.8",
+            "package_key": "pulley-interpreter-48.0.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -3709,12 +3709,12 @@
           "pulley"
         ]
       },
-      "cranelift-codegen-shared-0.135.8": {
+      "cranelift-codegen-shared-0.135.10": {
         "runtime_dependencies": [],
         "build_dependencies": [],
         "features": []
       },
-      "cranelift-control-0.135.8": {
+      "cranelift-control-0.135.10": {
         "runtime_dependencies": [
           {
             "name": "arbitrary",
@@ -3732,11 +3732,11 @@
           "fuzz"
         ]
       },
-      "cranelift-entity-0.135.8": {
+      "cranelift-entity-0.135.10": {
         "runtime_dependencies": [
           {
             "name": "cranelift_bitset",
-            "package_key": "cranelift-bitset-0.135.8",
+            "package_key": "cranelift-bitset-0.135.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -3768,7 +3768,7 @@
           },
           {
             "name": "wasmtime_core",
-            "package_key": "wasmtime-internal-core-48.0.8",
+            "package_key": "wasmtime-internal-core-48.0.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -3784,11 +3784,11 @@
           "serde_derive"
         ]
       },
-      "cranelift-frontend-0.135.8": {
+      "cranelift-frontend-0.135.10": {
         "runtime_dependencies": [
           {
             "name": "cranelift_codegen",
-            "package_key": "cranelift-codegen-0.135.8",
+            "package_key": "cranelift-codegen-0.135.10",
             "kind": "normal",
             "features": [
               "unwind"
@@ -3847,18 +3847,18 @@
           "std"
         ]
       },
-      "cranelift-isle-0.135.8": {
+      "cranelift-isle-0.135.10": {
         "runtime_dependencies": [],
         "build_dependencies": [],
         "features": [
           "default"
         ]
       },
-      "cranelift-native-0.135.8": {
+      "cranelift-native-0.135.10": {
         "runtime_dependencies": [
           {
             "name": "cranelift_codegen",
-            "package_key": "cranelift-codegen-0.135.8",
+            "package_key": "cranelift-codegen-0.135.10",
             "kind": "normal",
             "features": [
               "unwind"
@@ -3885,7 +3885,7 @@
           "std"
         ]
       },
-      "cranelift-srcgen-0.135.8": {
+      "cranelift-srcgen-0.135.10": {
         "runtime_dependencies": [],
         "build_dependencies": [],
         "features": []
@@ -13320,7 +13320,7 @@
           },
           {
             "name": "hashbrown",
-            "package_key": "hashbrown-0.17.1",
+            "package_key": "hashbrown-0.15.5",
             "kind": "normal",
             "features": [
               "default-hasher",
@@ -21222,11 +21222,11 @@
         "build_dependencies": [],
         "features": []
       },
-      "pulley-interpreter-48.0.8": {
+      "pulley-interpreter-48.0.10": {
         "runtime_dependencies": [
           {
             "name": "cranelift_bitset",
-            "package_key": "cranelift-bitset-0.135.8",
+            "package_key": "cranelift-bitset-0.135.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -21246,7 +21246,7 @@
           },
           {
             "name": "pulley_macros",
-            "package_key": "pulley-macros-48.0.8",
+            "package_key": "pulley-macros-48.0.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -21256,7 +21256,7 @@
           },
           {
             "name": "wasmtime_core",
-            "package_key": "wasmtime-internal-core-48.0.8",
+            "package_key": "wasmtime-internal-core-48.0.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -21274,7 +21274,7 @@
           "std"
         ]
       },
-      "pulley-macros-48.0.8": {
+      "pulley-macros-48.0.10": {
         "runtime_dependencies": [
           {
             "name": "proc_macro2",
@@ -27560,7 +27560,7 @@
           },
           {
             "name": "wasmtime",
-            "package_key": "wasmtime-48.0.8",
+            "package_key": "wasmtime-48.0.10",
             "kind": "normal",
             "features": [
               "addr2line",
@@ -27579,7 +27579,7 @@
           },
           {
             "name": "wasmtime_wasi",
-            "package_key": "wasmtime-wasi-48.0.8",
+            "package_key": "wasmtime-wasi-48.0.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -27589,7 +27589,7 @@
           },
           {
             "name": "wasmtime_wasi_http",
-            "package_key": "wasmtime-wasi-http-48.0.8",
+            "package_key": "wasmtime-wasi-http-48.0.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -27630,7 +27630,7 @@
           },
           {
             "name": "getrandom",
-            "package_key": "getrandom-0.4.3",
+            "package_key": "getrandom-0.3.4",
             "kind": "normal",
             "features": [],
             "uses_default_features": false,
@@ -30915,7 +30915,7 @@
           "validate"
         ]
       },
-      "wasmtime-environ-48.0.8": {
+      "wasmtime-environ-48.0.10": {
         "runtime_dependencies": [
           {
             "name": "anyhow",
@@ -30929,7 +30929,7 @@
           },
           {
             "name": "cranelift_bforest",
-            "package_key": "cranelift-bforest-0.135.8",
+            "package_key": "cranelift-bforest-0.135.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -30939,7 +30939,7 @@
           },
           {
             "name": "cranelift_bitset",
-            "package_key": "cranelift-bitset-0.135.8",
+            "package_key": "cranelift-bitset-0.135.10",
             "kind": "normal",
             "features": [
               "enable-serde"
@@ -30951,7 +30951,7 @@
           },
           {
             "name": "cranelift_entity",
-            "package_key": "cranelift-entity-0.135.8",
+            "package_key": "cranelift-entity-0.135.10",
             "kind": "normal",
             "features": [
               "enable-serde"
@@ -31136,7 +31136,7 @@
           },
           {
             "name": "wasmtime_component_util",
-            "package_key": "wasmtime-internal-component-util-48.0.8",
+            "package_key": "wasmtime-internal-component-util-48.0.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -31146,7 +31146,7 @@
           },
           {
             "name": "wasmtime_core",
-            "package_key": "wasmtime-internal-core-48.0.8",
+            "package_key": "wasmtime-internal-core-48.0.10",
             "kind": "normal",
             "features": [
               "serde"
@@ -31170,7 +31170,7 @@
           "threads"
         ]
       },
-      "wasmtime-internal-component-macro-48.0.8": {
+      "wasmtime-internal-component-macro-48.0.10": {
         "runtime_dependencies": [
           {
             "name": "anyhow",
@@ -31216,7 +31216,7 @@
           },
           {
             "name": "wasmtime_component_util",
-            "package_key": "wasmtime-internal-component-util-48.0.8",
+            "package_key": "wasmtime-internal-component-util-48.0.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -31226,7 +31226,7 @@
           },
           {
             "name": "wasmtime_wit_bindgen",
-            "package_key": "wasmtime-internal-wit-bindgen-48.0.8",
+            "package_key": "wasmtime-internal-wit-bindgen-48.0.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -31250,12 +31250,12 @@
           "async"
         ]
       },
-      "wasmtime-internal-component-util-48.0.8": {
+      "wasmtime-internal-component-util-48.0.10": {
         "runtime_dependencies": [],
         "build_dependencies": [],
         "features": []
       },
-      "wasmtime-internal-core-48.0.8": {
+      "wasmtime-internal-core-48.0.10": {
         "runtime_dependencies": [
           {
             "name": "hashbrown",
@@ -31298,11 +31298,11 @@
           "std"
         ]
       },
-      "wasmtime-internal-cranelift-48.0.8": {
+      "wasmtime-internal-cranelift-48.0.10": {
         "runtime_dependencies": [
           {
             "name": "cranelift_codegen",
-            "package_key": "cranelift-codegen-0.135.8",
+            "package_key": "cranelift-codegen-0.135.10",
             "kind": "normal",
             "features": [
               "host-arch",
@@ -31317,7 +31317,7 @@
           },
           {
             "name": "cranelift_control",
-            "package_key": "cranelift-control-0.135.8",
+            "package_key": "cranelift-control-0.135.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": false,
@@ -31327,7 +31327,7 @@
           },
           {
             "name": "cranelift_entity",
-            "package_key": "cranelift-entity-0.135.8",
+            "package_key": "cranelift-entity-0.135.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -31337,7 +31337,7 @@
           },
           {
             "name": "cranelift_frontend",
-            "package_key": "cranelift-frontend-0.135.8",
+            "package_key": "cranelift-frontend-0.135.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -31347,7 +31347,7 @@
           },
           {
             "name": "cranelift_native",
-            "package_key": "cranelift-native-0.135.8",
+            "package_key": "cranelift-native-0.135.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -31405,7 +31405,7 @@
           },
           {
             "name": "pulley_interpreter",
-            "package_key": "pulley-interpreter-48.0.8",
+            "package_key": "pulley-interpreter-48.0.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -31459,7 +31459,7 @@
           },
           {
             "name": "wasmtime_environ",
-            "package_key": "wasmtime-environ-48.0.8",
+            "package_key": "wasmtime-environ-48.0.10",
             "kind": "normal",
             "features": [
               "compile",
@@ -31477,7 +31477,7 @@
           },
           {
             "name": "wasmtime_core",
-            "package_key": "wasmtime-internal-core-48.0.8",
+            "package_key": "wasmtime-internal-core-48.0.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -31487,7 +31487,7 @@
           },
           {
             "name": "wasmtime_unwinder",
-            "package_key": "wasmtime-internal-unwinder-48.0.8",
+            "package_key": "wasmtime-internal-unwinder-48.0.10",
             "kind": "normal",
             "features": [
               "cranelift"
@@ -31499,7 +31499,7 @@
           },
           {
             "name": "wasmtime_versioned_export_macros",
-            "package_key": "wasmtime-internal-versioned-export-macros-48.0.8",
+            "package_key": "wasmtime-internal-versioned-export-macros-48.0.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -31513,7 +31513,7 @@
           "pulley"
         ]
       },
-      "wasmtime-internal-fiber-48.0.8": {
+      "wasmtime-internal-fiber-48.0.10": {
         "runtime_dependencies": [
           {
             "name": "libc",
@@ -31539,7 +31539,7 @@
           },
           {
             "name": "wasmtime_environ",
-            "package_key": "wasmtime-environ-48.0.8",
+            "package_key": "wasmtime-environ-48.0.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -31549,7 +31549,7 @@
           },
           {
             "name": "wasmtime_versioned_export_macros",
-            "package_key": "wasmtime-internal-versioned-export-macros-48.0.8",
+            "package_key": "wasmtime-internal-versioned-export-macros-48.0.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -31571,7 +31571,7 @@
           },
           {
             "name": "wasmtime_versioned_export_macros",
-            "package_key": "wasmtime-internal-versioned-export-macros-48.0.8",
+            "package_key": "wasmtime-internal-versioned-export-macros-48.0.10",
             "kind": "build",
             "features": [],
             "uses_default_features": true,
@@ -31584,11 +31584,11 @@
           "std"
         ]
       },
-      "wasmtime-internal-jit-debug-48.0.8": {
+      "wasmtime-internal-jit-debug-48.0.10": {
         "runtime_dependencies": [
           {
             "name": "wasmtime_versioned_export_macros",
-            "package_key": "wasmtime-internal-versioned-export-macros-48.0.8",
+            "package_key": "wasmtime-internal-versioned-export-macros-48.0.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -31610,7 +31610,7 @@
           },
           {
             "name": "wasmtime_versioned_export_macros",
-            "package_key": "wasmtime-internal-versioned-export-macros-48.0.8",
+            "package_key": "wasmtime-internal-versioned-export-macros-48.0.10",
             "kind": "build",
             "features": [],
             "uses_default_features": true,
@@ -31623,7 +31623,7 @@
           "std"
         ]
       },
-      "wasmtime-internal-jit-icache-coherence-48.0.8": {
+      "wasmtime-internal-jit-icache-coherence-48.0.10": {
         "runtime_dependencies": [
           {
             "name": "libc",
@@ -31637,7 +31637,7 @@
           },
           {
             "name": "wasmtime_core",
-            "package_key": "wasmtime-internal-core-48.0.8",
+            "package_key": "wasmtime-internal-core-48.0.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -31649,11 +31649,11 @@
         "build_dependencies": [],
         "features": []
       },
-      "wasmtime-internal-unwinder-48.0.8": {
+      "wasmtime-internal-unwinder-48.0.10": {
         "runtime_dependencies": [
           {
             "name": "cranelift_codegen",
-            "package_key": "cranelift-codegen-0.135.8",
+            "package_key": "cranelift-codegen-0.135.10",
             "kind": "normal",
             "features": [
               "unwind"
@@ -31688,7 +31688,7 @@
           },
           {
             "name": "wasmtime_environ",
-            "package_key": "wasmtime-environ-48.0.8",
+            "package_key": "wasmtime-environ-48.0.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -31703,7 +31703,7 @@
           "default"
         ]
       },
-      "wasmtime-internal-versioned-export-macros-48.0.8": {
+      "wasmtime-internal-versioned-export-macros-48.0.10": {
         "runtime_dependencies": [
           {
             "name": "proc_macro2",
@@ -31741,7 +31741,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "wasmtime-internal-wit-bindgen-48.0.8": {
+      "wasmtime-internal-wit-bindgen-48.0.10": {
         "runtime_dependencies": [
           {
             "name": "anyhow",
@@ -31811,7 +31811,7 @@
           "async"
         ]
       },
-      "wasmtime-wasi-48.0.8": {
+      "wasmtime-wasi-48.0.10": {
         "runtime_dependencies": [
           {
             "name": "async_trait",
@@ -31968,7 +31968,7 @@
           },
           {
             "name": "wasmtime",
-            "package_key": "wasmtime-48.0.8",
+            "package_key": "wasmtime-48.0.10",
             "kind": "normal",
             "features": [
               "runtime",
@@ -31981,7 +31981,7 @@
           },
           {
             "name": "wasmtime_wasi_io",
-            "package_key": "wasmtime-wasi-io-48.0.8",
+            "package_key": "wasmtime-wasi-io-48.0.10",
             "kind": "normal",
             "features": [
               "std"
@@ -31993,7 +31993,7 @@
           },
           {
             "name": "wiggle",
-            "package_key": "wiggle-48.0.8",
+            "package_key": "wiggle-48.0.10",
             "kind": "normal",
             "features": [
               "wasmtime"
@@ -32011,7 +32011,7 @@
           "p2"
         ]
       },
-      "wasmtime-wasi-http-48.0.8": {
+      "wasmtime-wasi-http-48.0.10": {
         "runtime_dependencies": [
           {
             "name": "async_trait",
@@ -32151,7 +32151,7 @@
           },
           {
             "name": "wasmtime",
-            "package_key": "wasmtime-48.0.8",
+            "package_key": "wasmtime-48.0.10",
             "kind": "normal",
             "features": [
               "component-model"
@@ -32163,7 +32163,7 @@
           },
           {
             "name": "wasmtime_wasi",
-            "package_key": "wasmtime-wasi-48.0.8",
+            "package_key": "wasmtime-wasi-48.0.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": false,
@@ -32173,7 +32173,7 @@
           },
           {
             "name": "wasmtime_wasi_io",
-            "package_key": "wasmtime-wasi-io-48.0.8",
+            "package_key": "wasmtime-wasi-io-48.0.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": false,
@@ -32199,7 +32199,7 @@
           "p2"
         ]
       },
-      "wasmtime-wasi-io-48.0.8": {
+      "wasmtime-wasi-io-48.0.10": {
         "runtime_dependencies": [
           {
             "name": "async_trait",
@@ -32243,7 +32243,7 @@
           },
           {
             "name": "wasmtime",
-            "package_key": "wasmtime-48.0.8",
+            "package_key": "wasmtime-48.0.10",
             "kind": "normal",
             "features": [
               "async",
@@ -32406,7 +32406,7 @@
           "std"
         ]
       },
-      "wiggle-48.0.8": {
+      "wiggle-48.0.10": {
         "runtime_dependencies": [
           {
             "name": "bitflags",
@@ -32440,7 +32440,7 @@
           },
           {
             "name": "wasmtime",
-            "package_key": "wasmtime-48.0.8",
+            "package_key": "wasmtime-48.0.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": false,
@@ -32450,7 +32450,7 @@
           },
           {
             "name": "wasmtime_environ",
-            "package_key": "wasmtime-environ-48.0.8",
+            "package_key": "wasmtime-environ-48.0.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -32460,7 +32460,7 @@
           },
           {
             "name": "wiggle_macro",
-            "package_key": "wiggle-macro-48.0.8",
+            "package_key": "wiggle-macro-48.0.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -32474,7 +32474,7 @@
           "wasmtime"
         ]
       },
-      "wiggle-generate-48.0.8": {
+      "wiggle-generate-48.0.10": {
         "runtime_dependencies": [
           {
             "name": "heck",
@@ -32520,7 +32520,7 @@
           },
           {
             "name": "wasmtime_environ",
-            "package_key": "wasmtime-environ-48.0.8",
+            "package_key": "wasmtime-environ-48.0.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -32542,7 +32542,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "wiggle-macro-48.0.8": {
+      "wiggle-macro-48.0.10": {
         "runtime_dependencies": [
           {
             "name": "proc_macro2",
@@ -32578,7 +32578,7 @@
           },
           {
             "name": "wiggle_generate",
-            "package_key": "wiggle-generate-48.0.8",
+            "package_key": "wiggle-generate-48.0.10",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -35136,7 +35136,7 @@
             "build_dependencies": [],
             "features": []
           },
-          "wasmtime-48.0.8": {
+          "wasmtime-48.0.10": {
             "runtime_dependencies": [
               {
                 "name": "addr2line",
@@ -35268,7 +35268,7 @@
               },
               {
                 "name": "pulley_interpreter",
-                "package_key": "pulley-interpreter-48.0.8",
+                "package_key": "pulley-interpreter-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -35367,7 +35367,7 @@
               },
               {
                 "name": "wasmtime_environ",
-                "package_key": "wasmtime-environ-48.0.8",
+                "package_key": "wasmtime-environ-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -35377,7 +35377,7 @@
               },
               {
                 "name": "wasmtime_component_macro",
-                "package_key": "wasmtime-internal-component-macro-48.0.8",
+                "package_key": "wasmtime-internal-component-macro-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -35387,7 +35387,7 @@
               },
               {
                 "name": "wasmtime_component_util",
-                "package_key": "wasmtime-internal-component-util-48.0.8",
+                "package_key": "wasmtime-internal-component-util-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -35397,7 +35397,7 @@
               },
               {
                 "name": "wasmtime_core",
-                "package_key": "wasmtime-internal-core-48.0.8",
+                "package_key": "wasmtime-internal-core-48.0.10",
                 "kind": "normal",
                 "features": [
                   "serde"
@@ -35409,7 +35409,7 @@
               },
               {
                 "name": "wasmtime_cranelift",
-                "package_key": "wasmtime-internal-cranelift-48.0.8",
+                "package_key": "wasmtime-internal-cranelift-48.0.10",
                 "kind": "normal",
                 "features": [
                   "pulley"
@@ -35421,7 +35421,7 @@
               },
               {
                 "name": "wasmtime_fiber",
-                "package_key": "wasmtime-internal-fiber-48.0.8",
+                "package_key": "wasmtime-internal-fiber-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -35431,7 +35431,7 @@
               },
               {
                 "name": "wasmtime_jit_icache_coherence",
-                "package_key": "wasmtime-internal-jit-icache-coherence-48.0.8",
+                "package_key": "wasmtime-internal-jit-icache-coherence-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -35441,7 +35441,7 @@
               },
               {
                 "name": "wasmtime_unwinder",
-                "package_key": "wasmtime-internal-unwinder-48.0.8",
+                "package_key": "wasmtime-internal-unwinder-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -35451,7 +35451,7 @@
               },
               {
                 "name": "wasmtime_versioned_export_macros",
-                "package_key": "wasmtime-internal-versioned-export-macros-48.0.8",
+                "package_key": "wasmtime-internal-versioned-export-macros-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -35483,7 +35483,7 @@
               },
               {
                 "name": "wasmtime_versioned_export_macros",
-                "package_key": "wasmtime-internal-versioned-export-macros-48.0.8",
+                "package_key": "wasmtime-internal-versioned-export-macros-48.0.10",
                 "kind": "build",
                 "features": [],
                 "uses_default_features": true,
@@ -36824,7 +36824,7 @@
             "build_dependencies": [],
             "features": []
           },
-          "wasmtime-48.0.8": {
+          "wasmtime-48.0.10": {
             "runtime_dependencies": [
               {
                 "name": "addr2line",
@@ -36956,7 +36956,7 @@
               },
               {
                 "name": "pulley_interpreter",
-                "package_key": "pulley-interpreter-48.0.8",
+                "package_key": "pulley-interpreter-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -37055,7 +37055,7 @@
               },
               {
                 "name": "wasmtime_environ",
-                "package_key": "wasmtime-environ-48.0.8",
+                "package_key": "wasmtime-environ-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -37065,7 +37065,7 @@
               },
               {
                 "name": "wasmtime_component_macro",
-                "package_key": "wasmtime-internal-component-macro-48.0.8",
+                "package_key": "wasmtime-internal-component-macro-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -37075,7 +37075,7 @@
               },
               {
                 "name": "wasmtime_component_util",
-                "package_key": "wasmtime-internal-component-util-48.0.8",
+                "package_key": "wasmtime-internal-component-util-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -37085,7 +37085,7 @@
               },
               {
                 "name": "wasmtime_core",
-                "package_key": "wasmtime-internal-core-48.0.8",
+                "package_key": "wasmtime-internal-core-48.0.10",
                 "kind": "normal",
                 "features": [
                   "serde"
@@ -37097,7 +37097,7 @@
               },
               {
                 "name": "wasmtime_cranelift",
-                "package_key": "wasmtime-internal-cranelift-48.0.8",
+                "package_key": "wasmtime-internal-cranelift-48.0.10",
                 "kind": "normal",
                 "features": [
                   "pulley"
@@ -37109,7 +37109,7 @@
               },
               {
                 "name": "wasmtime_fiber",
-                "package_key": "wasmtime-internal-fiber-48.0.8",
+                "package_key": "wasmtime-internal-fiber-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -37119,7 +37119,7 @@
               },
               {
                 "name": "wasmtime_jit_icache_coherence",
-                "package_key": "wasmtime-internal-jit-icache-coherence-48.0.8",
+                "package_key": "wasmtime-internal-jit-icache-coherence-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -37129,7 +37129,7 @@
               },
               {
                 "name": "wasmtime_unwinder",
-                "package_key": "wasmtime-internal-unwinder-48.0.8",
+                "package_key": "wasmtime-internal-unwinder-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -37139,7 +37139,7 @@
               },
               {
                 "name": "wasmtime_versioned_export_macros",
-                "package_key": "wasmtime-internal-versioned-export-macros-48.0.8",
+                "package_key": "wasmtime-internal-versioned-export-macros-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -37171,7 +37171,7 @@
               },
               {
                 "name": "wasmtime_versioned_export_macros",
-                "package_key": "wasmtime-internal-versioned-export-macros-48.0.8",
+                "package_key": "wasmtime-internal-versioned-export-macros-48.0.10",
                 "kind": "build",
                 "features": [],
                 "uses_default_features": true,
@@ -38512,7 +38512,7 @@
             "build_dependencies": [],
             "features": []
           },
-          "wasmtime-48.0.8": {
+          "wasmtime-48.0.10": {
             "runtime_dependencies": [
               {
                 "name": "addr2line",
@@ -38644,7 +38644,7 @@
               },
               {
                 "name": "pulley_interpreter",
-                "package_key": "pulley-interpreter-48.0.8",
+                "package_key": "pulley-interpreter-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -38743,7 +38743,7 @@
               },
               {
                 "name": "wasmtime_environ",
-                "package_key": "wasmtime-environ-48.0.8",
+                "package_key": "wasmtime-environ-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -38753,7 +38753,7 @@
               },
               {
                 "name": "wasmtime_component_macro",
-                "package_key": "wasmtime-internal-component-macro-48.0.8",
+                "package_key": "wasmtime-internal-component-macro-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -38763,7 +38763,7 @@
               },
               {
                 "name": "wasmtime_component_util",
-                "package_key": "wasmtime-internal-component-util-48.0.8",
+                "package_key": "wasmtime-internal-component-util-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -38773,7 +38773,7 @@
               },
               {
                 "name": "wasmtime_core",
-                "package_key": "wasmtime-internal-core-48.0.8",
+                "package_key": "wasmtime-internal-core-48.0.10",
                 "kind": "normal",
                 "features": [
                   "serde"
@@ -38785,7 +38785,7 @@
               },
               {
                 "name": "wasmtime_cranelift",
-                "package_key": "wasmtime-internal-cranelift-48.0.8",
+                "package_key": "wasmtime-internal-cranelift-48.0.10",
                 "kind": "normal",
                 "features": [
                   "pulley"
@@ -38797,7 +38797,7 @@
               },
               {
                 "name": "wasmtime_fiber",
-                "package_key": "wasmtime-internal-fiber-48.0.8",
+                "package_key": "wasmtime-internal-fiber-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -38807,7 +38807,7 @@
               },
               {
                 "name": "wasmtime_jit_icache_coherence",
-                "package_key": "wasmtime-internal-jit-icache-coherence-48.0.8",
+                "package_key": "wasmtime-internal-jit-icache-coherence-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -38817,7 +38817,7 @@
               },
               {
                 "name": "wasmtime_unwinder",
-                "package_key": "wasmtime-internal-unwinder-48.0.8",
+                "package_key": "wasmtime-internal-unwinder-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -38827,7 +38827,7 @@
               },
               {
                 "name": "wasmtime_versioned_export_macros",
-                "package_key": "wasmtime-internal-versioned-export-macros-48.0.8",
+                "package_key": "wasmtime-internal-versioned-export-macros-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -38859,7 +38859,7 @@
               },
               {
                 "name": "wasmtime_versioned_export_macros",
-                "package_key": "wasmtime-internal-versioned-export-macros-48.0.8",
+                "package_key": "wasmtime-internal-versioned-export-macros-48.0.10",
                 "kind": "build",
                 "features": [],
                 "uses_default_features": true,
@@ -40367,7 +40367,7 @@
             "build_dependencies": [],
             "features": []
           },
-          "wasmtime-48.0.8": {
+          "wasmtime-48.0.10": {
             "runtime_dependencies": [
               {
                 "name": "addr2line",
@@ -40499,7 +40499,7 @@
               },
               {
                 "name": "pulley_interpreter",
-                "package_key": "pulley-interpreter-48.0.8",
+                "package_key": "pulley-interpreter-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -40598,7 +40598,7 @@
               },
               {
                 "name": "wasmtime_environ",
-                "package_key": "wasmtime-environ-48.0.8",
+                "package_key": "wasmtime-environ-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -40608,7 +40608,7 @@
               },
               {
                 "name": "wasmtime_component_macro",
-                "package_key": "wasmtime-internal-component-macro-48.0.8",
+                "package_key": "wasmtime-internal-component-macro-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -40618,7 +40618,7 @@
               },
               {
                 "name": "wasmtime_component_util",
-                "package_key": "wasmtime-internal-component-util-48.0.8",
+                "package_key": "wasmtime-internal-component-util-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -40628,7 +40628,7 @@
               },
               {
                 "name": "wasmtime_core",
-                "package_key": "wasmtime-internal-core-48.0.8",
+                "package_key": "wasmtime-internal-core-48.0.10",
                 "kind": "normal",
                 "features": [
                   "serde"
@@ -40640,7 +40640,7 @@
               },
               {
                 "name": "wasmtime_cranelift",
-                "package_key": "wasmtime-internal-cranelift-48.0.8",
+                "package_key": "wasmtime-internal-cranelift-48.0.10",
                 "kind": "normal",
                 "features": [
                   "pulley"
@@ -40652,7 +40652,7 @@
               },
               {
                 "name": "wasmtime_fiber",
-                "package_key": "wasmtime-internal-fiber-48.0.8",
+                "package_key": "wasmtime-internal-fiber-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -40662,7 +40662,7 @@
               },
               {
                 "name": "wasmtime_jit_icache_coherence",
-                "package_key": "wasmtime-internal-jit-icache-coherence-48.0.8",
+                "package_key": "wasmtime-internal-jit-icache-coherence-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -40672,7 +40672,7 @@
               },
               {
                 "name": "wasmtime_unwinder",
-                "package_key": "wasmtime-internal-unwinder-48.0.8",
+                "package_key": "wasmtime-internal-unwinder-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -40682,7 +40682,7 @@
               },
               {
                 "name": "wasmtime_versioned_export_macros",
-                "package_key": "wasmtime-internal-versioned-export-macros-48.0.8",
+                "package_key": "wasmtime-internal-versioned-export-macros-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -40714,7 +40714,7 @@
               },
               {
                 "name": "wasmtime_versioned_export_macros",
-                "package_key": "wasmtime-internal-versioned-export-macros-48.0.8",
+                "package_key": "wasmtime-internal-versioned-export-macros-48.0.10",
                 "kind": "build",
                 "features": [],
                 "uses_default_features": true,
@@ -42060,7 +42060,7 @@
             "build_dependencies": [],
             "features": []
           },
-          "wasmtime-48.0.8": {
+          "wasmtime-48.0.10": {
             "runtime_dependencies": [
               {
                 "name": "addr2line",
@@ -42192,7 +42192,7 @@
               },
               {
                 "name": "pulley_interpreter",
-                "package_key": "pulley-interpreter-48.0.8",
+                "package_key": "pulley-interpreter-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -42291,7 +42291,7 @@
               },
               {
                 "name": "wasmtime_environ",
-                "package_key": "wasmtime-environ-48.0.8",
+                "package_key": "wasmtime-environ-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -42301,7 +42301,7 @@
               },
               {
                 "name": "wasmtime_component_macro",
-                "package_key": "wasmtime-internal-component-macro-48.0.8",
+                "package_key": "wasmtime-internal-component-macro-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -42311,7 +42311,7 @@
               },
               {
                 "name": "wasmtime_component_util",
-                "package_key": "wasmtime-internal-component-util-48.0.8",
+                "package_key": "wasmtime-internal-component-util-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -42321,7 +42321,7 @@
               },
               {
                 "name": "wasmtime_core",
-                "package_key": "wasmtime-internal-core-48.0.8",
+                "package_key": "wasmtime-internal-core-48.0.10",
                 "kind": "normal",
                 "features": [
                   "serde"
@@ -42333,7 +42333,7 @@
               },
               {
                 "name": "wasmtime_cranelift",
-                "package_key": "wasmtime-internal-cranelift-48.0.8",
+                "package_key": "wasmtime-internal-cranelift-48.0.10",
                 "kind": "normal",
                 "features": [
                   "pulley"
@@ -42345,7 +42345,7 @@
               },
               {
                 "name": "wasmtime_fiber",
-                "package_key": "wasmtime-internal-fiber-48.0.8",
+                "package_key": "wasmtime-internal-fiber-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -42355,7 +42355,7 @@
               },
               {
                 "name": "wasmtime_jit_icache_coherence",
-                "package_key": "wasmtime-internal-jit-icache-coherence-48.0.8",
+                "package_key": "wasmtime-internal-jit-icache-coherence-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -42365,7 +42365,7 @@
               },
               {
                 "name": "wasmtime_unwinder",
-                "package_key": "wasmtime-internal-unwinder-48.0.8",
+                "package_key": "wasmtime-internal-unwinder-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -42375,7 +42375,7 @@
               },
               {
                 "name": "wasmtime_versioned_export_macros",
-                "package_key": "wasmtime-internal-versioned-export-macros-48.0.8",
+                "package_key": "wasmtime-internal-versioned-export-macros-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -42407,7 +42407,7 @@
               },
               {
                 "name": "wasmtime_versioned_export_macros",
-                "package_key": "wasmtime-internal-versioned-export-macros-48.0.8",
+                "package_key": "wasmtime-internal-versioned-export-macros-48.0.10",
                 "kind": "build",
                 "features": [],
                 "uses_default_features": true,
@@ -43753,7 +43753,7 @@
             "build_dependencies": [],
             "features": []
           },
-          "wasmtime-48.0.8": {
+          "wasmtime-48.0.10": {
             "runtime_dependencies": [
               {
                 "name": "addr2line",
@@ -43885,7 +43885,7 @@
               },
               {
                 "name": "pulley_interpreter",
-                "package_key": "pulley-interpreter-48.0.8",
+                "package_key": "pulley-interpreter-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -43984,7 +43984,7 @@
               },
               {
                 "name": "wasmtime_environ",
-                "package_key": "wasmtime-environ-48.0.8",
+                "package_key": "wasmtime-environ-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -43994,7 +43994,7 @@
               },
               {
                 "name": "wasmtime_component_macro",
-                "package_key": "wasmtime-internal-component-macro-48.0.8",
+                "package_key": "wasmtime-internal-component-macro-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -44004,7 +44004,7 @@
               },
               {
                 "name": "wasmtime_component_util",
-                "package_key": "wasmtime-internal-component-util-48.0.8",
+                "package_key": "wasmtime-internal-component-util-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -44014,7 +44014,7 @@
               },
               {
                 "name": "wasmtime_core",
-                "package_key": "wasmtime-internal-core-48.0.8",
+                "package_key": "wasmtime-internal-core-48.0.10",
                 "kind": "normal",
                 "features": [
                   "serde"
@@ -44026,7 +44026,7 @@
               },
               {
                 "name": "wasmtime_cranelift",
-                "package_key": "wasmtime-internal-cranelift-48.0.8",
+                "package_key": "wasmtime-internal-cranelift-48.0.10",
                 "kind": "normal",
                 "features": [
                   "pulley"
@@ -44038,7 +44038,7 @@
               },
               {
                 "name": "wasmtime_fiber",
-                "package_key": "wasmtime-internal-fiber-48.0.8",
+                "package_key": "wasmtime-internal-fiber-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -44048,7 +44048,7 @@
               },
               {
                 "name": "wasmtime_jit_icache_coherence",
-                "package_key": "wasmtime-internal-jit-icache-coherence-48.0.8",
+                "package_key": "wasmtime-internal-jit-icache-coherence-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -44058,7 +44058,7 @@
               },
               {
                 "name": "wasmtime_unwinder",
-                "package_key": "wasmtime-internal-unwinder-48.0.8",
+                "package_key": "wasmtime-internal-unwinder-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -44068,7 +44068,7 @@
               },
               {
                 "name": "wasmtime_versioned_export_macros",
-                "package_key": "wasmtime-internal-versioned-export-macros-48.0.8",
+                "package_key": "wasmtime-internal-versioned-export-macros-48.0.10",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -44100,7 +44100,7 @@
               },
               {
                 "name": "wasmtime_versioned_export_macros",
-                "package_key": "wasmtime-internal-versioned-export-macros-48.0.8",
+                "package_key": "wasmtime-internal-versioned-export-macros-48.0.10",
                 "kind": "build",
                 "features": [],
                 "uses_default_features": true,
@@ -44482,7 +44482,7 @@
     "cpufeatures-0.3.1": {
       "edition": "2024"
     },
-    "cranelift-assembler-x64-0.135.8": {
+    "cranelift-assembler-x64-0.135.10": {
       "edition": "2024",
       "build_script": "build.rs",
       "binaries": [
@@ -44492,7 +44492,7 @@
         }
       ]
     },
-    "cranelift-assembler-x64-meta-0.135.8": {
+    "cranelift-assembler-x64-meta-0.135.10": {
       "edition": "2024",
       "binaries": [
         {
@@ -44501,39 +44501,39 @@
         }
       ]
     },
-    "cranelift-bforest-0.135.8": {
+    "cranelift-bforest-0.135.10": {
       "edition": "2024"
     },
-    "cranelift-bitset-0.135.8": {
+    "cranelift-bitset-0.135.10": {
       "edition": "2024"
     },
-    "cranelift-codegen-0.135.8": {
+    "cranelift-codegen-0.135.10": {
       "edition": "2024",
       "build_script": "build.rs"
     },
-    "cranelift-codegen-meta-0.135.8": {
+    "cranelift-codegen-meta-0.135.10": {
       "edition": "2024"
     },
-    "cranelift-codegen-shared-0.135.8": {
+    "cranelift-codegen-shared-0.135.10": {
       "edition": "2024"
     },
-    "cranelift-control-0.135.8": {
+    "cranelift-control-0.135.10": {
       "edition": "2024"
     },
-    "cranelift-entity-0.135.8": {
+    "cranelift-entity-0.135.10": {
       "edition": "2024"
     },
-    "cranelift-frontend-0.135.8": {
+    "cranelift-frontend-0.135.10": {
       "edition": "2024"
     },
-    "cranelift-isle-0.135.8": {
+    "cranelift-isle-0.135.10": {
       "edition": "2024",
       "build_script": "build.rs"
     },
-    "cranelift-native-0.135.8": {
+    "cranelift-native-0.135.10": {
       "edition": "2024"
     },
-    "cranelift-srcgen-0.135.8": {
+    "cranelift-srcgen-0.135.10": {
       "edition": "2024"
     },
     "crc32fast-1.5.5": {
@@ -45822,10 +45822,10 @@
     "pulldown-cmark-to-cmark-22.0.3": {
       "edition": "2018"
     },
-    "pulley-interpreter-48.0.8": {
+    "pulley-interpreter-48.0.10": {
       "edition": "2024"
     },
-    "pulley-macros-48.0.8": {
+    "pulley-macros-48.0.10": {
       "edition": "2024",
       "proc_macro": true
     },
@@ -46619,58 +46619,58 @@
     "wasmprinter-0.254.2": {
       "edition": "2024"
     },
-    "wasmtime-48.0.8": {
+    "wasmtime-48.0.10": {
       "edition": "2024",
       "build_script": "build.rs"
     },
-    "wasmtime-environ-48.0.8": {
+    "wasmtime-environ-48.0.10": {
       "edition": "2024"
     },
-    "wasmtime-internal-component-macro-48.0.8": {
+    "wasmtime-internal-component-macro-48.0.10": {
       "edition": "2024",
       "proc_macro": true,
       "build_script": "build.rs"
     },
-    "wasmtime-internal-component-util-48.0.8": {
+    "wasmtime-internal-component-util-48.0.10": {
       "edition": "2024"
     },
-    "wasmtime-internal-core-48.0.8": {
+    "wasmtime-internal-core-48.0.10": {
       "edition": "2024",
       "build_script": "build.rs"
     },
-    "wasmtime-internal-cranelift-48.0.8": {
+    "wasmtime-internal-cranelift-48.0.10": {
       "edition": "2024",
       "build_script": "build.rs"
     },
-    "wasmtime-internal-fiber-48.0.8": {
+    "wasmtime-internal-fiber-48.0.10": {
       "edition": "2024",
       "build_script": "build.rs"
     },
-    "wasmtime-internal-jit-debug-48.0.8": {
+    "wasmtime-internal-jit-debug-48.0.10": {
       "edition": "2024",
       "build_script": "build.rs"
     },
-    "wasmtime-internal-jit-icache-coherence-48.0.8": {
+    "wasmtime-internal-jit-icache-coherence-48.0.10": {
       "edition": "2024"
     },
-    "wasmtime-internal-unwinder-48.0.8": {
+    "wasmtime-internal-unwinder-48.0.10": {
       "edition": "2024",
       "build_script": "build.rs"
     },
-    "wasmtime-internal-versioned-export-macros-48.0.8": {
+    "wasmtime-internal-versioned-export-macros-48.0.10": {
       "edition": "2024",
       "proc_macro": true
     },
-    "wasmtime-internal-wit-bindgen-48.0.8": {
+    "wasmtime-internal-wit-bindgen-48.0.10": {
       "edition": "2024"
     },
-    "wasmtime-wasi-48.0.8": {
+    "wasmtime-wasi-48.0.10": {
       "edition": "2024"
     },
-    "wasmtime-wasi-http-48.0.8": {
+    "wasmtime-wasi-http-48.0.10": {
       "edition": "2024"
     },
-    "wasmtime-wasi-io-48.0.8": {
+    "wasmtime-wasi-io-48.0.10": {
       "edition": "2024"
     },
     "wast-263.0.0": {
@@ -46688,13 +46688,13 @@
     "wide-0.7.33": {
       "edition": "2018"
     },
-    "wiggle-48.0.8": {
+    "wiggle-48.0.10": {
       "edition": "2024"
     },
-    "wiggle-generate-48.0.8": {
+    "wiggle-generate-48.0.10": {
       "edition": "2024"
     },
-    "wiggle-macro-48.0.8": {
+    "wiggle-macro-48.0.10": {
       "edition": "2024",
       "proc_macro": true,
       "build_script": "build.rs"
