@@ -1391,6 +1391,36 @@ impl NativeBackend {
         Ok(candidate)
     }
 
+    fn program_and_args(
+        closure: &Path,
+        spec: &ContainerSpec,
+    ) -> Result<(PathBuf, Vec<String>), NativeError> {
+        match spec.entrypoint.as_deref() {
+            Some(entrypoint) if !entrypoint.is_empty() => {
+                let argv = spec.argv();
+                Ok((
+                    Self::resolve_program(closure, &argv)?,
+                    argv.into_iter().skip(1).collect(),
+                ))
+            }
+            _ => {
+                let named = spec.command.first().is_some_and(|first| {
+                    first.starts_with('/') || closure.join("bin").join(first).is_file()
+                });
+                match (named, Self::sole_executable(closure)) {
+                    (false, Ok(sole)) => Ok((sole, spec.command.clone())),
+                    _ => {
+                        let argv = spec.argv();
+                        Ok((
+                            Self::resolve_program(closure, &argv)?,
+                            argv.into_iter().skip(1).collect(),
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
     /// The closure's single executable, or a typed refusal naming what it
     /// found instead.
     fn sole_executable(closure: &Path) -> Result<PathBuf, NativeError> {
@@ -1548,8 +1578,7 @@ impl ContainerRuntime for NativeBackend {
         }
         let admission = self.admit(&spec.resources, &verdict.limits)?;
         let closure = Self::closure_of(spec)?;
-        let argv = spec.argv();
-        let program = Self::resolve_program(&closure, &argv)?;
+        let (program, args) = Self::program_and_args(&closure, spec)?;
         let private = self.private_mounts_for(spec)?;
         if private.is_none() {
             Self::verify_mounts(spec)?;
@@ -1591,7 +1620,7 @@ impl ContainerRuntime for NativeBackend {
 
         let mut cmd = workload_command(
             &program,
-            argv.iter().skip(1),
+            args.iter(),
             &spec.env,
             self.survival.is_none() || outliving.is_none(),
         );
@@ -2172,6 +2201,39 @@ mod tests {
         for n in ["initdb", "postgres", "psql"] {
             assert!(msg.contains(n), "the candidates must be named: {msg}");
         }
+    }
+
+    #[test]
+    fn args_without_a_command_run_the_sole_executable_as_kubernetes_does() {
+        let dir = std::env::temp_dir().join(format!("engenho-args-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("bin").join("kensa"), "").unwrap();
+        let spec = ContainerSpec {
+            entrypoint: None,
+            command: vec!["daemon".to_string()],
+            ..ContainerSpec::default()
+        };
+        let (program, args) = NativeBackend::program_and_args(&dir, &spec).unwrap();
+        assert_eq!(program, dir.join("bin").join("kensa"));
+        assert_eq!(args, vec!["daemon".to_string()]);
+        let named = ContainerSpec {
+            entrypoint: Some(vec!["/nix/store/x-p/bin/p".to_string()]),
+            command: vec!["--flag".to_string()],
+            ..ContainerSpec::default()
+        };
+        let (program, args) = NativeBackend::program_and_args(&dir, &named).unwrap();
+        assert_eq!(program, PathBuf::from("/nix/store/x-p/bin/p"));
+        assert_eq!(args, vec!["--flag".to_string()]);
+        let named_in_args = ContainerSpec {
+            entrypoint: None,
+            command: vec!["kensa".to_string(), "check".to_string()],
+            ..ContainerSpec::default()
+        };
+        assert!(matches!(
+            NativeBackend::program_and_args(&dir, &named_in_args),
+            Err(NativeError::CommandEscapesStore { .. })
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// An empty `bin/` infers nothing, and says so distinctly from ambiguous.
