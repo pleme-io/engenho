@@ -2216,6 +2216,14 @@ mod tests {
         let (program, args) = NativeBackend::program_and_args(&dir, &spec).unwrap();
         assert_eq!(program, dir.join("bin").join("kensa"));
         assert_eq!(args, vec!["daemon".to_string()]);
+        let empty_entrypoint = ContainerSpec {
+            entrypoint: Some(Vec::new()),
+            command: vec!["daemon".to_string()],
+            ..ContainerSpec::default()
+        };
+        let (program, args) = NativeBackend::program_and_args(&dir, &empty_entrypoint).unwrap();
+        assert_eq!(program, dir.join("bin").join("kensa"));
+        assert_eq!(args, vec!["daemon".to_string()]);
         let named = ContainerSpec {
             entrypoint: Some(vec!["/nix/store/x-p/bin/p".to_string()]),
             command: vec!["--flag".to_string()],
