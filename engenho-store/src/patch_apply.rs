@@ -442,15 +442,11 @@ fn apply_one_op(doc: &mut Value, op: &JsonPatchOp) -> Result<(), PatchError> {
             let v = pointer_remove(doc, from)?;
             pointer_add(doc, path, v)
         }
-        JsonPatchOp::Test { path, value } => {
-            let actual = pointer_get(doc, path)
-                .ok_or_else(|| PatchError::TestFailed { path: path.clone() })?;
-            if actual == value {
-                Ok(())
-            } else {
-                Err(PatchError::TestFailed { path: path.clone() })
-            }
-        }
+        JsonPatchOp::Test { path, value } => match pointer_get(doc, path) {
+            Some(actual) if actual == value => Ok(()),
+            None if value.is_null() => Ok(()),
+            _ => Err(PatchError::TestFailed { path: path.clone() }),
+        },
     }
 }
 
@@ -1277,6 +1273,42 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, PatchError::TestFailed { path: "/a".into() });
+    }
+
+    #[test]
+    fn json_test_of_a_missing_path_against_null_passes_as_kubernetes_does() {
+        let out = json_patch(
+            json!({"metadata": {"name": "m"}}),
+            vec![
+                JsonPatchOp::Test {
+                    path: "/metadata/finalizers".into(),
+                    value: json!(null),
+                },
+                JsonPatchOp::Add {
+                    path: "/metadata/finalizers".into(),
+                    value: json!(["shinka.pleme.io/cleanup"]),
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            out["metadata"]["finalizers"],
+            json!(["shinka.pleme.io/cleanup"])
+        );
+        let err = json_patch(
+            json!({"metadata": {}}),
+            vec![JsonPatchOp::Test {
+                path: "/metadata/finalizers".into(),
+                value: json!([]),
+            }],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            PatchError::TestFailed {
+                path: "/metadata/finalizers".into()
+            }
+        );
     }
 
     #[test]

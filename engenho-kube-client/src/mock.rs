@@ -279,14 +279,12 @@ fn apply_json_patch_ops(
                 let v = mock_ptr_remove(&mut doc, from)?;
                 mock_ptr_add(&mut doc, path, v)?;
             }
-            JsonPatchOp::Test { path, value } => {
-                let actual = doc
-                    .pointer(path)
-                    .ok_or_else(|| format!("test: missing pointer {path}"))?;
-                if actual != value {
-                    return Err(format!("test failed at {path}"));
-                }
-            }
+            JsonPatchOp::Test { path, value } => match doc.pointer(path) {
+                Some(actual) if actual == value => {}
+                None if value.is_null() => {}
+                None => return Err(format!("test: missing pointer {path}")),
+                Some(_) => return Err(format!("test failed at {path}")),
+            },
         }
     }
     Ok(doc)
