@@ -1,0 +1,6 @@
+# RUSTSEC-2026-0255 — sized-chunks 0.6.5 (via im-rc 15.1.0 via sui-eval):
+# panic-safety unsoundness, NOT a CVE; no fixed upgrade exists — im-rc's
+# fix release (16.x, which drops sized-chunks) has not shipped. Ignored
+# 2026-11-26; revisit when im-rc > 15.1.0 lands and remove this row.
+[advisories]
+ignore = ["RUSTSEC-2026-0255"]
